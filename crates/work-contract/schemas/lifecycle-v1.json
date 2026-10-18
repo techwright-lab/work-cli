@@ -1,0 +1,296 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LifecycleEnvelope",
+  "description": "Versioned lifecycle document. Owner is required and must never be null.",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "$ref": "#/$defs/ActorId"
+    },
+    "checkout_id": {
+      "$ref": "#/$defs/CheckoutId"
+    },
+    "delivery": {
+      "$ref": "#/$defs/AttributionDelivery"
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/LifecycleEvent"
+      }
+    },
+    "group_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GroupId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/CheckoutLifecycle"
+    },
+    "mode": {
+      "$ref": "#/$defs/ExecutionMode"
+    },
+    "operation_id": {
+      "$ref": "#/$defs/AllocationOperationId"
+    },
+    "owner": {
+      "$ref": "#/$defs/OwnerId"
+    },
+    "repository": {
+      "$ref": "#/$defs/RepositoryId"
+    },
+    "run_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RunId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "run_outcome": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RunOutcome"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "schema_version": {
+      "$ref": "#/$defs/SchemaVersion"
+    },
+    "task": {
+      "$ref": "#/$defs/TaskId"
+    },
+    "task_completion": {
+      "$ref": "#/$defs/TaskCompletion"
+    }
+  },
+  "required": [
+    "schema_version",
+    "operation_id",
+    "checkout_id",
+    "actor",
+    "repository",
+    "task",
+    "owner",
+    "mode",
+    "lifecycle",
+    "delivery",
+    "task_completion",
+    "events"
+  ],
+  "$defs": {
+    "ActorId": {
+      "description": "Nonempty validated identity. Empty or whitespace-only values are rejected.",
+      "type": "string"
+    },
+    "AllocationOperationId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "AttributionDelivery": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "pending",
+        "delivered",
+        "failed"
+      ]
+    },
+    "CheckoutId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "CheckoutLifecycle": {
+      "type": "string",
+      "enum": [
+        "reserved",
+        "partially_created",
+        "ready",
+        "active",
+        "expired",
+        "interrupted",
+        "held",
+        "quarantined",
+        "partially_deleted",
+        "retired"
+      ]
+    },
+    "EventId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "ExecutionMode": {
+      "type": "string",
+      "enum": [
+        "supervised",
+        "adopted"
+      ]
+    },
+    "GroupId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "LifecycleEvent": {
+      "description": "Lifecycle journal events. Unknown required variants are rejected at parse time.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/EventId"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "attribution_gap"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "from": {
+              "$ref": "#/$defs/OwnerId"
+            },
+            "id": {
+              "$ref": "#/$defs/EventId"
+            },
+            "over_quota": {
+              "type": "boolean"
+            },
+            "to": {
+              "$ref": "#/$defs/OwnerId"
+            },
+            "type": {
+              "type": "string",
+              "const": "owner_escalation"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "from",
+            "to",
+            "over_quota"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "digest": {
+              "type": "string"
+            },
+            "id": {
+              "$ref": "#/$defs/EventId"
+            },
+            "type": {
+              "type": "string",
+              "const": "inspection"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "digest"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/EventId"
+            },
+            "inspection_digest": {
+              "type": "string"
+            },
+            "operator": {
+              "$ref": "#/$defs/ActorId"
+            },
+            "type": {
+              "type": "string",
+              "const": "approval"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "operator",
+            "inspection_digest"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "id": {
+              "$ref": "#/$defs/EventId"
+            },
+            "type": {
+              "type": "string",
+              "const": "reconciliation"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "detail"
+          ]
+        }
+      ]
+    },
+    "OwnerId": {
+      "description": "Nonempty validated identity. Empty or whitespace-only values are rejected.",
+      "type": "string"
+    },
+    "RepositoryId": {
+      "description": "Nonempty validated identity. Empty or whitespace-only values are rejected.",
+      "type": "string"
+    },
+    "RunId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "RunOutcome": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "SchemaVersion": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "TaskCompletion": {
+      "type": "string",
+      "enum": [
+        "open",
+        "finished"
+      ]
+    },
+    "TaskId": {
+      "description": "Nonempty validated identity. Empty or whitespace-only values are rejected.",
+      "type": "string"
+    }
+  }
+}
