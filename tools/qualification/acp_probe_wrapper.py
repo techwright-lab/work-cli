@@ -3,7 +3,13 @@
 
 WORK_QUALIFICATION_CONFIG names an absolute, owner-private JSON file with exactly
 probe_binary, pinned_sha256, evidence_dir, delegate_command (argv list), and
-timeout_seconds (0 < n <= 45). Executable paths must be absolute regular files;
+timeout_seconds (0 < n <= 45), plus optional probe_runtime_context with exactly
+xdg_runtime_dir and dbus_session_bus_address. That context overrides only the
+pinned probe child's environment, never this process or the ACP delegate. The
+runtime directory must be canonical, private, own-UID; its no-follow bus must be
+an own-UID socket and the address exactly unix:path=<runtime>/bus. It is checked
+again immediately before launch; failure consumes the attempt without retry.
+Executable paths must be absolute regular files;
 all path components must be non-symlink and not group/world writable. Config and
 evidence root must be own-UID, with no group/world permissions. Parent prepares
 these paths; this helper installs nothing. delegate_command must name the existing
@@ -37,6 +43,8 @@ FIELDS = {"probe_binary", "pinned_sha256", "evidence_dir", "delegate_command",
           "timeout_seconds"}
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 LIMIT = 65536
+CONTEXT = "probe_runtime_context"
+CONTEXT_FIELDS = {"xdg_runtime_dir", "dbus_session_bus_address"}
 
 
 def checked_open(path, directory=False, private=False):
@@ -72,6 +80,26 @@ def checked_open(path, directory=False, private=False):
         raise
 
 
+def checked_runtime_context(context):
+    """Validate a narrowly scoped user bus, returning identities for revalidation."""
+    runtime = context["xdg_runtime_dir"]
+    address = context["dbus_session_bus_address"]
+    # No D-Bus delimiters, escapes, control characters, or alternate transports.
+    if (not isinstance(runtime, str) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", runtime)
+            or address != f"unix:path={runtime}/bus"):
+        raise ValueError()
+    fd = checked_open(runtime, directory=True, private=True)
+    try:
+        directory = os.fstat(fd)
+        bus = os.stat("bus", dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISSOCK(bus.st_mode) or bus.st_uid != os.getuid():
+            raise ValueError()
+        return tuple((info.st_dev, info.st_ino, info.st_uid, info.st_mode)
+                     for info in (directory, bus))
+    finally:
+        os.close(fd)
+
+
 def unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -90,7 +118,10 @@ def load_config():
         if len(raw) > LIMIT:
             raise ValueError()
         cfg = json.loads(raw, object_pairs_hook=unique_object)
-        if not isinstance(cfg, dict) or set(cfg) != FIELDS:
+        if not isinstance(cfg, dict) or set(cfg) not in (FIELDS, FIELDS | {CONTEXT}):
+            raise ValueError()
+        if CONTEXT in cfg and (not isinstance(cfg[CONTEXT], dict)
+                               or set(cfg[CONTEXT]) != CONTEXT_FIELDS):
             raise ValueError()
         digest = cfg["pinned_sha256"]
         timeout = cfg["timeout_seconds"]
@@ -129,12 +160,12 @@ def atomic_json(root, name, value):
     os.fsync(root)
 
 
-def capture(probe_fd, argv, timeout):
+def capture(probe_fd, argv, timeout, env=None):
     """Drain bounded stdout; stderr is discarded, never logged or sent to ACP."""
     with subprocess.Popen(argv, executable=f"/proc/self/fd/{probe_fd}",
                           pass_fds=(probe_fd,), stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                          start_new_session=True) as child:
+                          start_new_session=True, env=env) as child:
         data = bytearray()
         deadline = time.monotonic() + timeout
         with selectors.DefaultSelector() as selector:
@@ -262,15 +293,26 @@ def qualify(cfg, probe_fd, root):
                   "pinned_sha256": cfg["pinned_sha256"], "digest_verified": False}
     if valid_ids:
         try:
+            context = cfg.get(CONTEXT)
+            identity = checked_runtime_context(context) if context is not None else None
             with os.fdopen(os.dup(probe_fd), "rb") as binary:
                 digest = hashlib.file_digest(binary, "sha256").hexdigest()
             if digest != cfg["pinned_sha256"]:
                 completion["status"] = "digest-mismatch"
             else:
                 provenance["digest_verified"] = True
+                env = None
+                if context is not None:
+                    env = dict(os.environ, XDG_RUNTIME_DIR=context["xdg_runtime_dir"],
+                               DBUS_SESSION_BUS_ADDRESS=context["dbus_session_bus_address"])
+                    provenance[CONTEXT] = dict(
+                        source="config.probe_runtime_context", **context,
+                        runtime_uid=identity[0][2], bus_uid=identity[1][2])
+                    if checked_runtime_context(context) != identity:
+                        raise ValueError()
                 code, raw, status = capture(probe_fd, [cfg["probe_binary"], run_id,
                                             "codex_local", "--real-user-scope"],
-                                            cfg["timeout_seconds"])
+                                            cfg["timeout_seconds"], env=env)
                 completion.update(exit_code=code, status=status)
                 if status == "finished":
                     report = sanitized(raw)

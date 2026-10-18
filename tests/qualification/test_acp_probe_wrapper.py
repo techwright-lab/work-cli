@@ -4,10 +4,12 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -121,6 +123,176 @@ sys.exit(7)
             self.assertEqual(path.stat().st_mode & 0o077, 0)
             self.assertNotIn("secret-do-not-record", path.read_text())
         self.assertIs(completion["paperclip_qualified"], False)
+
+    def runtime_context(self):
+        runtime = self.root / "runtime"
+        runtime.mkdir(mode=0o700)
+        bus = socket.socket(socket.AF_UNIX)
+        self.addCleanup(bus.close)
+        bus.bind(str(runtime / "bus"))
+        context = dict(xdg_runtime_dir=str(runtime),
+                       dbus_session_bus_address=f"unix:path={runtime}/bus")
+        self.config["probe_runtime_context"] = context
+        self.save_config()
+        return runtime, bus, context
+
+    def test_runtime_context_is_probe_only_and_parent_environment_is_unchanged(self):
+        runtime, _, context = self.runtime_context()
+        probe_env = self.root / "probe-env"
+        self.probe = self.stub("context-probe", f'''import json, os
+with open({str(probe_env)!r}, "w") as stream:
+    json.dump(dict(os.environ), stream)
+print('{{}}')
+''')
+        self.delegate = self.stub("context-delegate", '''import json, os
+print(json.dumps(dict(os.environ)))
+''')
+        self.config.update(probe_binary=str(self.probe),
+                           pinned_sha256=hashlib.sha256(self.probe.read_bytes()).hexdigest(),
+                           delegate_command=[str(self.delegate)])
+        # Each row gets a fresh claim, and tests absence as well as sentinel values.
+        for inherited in (False, True):
+            with self.subTest(inherited=inherited):
+                evidence = self.root / f"context-evidence-{inherited}"
+                evidence.mkdir(mode=0o700)
+                self.config["evidence_dir"] = str(evidence)
+                self.save_config()
+                env = dict(self.env)
+                for key in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+                    env.pop(key, None)
+                    if inherited:
+                        env[key] = f"sentinel-{key}"
+                original = dict(env)
+                parent = dict(os.environ)
+                result = self.launch(env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected_delegate = dict(original)
+                expected_delegate.pop(wrapper.CONTROL)
+                self.assertEqual(json.loads(result.stdout), expected_delegate)
+                self.assertEqual(env, original)
+                self.assertEqual(dict(os.environ), parent)
+                expected_probe = dict(original, XDG_RUNTIME_DIR=str(runtime),
+                                      DBUS_SESSION_BUS_ADDRESS=context["dbus_session_bus_address"])
+                self.assertEqual(json.loads(probe_env.read_text()), expected_probe)
+                provenance = json.loads((evidence / "provenance.json").read_text())
+                self.assertEqual(provenance["probe_runtime_context"], dict(
+                    source="config.probe_runtime_context", **context,
+                    runtime_uid=os.getuid(), bus_uid=os.getuid()))
+
+    def test_runtime_context_schema_is_closed(self):
+        _, _, context = self.runtime_context()
+        for value in (None, [], {}, {"xdg_runtime_dir": context["xdg_runtime_dir"]},
+                      {"dbus_session_bus_address": context["dbus_session_bus_address"]},
+                      dict(context, env={"SECRET": "x"})):
+            with self.subTest(value=value):
+                self.config["probe_runtime_context"] = value
+                self.save_config()
+                result = self.launch()
+                self.assertEqual(result.returncode, 78)
+                self.assertEqual(result.stdout, "")
+        self.assertEqual(self.records(), [])
+
+    def test_invalid_runtime_context_claims_unknown_without_probe_or_retry(self):
+        runtime, _, context = self.runtime_context()
+        link = self.root / "runtime-link"
+        link.symlink_to(runtime)
+        cases = [
+            dict(context, xdg_runtime_dir="relative"),
+            dict(context, xdg_runtime_dir=str(runtime) + "/"),
+            dict(context, xdg_runtime_dir=str(runtime) + "/../runtime"),
+            dict(context, xdg_runtime_dir=str(link),
+                 dbus_session_bus_address=f"unix:path={link}/bus"),
+            dict(context, xdg_runtime_dir=None),
+        ]
+        for address in (None, "unix:abstract=bus", "tcp:host=localhost",
+                        context["dbus_session_bus_address"] + ";unix:path=/other",
+                        context["dbus_session_bus_address"] + ",guid=123",
+                        context["dbus_session_bus_address"] + "\n", "unix:path=/other/bus"):
+            cases.append(dict(context, dbus_session_bus_address=address))
+        for index, value in enumerate(cases):
+            with self.subTest(value=value):
+                evidence = self.root / f"invalid-{index}"
+                evidence.mkdir(mode=0o700)
+                self.config.update(evidence_dir=str(evidence), probe_runtime_context=value)
+                self.save_config()
+                self.assert_delegate(self.launch())
+                completion = json.loads((evidence / "completion.json").read_text())
+                self.assertEqual(completion["status"], "probe-error")
+                self.assertEqual(completion["disposition"], "unknown_hold")
+                self.config["probe_runtime_context"] = context
+                self.save_config()
+                self.assert_delegate(self.launch())
+        self.assertEqual(self.records(), [])
+
+    def test_runtime_permissions_bus_type_symlink_and_owners_are_rejected(self):
+        runtime, _, _ = self.runtime_context()
+        for case in ("permissions", "file", "symlink", "runtime-owner", "bus-owner"):
+            with self.subTest(case=case):
+                evidence = self.root / case
+                evidence.mkdir(mode=0o700)
+                self.config["evidence_dir"] = str(evidence)
+                if case == "permissions":
+                    runtime.chmod(0o750)
+                if case in ("file", "symlink"):
+                    (runtime / "bus").rename(runtime / "original-bus")
+                    if case == "file":
+                        (runtime / "bus").touch()
+                    else:
+                        (runtime / "bus").symlink_to(runtime / "original-bus")
+                # A foreign UID needs no chown/root: inject only the kernel UID response.
+                function = "fstat" if case == "runtime-owner" else "stat"
+                original = getattr(wrapper.os, function)
+
+                def foreign_uid(*args, **kwargs):
+                    info = original(*args, **kwargs)
+                    if ((case == "runtime-owner" and info.st_ino == runtime.stat().st_ino)
+                            or (case == "bus-owner" and args[0] == "bus")):
+                        fields = list(info)
+                        fields[4] = os.getuid() + 1
+                        return os.stat_result(fields)
+                    return info
+
+                with patch.dict(os.environ, self.env, clear=True), patch.object(
+                        wrapper.os, function, side_effect=foreign_uid):
+                    probe_fd = os.open(self.probe, os.O_RDONLY)
+                    root_fd = os.open(evidence, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        wrapper.qualify(self.config, probe_fd, root_fd)
+                    finally:
+                        os.close(probe_fd)
+                        os.close(root_fd)
+                self.assertEqual(json.loads((evidence / "completion.json").read_text())["status"],
+                                 "probe-error")
+                runtime.chmod(0o700)
+                if case in ("file", "symlink"):
+                    (runtime / "bus").unlink()
+                    (runtime / "original-bus").rename(runtime / "bus")
+        self.assertEqual(self.records(), [])
+
+    def test_runtime_socket_replacement_before_launch_never_probes_or_retries(self):
+        runtime, _, _ = self.runtime_context()
+        replacement = socket.socket(socket.AF_UNIX)
+        self.addCleanup(replacement.close)
+        real_digest = hashlib.file_digest
+
+        def replace_bus(*args):
+            (runtime / "bus").unlink()
+            replacement.bind(str(runtime / "bus"))
+            return real_digest(*args)
+
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+                wrapper.hashlib, "file_digest", side_effect=replace_bus):
+            probe_fd = os.open(self.probe, os.O_RDONLY)
+            root_fd = os.open(self.evidence, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                wrapper.qualify(self.config, probe_fd, root_fd)
+            finally:
+                for fd in (probe_fd, root_fd):
+                    os.close(fd)
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.completion()["status"], "probe-error")
+        self.assert_delegate(self.launch())
+        self.assertEqual(self.records(), [])
 
     def test_negative_report_retains_only_static_reasons(self):
         reasons = ["user-bus-or-cgroup-v2-unavailable", "fixture-inspection-failed",
