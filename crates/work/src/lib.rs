@@ -17,4 +17,5 @@ pub mod identity;
 pub mod linux_scope;
 pub mod ownership;
 pub mod recovery;
+pub mod runtime_scope;
 pub mod store;
