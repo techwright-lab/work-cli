@@ -72,6 +72,31 @@ fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>, &'static str> {
 }
 // Reject obvious unsafe metadata before Git opens it. The process deadline is
 // still required because these checks cannot eliminate filesystem races.
+// Inspect each component before consuming a following `..`: lexical cleanup
+// alone could conceal a symlink traversal in Git's relative metadata.
+fn metadata_directory(path: &Path) -> Result<PathBuf, &'static str> {
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(UNSAFE_METADATA);
+    }
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(UNSAFE_METADATA);
+                }
+            }
+            Component::CurDir => (),
+            _ => resolved.push(component.as_os_str()),
+        }
+        let m = fs::symlink_metadata(&resolved).map_err(|_| UNSAFE_METADATA)?;
+        if !m.is_dir() || m.file_type().is_symlink() {
+            return Err(UNSAFE_METADATA);
+        }
+    }
+    Ok(resolved)
+}
 fn precheck_private(path: &Path) -> Result<(), &'static str> {
     validate_path(path, true).map_err(|_| UNSAFE_METADATA)?;
     for name in ["HEAD", "config", "gitdir", "commondir"] {
@@ -89,14 +114,16 @@ fn precheck(path: &Path) -> Result<(), &'static str> {
         marker
     } else {
         let text = metadata_text(&marker).ok_or(UNSAFE_METADATA)?;
-        let private = path.join(
-            text.trim_end_matches('\n')
-                .strip_prefix("gitdir: ")
-                .ok_or(UNSAFE_METADATA)?,
-        );
+        let private = metadata_directory(
+            &path.join(
+                text.trim_end_matches('\n')
+                    .strip_prefix("gitdir: ")
+                    .ok_or(UNSAFE_METADATA)?,
+            ),
+        )?;
         precheck_private(&private)?;
         let relative = metadata_text(&private.join("commondir")).ok_or(UNSAFE_METADATA)?;
-        private.join(relative.trim_end_matches('\n'))
+        metadata_directory(&private.join(relative.trim_end_matches('\n')))?
     };
     precheck_private(&common)?;
     let worktrees = common.join("worktrees");
@@ -164,15 +191,7 @@ fn valid_checkout(path: &Path, common_dir: &Path) -> bool {
     let Some(private) = text.trim_end_matches('\n').strip_prefix("gitdir: ") else {
         return false;
     };
-    let private = path.join(private);
-    // Git may use relative pointer paths; canonicalize only after rejecting symlink components.
-    if private
-        .ancestors()
-        .any(|p| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
-    {
-        return false;
-    }
-    let Ok(private) = private.canonicalize() else {
+    let Ok(private) = metadata_directory(&path.join(private)) else {
         return false;
     };
     if private.parent() != Some(common_dir.join("worktrees").as_path()) {
@@ -184,14 +203,9 @@ fn valid_checkout(path: &Path, common_dir: &Path) -> bool {
     let Some(relative) = metadata_text(&private.join("commondir")) else {
         return false;
     };
-    let c = private.join(relative.trim_end_matches('\n'));
-    if c.ancestors()
-        .any(|p| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
-    {
-        return false;
-    }
+    let c = metadata_directory(&private.join(relative.trim_end_matches('\n')));
     Path::new(backlink.trim_end_matches('\n')) == marker
-        && c.canonicalize().ok().as_deref() == Some(common_dir)
+        && c.ok().as_deref() == Some(common_dir)
         && metadata_text(&private.join("HEAD")).is_some()
 }
 /// Apparent regular-file lengths only: no file contents, symlink traversal,
@@ -314,6 +328,10 @@ pub fn report(config: &Config) -> Result<Report, Error> {
                 continue;
             };
             let path = child.path();
+            if path.to_str().is_none() {
+                uncertainties.push("non-UTF8 child path omitted; inventory incomplete");
+                continue;
+            }
             if registered.contains(&path) {
                 continue;
             }
@@ -339,7 +357,7 @@ pub fn report(config: &Config) -> Result<Report, Error> {
     uncertainties.sort();
     uncertainties.dedup();
     Ok(Report { version: 1, repositories: repos.into_keys().collect(), inventory: entries.into_values().collect(),
-        accounting: Accounting { status, charges: charges.unwrap_or_default(), reason: "accounting records lack checkout filesystem paths; cannot certify managed filesystem identity yet. Unknown means missing, partial, unsafe or unreadable authority/store evidence; no initialization or repair attempted" },
+        accounting: Accounting { status, charges: charges.unwrap_or_default(), reason: "accounting records lack checkout filesystem paths; cannot certify managed filesystem identity yet. Unknown means missing, partial, unsafe, unreadable or over-budget authority/store evidence; no initialization or repair attempted" },
         managed_filesystem_count: None, headroom, uncertainties,
         size_basis: "bounded logical regular-file lengths, not allocated or reclaimed Btrfs bytes; null means incomplete/unsafe. Immediate root children only; nested checkouts are not exhaustively discovered. SQLite read-only WAL locks may update existing SHM bookkeeping; not byte immutability" })
 }

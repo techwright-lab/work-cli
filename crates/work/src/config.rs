@@ -22,8 +22,28 @@ impl Config {
         if !path.exists() && std::env::var_os("WORK_CONFIG").is_none() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|_| Error::Config("cannot read configuration".into()))?;
+        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+        const MAX_BYTES: u64 = 1024 * 1024;
+        let unreadable =
+            || Error::Config("cannot read configuration safely within size limit".into());
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
+            .open(&path)
+            .map_err(|_| unreadable())?;
+        let metadata = file.metadata().map_err(|_| unreadable())?;
+        if !metadata.is_file() || metadata.len() > MAX_BYTES {
+            return Err(unreadable());
+        }
+        let mut text = String::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| unreadable())?;
+        if text.len() as u64 > MAX_BYTES {
+            return Err(unreadable());
+        }
         Self::from_toml(&text)
     }
 

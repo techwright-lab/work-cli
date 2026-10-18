@@ -459,6 +459,14 @@ pub struct Charge {
     pub charged: u64,
 }
 
+// Technical report-only budgets, never lifecycle admission policy. Exhaustion
+// rejects all accounting; a prefix must not masquerade as a complete report.
+const REPORT_DATABASE_BYTES: u64 = 16 * 1024 * 1024;
+const REPORT_CLAIMS: usize = 1024;
+const REPORT_GROUPS: usize = 256;
+const REPORT_ROWS: i64 = 4096;
+const REPORT_OUTPUT_BYTES: usize = 256 * 1024;
+
 fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     crate::config::validate_path(dir, true).map_err(|_| StoreError::Unsafe)?;
     let m = fs::symlink_metadata(dir)?;
@@ -467,6 +475,10 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     }
     let path = dir.join(name);
     check_file(&path)?;
+    let mut bytes = fs::symlink_metadata(&path)?.len();
+    if bytes > REPORT_DATABASE_BYTES {
+        return Err(StoreError::Unsafe);
+    }
     // SQLite WAL readers may create sidecars even with READONLY on the DB.
     // Require both pre-existing sidecars before opening a WAL database. Never
     // use immutable=1: that would silently ignore committed active WAL records.
@@ -483,7 +495,13 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     for suffix in ["-wal", "-shm"] {
         let side = dir.join(format!("{name}{suffix}"));
         match fs::symlink_metadata(&side) {
-            Ok(_) => check_file(&side)?,
+            Ok(m) => {
+                check_file(&side)?;
+                bytes = bytes.checked_add(m.len()).ok_or(StoreError::Unsafe)?;
+                if bytes > REPORT_DATABASE_BYTES {
+                    return Err(StoreError::Unsafe);
+                }
+            }
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
                     && header[18] != 2
@@ -498,8 +516,22 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
+    // Cumulative VM/time budget includes schema inspection, integrity checks
+    // and subsequent queries, even when untrusted schema contains views.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut ticks = 0u32;
+    conn.progress_handler(
+        1000,
+        Some(move || {
+            ticks += 1;
+            ticks >= 200 || std::time::Instant::now() >= deadline
+        }),
+    )?;
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 8192)?;
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH, 65536)?;
+    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_COLUMN, 64)?;
     // Aggregation/integrity queries must not spill SQLite temporary files.
-    conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY;")?;
+    conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     if version != 1 || integrity != "ok" {
@@ -525,10 +557,22 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
         return Err(StoreError::Unsafe);
     }
     let reg = existing_database(registry, "authorities.sqlite")?;
-    let mut stmt = reg.prepare("SELECT root,store FROM authorities ORDER BY root")?;
-    let claims = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut stmt = reg.prepare("SELECT root,store FROM authorities LIMIT 1025")?;
+    let mut rows = stmt.query([])?;
+    let mut claims = Vec::new();
+    let mut output_bytes = 0usize;
+    while let Some(row) = rows.next()? {
+        if claims.len() >= REPORT_CLAIMS {
+            return Err(StoreError::Unsafe);
+        }
+        let root: String = row.get(0)?;
+        let store: String = row.get(1)?;
+        output_bytes += root.len() + store.len();
+        if output_bytes > REPORT_OUTPUT_BYTES {
+            return Err(StoreError::Unsafe);
+        }
+        claims.push((root, store));
+    }
     if claims.len() != managed.len()
         || claims
             .iter()
@@ -544,8 +588,17 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
     conn.prepare("SELECT checkout,group_id FROM writers LIMIT 0")?;
     conn.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
     conn.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
+    // Bound aggregate input before SQLite allocates its in-memory sorter.
+    let rows: i64 = conn.query_row(
+        "SELECT count(*) FROM (SELECT 1 FROM checkouts LIMIT 4097)",
+        [],
+        |r| r.get(0),
+    )?;
+    if rows > REPORT_ROWS {
+        return Err(StoreError::Unsafe);
+    }
     let mut stmt = conn.prepare(
-        "SELECT owner,state,count(*) FROM checkouts GROUP BY owner,state ORDER BY owner,state",
+        "SELECT owner,state,count(*) FROM checkouts GROUP BY owner,state ORDER BY owner,state LIMIT 257",
     )?;
     let charges = stmt
         .query_map([], |r| {
@@ -559,7 +612,14 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    if charges.len() > REPORT_GROUPS {
+        return Err(StoreError::Unsafe);
+    }
     for charge in &charges {
+        output_bytes += charge.owner.len() + charge.state.len();
+        if output_bytes > REPORT_OUTPUT_BYTES {
+            return Err(StoreError::Unsafe);
+        }
         identity(&charge.owner)?;
         if !matches!(
             charge.state.as_str(),

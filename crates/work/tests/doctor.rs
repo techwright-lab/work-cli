@@ -377,6 +377,143 @@ fn existing_accounting_is_not_filesystem_certification_and_does_not_write_events
     assert_eq!(before, snapshot(f.temp.path()));
 }
 #[test]
+fn report_accepts_linked_checkout_as_only_repository_input() {
+    let f = Fixture::new();
+    let config = work_cli::config::Config {
+        repositories: vec![f.p("roots/linked")],
+        roots: vec![f.p("roots")],
+        ..Default::default()
+    };
+    let report = work_cli::doctor::report(&config).unwrap();
+    let v = serde_json::to_value(report).unwrap();
+    assert_eq!(v["repositories"].as_array().unwrap().len(), 1, "{v}");
+    assert!(v["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["registered"] == true && e["classification"] == "legacy"));
+}
+
+#[test]
+fn report_omits_non_utf8_child_without_losing_normal_sibling() {
+    use std::os::unix::ffi::OsStringExt;
+    let f = Fixture::new();
+    fs::create_dir(f.p("roots").join(std::ffi::OsString::from_vec(vec![0xff]))).unwrap();
+    fs::create_dir(f.p("roots/normal")).unwrap();
+    let v = f.report(&[]);
+    assert!(v["inventory"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["path"] == f.p("roots/normal").to_str().unwrap()));
+    assert!(v["uncertainties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s.as_str().unwrap().contains("non-UTF8")));
+}
+
+#[test]
+fn linked_metadata_parent_components_cannot_hide_symlinks() {
+    let f = Fixture::new();
+    let private = f.p("repo/.git/worktrees/linked");
+    symlink(&private, private.join("escape")).unwrap();
+    fs::write(private.join("commondir"), "escape/../../..\n").unwrap();
+    let config = work_cli::config::Config {
+        repositories: vec![f.p("roots/linked")],
+        roots: vec![f.p("roots")],
+        ..Default::default()
+    };
+    let v = serde_json::to_value(work_cli::doctor::report(&config).unwrap()).unwrap();
+    assert!(v["repositories"].as_array().unwrap().is_empty());
+    assert!(v["uncertainties"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s.as_str().unwrap().contains("unsafe Git metadata")));
+}
+
+#[test]
+fn report_config_special_and_oversized_inputs_fail_promptly_without_secrets() {
+    for discovered in [false, true] {
+        for kind in ["fifo", "oversized"] {
+            let f = Fixture::new();
+            fs::create_dir(f.p("work")).unwrap();
+            let path = f.p("work/config.toml");
+            if kind == "fifo" {
+                assert!(Command::new("/usr/bin/mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success());
+            } else {
+                fs::write(
+                    &path,
+                    format!(
+                        "roots = [{:?}]\nrepositories = [{:?}]\n# private-secret\n{}",
+                        f.p("roots"),
+                        f.p("repo"),
+                        " ".repeat(1024 * 1024 + 1)
+                    ),
+                )
+                .unwrap();
+            }
+            let mut cmd = Command::new("/usr/bin/timeout");
+            cmd.args(["2", env!("CARGO_BIN_EXE_work"), "doctor", "--json"]);
+            cmd.env_remove("WORK_CONFIG")
+                .env("XDG_CONFIG_HOME", f.temp.path());
+            if !discovered {
+                cmd.env("WORK_CONFIG", &path);
+            }
+            let o = cmd.output().unwrap();
+            assert_ne!(o.status.code(), Some(124), "blocked on {kind}");
+            assert!(!o.status.success());
+            assert!(!String::from_utf8_lossy(&o.stderr).contains("private-secret"));
+            assert!(String::from_utf8_lossy(&o.stderr).contains("configuration"));
+        }
+    }
+}
+
+#[test]
+fn report_accounting_budgets_preserve_inventory() {
+    let mut exhausted = Vec::new();
+    for case in ["oversized", "manygroups", "querybudget"] {
+        let f = Fixture::new();
+        let _store =
+            Store::open_registered(&f.p("registry"), &f.p("store"), &[f.p("roots")]).unwrap();
+        let registry = rusqlite::Connection::open(f.p("registry/authorities.sqlite")).unwrap();
+        registry
+            .query_row("SELECT count(*) FROM authorities", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap();
+        let conn = rusqlite::Connection::open(f.p("store/store.sqlite")).unwrap();
+        match case {
+            "oversized" => {
+                conn.execute_batch("CREATE TABLE padding(data BLOB); INSERT INTO padding VALUES(zeroblob(17*1024*1024));").unwrap();
+            }
+            "manygroups" => {
+                conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<257) INSERT INTO checkouts SELECT x,x,x,'repo','actor','task','owner'||x,'active' FROM n;").unwrap();
+            }
+            _ => {
+                conn.execute_batch("ALTER TABLE checkouts RENAME TO original; CREATE VIEW checkouts AS WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT x AS id,x AS operation,x AS digest,'repo' AS repository,'actor' AS actor,'task' AS task,'owner' AS owner,'active' AS state FROM n WHERE x=1000000;").unwrap();
+            }
+        }
+        let v = f.report(&[]);
+        exhausted.push((
+            case,
+            v["accounting"]["status"] == "unknown"
+                && v["accounting"]["charges"].as_array().unwrap().is_empty(),
+        ));
+        assert!(!v["inventory"].as_array().unwrap().is_empty());
+    }
+    assert!(
+        exhausted.iter().all(|(_, unknown)| *unknown),
+        "{exhausted:?}"
+    );
+}
+
+#[test]
 fn config_supplies_explicit_scope_and_empty_doctor_fails() {
     let f = Fixture::new();
     assert!(!Command::new(env!("CARGO_BIN_EXE_work"))
