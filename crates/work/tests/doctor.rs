@@ -56,8 +56,14 @@ impl Fixture {
         self.temp.path().join(s)
     }
     fn run(&self, extra: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_work"))
-            .args(["doctor", "--json", "--repository"])
+        Command::new("/usr/bin/timeout")
+            .args([
+                "5",
+                env!("CARGO_BIN_EXE_work"),
+                "doctor",
+                "--json",
+                "--repository",
+            ])
             .arg(self.p("repo"))
             .arg("--managed-root")
             .arg(self.p("roots"))
@@ -110,6 +116,13 @@ fn inventory_deduplicates_aliases_reports_unmanaged_and_never_creates_missing_st
         .contains("lack checkout filesystem paths"));
     let entries = v["inventory"].as_array().unwrap();
     assert_eq!(entries.len(), 3);
+    for entry in entries {
+        assert!(entry["age_seconds"].is_null());
+        assert_eq!(
+            entry["age_reason"],
+            "lifecycle timestamps unavailable; age unknown"
+        );
+    }
     assert!(entries.iter().any(|e| e["classification"] == "legacy"));
     assert!(entries
         .iter()
@@ -118,6 +131,85 @@ fn inventory_deduplicates_aliases_reports_unmanaged_and_never_creates_missing_st
     let second = f.report(&[]);
     assert_eq!(v["inventory"], second["inventory"]);
     assert_eq!(before, snapshot(f.temp.path()));
+}
+#[test]
+fn unsafe_git_metadata_is_bounded_and_inventory_is_explicitly_incomplete() {
+    for name in ["gitdir", "commondir"] {
+        for kind in ["fifo", "symlink", "oversized"] {
+            let f = Fixture::new();
+            let path = f.p(&format!("repo/.git/worktrees/linked/{name}"));
+            fs::remove_file(&path).unwrap();
+            match kind {
+                "fifo" => assert!(Command::new("/usr/bin/mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()),
+                "symlink" => symlink(f.p("repo/.git/HEAD"), &path).unwrap(),
+                _ => fs::write(&path, vec![b'x'; 1024 * 1024 + 1]).unwrap(),
+            }
+            let v = f.report(&[]);
+            assert!(
+                v["uncertainties"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.as_str().unwrap().contains("incomplete")),
+                "{name}/{kind}: {v}"
+            );
+        }
+    }
+}
+#[test]
+fn oversized_git_registration_output_is_explicitly_incomplete() {
+    let f = Fixture::new();
+    for i in 0..140 {
+        let private = f.p(&format!("repo/.git/worktrees/extra{i}"));
+        fs::create_dir(&private).unwrap();
+        // Each pointer is within the metadata bound, while aggregate Git
+        // output exceeds its capture budget without exceeding the count cap.
+        fs::write(
+            private.join("gitdir"),
+            format!("/missing/{}/checkout{i}/.git\n", "x".repeat(8000)),
+        )
+        .unwrap();
+        fs::write(private.join("commondir"), "../..\n").unwrap();
+        fs::write(private.join("HEAD"), "ref: refs/heads/linked\n").unwrap();
+    }
+    let v = f.report(&[]);
+    assert!(
+        v["uncertainties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s == "Git capture limit reached; inventory incomplete"),
+        "{v}"
+    );
+}
+#[test]
+fn registration_count_is_capped_with_explicit_incomplete_reason() {
+    let f = Fixture::new();
+    for i in 0..1025 {
+        let private = f.p(&format!("repo/.git/worktrees/extra{i}"));
+        fs::create_dir(&private).unwrap();
+        fs::write(
+            private.join("gitdir"),
+            format!("/missing/checkout{i}/.git\n"),
+        )
+        .unwrap();
+        fs::write(private.join("commondir"), "../..\n").unwrap();
+        fs::write(private.join("HEAD"), "ref: refs/heads/linked\n").unwrap();
+    }
+    let v = f.report(&[]);
+    assert!(v["inventory"].as_array().unwrap().len() <= 1025);
+    assert!(
+        v["uncertainties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("registration limit")),
+        "{v}"
+    );
 }
 #[test]
 fn rejects_ambiguous_roots_and_config_types_without_leaking_values() {

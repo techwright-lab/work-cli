@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+mod bounded_process;
 pub mod cli;
 pub mod config;
 pub mod doctor;
