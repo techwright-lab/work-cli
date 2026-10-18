@@ -88,3 +88,169 @@ fn opt_in_disposable_scope_accounts_for_escape_fixtures_or_explicitly_holds() {
     }
     assert!(!report.paperclip_qualified);
 }
+
+use work_cli::linux_scope::{
+    assess_cleanup, CleanupEvidence, ParticipantState, ScopeIdentity, UnitState,
+};
+
+#[test]
+fn bounded_cleanup_state_table() {
+    let scope = ScopeIdentity {
+        unit: "work-qualification-test.scope",
+        cgroup: "/user.slice/work-qualification-test.scope",
+    };
+    let inactive = UnitState {
+        id: scope.unit,
+        load: "not-found",
+        active: "inactive",
+        cgroup: "",
+    };
+    let absent = [ParticipantState::Absent; 4];
+    let live = [ParticipantState::Absent, ParticipantState::Present];
+    let unknown = [ParticipantState::Unknown];
+    let nonempty = [42];
+    let wrong = ScopeIdentity {
+        unit: scope.unit,
+        cgroup: "/user.slice/other.scope",
+    };
+    let cases = [
+        (
+            "stop failed, autoreaped",
+            Some(scope),
+            Some(inactive),
+            None,
+            true,
+            absent.as_slice(),
+            true,
+        ),
+        (
+            "verified empty",
+            Some(scope),
+            None,
+            Some([].as_slice()),
+            false,
+            unknown.as_slice(),
+            true,
+        ),
+        (
+            "members remain",
+            Some(scope),
+            Some(inactive),
+            Some(nonempty.as_slice()),
+            true,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "live participant",
+            Some(scope),
+            Some(inactive),
+            None,
+            true,
+            live.as_slice(),
+            false,
+        ),
+        (
+            "unit unavailable",
+            Some(scope),
+            None,
+            None,
+            true,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "unknown pid",
+            Some(scope),
+            Some(inactive),
+            None,
+            true,
+            unknown.as_slice(),
+            false,
+        ),
+        (
+            "no participant evidence",
+            Some(scope),
+            Some(inactive),
+            None,
+            true,
+            [].as_slice(),
+            false,
+        ),
+        (
+            "no creation authority",
+            None,
+            Some(inactive),
+            Some([].as_slice()),
+            true,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "wrong scoped identity",
+            Some(wrong),
+            Some(inactive),
+            Some([].as_slice()),
+            true,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "no absence proof",
+            Some(scope),
+            Some(inactive),
+            None,
+            false,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "stop alone grants nothing",
+            Some(scope),
+            None,
+            None,
+            false,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "different unit",
+            Some(scope),
+            Some(UnitState {
+                id: "other.scope",
+                ..inactive
+            }),
+            None,
+            true,
+            absent.as_slice(),
+            false,
+        ),
+        (
+            "active unit",
+            Some(scope),
+            Some(UnitState {
+                active: "active",
+                ..inactive
+            }),
+            None,
+            true,
+            absent.as_slice(),
+            false,
+        ),
+    ];
+    for (name, created_scope, unit_state, membership, cgroup_absent, participants, expected) in
+        cases
+    {
+        assert_eq!(
+            assess_cleanup(CleanupEvidence {
+                created_scope,
+                unit_state,
+                membership,
+                cgroup_absent,
+                participants
+            }),
+            expected,
+            "{name}"
+        );
+    }
+}

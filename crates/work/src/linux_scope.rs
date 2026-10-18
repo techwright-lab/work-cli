@@ -154,6 +154,70 @@ fn members(group: &str) -> Option<Vec<u32>> {
         .map(|p| p.parse().ok())
         .collect()
 }
+/// Identity captured from the exact newly created disposable scope.
+#[derive(Clone, Copy)]
+pub struct ScopeIdentity<'a> {
+    pub unit: &'a str,
+    pub cgroup: &'a str,
+}
+#[derive(Clone, Copy)]
+pub struct UnitState<'a> {
+    pub id: &'a str,
+    pub load: &'a str,
+    pub active: &'a str,
+    pub cgroup: &'a str,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParticipantState {
+    Absent,
+    Present,
+    Unknown,
+}
+pub struct CleanupEvidence<'a> {
+    pub created_scope: Option<ScopeIdentity<'a>>,
+    pub unit_state: Option<UnitState<'a>>,
+    pub membership: Option<&'a [u32]>,
+    pub cgroup_absent: bool,
+    pub participants: &'a [ParticipantState],
+}
+/// Point-in-time fixture cleanup only; grants no creation or retirement authority.
+pub fn assess_cleanup(evidence: CleanupEvidence<'_>) -> bool {
+    let Some(scope) = evidence.created_scope else {
+        return false;
+    };
+    if !valid_label(scope.unit)
+        || !scope.unit.starts_with("work-qualification-")
+        || !scope.unit.ends_with(".scope")
+        || group_path(scope.cgroup).is_none()
+        || scope.cgroup.rsplit('/').next() != Some(scope.unit)
+    {
+        return false;
+    }
+    if let Some(membership) = evidence.membership {
+        return membership.is_empty();
+    }
+    evidence.cgroup_absent
+        && evidence.unit_state.is_some_and(|state| {
+            state.id == scope.unit
+                && matches!(state.load, "loaded" | "not-found")
+                && state.active == "inactive"
+                && (state.cgroup.is_empty() || state.cgroup == scope.cgroup)
+        })
+        && !evidence.participants.is_empty()
+        && evidence
+            .participants
+            .iter()
+            .all(|state| *state == ParticipantState::Absent)
+}
+fn participant_state(pid: u32) -> ParticipantState {
+    // A present PID is never assumed to be a reused identity or safely dead.
+    // Only ENOENT proves absence; permission/metadata errors hold.
+    match fs::symlink_metadata(format!("/proc/{pid}")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => ParticipantState::Absent,
+        Ok(_) => ParticipantState::Present,
+        Err(_) => ParticipantState::Unknown,
+    }
+}
 fn valid_label(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -237,14 +301,18 @@ fn run_fixture(report: &mut QualificationReport, root: &Path, unit: &str) -> io:
         "show",
         unit,
         "--property=ControlGroup",
+        "--property=Id",
         "--property=LoadState",
         "--property=ActiveState",
         "--property=Slice",
     ]) {
         let properties = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() && property(&properties, "LoadState=") == Some("loaded") {
+        if output.status.success()
+            && property(&properties, "Id=") == Some(unit)
+            && property(&properties, "LoadState=") == Some("loaded")
+        {
             report.scope_cgroup = property(&properties, "ControlGroup=")
-                .filter(|s| group_path(s).is_some())
+                .filter(|s| group_path(s).is_some() && s.rsplit('/').next() == Some(unit))
                 .map(str::to_owned);
             // Unit queried through this UID's user manager, not the system manager.
             report.unit_owner_uid = report.host.uid;
@@ -300,12 +368,57 @@ fn run_fixture(report: &mut QualificationReport, root: &Path, unit: &str) -> io:
         let _ = child.kill();
         let _ = child.wait();
     }
-    // Stop ONLY the uniquely named disposable scope, including failed launches.
-    let stopped = systemctl(&["stop", unit]).is_ok_and(|o| o.status.success());
-    let empty = report.scope_cgroup.as_deref().is_some_and(|g| {
-        members(g).is_some_and(|m| m.is_empty())
-            || (stopped && group_path(g).is_some_and(|p| !p.exists()))
-    });
+    // Stop only the exact scope whose identity was observed after creation.
+    // Stop success or failure alone is never cleanup evidence.
+    let empty = if let Some(group) = report.scope_cgroup.as_deref() {
+        let _ = systemctl(&["stop", unit]);
+        let output = systemctl(&[
+            "show",
+            unit,
+            "--property=Id",
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=ControlGroup",
+        ])
+        .ok();
+        // A not-found unit may produce a nonzero exit with complete properties.
+        let properties = output.as_ref().map(|o| String::from_utf8_lossy(&o.stdout));
+        let state = properties.as_deref().and_then(|text| {
+            Some(UnitState {
+                id: property(text, "Id=")?,
+                load: property(text, "LoadState=")?,
+                active: property(text, "ActiveState=")?,
+                cgroup: property(text, "ControlGroup=")?,
+            })
+        });
+        let membership = members(group);
+        let cgroup_absent = group_path(group).is_some_and(|path| {
+            fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        });
+        let mut participants: Vec<_> = report
+            .observed_members
+            .iter()
+            .copied()
+            .chain(report.observations.iter().map(|o| o.pid))
+            .map(participant_state)
+            .collect();
+        // Missing receipts must not turn incomplete participant evidence into proof.
+        if report.observations.len() != 4 {
+            participants.push(ParticipantState::Unknown);
+        }
+        assess_cleanup(CleanupEvidence {
+            created_scope: Some(ScopeIdentity {
+                unit,
+                cgroup: group,
+            }),
+            unit_state: state,
+            membership: membership.as_deref(),
+            cgroup_absent,
+            participants: &participants,
+        })
+    } else {
+        false
+    };
     report.cleanup_outcome = if empty {
         "verified-empty"
     } else {
