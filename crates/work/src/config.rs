@@ -11,6 +11,17 @@ pub struct Config {
     pub trusted_registry: Option<PathBuf>,
     pub roots: Vec<PathBuf>,
     pub repositories: Vec<PathBuf>,
+    pub allocation: Option<AllocationPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllocationPolicy {
+    pub repository_limit: u64,
+    pub owner_limit: u64,
+    pub floor_bytes: u64,
+    pub warn_bytes: u64,
+    pub capture_sink: Option<String>,
 }
 
 impl Config {
@@ -106,6 +117,14 @@ impl Config {
             trusted_registry: single("trusted_registry")?,
             roots: many("roots")?,
             repositories: many("repositories")?,
+            allocation: value
+                .get("allocation")
+                .map(|v| {
+                    v.clone()
+                        .try_into()
+                        .map_err(|_| Error::Config("invalid allocation policy".into()))
+                })
+                .transpose()?,
         })
     }
 }

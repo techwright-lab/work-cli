@@ -124,7 +124,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if version != 1 && !(pending && version == 0) {
+    if !(version == 1 || (name == "store.sqlite" && version == 2) || (pending && version == 0)) {
         return Err(StoreError::Unsafe);
     }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
@@ -339,7 +339,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0 | 1) {
+        if !matches!(version, 0..=2) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -354,6 +354,14 @@ impl Store {
    CREATE TABLE outbox(sequence INTEGER PRIMARY KEY AUTOINCREMENT, version INTEGER NOT NULL CHECK(version=1), payload TEXT NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0 CHECK(acknowledged IN (0,1)));
    PRAGMA user_version=1;")?;
         }
+        if version < 2 {
+            // Preserve every earlier charge; old reservations have no readiness proof.
+            tx.execute_batch("ALTER TABLE checkouts ADD COLUMN ready INTEGER NOT NULL DEFAULT 0 CHECK(ready IN (0,1));
+                CREATE TABLE allocations(checkout TEXT PRIMARY KEY REFERENCES checkouts(id), request TEXT NOT NULL, record TEXT NOT NULL);
+                PRAGMA user_version=2;")?;
+        }
+        tx.prepare("SELECT ready FROM checkouts LIMIT 0")?;
+        tx.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
         // Never repair a versioned schema by manufacturing empty accounting.
         tx.prepare(
             "SELECT id,operation,digest,repository,actor,task,owner,state FROM checkouts LIMIT 0",
@@ -395,11 +403,9 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Reserved remains eligible for this low-level reservation API until
-        // lifecycle readiness is separated. No recovery/terminal state may
-        // reacquire, even idempotently; eligibility never moves state backward.
+        // Readiness requires durable allocation evidence, never a migrated default.
         let eligible: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state IN ('reserved','partial','active'))",
+            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1)",
             [checkout.to_string()],
             |r| r.get(0),
         )?;
@@ -534,7 +540,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if version != 1 || integrity != "ok" {
+    if !(version == 1 || (name == "store.sqlite" && version == 2)) || integrity != "ok" {
         return Err(StoreError::Unsafe);
     }
     Ok(conn)

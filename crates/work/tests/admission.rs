@@ -112,8 +112,7 @@ fn reuse_lookup_does_not_grant_an_independent_writer() {
             .unwrap(),
         vec![checkout]
     );
-    let group = Uuid::now_v7();
-    store.acquire_writer(checkout, group).unwrap();
-    store.acquire_writer(checkout, group).unwrap();
+    // A lookup is not creation-readiness proof either. Real ready checkout
+    // exclusivity is exercised by allocation.rs.
     assert!(store.acquire_writer(checkout, Uuid::now_v7()).is_err());
 }

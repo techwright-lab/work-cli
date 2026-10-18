@@ -27,6 +27,15 @@ pub struct Limits {
 }
 impl Store {
     pub fn reserve(&mut self, request: &Reservation, limits: Limits) -> Result<Uuid> {
+        self.reserve_recorded(request, limits, |_| Ok(None))
+    }
+    /// Attach the exact lifecycle intent to the charge in the same FULL commit.
+    pub(crate) fn reserve_recorded(
+        &mut self,
+        request: &Reservation,
+        limits: Limits,
+        record: impl FnOnce(Uuid) -> Result<Option<(String, String)>>,
+    ) -> Result<Uuid> {
         if request.operation.get_version_num() != 7
             || request.operation.get_variant() != uuid::Variant::RFC4122
         {
@@ -92,6 +101,12 @@ impl Store {
                     .is_some_and(|b| b < limits.warn_bytes),
             },
         )?;
+        if let Some((request_json, record_json)) = record(checkout)? {
+            tx.execute(
+                "INSERT INTO allocations VALUES(?1,?2,?3)",
+                rusqlite::params![checkout.to_string(), request_json, record_json],
+            )?;
+        }
         tx.commit()?;
         Ok(checkout)
     }

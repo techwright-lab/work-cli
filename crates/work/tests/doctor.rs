@@ -493,7 +493,7 @@ fn report_accounting_budgets_preserve_inventory() {
                 conn.execute_batch("CREATE TABLE padding(data BLOB); INSERT INTO padding VALUES(zeroblob(17*1024*1024));").unwrap();
             }
             "manygroups" => {
-                conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<257) INSERT INTO checkouts SELECT x,x,x,'repo','actor','task','owner'||x,'active' FROM n;").unwrap();
+                conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<257) INSERT INTO checkouts(id,operation,digest,repository,actor,task,owner,state) SELECT x,x,x,'repo','actor','task','owner'||x,'active' FROM n;").unwrap();
             }
             _ => {
                 conn.execute_batch("ALTER TABLE checkouts RENAME TO original; CREATE VIEW checkouts AS WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT x AS id,x AS operation,x AS digest,'repo' AS repository,'actor' AS actor,'task' AS task,'owner' AS owner,'active' AS state FROM n WHERE x=1000000;").unwrap();

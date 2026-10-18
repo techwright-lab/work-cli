@@ -3,6 +3,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    AllocationStage {
+        checkout: Uuid,
+        operation: Uuid,
+        stage: String,
+        reason: Option<String>,
+    },
     Reserved {
         checkout: Uuid,
         low_disk: bool,

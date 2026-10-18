@@ -17,6 +17,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Reserve and create a configured checkout; does not launch a writer
+    Start(crate::allocate::Start),
     /// Show lifecycle status without changing state
     Status,
     /// Bounded read-only inventory; no initialization, repair or enforcement
@@ -38,6 +40,25 @@ enum Command {
 pub fn run() {
     let cli = Cli::parse();
     match cli.command {
+        Command::Start(request) => {
+            eprintln!(
+                "allocation operation: {} (retain for retries)",
+                request.operation
+            );
+            let result = Config::load()
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|config| crate::allocate::start(&config, request));
+            match result {
+                Ok(a) => println!(
+                    "{}",
+                    serde_json::to_string(&a).expect("allocation serialization")
+                ),
+                Err(e) => {
+                    eprintln!("start refused: {e}; inspect WORK_CONFIG and held allocations; retry with the same --operation UUID");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Status => print_status(),
         Command::Doctor {
             json,

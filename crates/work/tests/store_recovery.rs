@@ -326,11 +326,16 @@ fn writer_eligibility_precedes_even_same_group_idempotency() {
         let mut store = f.open();
         let checkout = store.reserve(&f.request(), limits()).unwrap();
         let group = Uuid::now_v7();
+        let conn = f.connection();
         if retained_writer {
+            // Seed the prior ready state to exercise retained-writer revocation.
+            conn.execute("UPDATE checkouts SET state='active',ready=1", [])
+                .unwrap();
             store.acquire_writer(checkout, group).unwrap();
         }
-        let conn = f.connection();
         for state in [
+            "reserved",
+            "partial",
             "expired",
             "interrupted",
             "held",

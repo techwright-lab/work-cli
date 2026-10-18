@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod admission;
+pub mod allocate;
 mod bounded_process;
 pub mod cli;
 pub mod config;
@@ -15,4 +16,5 @@ pub mod events;
 pub mod identity;
 pub mod linux_scope;
 pub mod ownership;
+pub mod recovery;
 pub mod store;

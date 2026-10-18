@@ -1,0 +1,85 @@
+//! Non-destructive reconciliation. Uncertain allocations remain quota charged.
+use crate::{
+    allocate::{self, Allocation},
+    identity::CheckoutIdentity,
+    store::Store,
+};
+use serde::{Deserialize, Serialize};
+use std::{fs, io, path::PathBuf};
+use uuid::Uuid;
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Marker {
+    version: u32,
+    checkout: Uuid,
+    operation: Uuid,
+    path: PathBuf,
+    private: PathBuf,
+    common: PathBuf,
+    head: String,
+}
+impl From<&Allocation> for Marker {
+    fn from(a: &Allocation) -> Self {
+        let i = a
+            .identity
+            .as_ref()
+            .expect("marker needs persisted identity");
+        Self {
+            version: 1,
+            checkout: a.checkout,
+            operation: a.request.operation,
+            path: i.path.clone(),
+            private: i.private_git_dir.clone(),
+            common: i.common_git_dir.clone(),
+            head: a.base_commit.clone(),
+        }
+    }
+}
+pub(crate) fn hold(store: &mut Store, a: &mut Allocation, reason: &str) -> io::Result<()> {
+    a.stage = "held".into();
+    a.reason = Some(reason.into());
+    allocate::save(store, a)
+}
+pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()> {
+    let result = verify(a);
+    match result {
+        Ok(current) => {
+            // Boot/device changes alone are not activity. Durable paths, marker,
+            // registration, HEAD and inode must still agree before refreshing stat.
+            a.identity = Some(current); a.stage = "ready".into(); a.reason = None;
+            allocate::save(store, a)
+        }
+        Err(_) => hold(store, a, "identity/marker/registration incomplete or changed; operator reconciliation required (slot retained)"),
+    }
+}
+fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
+    let fail = || allocate::err("insufficient allocation identity");
+    let prior = a.identity.as_ref().ok_or_else(fail)?;
+    for path in [
+        &a.destination,
+        &prior.private_git_dir,
+        &prior.common_git_dir,
+    ] {
+        crate::config::validate_path(path, true).map_err(|_| fail())?;
+    }
+    let current = CheckoutIdentity::inspect(&a.destination)?;
+    if current.path != prior.path
+        || current.private_git_dir != prior.private_git_dir
+        || current.common_git_dir != prior.common_git_dir
+        || current.head != prior.head
+        || current.directory.inode != prior.directory.inode
+        || (current.boot_id == prior.boot_id && current.directory.device != prior.directory.device)
+    {
+        return Err(fail());
+    }
+    let path = prior.private_git_dir.join("work-lease.json");
+    let m = fs::symlink_metadata(&path)?;
+    if !m.is_file() || m.len() > 16384 {
+        return Err(fail());
+    }
+    let marker: Marker = serde_json::from_slice(&fs::read(path)?)?;
+    if marker != Marker::from(a) {
+        return Err(fail());
+    }
+    Ok(current)
+}

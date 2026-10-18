@@ -9,9 +9,10 @@ channels.
 
 ## Status
 
-Early construction. The executable provides read-only `work --help`, `work status`
-and `work doctor`. Status reports an honest uninitialized store. Other lifecycle
-commands are not implemented and will not silently succeed.
+Early construction. Read-only `work --help`, `work status` and `work doctor` are
+available, plus configured `work start` allocation. Start never launches a writer.
+Run/finish/removal and capture integration are not implemented. Status remains an
+uninitialized capability report, not a lifecycle inventory; use doctor for accounting.
 
 ## Read-only inventory
 
@@ -37,7 +38,7 @@ store_dir = "/absolute/private/store"
 trusted_registry = "/absolute/private/registry"
 ```
 
-Known fields require strings/string arrays of absolute canonical directory paths;
+Path fields require strings/string arrays of absolute canonical directory paths;
 store/registry paths may be missing or inaccessible so unresolved evidence can be
 reported unknown (never treated as canonical identity proof).
 Explicit CLI lists replace their respective config lists. Empty scope is an error.
@@ -49,7 +50,7 @@ per managed root. Unregistered child subtrees are reported as unmanaged/unknown,
 not exhaustively searched for nested checkouts. Missing or malformed private Git
 metadata is unknown/partial/recreated, never evidence of safe retirement. Valid
 registered checkouts are **legacy/unmanaged candidates**, not proof of absence
-from managed accounting: the current database lacks checkout filesystem paths.
+from managed accounting: doctor does not certify allocation metadata against filesystem identity.
 `managed_filesystem_count` therefore remains null; doctor never guesses a match
 from a basename, actor or task. Owner/state accounting includes every non-retired
 charge independently of filesystem classification.
@@ -68,6 +69,46 @@ than recreating sidecars or using `immutable=1` (which ignores active WAL). Exis
 SHM lock bookkeeping may change: read-only does not promise byte immutability.
 No new files/directories or lifecycle/outbox writes are intended. Missing, corrupt,
 inaccessible or partial authority/store evidence is unknown, not zero charges.
+
+## Allocation (explicit host policy only)
+
+Protect managed roots from competing cleaners before activation. No host is activated
+by these examples. Configure existing canonical repository/root directories and one
+trusted registry/store; every non-retired reservation consumes its owner/repository slot.
+Add explicit policy to the configuration above (these small values are examples, not defaults):
+
+```toml
+[allocation]
+repository_limit = 10
+owner_limit = 2
+floor_bytes = 1073741824
+warn_bytes = 2147483648
+# No capture_sink: allocation may become ready without attribution capture.
+# Any configured capture_sink currently fails closed; capture is NOT prepared.
+```
+
+```sh
+work start --operation UUIDV7 --repository /absolute/repo --root /absolute/checkouts \
+  --actor developer --task ticket-123 --branch ticket-123 --base main
+```
+
+Generate one UUIDv7 per operation and retain it for retries. Without `--operation`,
+start generates and prints one. A retry must supply the same normalized arguments;
+policy reductions do not consume another slot or checkout. Destination is exactly
+`root/task`. The allocating actor remains accountable (`--owner`, if supplied,
+must match); reassignment requires explicit transfer, not an allocation flag. Existing
+branches require explicit `--reuse-branch`; their commits are preserved, never reset.
+Colliding destinations are never adopted, removed or replaced. Same-task lookup
+alone never grants a writer and a different operation cannot adopt an existing path.
+
+Full intent and reservation are committed together before Git. Allocation retries
+reconcile private-Git-directory marker, registration and durable/stat identity.
+Incomplete creation (including create-before-marker crashes), altered metadata or
+unsupported layouts remain charged and held for operator reconciliation; nothing
+is deleted, timed out or automatically retired. Boot/device changes require durable
+identity reconciliation, not invented activity. Capture-enabled configurations are
+unsupported and fail closed. Schema-v1 migration preserves old charges with writer
+readiness false; doctor remains a no-migration existing-evidence reader for both versions.
 
 ## Requirements
 

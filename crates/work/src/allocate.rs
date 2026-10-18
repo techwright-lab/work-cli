@@ -1,0 +1,445 @@
+//! Cooperative allocation only. No writer is launched, capture prepared or payload removed.
+use crate::{
+    admission::{Limits, Reservation},
+    config::Config,
+    identity::{query, CheckoutIdentity},
+    store::Store,
+};
+use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::{self, Write},
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, clap::Args)]
+#[serde(deny_unknown_fields)]
+pub struct Start {
+    #[arg(long, default_value_t = Uuid::now_v7())]
+    pub operation: Uuid,
+    #[arg(long)]
+    pub repository: Option<PathBuf>,
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    #[arg(long)]
+    pub actor: Option<String>,
+    #[arg(long)]
+    pub owner: Option<String>,
+    #[arg(long)]
+    pub task: String,
+    #[arg(long)]
+    pub branch: Option<String>,
+    #[arg(long, default_value = "HEAD")]
+    pub base: String,
+    #[arg(long)]
+    pub reuse_branch: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Allocation {
+    pub checkout: Uuid,
+    pub request: Start,
+    pub destination: PathBuf,
+    pub base_commit: String,
+    pub stage: String,
+    pub reason: Option<String>,
+    pub identity: Option<CheckoutIdentity>,
+}
+pub(crate) fn err(message: &str) -> io::Error {
+    io::Error::other(message)
+}
+pub(crate) fn db<T>(r: crate::store::Result<T>) -> io::Result<T> {
+    r.map_err(|e| err(&e.to_string()))
+}
+pub(crate) fn sql<T>(r: rusqlite::Result<T>) -> io::Result<T> {
+    r.map_err(|e| err(&e.to_string()))
+}
+fn component(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && !s.starts_with(['-', '.'])
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
+    let record = serde_json::to_string(a)?;
+    let request = serde_json::to_string(&a.request)?;
+    let tx = sql(store.conn.transaction())?;
+    sql(tx.execute("INSERT INTO allocations VALUES(?1,?2,?3) ON CONFLICT(checkout) DO UPDATE SET record=excluded.record", rusqlite::params![a.checkout.to_string(), request, record]))?;
+    sql(tx.execute(
+        "UPDATE checkouts SET state=?2,ready=?3 WHERE id=?1",
+        rusqlite::params![
+            a.checkout.to_string(),
+            if a.stage == "ready" {
+                "active"
+            } else if a.stage == "held" {
+                "held"
+            } else {
+                "partial"
+            },
+            a.stage == "ready"
+        ],
+    ))?;
+    db(crate::store::emit(
+        &tx,
+        &crate::events::Event::AllocationStage {
+            checkout: a.checkout,
+            operation: a.request.operation,
+            stage: a.stage.clone(),
+            reason: a.reason.clone(),
+        },
+    ))?;
+    sql(tx.commit())
+}
+pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allocation>> {
+    let value: Option<(String, Option<String>, Option<String>)> = sql(store.conn.query_row("SELECT c.id,a.request,a.record FROM checkouts c LEFT JOIN allocations a ON c.id=a.checkout WHERE c.operation=?1", [operation.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional())?;
+    let Some((id, request, record)) = value else {
+        return Ok(None);
+    };
+    let parsed = record
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<Allocation>(v).ok())
+        .filter(|a| {
+            a.checkout.to_string() == id
+                && a.request.operation == operation
+                && request
+                    .as_deref()
+                    .and_then(|v| serde_json::from_str::<Start>(v).ok())
+                    .as_ref()
+                    == Some(&a.request)
+        });
+    if let Some(a) = parsed {
+        return Ok(Some(a));
+    }
+    // Keep corrupt evidence untouched, but revoke eligibility using the trusted row
+    // key, never an ID supplied by malformed JSON.
+    let tx = sql(store.conn.transaction())?;
+    sql(tx.execute(
+        "UPDATE checkouts SET state='held',ready=0 WHERE id=?1",
+        [&id],
+    ))?;
+    db(crate::store::emit(
+        &tx,
+        &crate::events::Event::AllocationStage {
+            checkout: Uuid::parse_str(&id).map_err(|_| err("invalid checkout key"))?,
+            operation,
+            stage: "held".into(),
+            reason: Some("malformed allocation metadata; operator reconciliation required".into()),
+        },
+    ))?;
+    sql(tx.commit())?;
+    Err(err(
+        "malformed allocation metadata; held with charge retained",
+    ))
+}
+pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
+    let dir = config
+        .store_dir
+        .as_ref()
+        .ok_or_else(|| err("configure store_dir in WORK_CONFIG"))?;
+    let registry = config
+        .trusted_registry
+        .as_ref()
+        .ok_or_else(|| err("configure trusted_registry in WORK_CONFIG"))?;
+    let store = db(Store::open_registered(registry, dir, &config.roots))?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(dir.join("allocation.lock"))?;
+    // Bound contention; do not wait indefinitely behind an unknown allocator.
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .map_err(io::Error::from)?;
+    Ok((store, lock))
+}
+fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {
+    let policy = config
+        .allocation
+        .as_ref()
+        .ok_or_else(|| err("configure [allocation] quotas and byte floors in WORK_CONFIG"))?;
+    if policy.warn_bytes < policy.floor_bytes {
+        return Err(err("invalid configured disk thresholds"));
+    }
+    let repo = r
+        .repository
+        .as_ref()
+        .ok_or_else(|| err("configure and supply --repository"))?;
+    let root = r
+        .root
+        .as_ref()
+        .ok_or_else(|| err("configure and supply --root"))?;
+    if !config.repositories.contains(repo) || !config.roots.contains(root) {
+        return Err(err("repository/root not allowed by configuration"));
+    }
+    for path in [repo, root] {
+        crate::config::validate_path(path, true)
+            .map_err(|_| err("noncanonical or symlink path"))?;
+    }
+    let actor = r.actor.as_ref().ok_or_else(|| err("supply --actor"))?;
+    if !component(actor) || !component(&r.task) || !component(r.owner.as_ref().unwrap_or(actor)) {
+        return Err(err("unsafe actor/owner/task component"));
+    }
+    if r.owner.as_ref().is_some_and(|owner| owner != actor) {
+        return Err(err(
+            "allocating actor must remain accountable; use explicit transfer after allocation",
+        ));
+    }
+    r.owner = Some(actor.clone());
+    let branch = r.branch.clone().unwrap_or_else(|| r.task.clone());
+    if !component(&branch)
+        || branch.ends_with(".lock")
+        || r.base.starts_with('-')
+        || r.base.contains("..")
+        || r.base.chars().any(char::is_whitespace)
+        || r.base.contains(['\\', ':', '~', '^', '?', '*', '['])
+        || r.base.is_empty()
+    {
+        return Err(err("unsafe branch/base ref"));
+    }
+    query(repo, &["check-ref-format", &format!("refs/heads/{branch}")])?;
+    r.branch = Some(branch);
+    if r.operation.get_version_num() != 7 || r.operation.get_variant() != uuid::Variant::RFC4122 {
+        return Err(err("operation must be UUIDv7"));
+    }
+    Ok(r)
+}
+pub fn start(config: &Config, request: Start) -> io::Result<Allocation> {
+    start_observed(config, request, |_| {})
+}
+/// Observer is called only at persisted protocol boundaries. It does not supply policy
+/// or authority. Used by subprocess qualification to abort the allocator itself.
+pub fn start_observed(
+    config: &Config,
+    request: Start,
+    mut boundary: impl FnMut(&str),
+) -> io::Result<Allocation> {
+    let r = normalize(config, request)?;
+    let (mut store, _lock) = locked(config)?;
+    if let Some(mut a) = load(&mut store, r.operation)? {
+        if a.request != r {
+            return Err(err("operation request conflicts"));
+        }
+        let state: String = sql(store.conn.query_row(
+            "SELECT state FROM checkouts WHERE id=?1",
+            [a.checkout.to_string()],
+            |row| row.get(0),
+        ))?;
+        if !matches!(state.as_str(), "reserved" | "partial" | "active")
+            && !(state == "held" && a.stage == "held")
+        {
+            return Err(err(
+                "later lifecycle state requires explicit recovery; start cannot reverse it",
+            ));
+        }
+        if config.allocation.as_ref().unwrap().capture_sink.is_some() {
+            crate::recovery::hold(
+                &mut store,
+                &mut a,
+                "configured capture unsupported; no capture prepared",
+            )?;
+            return Err(err(
+                "configured capture unsupported; writer eligibility revoked",
+            ));
+        }
+        if a.stage == "reserved" {
+            return create(config, &mut store, a, &mut boundary);
+        }
+        crate::recovery::reconcile(&mut store, &mut a)?;
+        return if a.stage == "ready" {
+            Ok(a)
+        } else {
+            Err(err(a.reason.as_deref().unwrap_or("allocation held")))
+        };
+    }
+    let prior: bool = sql(store.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkouts WHERE operation=?1)",
+        [r.operation.to_string()],
+        |row| row.get(0),
+    ))?;
+    if prior {
+        return Err(err(
+            "reservation lacks allocation intent; hold charged for operator reconciliation",
+        ));
+    }
+    let policy = config.allocation.as_ref().unwrap();
+    if policy.capture_sink.is_some() {
+        return Err(err(
+            "configured capture sink unsupported; no capture prepared, no writer eligible",
+        ));
+    }
+    let repo = r.repository.as_ref().unwrap();
+    let source = CheckoutIdentity::inspect(repo)?;
+    if repo.join(".gitmodules").exists() || source.common_git_dir.join("modules").exists() {
+        return Err(err("unsupported submodule layout; hold"));
+    }
+    let destination = r.root.as_ref().unwrap().join(&r.task);
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(err(
+            "destination collision; never adopting existing directory",
+        ));
+    }
+    let branch = r.branch.as_ref().unwrap();
+    let exists = query(
+        repo,
+        &["show-ref", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .is_ok();
+    if exists != r.reuse_branch {
+        return Err(err(
+            "existing branch requires explicit --reuse-branch; missing branch cannot be reused",
+        ));
+    }
+    let base_commit = query(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", if exists { branch } else { &r.base }),
+        ],
+    )?;
+    let stat = rustix::fs::statvfs(r.root.as_ref().unwrap()).map_err(io::Error::from)?;
+    let available = stat.f_bavail.checked_mul(stat.f_frsize);
+    let mut a = Allocation {
+        checkout: Uuid::nil(),
+        request: r.clone(),
+        destination,
+        base_commit,
+        stage: "reserved".into(),
+        reason: None,
+        identity: None,
+    };
+    db(store.reserve_recorded(
+        &Reservation {
+            operation: r.operation,
+            repository: repo.clone(),
+            actor: r.actor.clone().unwrap(),
+            owner: r.owner.clone().unwrap(),
+            task: r.task.clone(),
+        },
+        Limits {
+            repository: policy.repository_limit,
+            owner: policy.owner_limit,
+            available_bytes: available,
+            floor_bytes: policy.floor_bytes,
+            warn_bytes: policy.warn_bytes,
+        },
+        |checkout| {
+            a.checkout = checkout;
+            Ok(Some((
+                serde_json::to_string(&a.request).map_err(|_| crate::store::StoreError::Invalid)?,
+                serde_json::to_string(&a).map_err(|_| crate::store::StoreError::Invalid)?,
+            )))
+        },
+    ))?;
+    boundary("charged");
+    boundary("reserved");
+    create(config, &mut store, a, &mut boundary)
+}
+fn create(
+    config: &Config,
+    store: &mut Store,
+    mut a: Allocation,
+    boundary: &mut impl FnMut(&str),
+) -> io::Result<Allocation> {
+    if config.allocation.as_ref().unwrap().capture_sink.is_some() {
+        return Err(err(
+            "configured capture unsupported; allocation remains charged",
+        ));
+    }
+    crate::config::validate_path(a.destination.parent().unwrap(), true)
+        .map_err(|_| err("destination ancestor changed"))?;
+    if fs::symlink_metadata(&a.destination).is_ok() {
+        return crate::recovery::hold(store, &mut a, "destination collision")
+            .and_then(|()| Err(err("destination collision")));
+    }
+    a.stage = "creating".into();
+    save(store, &a)?;
+    boundary("intent");
+    let repo = a.request.repository.as_ref().unwrap();
+    let branch = a.request.branch.as_ref().unwrap();
+    let result = if a.request.reuse_branch {
+        // Freeze the explicit existing branch boundary; do not reset it to base.
+        if query(repo, &["rev-parse", &format!("refs/heads/{branch}")])? != a.base_commit {
+            return Err(err("branch moved; charged intent requires reconciliation"));
+        }
+        query(
+            repo,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "--",
+                a.destination.to_str().unwrap(),
+                branch,
+            ],
+        )
+    } else {
+        query(
+            repo,
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                "--",
+                a.destination.to_str().unwrap(),
+                &a.base_commit,
+            ],
+        )
+    };
+    boundary("created");
+    if result.is_err() {
+        crate::recovery::hold(
+            store,
+            &mut a,
+            "Git creation failed; inspect path and registration (charge retained)",
+        )?;
+        return Err(err("Git creation failed; allocation held"));
+    }
+    let identity = CheckoutIdentity::inspect(&a.destination)?;
+    if identity.common_git_dir != CheckoutIdentity::inspect(repo)?.common_git_dir
+        || identity.private_git_dir == identity.common_git_dir
+        || identity.head != a.base_commit
+    {
+        crate::recovery::hold(store, &mut a, "unsupported or changed Git identity")?;
+        return Err(err("Git identity mismatch; held"));
+    }
+    a.identity = Some(identity);
+    // Identity commit BEFORE marker: an interrupted marker write is not adopted.
+    a.stage = "created".into();
+    save(store, &a)?;
+    boundary("identity");
+    let marker = a
+        .identity
+        .as_ref()
+        .unwrap()
+        .private_git_dir
+        .join("work-lease.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&marker)?;
+    file.write_all(&serde_json::to_vec(&crate::recovery::Marker::from(&a))?)?;
+    file.sync_all()?;
+    fs::File::open(marker.parent().unwrap())?.sync_all()?;
+    fs::File::open(&a.destination)?.sync_all()?;
+    fs::File::open(a.destination.parent().unwrap())?.sync_all()?;
+    boundary("marker");
+    crate::recovery::reconcile(store, &mut a)?;
+    if a.stage != "ready" {
+        return Err(err("identity changed before readiness; allocation held"));
+    }
+    boundary("ready");
+    Ok(a)
+}

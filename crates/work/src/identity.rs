@@ -8,12 +8,12 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirectoryIdentity {
     pub device: u64,
     pub inode: u64,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckoutIdentity {
     pub path: PathBuf,
     pub private_git_dir: PathBuf,
@@ -50,7 +50,7 @@ fn git(path: &Path, args: &[&std::ffi::OsStr]) -> io::Result<String> {
         .map(|s| s.trim_end_matches('\n').to_owned())
         .map_err(|_| hold("non-UTF8 Git identity unsupported"))
 }
-fn query(path: &Path, args: &[&str]) -> io::Result<String> {
+pub(crate) fn query(path: &Path, args: &[&str]) -> io::Result<String> {
     git(
         path,
         &args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>(),
