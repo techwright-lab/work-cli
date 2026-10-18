@@ -38,6 +38,15 @@ enum Command {
 
 /// Parse arguments and execute a read-only command. Clap exits for help/version.
 pub fn run() {
+    // Parse the private entry point without Clap diagnostics echoing sensitive argv.
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "__scope-child") {
+        if args.len() >= 5 && args[1] == "--context" && args[3] == "--" {
+            let _ = crate::scope_child::run(std::path::Path::new(&args[2]), &args[4..]);
+        }
+        eprintln!("scope child held");
+        std::process::exit(1);
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Start(request) => {

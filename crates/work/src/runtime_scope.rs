@@ -121,6 +121,7 @@ pub enum HoldReason {
 pub struct Binding {
     identity: ScopeIdentity,
     boot: String,
+    child: ChildIdentity,
 }
 
 /// Authorizes only cancellation of this bound unit, never arbitrary PID signaling.
@@ -191,9 +192,13 @@ pub fn bind(
     Ok(Binding {
         identity: identity.clone(),
         boot: intent.boot.clone(),
+        child: child.clone(),
     })
 }
 impl Binding {
+    pub fn trusted_child(&self) -> &ChildIdentity {
+        &self.child
+    }
     pub fn identity(&self) -> &ScopeIdentity {
         &self.identity
     }

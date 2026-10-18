@@ -342,7 +342,7 @@ fn normalized(path: &str) -> bool {
 fn within(path: &str, group: &str) -> bool {
     path == group || path.strip_prefix(group).is_some_and(|p| p.starts_with('/'))
 }
-fn canonical_dir(path: &Path) -> Result<File> {
+pub(crate) fn canonical_dir(path: &Path) -> Result<File> {
     if !path.is_absolute() || fs::canonicalize(path).map_err(|_| HOLD)? != path {
         return Err(HOLD);
     }
@@ -536,6 +536,35 @@ fn process(
         boot: boot.into(),
         cgroup: cgroup.into(),
     }))
+}
+/// Fixed production procfs reader shared with the pre-exec child. No caller roots.
+pub(crate) fn live_process(pid: u32) -> Result<ChildIdentity> {
+    let limits = Limits::default();
+    let mut budget = Budget {
+        start: Instant::now(),
+        limits: &limits,
+        bytes: 0,
+    };
+    let proc = canonical_dir(Path::new("/proc"))?;
+    let boot = read(&proc, "sys/kernel/random/boot_id", &mut budget)?
+        .trim()
+        .to_owned();
+    let identity = process(&proc, pid, &boot, &mut budget)?.ok_or(HOLD)?;
+    let stat = read(&proc, &format!("{pid}/stat"), &mut budget)?;
+    let state = stat
+        .rsplit_once(')')
+        .ok_or(HOLD)?
+        .1
+        .split_whitespace()
+        .next()
+        .ok_or(HOLD)?;
+    if matches!(state, "Z" | "X" | "x")
+        || start_ticks(&stat, pid)? != identity.start_ticks
+        || read(&proc, "sys/kernel/random/boot_id", &mut budget)?.trim() != boot
+    {
+        return Err(HOLD);
+    }
+    Ok(identity)
 }
 fn validate_stat_pair(first: &str, second: &str, pid: u32) -> Result<()> {
     if start_ticks(first, pid)? != start_ticks(second, pid)? {
