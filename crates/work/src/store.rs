@@ -450,6 +450,135 @@ impl Store {
         Ok(())
     }
 }
+/// Aggregated accounting only; current schema does not bind records to FS paths.
+#[derive(Debug, serde::Serialize)]
+pub struct Charge {
+    pub owner: String,
+    pub state: String,
+    pub count: u64,
+    pub charged: u64,
+}
+
+fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
+    crate::config::validate_path(dir, true).map_err(|_| StoreError::Unsafe)?;
+    let m = fs::symlink_metadata(dir)?;
+    if m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
+        return Err(StoreError::Unsafe);
+    }
+    let path = dir.join(name);
+    check_file(&path)?;
+    // SQLite WAL readers may create sidecars even with READONLY on the DB.
+    // Require both pre-existing sidecars before opening a WAL database. Never
+    // use immutable=1: that would silently ignore committed active WAL records.
+    use std::io::Read;
+    let mut header = [0u8; 100];
+    fs::File::open(&path)?.read_exact(&mut header)?;
+    if &header[..16] != b"SQLite format 3\0" {
+        return Err(StoreError::Unsafe);
+    }
+    match fs::symlink_metadata(dir.join(format!("{name}-journal"))) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err(StoreError::Unsafe),
+    }
+    for suffix in ["-wal", "-shm"] {
+        let side = dir.join(format!("{name}{suffix}"));
+        match fs::symlink_metadata(&side) {
+            Ok(_) => check_file(&side)?,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && header[18] != 2
+                    && header[19] != 2 => {}
+            _ => return Err(StoreError::Unsafe),
+        }
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    conn.busy_timeout(Duration::from_millis(500))?;
+    // Aggregation/integrity queries must not spill SQLite temporary files.
+    conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY;")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if version != 1 || integrity != "ok" {
+        return Err(StoreError::Unsafe);
+    }
+    Ok(conn)
+}
+
+/// Strict existing-evidence reader: no bootstrap, migration, locks created on
+/// disk, writes, repair, event generation or acknowledgments. Existing WAL SHM
+/// lock bookkeeping can change; this is not a byte-immutability guarantee.
+pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Vec<Charge>> {
+    crate::config::validate_path(registry, true).map_err(|_| StoreError::Unsafe)?;
+    crate::config::validate_path(dir, true).map_err(|_| StoreError::Unsafe)?;
+    let marker = registry.join("initialization.json");
+    check_file(&marker)?;
+    if fs::metadata(&marker)?.len() > 8192 {
+        return Err(StoreError::Unsafe);
+    }
+    let record: Initialization =
+        serde_json::from_slice(&fs::read(marker)?).map_err(|_| StoreError::Unsafe)?;
+    if record.version != 1 || !record.initialized || record.store != dir {
+        return Err(StoreError::Unsafe);
+    }
+    let reg = existing_database(registry, "authorities.sqlite")?;
+    let mut stmt = reg.prepare("SELECT root,store FROM authorities ORDER BY root")?;
+    let claims = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if claims.len() != managed.len()
+        || claims
+            .iter()
+            .any(|(root, store)| Path::new(store) != dir || !managed.contains(&PathBuf::from(root)))
+    {
+        return Err(StoreError::Unsafe);
+    }
+    let conn = existing_database(dir, "store.sqlite")?;
+    conn.execute_batch("BEGIN;")?;
+    conn.prepare(
+        "SELECT id,operation,digest,repository,actor,task,owner,state FROM checkouts LIMIT 0",
+    )?;
+    conn.prepare("SELECT checkout,group_id FROM writers LIMIT 0")?;
+    conn.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
+    conn.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
+    let mut stmt = conn.prepare(
+        "SELECT owner,state,count(*) FROM checkouts GROUP BY owner,state ORDER BY owner,state",
+    )?;
+    let charges = stmt
+        .query_map([], |r| {
+            let state: String = r.get(1)?;
+            let count = u64::from(r.get::<_, u32>(2)?);
+            Ok(Charge {
+                owner: r.get(0)?,
+                charged: if state == "retired" { 0 } else { count },
+                state,
+                count,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for charge in &charges {
+        identity(&charge.owner)?;
+        if !matches!(
+            charge.state.as_str(),
+            "reserved"
+                | "partial"
+                | "active"
+                | "expired"
+                | "interrupted"
+                | "held"
+                | "quarantined"
+                | "partially_deleted"
+                | "retired"
+        ) {
+            return Err(StoreError::Invalid);
+        }
+    }
+    Ok(charges)
+}
+
 pub(crate) fn count(conn: &Connection, repo: &str, owner: Option<&str>) -> Result<u64> {
     let n: i64 = conn.query_row("SELECT count(*) FROM checkouts WHERE repository=?1 AND state!='retired' AND (?2 IS NULL OR owner=?2)", (repo,owner), |r| r.get(0))?;
     u64::try_from(n).map_err(|_| StoreError::Invalid)

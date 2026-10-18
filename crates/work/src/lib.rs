@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod events;
 pub mod identity;

@@ -8,6 +8,9 @@ use crate::error::Error;
 pub struct Config {
     /// Directory for the local lifecycle store, when the host has configured one.
     pub store_dir: Option<PathBuf>,
+    pub trusted_registry: Option<PathBuf>,
+    pub roots: Vec<PathBuf>,
+    pub repositories: Vec<PathBuf>,
 }
 
 impl Config {
@@ -16,10 +19,11 @@ impl Config {
         let Some(path) = Self::discover_path() else {
             return Ok(Self::default());
         };
-        if !path.is_file() {
+        if !path.exists() && std::env::var_os("WORK_CONFIG").is_none() {
             return Ok(Self::default());
         }
-        let text = std::fs::read_to_string(&path).map_err(|source| Error::io(path, source))?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| Error::Config("cannot read configuration".into()))?;
         Self::from_toml(&text)
     }
 
@@ -50,11 +54,71 @@ impl Config {
             }
             Error::Config(diagnostic)
         })?;
-        let store_dir = value
-            .get("store_dir")
-            .and_then(toml::Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(PathBuf::from);
-        Ok(Self { store_dir })
+        if !value.is_table() {
+            return Err(Error::Config("expected configuration table".into()));
+        }
+        let single = |key: &str| -> Result<Option<PathBuf>, Error> {
+            value
+                .get(key)
+                .map(|v| {
+                    let s = v.as_str().ok_or_else(invalid_path)?;
+                    validate_path(std::path::Path::new(s), false)
+                })
+                .transpose()
+        };
+        let many = |key: &str| -> Result<Vec<PathBuf>, Error> {
+            let Some(v) = value.get(key) else {
+                return Ok(Vec::new());
+            };
+            v.as_array()
+                .ok_or_else(invalid_path)?
+                .iter()
+                .map(|v| {
+                    validate_path(
+                        std::path::Path::new(v.as_str().ok_or_else(invalid_path)?),
+                        true,
+                    )
+                })
+                .collect()
+        };
+        Ok(Self {
+            store_dir: single("store_dir")?,
+            trusted_registry: single("trusted_registry")?,
+            roots: many("roots")?,
+            repositories: many("repositories")?,
+        })
     }
+}
+fn invalid_path() -> Error {
+    Error::Config("expected absolute canonical path(s) without symlinks".into())
+}
+
+/// Validate every existing component without following symlinks. Missing store
+/// or inaccessible optional evidence is allowed (later reported unknown), not
+/// manufactured or treated as canonical identity proof.
+pub fn validate_path(path: &std::path::Path, required: bool) -> Result<PathBuf, Error> {
+    use std::path::Component;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(invalid_path());
+    }
+    for ancestor in path.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => (),
+            Err(e)
+                if !required
+                    && matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                    ) => {}
+            _ => return Err(invalid_path()),
+        }
+    }
+    if path.exists() && path.canonicalize().map_err(|_| invalid_path())? != path {
+        return Err(invalid_path());
+    }
+    Ok(path.to_owned())
 }
