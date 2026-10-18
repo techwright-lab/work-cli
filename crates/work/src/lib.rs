@@ -5,8 +5,12 @@
 
 #![forbid(unsafe_code)]
 
+pub mod admission;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod events;
 pub mod identity;
 pub mod linux_scope;
+pub mod ownership;
+pub mod store;
