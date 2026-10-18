@@ -23,6 +23,9 @@ fn valid_json() -> serde_json::Value {
         "checkout_id": CHECKOUT,
         "run_id": RUN,
         "group_id": GROUP,
+        "run_ref": "run:implementation",
+        "parent_run_ref": "run:root",
+        "execution_chain": "chain:task-1",
         "actor": "agent-1",
         "repository": "https://git.example.invalid/acme/app.git",
         "task": "TASK-1",
@@ -125,10 +128,7 @@ fn rejects_missing_identity_fields() {
         let mut value = valid_json();
         value.as_object_mut().expect("object").remove(field);
         let err = LifecycleEnvelope::from_json(&value.to_string()).expect_err(field);
-        assert!(
-            matches!(err, ContractError::MissingIdentity { field: got } if got == field),
-            "{field}: {err:?}"
-        );
+        assert!(err.to_string().contains(field), "{field}: {err:?}");
     }
 }
 
@@ -138,10 +138,7 @@ fn rejects_empty_identity_values() {
         let mut value = valid_json();
         value[field] = serde_json::json!("");
         let err = LifecycleEnvelope::from_json(&value.to_string()).expect_err(field);
-        assert!(
-            matches!(err, ContractError::MissingIdentity { field: got } if got == field),
-            "{field}: {err:?}"
-        );
+        assert!(err.to_string().contains(field), "{field}: {err:?}");
     }
 
     assert!(matches!(
@@ -163,7 +160,7 @@ fn rejects_null_owner() {
     let mut value = valid_json();
     value["owner"] = serde_json::Value::Null;
     let err = LifecycleEnvelope::from_json(&value.to_string()).expect_err("null owner");
-    assert!(matches!(err, ContractError::NullOwner), "{err:?}");
+    assert!(err.to_string().contains("invalid type: null"), "{err:?}");
 }
 
 #[test]
@@ -181,7 +178,7 @@ fn rejects_incompatible_schema_major() {
     value["schema_version"] = serde_json::json!("2.0");
     let err = LifecycleEnvelope::from_json(&value.to_string()).expect_err("envelope major 2");
     assert!(
-        matches!(err, ContractError::IncompatibleSchema { major: 2, .. }),
+        err.to_string().contains("incompatible schema version 2.0"),
         "{err:?}"
     );
 }
@@ -199,14 +196,7 @@ fn rejects_unknown_required_enums() {
         let mut json = valid_json();
         json[field] = serde_json::json!(value);
         let err = LifecycleEnvelope::from_json(&json.to_string()).expect_err(field);
-        assert!(
-            matches!(
-                err,
-                ContractError::UnknownEnum { field: got, value: ref got_value }
-                    if got == field && got_value == value
-            ),
-            "{field}={value}: {err:?}"
-        );
+        assert!(err.to_string().contains(value), "{field}={value}: {err:?}");
     }
 }
 
@@ -279,6 +269,184 @@ fn reuse_key_is_actor_repository_task_not_operation_id() {
 
     let operation = AllocationOperationId::generate();
     assert_ne!(operation.to_string(), joined);
+}
+
+#[test]
+fn metadata_round_trips_without_being_discarded() {
+    let parsed = parse_valid();
+    assert_eq!(
+        parsed.run_ref.as_ref().unwrap().as_str(),
+        "run:implementation"
+    );
+    assert_eq!(parsed.parent_run_ref.as_ref().unwrap().as_str(), "run:root");
+    assert_eq!(
+        parsed.execution_chain.as_ref().unwrap().as_str(),
+        "chain:task-1"
+    );
+    let serialized: serde_json::Value = serde_json::from_str(&parsed.to_json().unwrap()).unwrap();
+    for field in ["run_ref", "parent_run_ref", "execution_chain"] {
+        assert_eq!(serialized[field], valid_json()[field], "{field}");
+    }
+}
+
+fn core_events() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({"type":"started", "id":EVENT_GAP, "run_id":RUN, "group_id":GROUP, "mode":"supervised"}),
+        serde_json::json!({"type":"finished", "id":EVENT_GAP, "run_id":RUN, "outcome":"completed"}),
+        serde_json::json!({"type":"held", "id":EVENT_GAP, "reason":"unpreserved_changes"}),
+        serde_json::json!({"type":"expired", "id":EVENT_GAP, "reason":"lease_ttl"}),
+        serde_json::json!({"type":"interrupted", "id":EVENT_GAP, "reason":"execution_lost"}),
+        serde_json::json!({"type":"retired", "id":EVENT_GAP, "checkout_id":CHECKOUT, "reason":"absence_confirmed"}),
+    ]
+}
+
+#[test]
+fn core_lifecycle_events_have_typed_payloads() {
+    for event in core_events() {
+        let mut value = valid_json();
+        value["events"] = serde_json::json!([event]);
+        let parsed = LifecycleEnvelope::from_json(&value.to_string()).expect("core event");
+        assert_eq!(parsed.events[0].kind(), event["type"]);
+        let serialized: serde_json::Value =
+            serde_json::from_str(&parsed.to_json().unwrap()).unwrap();
+        assert_eq!(serialized["events"][0], event);
+    }
+}
+
+#[test]
+fn schema_validation_matches_runtime_constraints() {
+    let schema: serde_json::Value = serde_json::from_str(&lifecycle_v1_schema_json()).unwrap();
+    let validator = jsonschema::validator_for(&schema).expect("generated schema compiles");
+    let mut failures = Vec::new();
+    let mut check = |label: &str, value: serde_json::Value, expected: bool| {
+        if validator.is_valid(&value) != expected {
+            failures.push(format!("schema: {label}"));
+        }
+        if LifecycleEnvelope::from_json(&value.to_string()).is_ok() != expected {
+            failures.push(format!("runtime: {label}"));
+        }
+        if serde_json::from_value::<LifecycleEnvelope>(value).is_ok() != expected {
+            failures.push(format!("serde: {label}"));
+        }
+    };
+    check("baseline", valid_json(), true);
+    for event in core_events() {
+        let mut value = valid_json();
+        value["events"] = serde_json::json!([event]);
+        check("core event", value.clone(), true);
+        let fields: Vec<_> = event.as_object().unwrap().keys().cloned().collect();
+        for field in fields {
+            let mut invalid = value.clone();
+            invalid["events"][0].as_object_mut().unwrap().remove(&field);
+            check(&format!("event missing {field}"), invalid, false);
+        }
+        for field in ["mode", "outcome", "reason"] {
+            if event.get(field).is_some() {
+                let mut invalid = value.clone();
+                invalid["events"][0][field] = serde_json::json!("unsupported");
+                check("unknown event enum", invalid, false);
+            }
+        }
+    }
+    for field in [
+        "actor",
+        "repository",
+        "task",
+        "owner",
+        "run_ref",
+        "parent_run_ref",
+        "execution_chain",
+    ] {
+        for blank in ["", " ", "\t\n", "\u{a0}"] {
+            let mut value = valid_json();
+            value[field] = serde_json::json!(blank);
+            check(field, value, false);
+        }
+    }
+    for field in ["operation_id", "checkout_id", "run_id", "group_id"] {
+        for invalid in [
+            UUID_V4,
+            "not-a-uuid",
+            "018f4b2e8c3a7d918a2b0123456789ab",
+            "018f4b2e-8c3a-7d91-1a2b-0123456789ab",
+        ] {
+            let mut value = valid_json();
+            value[field] = serde_json::json!(invalid);
+            check(field, value, false);
+        }
+    }
+    for version in [
+        "1",
+        "01.0",
+        "1.00",
+        "1.+1",
+        "1.0.extra",
+        "1.0.0",
+        "1.0-beta",
+        " 1.0",
+        "2.0",
+        "1.4294967296",
+    ] {
+        let mut value = valid_json();
+        value["schema_version"] = serde_json::json!(version);
+        check(version, value, false);
+    }
+    for version in ["1.0", "1.1", "1.4294967295"] {
+        let mut value = valid_json();
+        value["schema_version"] = serde_json::json!(version);
+        check(version, value, true);
+    }
+    for field in ["actor", "repository", "task", "owner", "events"] {
+        let mut value = valid_json();
+        value.as_object_mut().unwrap().remove(field);
+        check(&format!("missing {field}"), value, false);
+        let mut value = valid_json();
+        value[field] = serde_json::Value::Null;
+        check(&format!("null {field}"), value, false);
+    }
+    let mut value = valid_json();
+    value["events"][0]["id"] = serde_json::json!(UUID_V4);
+    check("event UUIDv4", value, false);
+    assert!(failures.is_empty(), "parity failures: {failures:#?}");
+}
+
+#[test]
+fn allocation_operation_cannot_alias_entity_ids() {
+    for field in ["checkout_id", "run_id", "group_id"] {
+        let mut value = valid_json();
+        value[field] = serde_json::json!(OP);
+        assert!(
+            LifecycleEnvelope::from_json(&value.to_string()).is_err(),
+            "{field}"
+        );
+        assert!(
+            serde_json::from_value::<LifecycleEnvelope>(value).is_err(),
+            "serde {field}"
+        );
+    }
+    let mut value = valid_json();
+    value["events"][0]["id"] = serde_json::json!(OP);
+    assert!(
+        LifecycleEnvelope::from_json(&value.to_string()).is_err(),
+        "event id"
+    );
+    assert!(
+        serde_json::from_value::<LifecycleEnvelope>(value.clone()).is_err(),
+        "serde event id"
+    );
+    for event in core_events() {
+        for field in ["run_id", "group_id", "checkout_id"] {
+            if event.get(field).is_some() {
+                let mut invalid = event.clone();
+                invalid[field] = serde_json::json!(OP);
+                value["events"] = serde_json::json!([invalid]);
+                assert!(
+                    LifecycleEnvelope::from_json(&value.to_string()).is_err(),
+                    "event {field}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

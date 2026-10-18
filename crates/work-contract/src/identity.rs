@@ -24,7 +24,7 @@ pub enum ContractError {
 macro_rules! nonempty_id {
     ($name:ident, $field:literal) => {
         /// Nonempty validated identity. Empty or whitespace-only values are rejected.
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, JsonSchema)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -54,6 +54,20 @@ macro_rules! nonempty_id {
                 Self::parse(&raw).map_err(serde::de::Error::custom)
             }
         }
+
+        impl JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                std::borrow::Cow::Borrowed(stringify!($name))
+            }
+
+            fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+                // The explicit Unicode White_Space set matches Rust's str::trim.
+                schemars::json_schema!({
+                    "type": "string",
+                    "pattern": r"[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]"
+                })
+            }
+        }
     };
 }
 
@@ -61,6 +75,8 @@ nonempty_id!(ActorId, "actor");
 nonempty_id!(RepositoryId, "repository");
 nonempty_id!(TaskId, "task");
 nonempty_id!(OwnerId, "owner");
+nonempty_id!(RunRef, "run_ref");
+nonempty_id!(ExecutionChain, "execution_chain");
 
 macro_rules! uuidv7_id {
     ($name:ident, $kind:literal) => {
@@ -75,16 +91,22 @@ macro_rules! uuidv7_id {
             }
 
             pub fn parse(raw: &str) -> Result<Self, ContractError> {
-                let uuid = Uuid::parse_str(raw.trim()).map_err(|err| ContractError::InvalidId {
+                let uuid = Uuid::parse_str(raw).map_err(|err| ContractError::InvalidId {
                     kind: $kind,
                     reason: err.to_string(),
                 })?;
+                if !raw.eq_ignore_ascii_case(&uuid.hyphenated().to_string()) {
+                    return Err(ContractError::InvalidId {
+                        kind: $kind,
+                        reason: "expected a hyphenated UUID".into(),
+                    });
+                }
                 Self::from_uuid(uuid)
             }
 
             fn from_uuid(uuid: Uuid) -> Result<Self, ContractError> {
                 let version = uuid.get_version_num();
-                if version != 7 {
+                if version != 7 || uuid.get_variant() != uuid::Variant::RFC4122 {
                     return Err(ContractError::InvalidId {
                         kind: $kind,
                         reason: format!("expected UUIDv7, got version {version}"),
@@ -119,7 +141,8 @@ macro_rules! uuidv7_id {
             fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
                 schemars::json_schema!({
                     "type": "string",
-                    "format": "uuid"
+                    "format": "uuid",
+                    "pattern": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
                 })
             }
         }
