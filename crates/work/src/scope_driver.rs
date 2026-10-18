@@ -526,15 +526,22 @@ fn process(
         .and_then(|l| l.strip_prefix("0::"))
         .filter(|p| normalized(p))
         .ok_or(HOLD)?;
-    if lines.next().is_some() || read(&dir, "stat", budget)? != stat {
+    if lines.next().is_some() {
         return Err(HOLD);
     }
+    validate_stat_pair(&stat, &read(&dir, "stat", budget)?, pid)?;
     Ok(Some(ChildIdentity {
         pid,
         start_ticks,
         boot: boot.into(),
         cgroup: cgroup.into(),
     }))
+}
+fn validate_stat_pair(first: &str, second: &str, pid: u32) -> Result<()> {
+    if start_ticks(first, pid)? != start_ticks(second, pid)? {
+        return Err(HOLD);
+    }
+    Ok(())
 }
 fn start_ticks(stat: &str, pid: u32) -> Result<u64> {
     let prefix = format!("{pid} (");
@@ -595,4 +602,37 @@ fn participant_states(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stat_pair_validates_stable_identity_only() {
+        let stat = |pid, state, ticks, fields: &[&str]| {
+            format!(
+                "{pid} (odd ) comm (x)) {state} {} {ticks} 0\n",
+                fields.join(" ")
+            )
+        };
+        let fields = ["0"; 18];
+        let first = stat(42, "S", 123, &fields);
+        let mut active_fields = fields;
+        // Fields 10/12 are fault counters; fields 14/15 are CPU time.
+        for index in [6, 8, 10, 11] {
+            active_fields[index] = "1";
+        }
+        for (case, second, expected) in [
+            ("unchanged", first.clone(), Ok(())),
+            ("state", stat(42, "R", 123, &fields), Ok(())),
+            ("cpu and faults", stat(42, "S", 123, &active_fields), Ok(())),
+            ("start time", stat(42, "S", 124, &fields), Err(HOLD)),
+            ("pid", stat(43, "S", 123, &fields), Err(HOLD)),
+            ("malformed", "42 (broken) S 0".into(), Err(HOLD)),
+            ("invalid state", stat(42, "?", 123, &fields), Err(HOLD)),
+        ] {
+            assert_eq!(validate_stat_pair(&first, &second, 42), expected, "{case}");
+        }
+    }
 }
