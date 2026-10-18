@@ -58,7 +58,7 @@ fn crash_worker() {
         return;
     };
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM outbox;")
+    conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM outbox; DELETE FROM checkouts;")
         .unwrap();
     std::process::abort();
 }
@@ -67,7 +67,9 @@ fn crash_worker() {
 fn committed_outbox_survives_process_death_and_ack_is_idempotent() {
     let f = Fixture::new();
     let mut store = f.open();
-    store.reserve(&f.request(), limits()).unwrap();
+    let request = f.request();
+    let checkout = store.reserve(&request, limits()).unwrap();
+    let events = store.pending_events(100).unwrap();
     drop(store);
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "crash_worker"])
@@ -77,12 +79,60 @@ fn committed_outbox_survives_process_death_and_ack_is_idempotent() {
         .unwrap();
     assert!(!status.success());
     let mut store = f.open();
-    let events = store.pending_events(100).unwrap();
+    assert_eq!(
+        store
+            .charged(&request.repository, Some(&request.owner))
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.reserve(&request, limits()).unwrap(), checkout);
     assert_eq!(events.len(), 1);
     assert_eq!(store.pending_events(100).unwrap(), events);
     store.acknowledge(events[0].sequence).unwrap();
     store.acknowledge(events[0].sequence).unwrap();
     assert!(store.pending_events(100).unwrap().is_empty());
+    drop(store);
+    assert!(f.open().pending_events(100).unwrap().is_empty());
+}
+
+#[test]
+fn one_registry_refuses_a_second_store_even_for_disjoint_roots() {
+    let f = Fixture::new();
+    let registry = f._dir.path().join("registry");
+    let other_root = f._dir.path().join("other-root");
+    let repository = f._dir.path().join("repository");
+    std::fs::create_dir(&other_root).unwrap();
+    std::fs::create_dir(&repository).unwrap();
+    let roots = vec![f.root.clone(), other_root.clone()];
+    let mut request = f.request();
+    // The canonical repository is independent of the managed checkout roots.
+    request.repository = repository;
+    let mut first =
+        Store::open_registered(&registry, &f.private, std::slice::from_ref(&f.root)).unwrap();
+    first.reserve(&request, limits()).unwrap();
+    assert!(matches!(
+        Store::open_registered(
+            &registry,
+            &f._dir.path().join("second-store"),
+            &[other_root]
+        ),
+        Err(work_cli::store::StoreError::Unsafe)
+    ));
+    drop(first);
+    // The same authority can expand its scope and reopen without losing charges.
+    drop(Store::open_registered(&registry, &f.private, &roots).unwrap());
+    let mut reopened = Store::open_registered(&registry, &f.private, &roots).unwrap();
+    assert_eq!(
+        reopened
+            .charged(&request.repository, Some(&request.owner))
+            .unwrap(),
+        1
+    );
+    request.operation = Uuid::now_v7();
+    assert!(matches!(
+        reopened.reserve(&request, limits()),
+        Err(work_cli::store::StoreError::Capacity)
+    ));
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Private local SQLite authority. Callers must select one trusted host-local
-//! registry for all managed roots. This is cooperative configuration enforcement,
-//! not discovery of arbitrary databases or protection from a malicious same UID.
+//! registry with one authoritative store for all managed roots. This is cooperative
+//! configuration enforcement, not discovery of arbitrary databases or protection
+//! from a malicious same UID.
 use crate::events::{Event, PendingEvent};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
@@ -145,13 +146,17 @@ fn roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 impl Store {
-    /// Convenience for a registry colocated at the store's parent. Production
-    /// callers spanning different parents MUST supply their common trusted registry.
+    /// Uses `.work-authorities` at the store's parent as the trusted registry,
+    /// permitting only one authoritative store there, even for disjoint roots.
+    /// Callers spanning different parents MUST use `open_registered` with their
+    /// common trusted registry. Choosing a different registry is explicit host
+    /// policy, not a security guarantee; no global filesystem scan is performed.
     pub fn open(dir: &Path, managed: &[PathBuf]) -> Result<Self> {
         let parent = dir.parent().ok_or(StoreError::Unsafe)?;
         Self::open_registered(&parent.join(".work-authorities"), dir, managed)
     }
-    /// Registry claims are deliberately never auto-released on database loss.
+    /// One trusted registry permits only one authoritative store, regardless of
+    /// root overlap. Registry claims are never auto-released on database loss.
     /// Reconfiguration needs an audited operator migration; no second authority is
     /// silently substituted. The registry is an explicitly trusted host policy
     /// boundary, not a global scan. Keep this path fixed across all configurations.
@@ -192,18 +197,9 @@ impl Store {
             rows
         };
         for (root, owner) in &claims {
-            if owner == dir.to_str().ok_or(StoreError::Invalid)? && !store_exists {
-                return Err(StoreError::Unsafe);
-            }
-            if managed
-                .iter()
-                .any(|p| p.starts_with(root) || Path::new(root).starts_with(p))
-                && owner != dir.to_str().ok_or(StoreError::Invalid)?
-            {
-                return Err(StoreError::Unsafe);
-            }
-            if owner == dir.to_str().ok_or(StoreError::Invalid)?
-                && !managed.contains(&PathBuf::from(root))
+            if owner != dir.to_str().ok_or(StoreError::Invalid)?
+                || !store_exists
+                || !managed.contains(&PathBuf::from(root))
             {
                 return Err(StoreError::Unsafe);
             }
