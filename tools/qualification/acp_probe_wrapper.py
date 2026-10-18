@@ -7,7 +7,9 @@ timeout_seconds (0 < n <= 45). Executable paths must be absolute regular files;
 all path components must be non-symlink and not group/world writable. Config and
 evidence root must be own-UID, with no group/world permissions. Parent prepares
 these paths; this helper installs nothing. delegate_command must name the existing
-ACP launcher (codex-acp), never raw codex. Its fixed arguments precede wrapper
+ACP launcher (codex-acp), never raw codex. Configure its canonical, resolved,
+existing executable path (not .bin/codex-acp when any component is a symlink).
+Its fixed arguments precede wrapper
 arguments. Only WORK_QUALIFICATION_CONFIG is removed from the delegated environment.
 
 The evidence root is ONE qualification attempt, shared across runs/resumes. An
@@ -152,19 +154,88 @@ def capture(probe_fd, argv, timeout):
         return child.wait(), bytes(data), "finished"
 
 
+REASONS = frozenset({
+    "real-user-scope-fixture-not-opted-in", "user-bus-or-cgroup-v2-unavailable",
+    "fixture-inspection-failed", "incomplete-or-terminated-during-inspection-membership",
+    "scope-membership-not-proven", "scope-cleanup-not-verified",
+})
+FIXTURES = frozenset({"setsid", "double_fork_parent_exit", "cwd_fd",
+                      "exit_during_inspection"})
+
+
+def unsigned(value, minimum=0):
+    return type(value) is int and minimum <= value <= 2**32 - 1
+
+
+def cgroup_path(value):
+    # Kernel cgroup paths, including systemd's literal \\xNN escapes; no raw lines.
+    return (isinstance(value, str) and 1 <= len(value) <= 4096
+            and re.fullmatch(r"/(?:[A-Za-z0-9_.:@/-]|\\\\x[0-9a-fA-F]{2})*", value)
+            is not None and not any(p in (".", "..", "") for p in value.split("/")[1:])
+            or value == "/")
+
+
 def sanitized(raw):
-    report = {"fixture_executed": None, "cleanup_outcome": "unknown"}
+    """Retain only typed fixture evidence, never raw properties/messages or a pass."""
+    report = {"fixture_executed": None, "cleanup_outcome": "unknown",
+              "disposition": "unknown_hold", "paperclip_qualified": False,
+              "host": {}, "observed_members": [], "observations": [], "reasons": []}
     try:
-        parsed = json.loads(raw) if len(raw) <= LIMIT else None
-        if not isinstance(parsed, dict):
-            return report
-        if type(parsed.get("fixture_executed")) is bool:
-            report["fixture_executed"] = parsed["fixture_executed"]
-        cleanup = parsed.get("cleanup_outcome")
-        if cleanup in ("not-started", "verified-empty", "unknown-hold"):
-            report["cleanup_outcome"] = cleanup
+        parsed = json.loads(raw, object_pairs_hook=unique_object) if len(raw) <= LIMIT else None
     except (ValueError, UnicodeError, RecursionError):
-        pass
+        return report
+    if not isinstance(parsed, dict):
+        return report
+    # Malformed containers are not a partial successful report.
+    if ("host" in parsed and not isinstance(parsed["host"], dict)) or any(
+            key in parsed and not isinstance(parsed[key], list)
+            for key in ("observations", "observed_members", "reasons")):
+        return report
+    if type(parsed.get("fixture_executed")) is bool:
+        report["fixture_executed"] = parsed["fixture_executed"]
+    if parsed.get("cleanup_outcome") in ("not-started", "verified-empty", "unknown-hold"):
+        report["cleanup_outcome"] = parsed["cleanup_outcome"]
+    if parsed.get("disposition") in ("accounted", "unknown_hold"):
+        report["disposition"] = parsed["disposition"]
+    host = parsed.get("host", {})
+    for key in ("runtime_directory_available", "user_bus_available", "cgroup_v2"):
+        if type(host.get(key)) is bool:
+            report["host"][key] = host[key]
+    if unsigned(host.get("uid")):
+        report["host"]["uid"] = host["uid"]
+    if cgroup_path(host.get("current_cgroup")):
+        report["host"]["current_cgroup"] = host["current_cgroup"]
+    for key, pattern in (
+            ("systemd_version", r"systemd [0-9][A-Za-z0-9 .()+:~_-]*"),
+            ("git_version", r"git version [0-9][A-Za-z0-9 .()+:~_-]*")):
+        value = host.get(key)
+        if isinstance(value, str) and len(value) <= 160 and re.fullmatch(pattern, value):
+            report["host"][key] = value
+    unit = parsed.get("unit")
+    if (isinstance(unit, str) and len(unit) <= 128
+            and re.fullmatch(r"work-qualification-[0-9]{1,10}-[0-9]{1,30}\.scope", unit)):
+        report["unit"] = unit
+    if unsigned(parsed.get("unit_owner_uid")):
+        report["unit_owner_uid"] = parsed["unit_owner_uid"]
+    if cgroup_path(parsed.get("scope_cgroup")):
+        report["scope_cgroup"] = parsed["scope_cgroup"]
+    members = parsed.get("observed_members", [])
+    if len(members) <= 512:
+        report["observed_members"] = [pid for pid in members if unsigned(pid, 1)]
+    observations = parsed.get("observations", [])
+    if len(observations) <= 16:
+        for observation in observations:
+            if (isinstance(observation, dict)
+                    and isinstance(observation.get("fixture"), str)
+                    and observation["fixture"] in FIXTURES
+                    and unsigned(observation.get("pid"), 1)
+                    and cgroup_path(observation.get("cgroup"))):
+                report["observations"].append({key: observation[key]
+                                               for key in ("fixture", "pid", "cgroup")})
+    reasons = parsed.get("reasons", [])
+    if len(reasons) <= 32:
+        report["reasons"] = [reason for reason in reasons
+                             if isinstance(reason, str) and reason in REASONS]
     return report
 
 
@@ -185,7 +256,7 @@ def qualify(cfg, probe_fd, root):
     report = sanitized(b"")
     completion = {"run_id": run_id if valid_ids else None, "exit_code": None,
                   "status": "missing-or-invalid-origin"}
-    provenance = {"adapter": "codex_local", "origin_valid": valid_ids,
+    provenance = {"adapter": "codex_local", "origin_valid": valid_ids, "uid": os.getuid(),
                   "run_id": run_id if valid_ids else None,
                   "agent_id": agent_id if valid_ids else None,
                   "pinned_sha256": cfg["pinned_sha256"], "digest_verified": False}

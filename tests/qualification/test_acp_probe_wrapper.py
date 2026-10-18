@@ -1,5 +1,6 @@
 """Opt-in launcher contract tests; only local fake executables are launched."""
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,22 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 WRAPPER = ROOT / "tools/qualification/acp_probe_wrapper.py"
+spec = importlib.util.spec_from_file_location("acp_probe_wrapper", WRAPPER)
+wrapper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wrapper)
+
+GROUP = "/user.slice/user-1000.slice/work-qualification-123-456.scope"
+REPORT = dict(
+    fixture_executed=True, cleanup_outcome="verified-empty", disposition="accounted",
+    paperclip_qualified=True,
+    host=dict(uid=1000, runtime_directory_available=True, user_bus_available=True,
+              cgroup_v2=True, current_cgroup=GROUP,
+              systemd_version="systemd 257 (257.5-1)", git_version="git version 2.49.0"),
+    unit="work-qualification-123-456.scope", unit_owner_uid=1000, scope_cgroup=GROUP,
+    observed_members=[123, 124, 125, 126],
+    observations=[dict(fixture=f, pid=123 + i, cgroup=GROUP) for i, f in enumerate(
+        ("setsid", "double_fork_parent_exit", "cwd_fd", "exit_during_inspection"))],
+    reasons=[])
 
 
 class WrapperTests(unittest.TestCase):
@@ -24,8 +41,11 @@ class WrapperTests(unittest.TestCase):
         self.probe = self.stub("probe", '''import json, os, sys, time
 with open(os.environ["PROBE_LOG"], "a") as f:
     f.write(json.dumps({"argv": sys.argv[1:], "stdin": sys.stdin.read()}) + "\\n")
-print(json.dumps({"fixture_executed": True, "cleanup_outcome": "verified-empty",
-                  "reasons": [os.environ["PROVIDER_KEY"]], "secret": os.environ["PROVIDER_KEY"]}), flush=True)
+report = json.loads(os.environ["PROBE_REPORT"])
+report.update(secret=os.environ["PROVIDER_KEY"], env=dict(os.environ),
+              rawstderr=os.environ["PROVIDER_KEY"], protocolstdout=os.environ["PROVIDER_KEY"])
+report["reasons"].append(os.environ["PROVIDER_KEY"])
+print(json.dumps(report), flush=True)
 print(os.environ["PROVIDER_KEY"], file=sys.stderr)
 time.sleep(float(os.environ.get("PROBE_SLEEP", "0")))
 ''')
@@ -47,7 +67,8 @@ sys.exit(7)
         self.save_config()
         self.env = dict(os.environ, WORK_QUALIFICATION_CONFIG=str(self.config_path),
                         PAPERCLIP_RUN_ID="actual-run-123", PAPERCLIP_AGENT_ID="actual-agent-456",
-                        PROVIDER_KEY="secret-do-not-record", PROBE_LOG=str(self.probe_log))
+                        PROVIDER_KEY="secret-do-not-record", PROBE_LOG=str(self.probe_log),
+                        PROBE_REPORT=json.dumps(REPORT))
 
     def stub(self, name, body):
         path = self.root / name
@@ -93,10 +114,57 @@ sys.exit(7)
         self.assertEqual(provenance.get("run_id"), "actual-run-123")
         self.assertEqual(provenance.get("agent_id"), "actual-agent-456")
         self.assertIs(provenance["digest_verified"], True)
+        self.assertEqual(provenance["uid"], os.getuid())
+        report = json.loads((self.evidence / "report.json").read_text())
+        self.assertEqual(report, dict(REPORT, paperclip_qualified=False))
         for path in self.evidence.iterdir():
             self.assertEqual(path.stat().st_mode & 0o077, 0)
             self.assertNotIn("secret-do-not-record", path.read_text())
-            self.assertNotIn("qualified", path.read_text())
+        self.assertIs(completion["paperclip_qualified"], False)
+
+    def test_negative_report_retains_only_static_reasons(self):
+        reasons = ["user-bus-or-cgroup-v2-unavailable", "fixture-inspection-failed",
+                   "incomplete-or-terminated-during-inspection-membership",
+                   "scope-membership-not-proven", "scope-cleanup-not-verified",
+                   "real-user-scope-fixture-not-opted-in"]
+        self.env["PROBE_REPORT"] = json.dumps(dict(
+            REPORT, disposition="unknown_hold", cleanup_outcome="unknown-hold",
+            reasons=reasons + ["secret-reason", {"token": "secret-token"}]))
+        self.assert_delegate(self.launch())
+        report = json.loads((self.evidence / "report.json").read_text())
+        self.assertEqual(report["reasons"], reasons)
+        self.assertEqual(report["disposition"], "unknown_hold")
+        self.assertEqual(report["observations"], REPORT["observations"])
+        self.assertNotIn("secret", json.dumps(report))
+
+    def test_malformed_reports_are_bounded_typed_and_unknown(self):
+        unknown = wrapper.sanitized(b"not json")
+        self.assertEqual(unknown["disposition"], "unknown_hold")
+        self.assertIs(unknown["paperclip_qualified"], False)
+        for value in ([], None, "secret", {"host": []},
+                      {"fixture_executed": True, "fixture_executed": "secret"}):
+            with self.subTest(value=value):
+                result = wrapper.sanitized(json.dumps(value).encode())
+                self.assertEqual(result["disposition"], "unknown_hold")
+                self.assertIsNone(result["fixture_executed"])
+        malformed = dict(REPORT, disposition="secret", unit="secret.scope",
+                         unit_owner_uid=True, scope_cgroup="/../secret",
+                         observed_members=[True, 0, -1, "123", 2**32],
+                         observations=[dict(fixture="secret", pid=123, cgroup=GROUP)],
+                         host=dict(uid=-1, cgroup_v2=1, current_cgroup="secret",
+                                   git_version="secret", systemd_version="x" * 161),
+                         reasons=["secret"], unknown="secret")
+        result = wrapper.sanitized(json.dumps(malformed).encode())
+        self.assertEqual(result["disposition"], "unknown_hold")
+        self.assertEqual(result["observed_members"], [])
+        self.assertEqual(result["observations"], [])
+        self.assertNotIn("secret", json.dumps(result))
+        self.assertNotEqual(result.get("unit_owner_uid"), True)
+        for key in ("observed_members", "observations", "reasons"):
+            oversized = dict(REPORT, **{key: [REPORT[key][0] if REPORT[key] else "secret"] * 513})
+            result = wrapper.sanitized(json.dumps(oversized).encode())
+            self.assertLessEqual(len(result.get(key, [])), 512)
+        self.assertEqual(wrapper.sanitized(b'{"fixture_executed":true,"fixture_executed":false}'), unknown)
 
     def test_repeated_and_concurrent_launches_share_one_claim(self):
         children = [subprocess.Popen([sys.executable, str(WRAPPER), "--acp", "space arg"],
