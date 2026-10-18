@@ -1,4 +1,4 @@
-//! Bounded capture for read-only Git inventory subprocesses.
+//! Bounded Git capture with owned process-group cleanup (not malicious setsid containment).
 use std::{
     io::{self, Read},
     process::{Command, Output, Stdio},
@@ -10,13 +10,16 @@ pub(crate) fn output(
     timeout: Duration,
     limit: usize,
 ) -> Result<Output, &'static str> {
+    use std::os::unix::process::CommandExt;
     const IO_ERROR: &str = "Git process I/O unavailable; inventory incomplete";
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|_| IO_ERROR)?;
+    let group = rustix::process::Pid::from_raw(child.id() as i32).ok_or(IO_ERROR)?;
     let result = (|| {
         let mut stdout = child.stdout.take().ok_or(IO_ERROR)?;
         let mut stderr = child.stderr.take().ok_or(IO_ERROR)?;
@@ -63,14 +66,18 @@ pub(crate) fn output(
                     Err(_) => return Err(IO_ERROR),
                 }
             }
-            if let Some(status) = child.try_wait().map_err(|_| IO_ERROR)? {
-                if eof == [true; 2] {
-                    return Ok(Output {
-                        status,
-                        stdout: out,
-                        stderr: err,
-                    });
-                }
+            // Observe exit without reaping: keep the leader PID/group owned until
+            // cleanup, avoiding a recycled process-group ID after try_wait/reap.
+            use rustix::process::{waitid, WaitId, WaitIdOptions};
+            if eof == [true; 2]
+                && waitid(
+                    WaitId::Pid(group),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                )
+                .map_err(|_| IO_ERROR)?
+                .is_some()
+            {
+                return Ok((out, err));
             }
             if !progressed {
                 std::thread::sleep(Duration::from_millis(5));
@@ -79,16 +86,36 @@ pub(crate) fn output(
     })();
     // Every failure path, including setup/read failures, kills and reaps. No
     // reader threads survive a deadline and neither pipe grows without bound.
+    // Kill the owned group even when the leader exited successfully: descendants
+    // must not escape through closed capture pipes. Never target the caller's group.
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     if result.is_err() {
         let _ = child.kill();
-        let _ = child.wait();
     }
-    result
+    let status = child.wait().map_err(|_| IO_ERROR);
+    let (stdout, stderr) = result?;
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timeout_kills_descendants_holding_capture_pipes() {
+        let temp = tempfile::tempdir().unwrap();
+        let sentinel = temp.path().join("survived");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("(sleep 0.2; touch {}) & wait", sentinel.display()));
+        assert!(output(&mut command, Duration::from_millis(30), 1024).is_err());
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!sentinel.exists(), "descendant survived timeout");
+    }
     #[test]
     fn captures_normal_output() {
         let result = output(

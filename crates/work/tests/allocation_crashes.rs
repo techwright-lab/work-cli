@@ -88,10 +88,89 @@ fn subprocess_abort_boundaries_retain_exact_path_and_charge() {
 }
 
 #[test]
+fn reserved_retry_rejects_replaced_source_authority() {
+    let f = Fixture::new();
+    let operation = Uuid::now_v7();
+    let request = Start {
+        operation,
+        repository: Some(f.repo.clone()),
+        root: Some(f.root.clone()),
+        actor: Some("alice".into()),
+        owner: None,
+        task: "task".into(),
+        branch: Some("topic".into()),
+        base: "main".into(),
+        reuse_branch: false,
+    };
+    std::fs::write(
+        f.temp.path().join("request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "allocation_worker"])
+        .env("WORK_ALLOCATION_BASE", f.temp.path())
+        .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+        .env("WORK_ALLOCATION_BOUNDARY", "reserved")
+        .current_dir(f.temp.path())
+        .status()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(6));
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let before: (String, Vec<u8>) = conn
+        .query_row("SELECT repository,digest FROM checkouts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    let other = f.temp.path().join("other");
+    git(
+        f.temp.path(),
+        &[
+            "clone",
+            "--no-local",
+            f.repo.to_str().unwrap(),
+            other.to_str().unwrap(),
+        ],
+    );
+    std::fs::rename(&f.repo, f.temp.path().join("original")).unwrap();
+    git(
+        &other,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "replacement",
+            f.repo.to_str().unwrap(),
+            "main",
+        ],
+    );
+    let out = f.start(&operation.to_string(), "task", "topic", &[]);
+    assert!(!out.status.success(), "reservation retargeted");
+    assert!(!f.root.join("task").exists());
+    assert!(!git(&other, &["worktree", "list", "--porcelain"]).contains(f.root.to_str().unwrap()));
+    let after: (String, Vec<u8>) = conn
+        .query_row("SELECT repository,digest FROM checkouts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(before, after);
+    let state: (String, bool) = conn
+        .query_row("SELECT state,ready FROM checkouts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, ("held".into(), false));
+}
+
+#[test]
 fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
     for damage in [
         "reboot",
         "malformed",
+        "marker-fifo",
+        "marker-oversized",
+        "marker-symlink",
         "copied",
         "inode",
         "missing",
@@ -142,6 +221,23 @@ fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
             }
             "bad-record" | "missing-record" => {}
             "wrong-id" => record["checkout"] = Uuid::now_v7().to_string().into(),
+            "marker-fifo" => {
+                std::fs::remove_file(&marker).unwrap();
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &marker,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                    0,
+                )
+                .unwrap();
+            }
+            "marker-oversized" => std::fs::write(&marker, vec![b' '; 16385]).unwrap(),
+            "marker-symlink" => {
+                let original = marker.with_extension("original");
+                std::fs::rename(&marker, &original).unwrap();
+                std::os::unix::fs::symlink(original, &marker).unwrap();
+            }
             "malformed" => std::fs::write(&marker, b"{").unwrap(),
             "missing" => std::fs::remove_file(&marker).unwrap(),
             "copied" => {
@@ -278,6 +374,163 @@ fn readiness_rechecks_marker_after_external_side_effects() {
         assert_eq!(ids.len(), 1);
         assert!(s.acquire_writer(ids[0], Uuid::now_v7()).is_err());
     }
+}
+
+#[test]
+fn fifo_backlink_is_not_opened_as_blocking_metadata() {
+    let f = Fixture::new();
+    let op = Uuid::now_v7().to_string();
+    assert!(f.start(&op, "task", "topic", &[]).status.success());
+    let identity = work_cli::identity::CheckoutIdentity::inspect(&f.root.join("task")).unwrap();
+    let backlink = identity.private_git_dir.join("gitdir");
+    std::fs::remove_file(&backlink).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &backlink,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_work"))
+        .args([
+            "start",
+            "--operation",
+            &op,
+            "--repository",
+            f.repo.to_str().unwrap(),
+            "--root",
+            f.root.to_str().unwrap(),
+            "--actor",
+            "alice",
+            "--task",
+            "task",
+            "--branch",
+            "topic",
+            "--base",
+            "main",
+        ])
+        .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let before = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success(), "FIFO backlink adopted");
+            break;
+        }
+        if before.elapsed() > std::time::Duration::from_secs(4) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("metadata read blocked past deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+    assert!(f.root.join("task").exists());
+}
+
+#[test]
+fn blocked_git_on_reserved_retry_is_bounded_and_persistently_held() {
+    let f = Fixture::new();
+    let operation = Uuid::now_v7();
+    let request = Start {
+        operation,
+        repository: Some(f.repo.clone()),
+        root: Some(f.root.clone()),
+        actor: Some("alice".into()),
+        owner: None,
+        task: "task".into(),
+        branch: Some("topic".into()),
+        base: "main".into(),
+        reuse_branch: false,
+    };
+    std::fs::write(
+        f.temp.path().join("request.json"),
+        serde_json::to_vec(&request).unwrap(),
+    )
+    .unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "allocation_worker"])
+        .env("WORK_ALLOCATION_BASE", f.temp.path())
+        .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+        .env("WORK_ALLOCATION_BOUNDARY", "reserved")
+        .current_dir(f.temp.path())
+        .status()
+        .unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(6));
+    let config = f.repo.join(".git/config");
+    std::fs::rename(&config, config.with_extension("original")).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &config,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .unwrap();
+    let before = std::time::Instant::now();
+    let out = f.start(&operation.to_string(), "task", "topic", &[]);
+    assert!(!out.status.success());
+    assert!(before.elapsed() < std::time::Duration::from_secs(4));
+    assert!(!f.root.join("task").exists());
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let state: (String, bool) = conn
+        .query_row("SELECT state,ready FROM checkouts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, ("held".into(), false));
+    assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+}
+
+#[test]
+fn moved_reuse_branch_boundary_is_persistently_held() {
+    let f = Fixture::new();
+    git(&f.repo, &["branch", "topic"]);
+    let config = Config {
+        store_dir: Some(f.temp.path().join("private")),
+        trusted_registry: Some(f.temp.path().join("registry")),
+        roots: vec![f.root.clone()],
+        repositories: vec![f.repo.clone()],
+        allocation: Some(work_cli::config::AllocationPolicy {
+            repository_limit: 10,
+            owner_limit: 10,
+            floor_bytes: 0,
+            warn_bytes: 0,
+            capture_sink: None,
+        }),
+    };
+    let request = Start {
+        operation: Uuid::now_v7(),
+        repository: Some(f.repo.clone()),
+        root: Some(f.root.clone()),
+        actor: Some("alice".into()),
+        owner: None,
+        task: "task".into(),
+        branch: Some("topic".into()),
+        base: "main".into(),
+        reuse_branch: true,
+    };
+    assert!(start_observed(&config, request, |boundary| {
+        if boundary == "reserved" {
+            git(&f.repo, &["commit", "--allow-empty", "-m", "advance"]);
+            git(&f.repo, &["branch", "-f", "topic", "main"]);
+        }
+    })
+    .is_err());
+    assert!(!f.root.join("task").exists());
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let state: (String, bool) = conn
+        .query_row("SELECT state,ready FROM checkouts", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(state, ("held".into(), false));
+    assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
 }
 
 #[test]

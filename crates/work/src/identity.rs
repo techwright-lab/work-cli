@@ -3,7 +3,8 @@
 //! intent first. Rename does not revoke cwd/open FDs. No removal or rename fallback.
 use std::{
     fs, io,
-    os::unix::fs::MetadataExt,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -26,21 +27,28 @@ fn hold(reason: &str) -> io::Error {
     io::Error::other(reason)
 }
 fn git(path: &Path, args: &[&std::ffi::OsStr]) -> io::Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(path)
-        // Repository-selection overrides must not redirect the identity query.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CONFIG_COUNT")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()?;
+    let output = crate::bounded_process::output(
+        Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "credential.helper=",
+            ])
+            .args(args)
+            .current_dir(path),
+        std::time::Duration::from_secs(2),
+        1024 * 1024,
+    )
+    .map_err(hold)?;
     if !output.status.success() {
         return Err(hold(
             "Git operation failed; hold for reconciliation (no fallback)",
@@ -50,6 +58,51 @@ fn git(path: &Path, args: &[&std::ffi::OsStr]) -> io::Result<String> {
         .map(|s| s.trim_end_matches('\n').to_owned())
         .map_err(|_| hold("non-UTF8 Git identity unsupported"))
 }
+/// Open first, then validate the descriptor: no symlink/FIFO/device or unbounded reads.
+pub(crate) fn read_metadata(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(hold("non-regular Git metadata"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(hold("Git metadata exceeds byte limit"));
+    }
+    Ok(bytes)
+}
+
+/// Controlled creation: executable checkout filters (including LFS) are unsupported.
+/// Inspect every effective value, including includes and worktree-local configuration.
+pub(crate) fn preflight_creation(path: &Path) -> io::Result<()> {
+    // --list succeeds for an empty filter set, unlike --get-regexp's ambiguous exit 1.
+    let config = query(path, &["config", "--null", "--list"])?;
+    for entry in config.split('\0') {
+        if let Some((key, value)) = entry.split_once('\n') {
+            let key = key.to_ascii_lowercase();
+            // A new private gitdir/branch can activate previously inactive config.
+            // Until target-context includes are qualified, fail closed, not override.
+            if key.starts_with("includeif.") {
+                return Err(hold(
+                    "conditional Git configuration unsupported for controlled creation",
+                ));
+            }
+            if key.starts_with("filter.")
+                && (key.ends_with(".smudge") || key.ends_with(".process"))
+                && !value.is_empty()
+            {
+                return Err(hold(
+                    "executable checkout filters unsupported; no filter override is available",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn query(path: &Path, args: &[&str]) -> io::Result<String> {
     git(
         path,
@@ -78,7 +131,9 @@ impl CheckoutIdentity {
         )?)
         .canonicalize()?;
         if private_git_dir != common_git_dir {
-            let backlink = fs::read_to_string(private_git_dir.join("gitdir"))?;
+            let backlink =
+                String::from_utf8(read_metadata(&private_git_dir.join("gitdir"), 16384)?)
+                    .map_err(|_| hold("non-UTF8 backlink"))?;
             if Path::new(backlink.trim_end_matches('\n')) != path.join(".git") {
                 return Err(hold("Git backlink mismatch"));
             }
@@ -162,4 +217,32 @@ pub fn move_worktree(
         return Err(hold("post-move identity mismatch; reconcile both paths"));
     }
     Ok(moved)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn git_child_environment_is_minimal() {
+        if std::env::var_os("WORK_ENV_PROBE").is_some() {
+            let temp = tempfile::tempdir().unwrap();
+            let env = super::query(temp.path(), &["-c", "alias.probe=!env", "probe"]).unwrap();
+            assert!(
+                !env.contains("must-not-reach-git"),
+                "credential leaked: {env}"
+            );
+            assert!(!env.contains("WORK_ENV_PROBE="));
+            return;
+        }
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "identity::tests::git_child_environment_is_minimal"
+            ])
+            .env("WORK_ENV_PROBE", "1")
+            .env("AWS_SECRET_ACCESS_KEY", "must-not-reach-git")
+            .env("GITHUB_TOKEN", "must-not-reach-git")
+            .status()
+            .unwrap()
+            .success());
+    }
 }

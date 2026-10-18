@@ -5,7 +5,7 @@ use crate::{
     store::Store,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::PathBuf};
+use std::{io, path::PathBuf};
 use uuid::Uuid;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -101,11 +101,7 @@ fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
         )?;
     }
     let path = prior.private_git_dir.join("work-lease.json");
-    let m = fs::symlink_metadata(&path)?;
-    if !m.is_file() || m.len() > 16384 {
-        return Err(fail());
-    }
-    let marker: Marker = serde_json::from_slice(&fs::read(path)?)?;
+    let marker: Marker = serde_json::from_slice(&crate::identity::read_metadata(&path, 16384)?)?;
     if marker != Marker::from(a) {
         return Err(fail());
     }

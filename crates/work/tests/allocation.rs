@@ -436,6 +436,118 @@ fn allocation_retry_never_reverses_later_lifecycle_state() {
 }
 
 #[test]
+fn persisted_holds_cannot_escape_through_start() {
+    for damage in ["capture", "marker"] {
+        let f = Fixture::new();
+        let op = Uuid::now_v7().to_string();
+        let out = f.start(&op, "task", "topic", &[]);
+        assert!(out.status.success());
+        let a: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let marker = std::path::PathBuf::from(a["identity"]["private_git_dir"].as_str().unwrap())
+            .join("work-lease.json");
+        let original = std::fs::read(&marker).unwrap();
+        if damage == "capture" {
+            f.config(10, true);
+        } else {
+            std::fs::write(&marker, "{}").unwrap();
+        }
+        assert!(!f.start(&op, "task", "topic", &[]).status.success());
+        f.config(10, false);
+        std::fs::write(&marker, original).unwrap();
+        for operation in [&op, &Uuid::now_v7().to_string()] {
+            assert!(
+                !f.start(operation, "task", "topic", &[]).status.success(),
+                "{damage}: hold escaped"
+            );
+        }
+        let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        let state: (String, bool) = conn
+            .query_row("SELECT state,ready FROM checkouts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(state, ("held".into(), false));
+        assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+    }
+}
+
+#[test]
+fn executable_checkout_filters_are_rejected_before_materialization() {
+    for kind in ["smudge", "process", "conditional-smudge"] {
+        let f = Fixture::new();
+        std::fs::write(f.repo.join(".gitattributes"), "payload filter=sentinel\n").unwrap();
+        std::fs::write(f.repo.join("payload"), "payload").unwrap();
+        git(&f.repo, &["add", "."]);
+        git(&f.repo, &["commit", "-m", "attributes"]);
+        let sentinel = f.temp.path().join("executed");
+        if kind == "conditional-smudge" {
+            let included = f.temp.path().join("filter.config");
+            std::fs::write(
+                &included,
+                format!(
+                    "[filter \"sentinel\"]\nsmudge = touch {}; cat\n",
+                    sentinel.display()
+                ),
+            )
+            .unwrap();
+            git(
+                &f.repo,
+                &[
+                    "config",
+                    &format!("includeIf.gitdir:{}/.git/worktrees/.path", f.repo.display()),
+                    included.to_str().unwrap(),
+                ],
+            );
+        } else {
+            git(
+                &f.repo,
+                &[
+                    "config",
+                    &format!("filter.sentinel.{kind}"),
+                    &format!("touch {}; cat", sentinel.display()),
+                ],
+            );
+        }
+        let out = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+        assert!(!sentinel.exists(), "{kind} executed");
+        assert!(!out.status.success(), "{kind} was allowed");
+        assert!(!f.root.join("task").exists());
+    }
+}
+
+#[test]
+fn git_configuration_environment_cannot_inject_checkout_commands() {
+    let f = Fixture::new();
+    let sentinel = f.temp.path().join("injected");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_work"))
+        .args([
+            "start",
+            "--repository",
+            f.repo.to_str().unwrap(),
+            "--root",
+            f.root.to_str().unwrap(),
+            "--actor",
+            "alice",
+            "--task",
+            "task",
+            "--base",
+            "main",
+        ])
+        .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+        .env("GIT_CONFIG_PARAMETERS", "malformed-untrusted-config")
+        .env("AWS_SECRET_ACCESS_KEY", "must-not-reach-git")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(f.root.join("task/.git").exists());
+    assert!(!sentinel.exists());
+}
+
+#[test]
 fn no_config_is_actionable_and_quota_cannot_be_overridden() {
     let f = Fixture::new();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_work"))

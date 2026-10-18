@@ -101,14 +101,31 @@ branches require explicit `--reuse-branch`; their commits are preserved, never r
 Colliding destinations are never adopted, removed or replaced. Same-task lookup
 alone never grants a writer and a different operation cannot adopt an existing path.
 
-Full intent and reservation are committed together before Git. Allocation retries
-reconcile private-Git-directory marker, registration and durable/stat identity.
+Full intent and reservation are committed together before Git. Every create/resume
+checks source common-Git-directory identity against the durable charged repository,
+not just two fresh Git observations. Allocation retries reconcile private-Git-directory
+marker, registration and durable/stat identity. An explicit persisted hold cannot be
+released by ordinary start, even after configuration or metadata is repaired; it
+requires operator recovery outside start. Initial in-progress crash stages may reconcile.
 Incomplete creation (including create-before-marker crashes), altered metadata or
 unsupported layouts remain charged and held for operator reconciliation; nothing
 is deleted, timed out or automatically retired. Boot/device changes require durable
 identity reconciliation, not invented activity. Capture-enabled configurations are
 unsupported and fail closed. Schema-v1 migration preserves old charges with writer
 readiness false; doctor remains a no-migration existing-evidence reader for both versions.
+
+Controlled creation fails closed on any effective nonempty `filter.*.smudge` or
+`filter.*.process` configuration, including included configuration. LFS is not yet
+supported. Conditional includes are also rejected: a new gitdir/branch can activate
+configuration absent in the source context. There is no filter override option until
+these execution paths are qualified. Hooks and fsmonitor are disabled. Git runs via
+`/usr/bin/git` with a cleared environment, trusted `/usr/bin:/bin` PATH, disabled
+global/system config and prompts; credentials and `GIT_CONFIG_*` overrides are not
+inherited. Each Git subprocess has a two-second deadline and one-MiB capture bound
+per output stream, with owned process-group kill and child reap. This is not hard
+containment against malicious `setsid` descendants or concurrent same-UID mutation.
+Private marker/backlink reads require nonblocking, no-follow regular descriptors
+and a 16-KiB byte bound. Uncertainty retains the charge and never triggers deletion.
 
 ## Requirements
 

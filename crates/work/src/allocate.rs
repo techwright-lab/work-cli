@@ -213,7 +213,6 @@ fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {
     {
         return Err(err("unsafe branch/base ref"));
     }
-    query(repo, &["check-ref-format", &format!("refs/heads/{branch}")])?;
     r.branch = Some(branch);
     if r.operation.get_version_num() != 7 || r.operation.get_variant() != uuid::Variant::RFC4122 {
         return Err(err("operation must be UUIDv7"));
@@ -231,18 +230,6 @@ pub fn start_observed(
     mut boundary: impl FnMut(&str),
 ) -> io::Result<Allocation> {
     let r = normalize(config, request)?;
-    // Resolve configured aliases using Git outside the database write transaction.
-    let aliases = config
-        .repositories
-        .iter()
-        .map(|path| {
-            crate::config::validate_path(path, true).map_err(|_| err("unsafe repository alias"))?;
-            Ok((
-                path.clone(),
-                CheckoutIdentity::inspect(path)?.common_git_dir,
-            ))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
     let (mut store, _lock) = locked(config)?;
     if let Some(mut a) = load(&mut store, r.operation)? {
         if a.request != r {
@@ -253,9 +240,7 @@ pub fn start_observed(
             [a.checkout.to_string()],
             |row| row.get(0),
         ))?;
-        if !matches!(state.as_str(), "reserved" | "partial" | "active")
-            && !(state == "held" && a.stage == "held")
-        {
+        if a.stage == "held" || !matches!(state.as_str(), "reserved" | "partial" | "active") {
             return Err(err(
                 "later lifecycle state requires explicit recovery; start cannot reverse it",
             ));
@@ -273,6 +258,7 @@ pub fn start_observed(
         if a.stage == "reserved" {
             return create(config, &mut store, a, &mut boundary);
         }
+        source_authority(&mut store, &mut a)?;
         crate::recovery::reconcile(&mut store, &mut a)?;
         return if a.stage == "ready" {
             Ok(a)
@@ -291,6 +277,26 @@ pub fn start_observed(
         ));
     }
     let repo = r.repository.as_ref().unwrap();
+    query(
+        repo,
+        &[
+            "check-ref-format",
+            &format!("refs/heads/{}", r.branch.as_ref().unwrap()),
+        ],
+    )?;
+    // Resolve aliases only for new operations: retries first validate the durable
+    // charge and persist a hold even when source Git is unavailable.
+    let aliases = config
+        .repositories
+        .iter()
+        .map(|path| {
+            crate::config::validate_path(path, true).map_err(|_| err("unsafe repository alias"))?;
+            Ok((
+                path.clone(),
+                CheckoutIdentity::inspect(path)?.common_git_dir,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let source = CheckoutIdentity::inspect(repo)?;
     let common = &source.common_git_dir;
     let tx = sql(store.conn.transaction())?;
@@ -369,6 +375,7 @@ pub fn start_observed(
             crate::recovery::hold(&mut store, &mut a, "configured capture unsupported")?;
             return Err(err("configured capture unsupported"));
         }
+        source_authority(&mut store, &mut a)?;
         crate::recovery::reconcile(&mut store, &mut a)?;
         return if a.stage == "ready" {
             Ok(a)
@@ -448,6 +455,29 @@ pub fn start_observed(
     boundary("reserved");
     create(config, &mut store, a, &mut boundary)
 }
+// The charged row, not a second fresh Git query, is repository authority.
+fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf> {
+    let charged: String = sql(store.conn.query_row(
+        "SELECT repository FROM checkouts WHERE id=?1",
+        [a.checkout.to_string()],
+        |row| row.get(0),
+    ))?;
+    let result = CheckoutIdentity::inspect(a.request.repository.as_ref().unwrap());
+    match result {
+        Ok(source) if source.common_git_dir == std::path::Path::new(&charged) => {
+            Ok(source.common_git_dir)
+        }
+        _ => {
+            crate::recovery::hold(
+                store,
+                a,
+                "source repository differs from durable charged authority or is unavailable",
+            )?;
+            Err(err("source repository authority mismatch; allocation held"))
+        }
+    }
+}
+
 fn create(
     config: &Config,
     store: &mut Store,
@@ -468,12 +498,26 @@ fn create(
     a.stage = "creating".into();
     save(store, &a)?;
     boundary("intent");
+    let charged_common = source_authority(store, &mut a)?;
     let repo = a.request.repository.as_ref().unwrap();
     let branch = a.request.branch.as_ref().unwrap();
+    if let Err(e) = crate::identity::preflight_creation(repo) {
+        crate::recovery::hold(store, &mut a, &format!("creation preflight failed: {e}"))?;
+        return Err(e);
+    }
     let result = if a.request.reuse_branch {
         // Freeze the explicit existing branch boundary; do not reset it to base.
-        if query(repo, &["rev-parse", &format!("refs/heads/{branch}")])? != a.base_commit {
-            return Err(err("branch moved; charged intent requires reconciliation"));
+        if query(repo, &["rev-parse", &format!("refs/heads/{branch}")])
+            .ok()
+            .as_deref()
+            != Some(a.base_commit.as_str())
+        {
+            crate::recovery::hold(
+                store,
+                &mut a,
+                "branch moved or unavailable; charged intent requires reconciliation",
+            )?;
+            return Err(err("branch moved; allocation held"));
         }
         query(
             repo,
@@ -513,7 +557,7 @@ fn create(
         return Err(err("Git creation failed; allocation held"));
     }
     let identity = CheckoutIdentity::inspect(&a.destination)?;
-    if identity.common_git_dir != CheckoutIdentity::inspect(repo)?.common_git_dir
+    if identity.common_git_dir != charged_common
         || identity.private_git_dir == identity.common_git_dir
         || identity.head != a.base_commit
     {
