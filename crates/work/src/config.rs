@@ -39,8 +39,17 @@ impl Config {
     }
 
     fn from_toml(text: &str) -> Result<Self, Error> {
-        let value: toml::Value =
-            toml::from_str(text).map_err(|err| Error::Config(err.to_string()))?;
+        let value: toml::Value = toml::from_str(text).map_err(|err: toml::de::Error| {
+            // Parser diagnostics include source text and values; expose only location.
+            let mut diagnostic = "invalid TOML".to_owned();
+            if let Some(span) = err.span() {
+                let prefix = &text[..span.start.min(text.len())];
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                diagnostic.push_str(&format!(" at line {line}, column {column}"));
+            }
+            Error::Config(diagnostic)
+        })?;
         let store_dir = value
             .get("store_dir")
             .and_then(toml::Value::as_str)

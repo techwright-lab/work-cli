@@ -127,7 +127,8 @@ pub enum TaskCompletion {
 /// Versioned lifecycle document. Owner and events are required and cannot be null.
 /// JSON Schema validates fields; operation/entity ID separation is additionally
 /// enforced by Deserialize, since JSON Schema cannot compare arbitrary fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+// Serialize also enforces these invariants for publicly constructed envelopes.
+#[derive(Debug, Clone, PartialEq, Eq, JsonSchema)]
 pub struct LifecycleEnvelope {
     pub schema_version: SchemaVersion,
     pub operation_id: AllocationOperationId,
@@ -156,17 +157,22 @@ pub struct LifecycleEnvelope {
 }
 
 // Serde's remote derive constructs the public type without a second manual JSON
-// parser. The only custom deserialization step is the cross-field invariant.
-#[derive(Deserialize)]
+// parser. Both directions enforce the envelope invariants.
+#[derive(Serialize, Deserialize)]
 #[serde(remote = "LifecycleEnvelope")]
 struct EnvelopeFields {
     schema_version: SchemaVersion,
     operation_id: AllocationOperationId,
     checkout_id: CheckoutId,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<RunId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     group_id: Option<GroupId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run_ref: Option<RunRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     parent_run_ref: Option<RunRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     execution_chain: Option<ExecutionChain>,
     actor: ActorId,
     repository: RepositoryId,
@@ -174,10 +180,18 @@ struct EnvelopeFields {
     owner: OwnerId,
     mode: ExecutionMode,
     lifecycle: CheckoutLifecycle,
+    #[serde(skip_serializing_if = "Option::is_none")]
     run_outcome: Option<RunOutcome>,
     delivery: AttributionDelivery,
     task_completion: TaskCompletion,
     events: Vec<LifecycleEvent>,
+}
+
+impl Serialize for LifecycleEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        EnvelopeFields::serialize(self, serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for LifecycleEnvelope {
@@ -199,6 +213,12 @@ impl LifecycleEnvelope {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
+        if self.schema_version.major != SCHEMA_MAJOR {
+            return Err(ContractError::IncompatibleSchema {
+                major: self.schema_version.major,
+                minor: self.schema_version.minor,
+            });
+        }
         let operation = self.operation_id.to_string();
         let check = |kind, id: String| {
             if id == operation {

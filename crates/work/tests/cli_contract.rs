@@ -181,6 +181,23 @@ fn status_is_secret_free_and_has_no_host_defaults() {
     );
 }
 
+#[test]
+fn malformed_config_reports_only_safe_location() {
+    let root = IsolatedRoot::new();
+    fs::create_dir_all(root.root.join("config/work")).unwrap();
+    fs::write(
+        root.root.join("config/work/config.toml"),
+        "token = \"private-config-secret\" unexpected-secret\n",
+    )
+    .unwrap();
+    let output = run_work(&root, &["status"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "config error: invalid TOML at line 1, column 33\n"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn status_reports_linux_qualification() {

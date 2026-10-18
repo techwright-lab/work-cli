@@ -184,6 +184,61 @@ fn rejects_incompatible_schema_major() {
 }
 
 #[test]
+fn serialization_rejects_unsupported_schema_major() {
+    let mut envelope = parse_valid();
+    envelope.schema_version = SchemaVersion { major: 2, minor: 0 };
+    assert!(envelope.validate().is_err());
+    assert!(envelope.to_json().is_err());
+    assert!(serde_json::to_string(&envelope).is_err());
+}
+
+#[test]
+fn serialization_preserves_supported_schema_minors_and_optional_omission() {
+    for version in ["1.0", "1.1", "1.4294967295"] {
+        let mut envelope = parse_valid();
+        envelope.schema_version = SchemaVersion::parse(version).unwrap();
+        envelope.run_id = None;
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["schema_version"], version);
+        assert!(value.get("run_id").is_none());
+        assert_eq!(
+            serde_json::from_value::<LifecycleEnvelope>(value).unwrap(),
+            envelope
+        );
+    }
+}
+
+#[test]
+fn serialization_rejects_operation_entity_aliases() {
+    for field in ["checkout_id", "run_id", "group_id", "event_id"] {
+        let mut envelope = parse_valid();
+        match field {
+            "checkout_id" => envelope.checkout_id = CheckoutId::parse(OP).unwrap(),
+            "run_id" => envelope.run_id = Some(RunId::parse(OP).unwrap()),
+            "group_id" => envelope.group_id = Some(GroupId::parse(OP).unwrap()),
+            "event_id" => {
+                let mut event = valid_json()["events"][0].clone();
+                event["id"] = serde_json::json!(OP);
+                envelope.events = vec![serde_json::from_value(event).unwrap()];
+            }
+            _ => unreachable!(),
+        }
+        assert!(serde_json::to_string(&envelope).is_err(), "{field}");
+    }
+    for event in core_events() {
+        for field in ["run_id", "group_id", "checkout_id"] {
+            if event.get(field).is_some() {
+                let mut envelope = parse_valid();
+                let mut invalid = event.clone();
+                invalid[field] = serde_json::json!(OP);
+                envelope.events = vec![serde_json::from_value(invalid).unwrap()];
+                assert!(serde_json::to_string(&envelope).is_err(), "event {field}");
+            }
+        }
+    }
+}
+
+#[test]
 fn rejects_unknown_required_enums() {
     let cases = [
         ("mode", "telepathy"),
