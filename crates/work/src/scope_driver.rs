@@ -141,6 +141,14 @@ impl Driver {
         let _ = self.collect(intent, binding, roster, &mut obs);
         obs
     }
+    /// Freshly validate the private manager context. Never mutates process environment.
+    pub(crate) fn apply_manager_context(&self, command: &mut Command) -> Result<()> {
+        self.context.validate()?;
+        command
+            .env("XDG_RUNTIME_DIR", &self.context.directory)
+            .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
+        Ok(())
+    }
     /// Reobserve before signalling; errors never fall back to PID-based signalling.
     /// Successful manager exit is a request acknowledgement, not quiescence proof.
     pub(crate) fn cancel_bound(&self, intent: &LaunchIntent, binding: &Binding) -> Result<()> {
@@ -552,7 +560,7 @@ fn process(
     let cgroup = lines
         .next()
         .and_then(|l| l.strip_prefix("0::"))
-        .filter(|p| normalized(p))
+        .filter(|p| *p == "/" || normalized(p))
         .ok_or(HOLD)?;
     if lines.next().is_some() {
         return Err(HOLD);
@@ -665,6 +673,32 @@ fn participant_states(
 mod tests {
     use super::*;
 
+    #[test]
+    fn generic_process_reader_accepts_root_cgroup() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("42")).unwrap();
+        fs::write(
+            root.path().join("42/stat"),
+            format!("42 (parent) S {} 123 0\n", vec!["0"; 18].join(" ")),
+        )
+        .unwrap();
+        fs::write(root.path().join("42/cgroup"), "0::/\n").unwrap();
+        let limits = Limits::default();
+        let mut budget = Budget {
+            start: Instant::now(),
+            limits: &limits,
+            bytes: 0,
+        };
+        let identity = process(
+            &canonical_dir(root.path()).unwrap(),
+            42,
+            "boot",
+            &mut budget,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(identity.cgroup, "/");
+    }
     #[test]
     fn stat_pair_validates_stable_identity_only() {
         let stat = |pid, state, ticks, fields: &[&str]| {

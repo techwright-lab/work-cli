@@ -103,7 +103,7 @@ impl Process {
             && self.pid <= i32::MAX as u32
             && self.start_ticks > 0
             && self.boot == boot
-            && normalized(&self.cgroup)
+            && (self.cgroup == "/" || normalized(&self.cgroup))
     }
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

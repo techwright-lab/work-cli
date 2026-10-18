@@ -1,15 +1,13 @@
-//! Guarded handoff of an **already prepared** child, not a systemd-run launcher.
+//! Guarded handoff of an already prepared child; `scope_spawn` owns EXEC-style launch.
 //!
 //! Caller must durably persist launch intent and writer BEFORE constructing this
 //! handle, and persist `binding()` AFTER `bind` and BEFORE `release`. No method
 //! combines those boundaries. Dropping this handle never deletes gate records or
 //! claims closure; after release, journal recovery owns every uncertain outcome.
 //!
-//! This increment deliberately cannot spawn: `systemd-run` may fork, so preparing
-//! a context with the supervisor as the assumed immediate parent is unsafe. A
-//! future launcher must discover/revalidate the actual child and parent, prove
-//! launch ancestry and owned-unit membership, and monitor the controller before
-//! adopting its gate here. This module supplies none of that bootstrap proof.
+//! `scope_spawn` supports systemd's EXEC-style scope launch only: the ready PID
+//! must remain the owned launcher PID and the child validates its actual parent.
+//! This lower-level gate adapter alone does not authenticate launch ancestry.
 use crate::{
     runtime_scope::{self, Binding, LaunchIntent},
     scope_child::Prepared,
@@ -105,6 +103,10 @@ impl GuardedLaunch {
     /// Irreversible gate publication. Caller MUST journal binding before this call.
     /// Reobserve immediately; cached bind-time membership cannot release a writer.
     pub fn release(&mut self, driver: &Driver) -> Result<()> {
+        self.validate_release(driver)?;
+        self.publish_release()
+    }
+    pub(crate) fn validate_release(&mut self, driver: &Driver) -> Result<()> {
         if self.phase != Phase::Bound || self.outcome != Outcome::Pending {
             return Err(HOLD);
         }
@@ -119,12 +121,27 @@ impl GuardedLaunch {
                 MAX_AGE,
             )
             .map_err(|_| HOLD)?;
-            self.gate.release(binding)?;
-            self.phase = Phase::Released;
-            self.outcome = Outcome::WriterReleased;
             Ok(())
         })();
         self.record(result)
+    }
+    pub(crate) fn publish_release(&mut self) -> Result<()> {
+        let result = self
+            .binding
+            .as_ref()
+            .ok_or(HOLD)
+            .and_then(|binding| self.gate.release(binding));
+        if result.is_ok() {
+            self.phase = Phase::Released;
+            self.outcome = Outcome::WriterReleased;
+        }
+        self.record(result)
+    }
+    pub(crate) fn ready_pid(&self) -> Result<Option<u32>> {
+        Ok(self.gate.read_ready()?.map(|ready| ready.child().pid))
+    }
+    pub(crate) fn recovery_hold(&mut self) {
+        self.outcome = Outcome::RecoveryHold;
     }
     /// Only the exact freshly observed bound unit is eligible. No PID/killpg fallback.
     /// Does not authorize deletion, retirement, or a closed journal outcome.

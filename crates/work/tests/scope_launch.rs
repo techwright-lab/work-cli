@@ -1,4 +1,6 @@
 //! Library-only snapshots exercise handoff guards, not OS containment proof.
+#[path = "support/scope_spawn.rs"]
+mod owned;
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, net::UnixListener},

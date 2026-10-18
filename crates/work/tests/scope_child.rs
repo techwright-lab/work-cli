@@ -99,6 +99,43 @@ impl LibraryCollector for Fixture {
     }
 }
 #[test]
+fn root_cgroup_parent_is_valid_but_root_child_is_not_scope_evidence() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let mut parent = identity(777);
+    parent.cgroup = "/".into();
+    assert!(prepare(
+        dir.path(),
+        &intent(),
+        &parent,
+        &std::env::current_dir().unwrap(),
+        OriginalRuntime::new(None, None),
+        Duration::from_secs(1)
+    )
+    .is_ok());
+    let mut child = identity(42);
+    child.cgroup = "/".into();
+    let now = Instant::now();
+    let observation = Observation {
+        boot: BOOT.into(),
+        observed_at: now,
+        unit: UnitPresence::Present {
+            identity: ScopeIdentity {
+                unit: intent().unit_name().into(),
+                invocation: "b312459a93464d029139c80a7017d962".into(),
+                cgroup: identity(1).cgroup,
+            },
+            load: LoadStatus::Loaded,
+            active: ActiveStatus::Active,
+        },
+        membership: Membership::Present(vec![child.clone()]),
+        recursive_coverage: Coverage::Complete,
+        participant_coverage: Coverage::Unknown,
+        participants: vec![],
+    };
+    assert!(bind(&intent(), &child, &observation, now, Duration::from_secs(1)).is_err());
+}
+#[test]
 fn local_child() {
     let Some(context) = std::env::var_os("CHILD_CONTEXT") else {
         return;
