@@ -40,6 +40,320 @@ fn start_is_durable_idempotent_policy_bound_and_not_a_writer() {
 }
 
 #[test]
+fn normal_start_reuses_key_under_reduced_capacity_and_changed_root_branch() {
+    let f = Fixture::new();
+    let run = |extra: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_work"))
+            .args([
+                "start",
+                "--repository",
+                f.repo.to_str().unwrap(),
+                "--root",
+                f.root.to_str().unwrap(),
+                "--actor",
+                "alice",
+                "--task",
+                "task",
+            ])
+            .args(extra)
+            .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+            .output()
+            .unwrap()
+    };
+    let first = run(&[]);
+    assert!(first.status.success());
+    let original: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    let other = f.temp.path().join("other-root");
+    std::fs::create_dir(&other).unwrap();
+    let config_path = f.temp.path().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace(
+            &format!("roots = [{:?}]", f.root),
+            &format!("roots = [{:?}, {:?}]", f.root, other),
+        )
+        .replace("repository_limit = 10", "repository_limit = 0")
+        .replace("owner_limit = 10", "owner_limit = 0")
+        .replace("floor_bytes = 0", "floor_bytes = 9223372036854775807")
+        .replace("warn_bytes = 0", "warn_bytes = 9223372036854775807");
+    std::fs::write(config_path, config).unwrap();
+    let repeated = run(&["--branch", "different"]);
+    assert!(
+        repeated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(value["checkout"], original["checkout"]);
+    assert_eq!(
+        value["request"]["operation"],
+        original["request"]["operation"]
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_work"))
+        .args([
+            "start",
+            "--repository",
+            f.repo.to_str().unwrap(),
+            "--root",
+            other.to_str().unwrap(),
+            "--actor",
+            "alice",
+            "--task",
+            "task",
+            "--branch",
+            "different",
+        ])
+        .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!other.join("task").exists());
+}
+
+#[test]
+fn ready_descendant_commit_is_reused_but_changed_branch_is_held() {
+    let f = Fixture::new();
+    let op = Uuid::now_v7().to_string();
+    assert!(f.start(&op, "task", "topic", &[]).status.success());
+    let checkout = f.root.join("task");
+    let identity = work_cli::identity::CheckoutIdentity::inspect(&checkout).unwrap();
+    let marker = identity.private_git_dir.join("work-lease.json");
+    let baseline = std::fs::read(&marker).unwrap();
+    git(&checkout, &["commit", "--allow-empty", "-m", "work"]);
+    let committed = git(&checkout, &["rev-parse", "HEAD"]);
+    for operation in [&op, &Uuid::now_v7().to_string()] {
+        let out = f.start(operation, "task", "topic", &[]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(std::fs::read(&marker).unwrap(), baseline);
+    assert!(f.store().pending_events(100).unwrap().iter().any(|event| matches!(
+        &event.event, work_cli::events::Event::HeadAdvanced { old, new, .. } if old == &identity.head && new == &committed
+    )));
+    git(&checkout, &["checkout", "-b", "changed"]);
+    assert!(!f.start(&op, "task", "topic", &[]).status.success());
+    assert!(!f
+        .start(&Uuid::now_v7().to_string(), "task", "topic", &[])
+        .status
+        .success());
+}
+
+#[test]
+fn sibling_alias_and_legacy_path_charge_share_capacity() {
+    for legacy in [false, true] {
+        let f = Fixture::new();
+        let sibling = f.temp.path().join("sibling");
+        git(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        );
+        if legacy {
+            f.store()
+                .reserve(
+                    &work_cli::admission::Reservation {
+                        operation: Uuid::now_v7(),
+                        repository: f.repo.clone(),
+                        actor: "old".into(),
+                        owner: "old".into(),
+                        task: "old".into(),
+                    },
+                    work_cli::admission::Limits {
+                        repository: 10,
+                        owner: 10,
+                        available_bytes: Some(100),
+                        floor_bytes: 0,
+                        warn_bytes: 0,
+                    },
+                )
+                .unwrap();
+            // Recreate the actual pre-v2 schema, retaining the charge and digest.
+            let conn =
+                rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+            conn.execute_batch("DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;").unwrap();
+        } else {
+            assert!(f
+                .start(&Uuid::now_v7().to_string(), "first", "first", &[])
+                .status
+                .success());
+        }
+        f.config(1, false);
+        let p = f.temp.path().join("config.toml");
+        let config = std::fs::read_to_string(&p).unwrap().replace(
+            &format!("repositories = [{:?}]", f.repo),
+            &format!("repositories = [{:?}, {:?}]", f.repo, sibling),
+        );
+        std::fs::write(p, config).unwrap();
+        let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        let charge: (String, Vec<u8>) = conn
+            .query_row("SELECT repository,digest FROM checkouts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_work"))
+            .args([
+                "start",
+                "--repository",
+                sibling.to_str().unwrap(),
+                "--root",
+                f.root.to_str().unwrap(),
+                "--actor",
+                "alice",
+                "--task",
+                "second",
+            ])
+            .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "legacy={legacy}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert!(!f.root.join("second").exists());
+        assert_eq!(f.store().charged(&sibling, None).unwrap(), 1);
+        let retained: (String, Vec<u8>) = conn
+            .query_row("SELECT repository,digest FROM checkouts", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            charge, retained,
+            "registration never rewrites legacy accounting evidence"
+        );
+    }
+}
+
+#[test]
+fn unresolved_legacy_charge_fails_closed_without_changing_digest() {
+    let f = Fixture::new();
+    let unknown = f.temp.path().join("unknown");
+    std::fs::create_dir(&unknown).unwrap();
+    f.store()
+        .reserve(
+            &work_cli::admission::Reservation {
+                operation: Uuid::now_v7(),
+                repository: unknown,
+                actor: "old".into(),
+                owner: "old".into(),
+                task: "old".into(),
+            },
+            work_cli::admission::Limits {
+                repository: 10,
+                owner: 10,
+                available_bytes: Some(100),
+                floor_bytes: 0,
+                warn_bytes: 0,
+            },
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let digest: Vec<u8> = conn
+        .query_row("SELECT digest FROM checkouts", [], |r| r.get(0))
+        .unwrap();
+    let out = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+    assert!(!out.status.success());
+    assert!(!f.root.join("task").exists());
+    let retained: Vec<u8> = conn
+        .query_row("SELECT digest FROM checkouts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(digest, retained);
+}
+
+#[test]
+fn concurrent_same_key_starts_return_one_checkout() {
+    let f = Fixture::new();
+    let barrier = std::sync::Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    f.start(&Uuid::now_v7().to_string(), "task", "topic", &[])
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let values: Vec<serde_json::Value> = results
+        .iter()
+        .map(|out| {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            serde_json::from_slice(&out.stdout).unwrap()
+        })
+        .collect();
+    assert_eq!(values[0]["checkout"], values[1]["checkout"]);
+    assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+}
+
+#[test]
+fn ambiguous_key_revokes_readiness_and_keeps_both_charges() {
+    let f = Fixture::new();
+    assert!(f
+        .start(&Uuid::now_v7().to_string(), "task", "topic", &[])
+        .status
+        .success());
+    f.store()
+        .reserve(
+            &work_cli::admission::Reservation {
+                operation: Uuid::now_v7(),
+                repository: f.repo.clone(),
+                actor: "alice".into(),
+                owner: "alice".into(),
+                task: "task".into(),
+            },
+            work_cli::admission::Limits {
+                repository: 10,
+                owner: 10,
+                available_bytes: Some(100),
+                floor_bytes: 0,
+                warn_bytes: 0,
+            },
+        )
+        .unwrap();
+    assert!(!f
+        .start(&Uuid::now_v7().to_string(), "task", "topic", &[])
+        .status
+        .success());
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let ready: i64 = conn
+        .query_row("SELECT sum(ready) FROM checkouts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ready, 0);
+    assert_eq!(f.store().charged(&f.repo, None).unwrap(), 2);
+    let path_keyed: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM checkouts WHERE repository=?1",
+            [f.repo.to_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        path_keyed, 0,
+        "new reservations use the registered common identity"
+    );
+}
+
+#[test]
 fn unsafe_names_collisions_and_unsupported_capture_never_grant_ready() {
     for name in ["../escape", "-option", "a/b", ".", "a..b"] {
         let f = Fixture::new();

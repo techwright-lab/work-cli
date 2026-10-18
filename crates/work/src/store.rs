@@ -124,7 +124,10 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && version == 2) || (pending && version == 0)) {
+    if !(version == 1
+        || (name == "store.sqlite" && matches!(version, 2..=3))
+        || (pending && version == 0))
+    {
         return Err(StoreError::Unsafe);
     }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
@@ -339,7 +342,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=2) {
+        if !matches!(version, 0..=3) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -360,6 +363,10 @@ impl Store {
                 CREATE TABLE allocations(checkout TEXT PRIMARY KEY REFERENCES checkouts(id), request TEXT NOT NULL, record TEXT NOT NULL);
                 PRAGMA user_version=2;")?;
         }
+        if version < 3 {
+            tx.execute_batch("CREATE TABLE repository_aliases(alias TEXT PRIMARY KEY, common TEXT NOT NULL); PRAGMA user_version=3;")?;
+        }
+        tx.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
         tx.prepare("SELECT ready FROM checkouts LIMIT 0")?;
         tx.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
         // Never repair a versioned schema by manufacturing empty accounting.
@@ -388,7 +395,7 @@ impl Store {
     }
     pub fn find_reusable(&self, actor: &str, repository: &Path, task: &str) -> Result<Vec<Uuid>> {
         let repo = canonical(repository)?;
-        let mut stmt = self.conn.prepare("SELECT id FROM checkouts WHERE actor=?1 AND repository=?2 AND task=?3 AND state!='retired' ORDER BY rowid")?;
+        let mut stmt = self.conn.prepare("SELECT id FROM checkouts c WHERE actor=?1 AND COALESCE((SELECT common FROM repository_aliases WHERE alias=c.repository),c.repository)=COALESCE((SELECT common FROM repository_aliases WHERE alias=?2),?2) AND task=?3 AND state!='retired' ORDER BY rowid")?;
         let ids = stmt
             .query_map((actor, repo, task), |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -540,7 +547,8 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && version == 2)) || integrity != "ok" {
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=3))) || integrity != "ok"
+    {
         return Err(StoreError::Unsafe);
     }
     Ok(conn)
@@ -646,7 +654,18 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
 }
 
 pub(crate) fn count(conn: &Connection, repo: &str, owner: Option<&str>) -> Result<u64> {
-    let n: i64 = conn.query_row("SELECT count(*) FROM checkouts WHERE repository=?1 AND state!='retired' AND (?2 IS NULL OR owner=?2)", (repo,owner), |r| r.get(0))?;
+    let mapped: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM repository_aliases WHERE alias=?1 OR common=?1)",
+        [repo],
+        |r| r.get(0),
+    )?;
+    if mapped {
+        let unresolved: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts c WHERE state!='retired' AND NOT EXISTS(SELECT 1 FROM repository_aliases a WHERE a.alias=c.repository OR a.common=c.repository))", [], |r| r.get(0))?;
+        if unresolved {
+            return Err(StoreError::Unsafe);
+        }
+    }
+    let n: i64 = conn.query_row("SELECT count(*) FROM checkouts c WHERE COALESCE((SELECT common FROM repository_aliases WHERE alias=c.repository),c.repository)=COALESCE((SELECT common FROM repository_aliases WHERE alias=?1),?1) AND state!='retired' AND (?2 IS NULL OR owner=?2)", (repo,owner), |r| r.get(0))?;
     u64::try_from(n).map_err(|_| StoreError::Invalid)
 }
 pub(crate) fn emit(conn: &Connection, event: &Event) -> Result<()> {

@@ -9,6 +9,12 @@ pub enum Event {
         stage: String,
         reason: Option<String>,
     },
+    /// Observed ancestry, not evidence of process authorship.
+    HeadAdvanced {
+        checkout: Uuid,
+        old: String,
+        new: String,
+    },
     Reserved {
         checkout: Uuid,
         low_disk: bool,

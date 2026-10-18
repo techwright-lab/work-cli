@@ -91,7 +91,9 @@ impl Store {
             return Err(StoreError::Capacity);
         }
         let checkout = Uuid::now_v7();
-        tx.execute("INSERT INTO checkouts(id,operation,digest,repository,actor,task,owner) VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![checkout.to_string(),request.operation.to_string(),digest,repo,request.actor,request.task,request.owner])?;
+        // Keep the original request digest immutable, including for pre-mapping
+        // retries, while all new charges use the authority's common identity.
+        tx.execute("INSERT INTO checkouts(id,operation,digest,repository,actor,task,owner) VALUES(?1,?2,?3,COALESCE((SELECT common FROM repository_aliases WHERE alias=?4),?4),?5,?6,?7)", rusqlite::params![checkout.to_string(),request.operation.to_string(),digest,repo,request.actor,request.task,request.owner])?;
         emit(
             &tx,
             &Event::Reserved {

@@ -98,6 +98,10 @@ fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
         "bad-record",
         "wrong-id",
         "missing-record",
+        "gitdir",
+        "registration",
+        "replacement",
+        "nonancestor",
     ] {
         let f = Fixture::new();
         let op = Uuid::now_v7().to_string();
@@ -113,6 +117,29 @@ fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
                 record["identity"]["directory"]["device"] = 999999.into();
             }
             "inode" => record["identity"]["directory"]["inode"] = 0.into(),
+            "gitdir" => std::fs::write(
+                f.root.join("task/.git"),
+                format!("gitdir: {}\n", f.repo.join(".git").display()),
+            )
+            .unwrap(),
+            "registration" => std::fs::write(
+                marker.parent().unwrap().join("gitdir"),
+                f.root.join("wrong/.git").to_str().unwrap(),
+            )
+            .unwrap(),
+            "replacement" => {
+                std::fs::rename(f.root.join("task"), f.root.join("original")).unwrap();
+                std::fs::create_dir(f.root.join("task")).unwrap();
+                std::fs::copy(f.root.join("original/.git"), f.root.join("task/.git")).unwrap();
+            }
+            "nonancestor" => {
+                let path = f.root.join("task");
+                git(&path, &["checkout", "--orphan", "unrelated"]);
+                git(&path, &["commit", "--allow-empty", "-m", "unrelated"]);
+                let head = git(&path, &["rev-parse", "HEAD"]);
+                git(&path, &["checkout", "topic"]);
+                git(&path, &["reset", "--hard", &head]);
+            }
             "bad-record" | "missing-record" => {}
             "wrong-id" => record["checkout"] = Uuid::now_v7().to_string().into(),
             "malformed" => std::fs::write(&marker, b"{").unwrap(),
@@ -195,7 +222,7 @@ fn version_one_migration_preserves_charge_without_inventing_ready() {
     drop(s);
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
     conn.execute_batch(
-        "DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
+        "DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
     )
     .unwrap();
     drop(conn);
@@ -205,42 +232,52 @@ fn version_one_migration_preserves_charge_without_inventing_ready() {
 }
 #[test]
 fn readiness_rechecks_marker_after_external_side_effects() {
-    let f = Fixture::new();
-    let config = Config {
-        store_dir: Some(f.temp.path().join("private")),
-        trusted_registry: Some(f.temp.path().join("registry")),
-        roots: vec![f.root.clone()],
-        repositories: vec![f.repo.clone()],
-        allocation: Some(work_cli::config::AllocationPolicy {
-            repository_limit: 10,
-            owner_limit: 10,
-            floor_bytes: 0,
-            warn_bytes: 0,
-            capture_sink: None,
-        }),
-    };
-    let request = Start {
-        operation: Uuid::now_v7(),
-        repository: Some(f.repo.clone()),
-        root: Some(f.root.clone()),
-        actor: Some("alice".into()),
-        owner: None,
-        task: "task".into(),
-        branch: Some("topic".into()),
-        base: "main".into(),
-        reuse_branch: false,
-    };
-    let result = start_observed(&config, request, |boundary| {
-        if boundary == "marker" {
-            let i = work_cli::identity::CheckoutIdentity::inspect(&f.root.join("task")).unwrap();
-            std::fs::write(i.private_git_dir.join("work-lease.json"), "{}").unwrap();
-        }
-    });
-    assert!(result.is_err());
-    let mut s = f.store();
-    let ids = s.find_reusable("alice", &f.repo, "task").unwrap();
-    assert_eq!(ids.len(), 1);
-    assert!(s.acquire_writer(ids[0], Uuid::now_v7()).is_err());
+    for damage in ["marker", "head"] {
+        let f = Fixture::new();
+        let config = Config {
+            store_dir: Some(f.temp.path().join("private")),
+            trusted_registry: Some(f.temp.path().join("registry")),
+            roots: vec![f.root.clone()],
+            repositories: vec![f.repo.clone()],
+            allocation: Some(work_cli::config::AllocationPolicy {
+                repository_limit: 10,
+                owner_limit: 10,
+                floor_bytes: 0,
+                warn_bytes: 0,
+                capture_sink: None,
+            }),
+        };
+        let request = Start {
+            operation: Uuid::now_v7(),
+            repository: Some(f.repo.clone()),
+            root: Some(f.root.clone()),
+            actor: Some("alice".into()),
+            owner: None,
+            task: "task".into(),
+            branch: Some("topic".into()),
+            base: "main".into(),
+            reuse_branch: false,
+        };
+        let result = start_observed(&config, request, |boundary| {
+            if boundary == "marker" {
+                let i =
+                    work_cli::identity::CheckoutIdentity::inspect(&f.root.join("task")).unwrap();
+                if damage == "marker" {
+                    std::fs::write(i.private_git_dir.join("work-lease.json"), "{}").unwrap();
+                } else {
+                    git(
+                        &f.root.join("task"),
+                        &["commit", "--allow-empty", "-m", "premature"],
+                    );
+                }
+            }
+        });
+        assert!(result.is_err());
+        let mut s = f.store();
+        let ids = s.find_reusable("alice", &f.repo, "task").unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(s.acquire_writer(ids[0], Uuid::now_v7()).is_err());
+    }
 }
 
 #[test]

@@ -46,6 +46,17 @@ pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()>
         Ok(current) => {
             // Boot/device changes alone are not activity. Durable paths, marker,
             // registration, HEAD and inode must still agree before refreshing stat.
+            if let Some(prior) = &a.identity {
+                if prior.head != current.head {
+                    // Commit evidence before refreshing the snapshot. A crash between
+                    // commits only repeats the ancestry observation; it grants no writer.
+                    let tx = allocate::sql(store.conn.transaction())?;
+                    allocate::db(crate::store::emit(&tx, &crate::events::Event::HeadAdvanced {
+                        checkout: a.checkout, old: prior.head.clone(), new: current.head.clone(),
+                    }))?;
+                    allocate::sql(tx.commit())?;
+                }
+            }
             a.identity = Some(current); a.stage = "ready".into(); a.reason = None;
             allocate::save(store, a)
         }
@@ -66,11 +77,28 @@ fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
     if current.path != prior.path
         || current.private_git_dir != prior.private_git_dir
         || current.common_git_dir != prior.common_git_dir
-        || current.head != prior.head
         || current.directory.inode != prior.directory.inode
         || (current.boot_id == prior.boot_id && current.directory.device != prior.directory.device)
     {
         return Err(fail());
+    }
+    let branch = crate::identity::query(&a.destination, &["symbolic-ref", "--quiet", "HEAD"])?;
+    if branch
+        != format!(
+            "refs/heads/{}",
+            a.request.branch.as_deref().ok_or_else(fail)?
+        )
+    {
+        return Err(fail());
+    }
+    if current.head != prior.head {
+        if a.stage != "ready" {
+            return Err(fail());
+        }
+        crate::identity::query(
+            &a.destination,
+            &["merge-base", "--is-ancestor", &prior.head, &current.head],
+        )?;
     }
     let path = prior.private_git_dir.join("work-lease.json");
     let m = fs::symlink_metadata(&path)?;

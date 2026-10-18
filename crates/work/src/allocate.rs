@@ -155,8 +155,18 @@ pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
         .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
         .open(dir.join("allocation.lock"))?;
     // Bound contention; do not wait indefinitely behind an unknown allocator.
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
-        .map_err(io::Error::from)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => break,
+            Err(e)
+                if e == rustix::io::Errno::WOULDBLOCK && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok((store, lock))
 }
 fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {
@@ -221,6 +231,18 @@ pub fn start_observed(
     mut boundary: impl FnMut(&str),
 ) -> io::Result<Allocation> {
     let r = normalize(config, request)?;
+    // Resolve configured aliases using Git outside the database write transaction.
+    let aliases = config
+        .repositories
+        .iter()
+        .map(|path| {
+            crate::config::validate_path(path, true).map_err(|_| err("unsafe repository alias"))?;
+            Ok((
+                path.clone(),
+                CheckoutIdentity::inspect(path)?.common_git_dir,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     let (mut store, _lock) = locked(config)?;
     if let Some(mut a) = load(&mut store, r.operation)? {
         if a.request != r {
@@ -268,14 +290,98 @@ pub fn start_observed(
             "reservation lacks allocation intent; hold charged for operator reconciliation",
         ));
     }
+    let repo = r.repository.as_ref().unwrap();
+    let source = CheckoutIdentity::inspect(repo)?;
+    let common = &source.common_git_dir;
+    let tx = sql(store.conn.transaction())?;
+    for (alias, identity) in &aliases {
+        let existing: Option<String> = sql(tx
+            .query_row(
+                "SELECT common FROM repository_aliases WHERE alias=?1",
+                [alias.to_str().unwrap()],
+                |row| row.get(0),
+            )
+            .optional())?;
+        if existing
+            .as_deref()
+            .is_some_and(|v| v != identity.to_str().unwrap())
+        {
+            return Err(err("repository alias identity changed; hold"));
+        }
+        sql(tx.execute(
+            "INSERT OR IGNORE INTO repository_aliases VALUES(?1,?2)",
+            rusqlite::params![alias.to_str().unwrap(), identity.to_str().unwrap()],
+        ))?;
+    }
+    sql(tx.commit())?;
+    // A charged legacy identity that cannot be resolved must never become zero usage.
+    db(crate::store::count(
+        &store.conn,
+        common.to_str().unwrap(),
+        None,
+    ))?;
+    let matches = db(store.find_reusable(r.actor.as_ref().unwrap(), common, &r.task))?;
+    if !matches.is_empty() {
+        if matches.len() != 1 {
+            let tx = sql(store.conn.transaction())?;
+            for id in matches {
+                sql(tx.execute("UPDATE checkouts SET ready=0,state=CASE WHEN state IN ('reserved','partial','active') THEN 'held' ELSE state END WHERE id=?1", [id.to_string()]))?;
+                let operation: String = sql(tx.query_row(
+                    "SELECT operation FROM checkouts WHERE id=?1",
+                    [id.to_string()],
+                    |row| row.get(0),
+                ))?;
+                db(crate::store::emit(
+                    &tx,
+                    &crate::events::Event::AllocationStage {
+                        checkout: id,
+                        operation: Uuid::parse_str(&operation)
+                            .map_err(|_| err("invalid stored operation"))?,
+                        stage: "held".into(),
+                        reason: Some(
+                            "ambiguous matching allocations; operator reconciliation required"
+                                .into(),
+                        ),
+                    },
+                ))?;
+            }
+            sql(tx.commit())?;
+            return Err(err(
+                "ambiguous matching allocations; hold for reconciliation",
+            ));
+        }
+        let (operation, state): (String, String) = sql(store.conn.query_row(
+            "SELECT operation,state FROM checkouts WHERE id=?1",
+            [matches[0].to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ))?;
+        let mut a = load(
+            &mut store,
+            Uuid::parse_str(&operation).map_err(|_| err("invalid stored operation"))?,
+        )?
+        .ok_or_else(|| err("matching charge lacks intent; hold"))?;
+        if state != "active" || a.stage != "ready" {
+            return Err(err(
+                "matching allocation incomplete or held; explicit recovery required",
+            ));
+        }
+        if config.allocation.as_ref().unwrap().capture_sink.is_some() {
+            crate::recovery::hold(&mut store, &mut a, "configured capture unsupported")?;
+            return Err(err("configured capture unsupported"));
+        }
+        crate::recovery::reconcile(&mut store, &mut a)?;
+        return if a.stage == "ready" {
+            Ok(a)
+        } else {
+            Err(err("matching allocation held"))
+        };
+    }
     let policy = config.allocation.as_ref().unwrap();
     if policy.capture_sink.is_some() {
         return Err(err(
             "configured capture sink unsupported; no capture prepared, no writer eligible",
         ));
     }
-    let repo = r.repository.as_ref().unwrap();
-    let source = CheckoutIdentity::inspect(repo)?;
     if repo.join(".gitmodules").exists() || source.common_git_dir.join("modules").exists() {
         return Err(err("unsupported submodule layout; hold"));
     }
@@ -318,7 +424,7 @@ pub fn start_observed(
     db(store.reserve_recorded(
         &Reservation {
             operation: r.operation,
-            repository: repo.clone(),
+            repository: common.clone(),
             actor: r.actor.clone().unwrap(),
             owner: r.owner.clone().unwrap(),
             task: r.task.clone(),
