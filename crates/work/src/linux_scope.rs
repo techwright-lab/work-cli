@@ -193,6 +193,14 @@ pub fn assess_cleanup(evidence: CleanupEvidence<'_>) -> bool {
     {
         return false;
     }
+    if evidence.participants.is_empty()
+        || evidence
+            .participants
+            .iter()
+            .any(|state| *state != ParticipantState::Absent)
+    {
+        return false;
+    }
     if let Some(membership) = evidence.membership {
         return membership.is_empty();
     }
@@ -203,11 +211,6 @@ pub fn assess_cleanup(evidence: CleanupEvidence<'_>) -> bool {
                 && state.active == "inactive"
                 && (state.cgroup.is_empty() || state.cgroup == scope.cgroup)
         })
-        && !evidence.participants.is_empty()
-        && evidence
-            .participants
-            .iter()
-            .all(|state| *state == ParticipantState::Absent)
 }
 fn participant_state(pid: u32) -> ParticipantState {
     // A present PID is never assumed to be a reused identity or safely dead.
