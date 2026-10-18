@@ -1,4 +1,4 @@
-//! Bounded read-only scope inspector, not launch or retirement authority.
+//! Bounded scope inspector and exact-binding cancellation, not retirement authority.
 //! Library IO injection is for controlled fixtures; production always uses fixed OS paths.
 use crate::{bounded_process, runtime_scope::*};
 use rustix::fs::{openat2, Dir, FileType, Mode, OFlags, ResolveFlags};
@@ -140,6 +140,34 @@ impl Driver {
         // Keep partial evidence unknown on any error. Never infer absence from a query error.
         let _ = self.collect(intent, binding, roster, &mut obs);
         obs
+    }
+    /// Reobserve before signalling; errors never fall back to PID-based signalling.
+    /// Successful manager exit is a request acknowledgement, not quiescence proof.
+    pub(crate) fn cancel_bound(&self, intent: &LaunchIntent, binding: &Binding) -> Result<()> {
+        let observation = self.observe(intent, Some(binding), None);
+        self.context.validate()?;
+        let cancellation = binding
+            .authorize_cancel(&observation, Instant::now(), Duration::from_secs(2))
+            .map_err(|_| HOLD)?;
+        let mut command = Command::new(&self.io.systemctl);
+        command
+            .args([
+                "--user",
+                "--no-pager",
+                "--no-ask-password",
+                "kill",
+                "--kill-whom=all",
+                "--signal=SIGTERM",
+                cancellation.unit_name(),
+            ])
+            .env("XDG_RUNTIME_DIR", &self.context.directory)
+            .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
+        let output = bounded_process::output(&mut command, self.limits.duration, 16_384)
+            .map_err(|_| HOLD)?;
+        if !output.status.success() {
+            return Err(HOLD);
+        }
+        Ok(())
     }
     fn manager(&self, intent: &LaunchIntent, budget: &mut Budget<'_>) -> Result<Manager> {
         self.context.validate()?;

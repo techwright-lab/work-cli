@@ -20,4 +20,5 @@ pub mod recovery;
 pub mod runtime_scope;
 pub mod scope_child;
 pub mod scope_driver;
+pub mod scope_launch;
 pub mod store;
