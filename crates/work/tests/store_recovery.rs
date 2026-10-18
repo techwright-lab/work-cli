@@ -197,6 +197,158 @@ fn a_claimed_authority_never_recreates_a_lost_database() {
 }
 
 #[test]
+fn interrupted_directory_creation_and_database_creation_failure_are_retryable() {
+    let f = Fixture::new();
+    let registry = f._dir.path().join(".work-authorities");
+    std::fs::create_dir(&registry).unwrap();
+    std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir(&f.private).unwrap();
+    std::fs::set_permissions(&f.private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let obstacle = f.private.join("store.sqlite");
+    std::fs::create_dir(&obstacle).unwrap();
+    assert!(Store::open(&f.private, std::slice::from_ref(&f.root)).is_err());
+    std::fs::remove_dir(obstacle).unwrap();
+    let mut store = f.open();
+    store.reserve(&f.request(), limits()).unwrap();
+    assert_eq!(store.charged(&f.root, None).unwrap(), 1);
+}
+
+#[test]
+fn empty_registry_directory_can_finish_first_initialization() {
+    let f = Fixture::new();
+    let registry = f._dir.path().join(".work-authorities");
+    std::fs::create_dir(&registry).unwrap();
+    std::fs::set_permissions(&registry, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(f.open());
+}
+
+#[test]
+fn established_databases_cannot_reset_accounting() {
+    for database in ["store", "registry"] {
+        for bytes in [0, 80] {
+            let f = Fixture::new();
+            let mut store = f.open();
+            store.reserve(&f.request(), limits()).unwrap();
+            drop(store);
+            let path = if database == "store" {
+                f.private.join("store.sqlite")
+            } else {
+                f._dir.path().join(".work-authorities/authorities.sqlite")
+            };
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(bytes)
+                .unwrap();
+            assert!(
+                Store::open(&f.private, std::slice::from_ref(&f.root)).is_err(),
+                "{database}: {bytes}"
+            );
+            assert_eq!(
+                std::fs::metadata(path).unwrap().len(),
+                bytes,
+                "must not repair damaged authority"
+            );
+        }
+    }
+}
+
+#[test]
+fn version_zero_and_missing_initialization_proof_fail_closed() {
+    for database in ["store", "registry"] {
+        let f = Fixture::new();
+        let mut store = f.open();
+        store.reserve(&f.request(), limits()).unwrap();
+        drop(store);
+        let path = if database == "store" {
+            f.private.join("store.sqlite")
+        } else {
+            f._dir.path().join(".work-authorities/authorities.sqlite")
+        };
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA user_version=0").unwrap();
+        drop(conn);
+        assert!(Store::open(&f.private, std::slice::from_ref(&f.root)).is_err());
+    }
+    let f = Fixture::new();
+    let mut store = f.open();
+    store.reserve(&f.request(), limits()).unwrap();
+    drop(store);
+    std::fs::remove_file(f._dir.path().join(".work-authorities/initialization.json")).unwrap();
+    assert!(Store::open(&f.private, std::slice::from_ref(&f.root)).is_err());
+    let conn = f.connection();
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM checkouts", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn unreadable_orphan_storage_cannot_gain_pending_initialization_proof() {
+    let f = Fixture::new();
+    std::fs::create_dir(&f.private).unwrap();
+    std::fs::write(f.private.join("store.sqlite"), []).unwrap();
+    std::fs::set_permissions(&f.private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = Store::open(&f.private, std::slice::from_ref(&f.root));
+    std::fs::set_permissions(&f.private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert!(!f
+        ._dir
+        .path()
+        .join(".work-authorities/initialization.json")
+        .exists());
+}
+
+#[test]
+fn initialization_lock_is_private_nofollow_and_bounded() {
+    let f = Fixture::new();
+    drop(f.open());
+    let lock_path = f._dir.path().join(".work-authorities/initialization.lock");
+    let lock = std::fs::File::open(&lock_path).unwrap();
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+    let start = std::time::Instant::now();
+    assert!(Store::open(&f.private, std::slice::from_ref(&f.root)).is_err());
+    assert!(start.elapsed().as_secs() < 3);
+    drop(lock);
+    std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(Store::open(&f.private, std::slice::from_ref(&f.root)).is_err());
+    std::fs::remove_file(&lock_path).unwrap();
+    symlink(f.private.join("store.sqlite"), &lock_path).unwrap();
+    assert!(Store::open(&f.private, std::slice::from_ref(&f.root)).is_err());
+}
+
+#[test]
+fn writer_eligibility_precedes_even_same_group_idempotency() {
+    for retained_writer in [false, true] {
+        let f = Fixture::new();
+        let mut store = f.open();
+        let checkout = store.reserve(&f.request(), limits()).unwrap();
+        let group = Uuid::now_v7();
+        if retained_writer {
+            store.acquire_writer(checkout, group).unwrap();
+        }
+        let conn = f.connection();
+        for state in [
+            "expired",
+            "interrupted",
+            "held",
+            "quarantined",
+            "partially_deleted",
+            "retired",
+        ] {
+            conn.execute("UPDATE checkouts SET state=?1", [state])
+                .unwrap();
+            assert!(
+                store.acquire_writer(checkout, group).is_err(),
+                "{state}, retained={retained_writer}"
+            );
+        }
+    }
+}
+
+#[test]
 fn every_nonretired_state_retains_its_charge() {
     let f = Fixture::new();
     let mut store = f.open();

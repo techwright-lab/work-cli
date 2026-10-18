@@ -6,6 +6,7 @@ use crate::events::{Event, PendingEvent};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
     fs,
+    io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -86,17 +87,25 @@ fn check_file(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn database(dir: &Path, name: &str) -> Result<Connection> {
+fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     let path = dir.join(name);
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-    {
-        Ok(_) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-        Err(e) => return Err(e.into()),
+    if !pending {
+        check_file(&path)?;
+        if fs::metadata(&path)?.len() < 100 {
+            return Err(StoreError::Unsafe);
+        }
+    }
+    if pending {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(_) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.into()),
+        }
     }
     check_file(&path)?;
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -114,6 +123,10 @@ fn database(dir: &Path, name: &str) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != 1 && !(pending && version == 0) {
+        return Err(StoreError::Unsafe);
+    }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
     let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     if mode != "wal" {
@@ -121,6 +134,77 @@ fn database(dir: &Path, name: &str) -> Result<Connection> {
     }
     Ok(conn)
 }
+// The registry lock serializes the entire bootstrap, not just claims. The file
+// is private, never unlinked, and NOFOLLOW prevents following a planted link.
+fn initialization_lock(registry: &Path) -> Result<fs::File> {
+    let path = registry.join("initialization.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .open(&path)?;
+    check_file(&path)?;
+    let metadata = file.metadata()?;
+    if metadata.ino() != fs::symlink_metadata(&path)?.ino() {
+        return Err(StoreError::Unsafe);
+    }
+    let start = std::time::Instant::now();
+    loop {
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(file),
+            Err(rustix::io::Errno::WOULDBLOCK) if start.elapsed() < Duration::from_millis(500) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Initialization {
+    version: u32,
+    store: PathBuf,
+    initialized: bool,
+}
+fn sync_dir(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+fn persist_initialization(registry: &Path, record: &Initialization) -> Result<()> {
+    let temporary = registry.join("initialization.tmp");
+    if temporary.try_exists()? {
+        check_file(&temporary)?;
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let bytes = serde_json::to_vec(record).map_err(|_| StoreError::Invalid)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    initialization_boundary(if record.initialized {
+        "initialized_temp"
+    } else {
+        "pending_temp"
+    });
+    fs::rename(temporary, registry.join("initialization.json"))?;
+    sync_dir(registry)
+}
+
+// Only unit-test builds can interrupt the real protocol at durability boundaries.
+fn initialization_boundary(_name: &str) {
+    #[cfg(test)]
+    if std::env::var("WORK_INIT_TEST_BOUNDARY").as_deref() == Ok(_name) {
+        std::process::abort();
+    }
+}
+
 pub(crate) fn canonical(path: &Path) -> Result<String> {
     let p = fs::canonicalize(path)?;
     p.to_str().map(str::to_owned).ok_or(StoreError::Invalid)
@@ -160,27 +244,67 @@ impl Store {
     /// Reconfiguration needs an audited operator migration; no second authority is
     /// silently substituted. The registry is an explicitly trusted host policy
     /// boundary, not a global scan. Keep this path fixed across all configurations.
+    /// A private, bounded registry lock serializes durable pending/initialized
+    /// intent. Only pending bootstrap may create schemas; established database
+    /// loss, version zero, or SQLite files without initialization proof fail
+    /// closed. Pre-protocol databases require explicit operator migration.
     /// Only allowlisted Linux local filesystem types are accepted. Overlay backing
     /// storage durability/locality remains a host qualification obligation.
     pub fn open_registered(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Self> {
         let managed = roots(managed)?;
-        let registry_existed = match fs::symlink_metadata(registry) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e.into()),
-        };
         let registry = private_dir(registry)?;
-        if registry_existed {
-            check_file(&registry.join("authorities.sqlite"))?;
+        sync_dir(registry.parent().ok_or(StoreError::Unsafe)?)?;
+        initialization_boundary("registry_dir");
+        let _lock = initialization_lock(&registry)?;
+        // Bind pending intent before creating either database (or the store
+        // directory). A marker-less directory is recoverable only with no prior
+        // authority data; SQLite files without proof are never adopted.
+        let parent = dir.parent().ok_or(StoreError::Unsafe)?;
+        let expected =
+            PathBuf::from(canonical(parent)?).join(dir.file_name().ok_or(StoreError::Unsafe)?);
+        if expected != dir || !dir.is_absolute() {
+            return Err(StoreError::Unsafe);
         }
-        let dir = private_dir(dir)?;
-        // Filesystem evidence is read before taking the registry write lock.
-        let store_exists = match fs::symlink_metadata(dir.join("store.sqlite")) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        let marker = registry.join("initialization.json");
+        let mut record: Initialization = match fs::symlink_metadata(&marker) {
+            Ok(_) => {
+                check_file(&marker)?;
+                serde_json::from_slice(&fs::read(&marker)?).map_err(|_| StoreError::Unsafe)?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                for entry in fs::read_dir(&registry)? {
+                    let name = entry?.file_name();
+                    if name != "initialization.lock" && name != "initialization.tmp" {
+                        return Err(StoreError::Unsafe);
+                    }
+                }
+                for suffix in ["", "-wal", "-shm", "-journal"] {
+                    match fs::symlink_metadata(dir.join(format!("store.sqlite{suffix}"))) {
+                        Ok(_) => return Err(StoreError::Unsafe),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                let record = Initialization {
+                    version: 1,
+                    store: expected.clone(),
+                    initialized: false,
+                };
+                persist_initialization(&registry, &record)?;
+                record
+            }
             Err(e) => return Err(e.into()),
         };
-        let mut reg = database(&registry, "authorities.sqlite")?;
+        if record.version != 1 || record.store != expected {
+            return Err(StoreError::Unsafe);
+        }
+        let pending = !record.initialized;
+        initialization_boundary("pending");
+        let dir = private_dir(dir)?;
+        sync_dir(parent)?;
+        initialization_boundary("store_dir");
+        let mut reg = database(&registry, "authorities.sqlite", pending)?;
+        initialization_boundary("registry_db");
         let version: i64 = reg.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !matches!(version, 0 | 1) {
             return Err(StoreError::Unsafe);
@@ -189,6 +313,7 @@ impl Store {
         if version == 0 {
             tx.execute_batch("CREATE TABLE authorities(root TEXT PRIMARY KEY, store TEXT NOT NULL); PRAGMA user_version=1;")?;
         }
+        initialization_boundary("registry_schema");
         let claims: Vec<(String, String)> = {
             let mut s = tx.prepare("SELECT root,store FROM authorities")?;
             let rows = s
@@ -198,7 +323,6 @@ impl Store {
         };
         for (root, owner) in &claims {
             if owner != dir.to_str().ok_or(StoreError::Invalid)?
-                || !store_exists
                 || !managed.contains(&PathBuf::from(root))
             {
                 return Err(StoreError::Unsafe);
@@ -211,7 +335,9 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        let mut conn = database(&dir, "store.sqlite")?;
+        initialization_boundary("claims");
+        let mut conn = database(&dir, "store.sqlite", pending)?;
+        initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !matches!(version, 0 | 1) {
             return Err(StoreError::Unsafe);
@@ -236,6 +362,16 @@ impl Store {
         tx.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
         tx.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
         tx.commit()?;
+        initialization_boundary("store_schema");
+        // FULL SQLite commits make schema and claims durable, including their
+        // WAL records. Sync directory entries before publishing initialized.
+        sync_dir(&dir)?;
+        sync_dir(&registry)?;
+        if pending {
+            record.initialized = true;
+            persist_initialization(&registry, &record)?;
+        }
+        initialization_boundary("initialized");
         Ok(Self { conn })
     }
     pub fn charged(&self, repository: &Path, owner: Option<&str>) -> Result<u64> {
@@ -259,6 +395,17 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Reserved remains eligible for this low-level reservation API until
+        // lifecycle readiness is separated. No recovery/terminal state may
+        // reacquire, even idempotently; eligibility never moves state backward.
+        let eligible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state IN ('reserved','partial','active'))",
+            [checkout.to_string()],
+            |r| r.get(0),
+        )?;
+        if !eligible {
+            return Err(StoreError::Invalid);
+        }
         let existing: Option<String> = tx
             .query_row(
                 "SELECT group_id FROM writers WHERE checkout=?1",
@@ -272,14 +419,6 @@ impl Store {
             } else {
                 Err(StoreError::Writer)
             };
-        }
-        let live: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state!='retired')",
-            [checkout.to_string()],
-            |r| r.get(0),
-        )?;
-        if !live {
-            return Err(StoreError::Invalid);
         }
         tx.execute(
             "INSERT INTO writers VALUES(?1,?2)",
@@ -333,6 +472,67 @@ pub(crate) fn identity(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initialization_worker() {
+        let Ok(base) = std::env::var("WORK_INIT_TEST_BASE") else {
+            return;
+        };
+        let base = std::path::Path::new(&base);
+        super::Store::open(&base.join("private"), &[base.join("root")]).unwrap();
+    }
+
+    #[test]
+    fn subprocess_initialization_interruptions_resume() {
+        for boundary in [
+            "registry_dir",
+            "pending_temp",
+            "pending",
+            "store_dir",
+            "registry_db",
+            "registry_schema",
+            "claims",
+            "store_db",
+            "store_schema",
+            "initialized_temp",
+            "initialized",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("root")).unwrap();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "store::tests::initialization_worker"])
+                .env("WORK_INIT_TEST_BASE", dir.path())
+                .env("WORK_INIT_TEST_BOUNDARY", boundary)
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(
+                status.signal(),
+                Some(6),
+                "child did not abort at {boundary}"
+            );
+            if boundary == "claims" {
+                // A normal creation error after durable claims must not strand
+                // retries either. No Store has escaped the pending protocol.
+                let obstacle = dir.path().join("private/store.sqlite");
+                std::fs::create_dir(&obstacle).unwrap();
+                assert!(super::Store::open(
+                    &dir.path().join("private"),
+                    &[dir.path().join("root")]
+                )
+                .is_err());
+                std::fs::remove_dir(obstacle).unwrap();
+            }
+            let store = super::Store::open(&dir.path().join("private"), &[dir.path().join("root")])
+                .unwrap();
+            assert_eq!(
+                store.charged(&dir.path().join("root"), None).unwrap(),
+                0,
+                "{boundary}"
+            );
+        }
+    }
+
     #[test]
     fn remote_and_unknown_filesystems_are_not_store_authorities() {
         for magic in [0x6969, 0xff534d42, 0x65735546, 0] {
