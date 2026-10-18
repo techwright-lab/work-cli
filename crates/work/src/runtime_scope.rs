@@ -21,6 +21,9 @@ impl LaunchIntent {
     pub fn unit_name(&self) -> &str {
         &self.unit
     }
+    pub fn boot_id(&self) -> &str {
+        &self.boot
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeIdentity {
@@ -191,6 +194,12 @@ pub fn bind(
     })
 }
 impl Binding {
+    pub fn identity(&self) -> &ScopeIdentity {
+        &self.identity
+    }
+    pub fn boot_id(&self) -> &str {
+        &self.boot
+    }
     pub fn authorize_cancel(
         &self,
         obs: &Observation,
