@@ -166,6 +166,27 @@ sys.exit(7)
             self.assertLessEqual(len(result.get(key, [])), 512)
         self.assertEqual(wrapper.sanitized(b'{"fixture_executed":true,"fixture_executed":false}'), unknown)
 
+    def test_cgroup_escape_sanitization_preserves_only_single_backslash_hex(self):
+        for path, valid in (
+                (r"/app-Hyprland-xdg\x2dterminal.scope", True),
+                (r"/app-Hyprland-xdg\\x2dterminal.scope", False),
+                (r"/app-Hyprland-xdg\x2terminal.scope", False),
+                (r"/app-Hyprland-xdg\xGGterminal.scope", False),
+                (r"/app-Hyprland-xdg\q2dterminal.scope", False)):
+            with self.subTest(path=path):
+                observation = dict(fixture="setsid", pid=123, cgroup=path)
+                result = wrapper.sanitized(json.dumps(dict(
+                    host=dict(current_cgroup=path), scope_cgroup=path,
+                    observations=[observation])).encode())
+                if valid:
+                    self.assertEqual(result["host"].get("current_cgroup"), path)
+                    self.assertEqual(result.get("scope_cgroup"), path)
+                    self.assertEqual(result["observations"], [observation])
+                else:
+                    self.assertNotIn("current_cgroup", result["host"])
+                    self.assertNotIn("scope_cgroup", result)
+                    self.assertEqual(result["observations"], [])
+
     def test_repeated_and_concurrent_launches_share_one_claim(self):
         children = [subprocess.Popen([sys.executable, str(WRAPPER), "--acp", "space arg"],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

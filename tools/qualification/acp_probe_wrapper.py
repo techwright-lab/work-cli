@@ -170,7 +170,7 @@ def unsigned(value, minimum=0):
 def cgroup_path(value):
     # Kernel cgroup paths, including systemd's literal \\xNN escapes; no raw lines.
     return (isinstance(value, str) and 1 <= len(value) <= 4096
-            and re.fullmatch(r"/(?:[A-Za-z0-9_.:@/-]|\\\\x[0-9a-fA-F]{2})*", value)
+            and re.fullmatch(r"/(?:[A-Za-z0-9_.:@/-]|\\x[0-9a-fA-F]{2})*", value)
             is not None and not any(p in (".", "..", "") for p in value.split("/")[1:])
             or value == "/")
 
