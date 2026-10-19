@@ -17,6 +17,7 @@ pub mod identity;
 pub mod linux_scope;
 pub mod ownership;
 pub mod recovery;
+pub mod run_journal;
 pub mod runtime_scope;
 pub mod scope_child;
 pub mod scope_driver;

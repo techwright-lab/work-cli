@@ -12,8 +12,8 @@ mod lifecycle;
 
 pub use events::{ExpiryReason, HoldReason, InterruptionReason, LifecycleEvent, RetirementReason};
 pub use identity::{
-    ActorId, AllocationOperationId, CheckoutId, ContractError, EventId, ExecutionChain, GroupId,
-    OwnerId, RepositoryId, ReuseKey, RunId, RunRef, TaskId,
+    ActorId, AllocationOperationId, ChainText, CheckoutId, ContractError, EventId, ExecutionChain,
+    ExecutionEntry, GroupId, OwnerId, RepositoryId, ReuseKey, RunId, RunRef, TaskId,
 };
 pub use lifecycle::{
     AttributionDelivery, CheckoutLifecycle, ExecutionMode, LifecycleEnvelope, RunOutcome,

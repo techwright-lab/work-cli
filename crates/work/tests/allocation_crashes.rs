@@ -318,7 +318,7 @@ fn version_one_migration_preserves_charge_without_inventing_ready() {
     drop(s);
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
     conn.execute_batch(
-        "DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
+        "DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
     )
     .unwrap();
     drop(conn);

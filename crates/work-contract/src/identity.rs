@@ -76,7 +76,116 @@ nonempty_id!(RepositoryId, "repository");
 nonempty_id!(TaskId, "task");
 nonempty_id!(OwnerId, "owner");
 nonempty_id!(RunRef, "run_ref");
-nonempty_id!(ExecutionChain, "execution_chain");
+/// A portable, caller-declared execution path. Never OS execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ExecutionChain(Vec<ExecutionEntry>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionEntry {
+    Orchestrator {
+        system: ChainText,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "session_ref"
+        )]
+        #[schemars(with = "ChainText")]
+        session_ref: Option<ChainText>,
+    },
+    Executor {
+        system: ChainText,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "session_ref"
+        )]
+        #[schemars(with = "ChainText")]
+        session_ref: Option<ChainText>,
+    },
+    Model {
+        provider: ChainText,
+        model: ChainText,
+    },
+}
+
+fn session_ref<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ChainText>, D::Error> {
+    ChainText::deserialize(d).map(Some)
+}
+
+/// Bounded, nonblank, control-free text; exact declared values are retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ChainText(String);
+impl ChainText {
+    pub fn new(value: String) -> Result<Self, ContractError> {
+        if value.trim().is_empty()
+            || value.chars().count() > 4096
+            || value.chars().any(char::is_control)
+        {
+            return Err(ContractError::InvalidId {
+                kind: "execution_chain",
+                reason: "invalid scalar".into(),
+            });
+        }
+        Ok(Self(value))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl<'de> Deserialize<'de> for ChainText {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+impl JsonSchema for ChainText {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ChainText".into()
+    }
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        schemars::json_schema!({"type":"string", "maxLength":4096,
+            "allOf":[{"pattern":r"[^\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]"}, {"pattern":r"^[^\u0000-\u001f\u007f-\u009f]*$"}]})
+    }
+}
+impl ExecutionChain {
+    pub fn new(entries: Vec<ExecutionEntry>) -> Result<Self, ContractError> {
+        if entries.is_empty()
+            || entries.len() > 32
+            || !entries.iter().any(|e| {
+                matches!(
+                    e,
+                    ExecutionEntry::Orchestrator { .. } | ExecutionEntry::Executor { .. }
+                )
+            })
+        {
+            return Err(ContractError::InvalidId {
+                kind: "execution_chain",
+                reason: "expected 1..32 entries including an executor or orchestrator".into(),
+            });
+        }
+        Ok(Self(entries))
+    }
+    pub fn entries(&self) -> &[ExecutionEntry] {
+        &self.0
+    }
+}
+impl<'de> Deserialize<'de> for ExecutionChain {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Self::new(Vec::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+impl JsonSchema for ExecutionChain {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "ExecutionChain".into()
+    }
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let entry = generator.subschema_for::<ExecutionEntry>();
+        schemars::json_schema!({"type":"array", "minItems":1, "maxItems":32, "items":entry,
+            "contains":{"type":"object", "required":["kind"], "properties":{"kind":{"enum":["orchestrator","executor"]}}}})
+    }
+}
 
 macro_rules! uuidv7_id {
     ($name:ident, $kind:literal) => {

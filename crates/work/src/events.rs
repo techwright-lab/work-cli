@@ -3,6 +3,13 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    RunJournalChanged {
+        checkout: Uuid,
+        group: Uuid,
+        run: Uuid,
+        revision: u64,
+        change: crate::run_journal::JournalChange,
+    },
     AllocationStage {
         checkout: Uuid,
         operation: Uuid,

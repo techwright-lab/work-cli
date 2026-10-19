@@ -25,7 +25,7 @@ fn valid_json() -> serde_json::Value {
         "group_id": GROUP,
         "run_ref": "run:implementation",
         "parent_run_ref": "run:root",
-        "execution_chain": "chain:task-1",
+        "execution_chain": [{"kind":"executor","system":"test-cli"}],
         "actor": "agent-1",
         "repository": "https://git.example.invalid/acme/app.git",
         "task": "TASK-1",
@@ -335,8 +335,8 @@ fn metadata_round_trips_without_being_discarded() {
     );
     assert_eq!(parsed.parent_run_ref.as_ref().unwrap().as_str(), "run:root");
     assert_eq!(
-        parsed.execution_chain.as_ref().unwrap().as_str(),
-        "chain:task-1"
+        serde_json::to_value(parsed.execution_chain.as_ref().unwrap()).unwrap(),
+        serde_json::json!([{"kind":"executor","system":"test-cli"}])
     );
     let serialized: serde_json::Value = serde_json::from_str(&parsed.to_json().unwrap()).unwrap();
     for field in ["run_ref", "parent_run_ref", "execution_chain"] {

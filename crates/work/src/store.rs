@@ -125,7 +125,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=3))
+        || (name == "store.sqlite" && matches!(version, 2..=4))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -342,7 +342,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=3) {
+        if !matches!(version, 0..=4) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -366,6 +366,22 @@ impl Store {
         if version < 3 {
             tx.execute_batch("CREATE TABLE repository_aliases(alias TEXT PRIMARY KEY, common TEXT NOT NULL); PRAGMA user_version=3;")?;
         }
+        if version < 4 {
+            tx.execute_batch("CREATE TABLE run_groups(
+                id TEXT PRIMARY KEY, checkout TEXT NOT NULL REFERENCES checkouts(id),
+                mode TEXT NOT NULL CHECK(mode='supervised'), revision INTEGER NOT NULL CHECK(revision>=1),
+                recovery_hold INTEGER NOT NULL DEFAULT 0 CHECK(recovery_hold IN (0,1)));")?;
+            initialization_boundary("run_schema");
+            tx.execute_batch(
+                "CREATE TABLE runs(
+                id TEXT PRIMARY KEY, group_id TEXT NOT NULL UNIQUE REFERENCES run_groups(id),
+                run_ref TEXT NOT NULL UNIQUE, request TEXT NOT NULL,
+                stage TEXT NOT NULL CHECK(stage IN ('intent','bound','permit_attempt')),
+                binding TEXT, outcome TEXT);
+                PRAGMA user_version=4;",
+            )?;
+        }
+        validate_run_schema(&tx)?;
         tx.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
         tx.prepare("SELECT ready FROM checkouts LIMIT 0")?;
         tx.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
@@ -410,34 +426,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        // Readiness requires durable allocation evidence, never a migrated default.
-        let eligible: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1)",
-            [checkout.to_string()],
-            |r| r.get(0),
-        )?;
-        if !eligible {
-            return Err(StoreError::Invalid);
-        }
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT group_id FROM writers WHERE checkout=?1",
-                [checkout.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(g) = existing {
-            return if g == group.to_string() {
-                Ok(())
-            } else {
-                Err(StoreError::Writer)
-            };
-        }
-        tx.execute(
-            "INSERT INTO writers VALUES(?1,?2)",
-            (checkout.to_string(), group.to_string()),
-        )?;
-        emit(&tx, &Event::WriterAcquired { checkout, group })?;
+        acquire_writer_tx(&tx, checkout, group, true)?;
         tx.commit()?;
         Ok(())
     }
@@ -547,7 +536,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=3))) || integrity != "ok"
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=4))) || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
@@ -596,6 +585,17 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
     }
     let conn = existing_database(dir, "store.sqlite")?;
     conn.execute_batch("BEGIN;")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 2 {
+        conn.prepare("SELECT ready FROM checkouts LIMIT 0")?;
+        conn.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
+    }
+    if version >= 3 {
+        conn.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
+    }
+    if version >= 4 {
+        validate_run_schema(&conn)?;
+    }
     conn.prepare(
         "SELECT id,operation,digest,repository,actor,task,owner,state FROM checkouts LIMIT 0",
     )?;
@@ -651,6 +651,59 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
         }
     }
     Ok(charges)
+}
+
+/// Caller owns the IMMEDIATE transaction. A journal may never adopt an older
+/// bare writer, even when its group identifier happens to match.
+pub(crate) fn acquire_writer_tx(
+    conn: &Connection,
+    checkout: Uuid,
+    group: Uuid,
+    allow_existing: bool,
+) -> Result<()> {
+    let eligible: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1)",
+        [checkout.to_string()],
+        |r| r.get(0),
+    )?;
+    if !eligible {
+        return Err(StoreError::Invalid);
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT group_id FROM writers WHERE checkout=?1",
+            [checkout.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(g) = existing {
+        return if allow_existing && g == group.to_string() {
+            Ok(())
+        } else {
+            Err(StoreError::Writer)
+        };
+    }
+    conn.execute(
+        "INSERT INTO writers VALUES(?1,?2)",
+        (checkout.to_string(), group.to_string()),
+    )?;
+    emit(conn, &Event::WriterAcquired { checkout, group })
+}
+
+fn validate_run_schema(conn: &Connection) -> Result<()> {
+    for name in ["runs", "run_groups"] {
+        let table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1 AND type='table')",
+            [name],
+            |r| r.get(0),
+        )?;
+        if !table {
+            return Err(StoreError::Unsafe);
+        }
+    }
+    conn.prepare("SELECT id,checkout,mode,revision,recovery_hold FROM run_groups LIMIT 0")?;
+    conn.prepare("SELECT id,group_id,run_ref,request,stage,binding,outcome FROM runs LIMIT 0")?;
+    Ok(())
 }
 
 pub(crate) fn count(conn: &Connection, repo: &str, owner: Option<&str>) -> Result<u64> {
@@ -745,6 +798,67 @@ mod tests {
                 "{boundary}"
             );
         }
+    }
+
+    #[test]
+    fn killed_v3_migration_rolls_back_partial_schema_and_preserves_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut store =
+            super::Store::open(&dir.path().join("private"), std::slice::from_ref(&root)).unwrap();
+        store
+            .reserve(
+                &crate::admission::Reservation {
+                    operation: uuid::Uuid::now_v7(),
+                    repository: root.clone(),
+                    actor: "actor".into(),
+                    owner: "owner".into(),
+                    task: "task".into(),
+                },
+                crate::admission::Limits {
+                    repository: 2,
+                    owner: 2,
+                    available_bytes: Some(10),
+                    floor_bytes: 0,
+                    warn_bytes: 0,
+                },
+            )
+            .unwrap();
+        let events = store.pending_events(100).unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
+            .unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::initialization_worker"])
+            .env("WORK_INIT_TEST_BASE", dir.path())
+            .env("WORK_INIT_TEST_BOUNDARY", "run_schema")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(6));
+        let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        assert_eq!(
+            sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            sql.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('runs','run_groups')",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let store =
+            super::Store::open(&dir.path().join("private"), std::slice::from_ref(&root)).unwrap();
+        assert_eq!(store.charged(&root, Some("owner")).unwrap(), 1);
+        assert_eq!(store.pending_events(100).unwrap(), events);
     }
 
     #[test]

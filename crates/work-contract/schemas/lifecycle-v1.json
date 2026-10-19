@@ -137,6 +137,18 @@
         "failed"
       ]
     },
+    "ChainText": {
+      "type": "string",
+      "allOf": [
+        {
+          "pattern": "[^\\t-\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+        },
+        {
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$"
+        }
+      ],
+      "maxLength": 4096
+    },
     "CheckoutId": {
       "type": "string",
       "format": "uuid",
@@ -163,8 +175,91 @@
       "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-7[0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
     },
     "ExecutionChain": {
-      "type": "string",
-      "pattern": "[^\\t-\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]"
+      "type": "array",
+      "contains": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "enum": [
+              "orchestrator",
+              "executor"
+            ]
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "items": {
+        "$ref": "#/$defs/ExecutionEntry"
+      },
+      "maxItems": 32,
+      "minItems": 1
+    },
+    "ExecutionEntry": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "orchestrator"
+            },
+            "session_ref": {
+              "$ref": "#/$defs/ChainText"
+            },
+            "system": {
+              "$ref": "#/$defs/ChainText"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "system"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "executor"
+            },
+            "session_ref": {
+              "$ref": "#/$defs/ChainText"
+            },
+            "system": {
+              "$ref": "#/$defs/ChainText"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "system"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "model"
+            },
+            "model": {
+              "$ref": "#/$defs/ChainText"
+            },
+            "provider": {
+              "$ref": "#/$defs/ChainText"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "provider",
+            "model"
+          ]
+        }
+      ]
     },
     "ExecutionMode": {
       "type": "string",
