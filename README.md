@@ -65,9 +65,11 @@ concurrent same-UID replacement remains a reconciliation concern.
 
 Doctor never calls store initialization/migration, repairs evidence, runs hooks,
 creates notifications or contacts remotes. SQLite is opened read-only with existing
-initialization/authority evidence. WAL databases require **both pre-existing WAL and
-SHM files**; a closed WAL database without sidecars is conservatively unknown rather
-than recreating sidecars or using `immutable=1` (which ignores active WAL). Existing
+initialization/authority evidence. Writable lifecycle connections retain **WAL and
+SHM files** on last close (no-close-checkpoint), while retaining FULL synchronization
+and normal autocheckpoint. Ordinary create/write/close therefore remains readable.
+External clients that remove bookkeeping leave strict reads conservatively unknown:
+readers never recreate sidecars or use `immutable=1` (which ignores active WAL). Existing
 SHM lock bookkeeping may change: read-only does not promise byte immutability.
 No new files/directories or lifecycle/outbox writes are intended. Missing, corrupt,
 inaccessible or partial authority/store evidence is unknown, not zero charges.
@@ -208,8 +210,10 @@ hold and charge metadata with runtime `not_inspected`, not an actual exit-code o
 runtime qualification claim. It requires an existing initialized trusted v5 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
-bookkeeping rather than creating files or ignoring committed WAL. Recovery may open
-existing database bookkeeping, but never initializes or migrates authority/schema.
+bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
+writers retain that bookkeeping. Recovery validates initialized intent, claims and
+schema read-only before opening the existing store writable; it never initializes,
+repairs missing sidecars or migrates authority/schema.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
 

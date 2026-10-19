@@ -124,6 +124,12 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    // Retain ordinary WAL/SHM bookkeeping at last close so strict readers never
+    // need to create it. FULL commits and normal autocheckpoint remain enabled.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
@@ -572,9 +578,25 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )?;
     conn.busy_timeout(Duration::from_millis(500))?;
-    // Cumulative VM/time budget includes schema inspection, integrity checks
-    // and subsequent queries, even when untrusted schema contains views.
+    query_protections(&conn)?;
+    conn.execute_batch("PRAGMA query_only=ON;")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=5))) || integrity != "ok"
+    {
+        return Err(StoreError::Unsafe);
+    }
+    Ok(conn)
+}
+
+// Install a fresh budget at each SQL phase, not at connection lifetime: valid
+// runtime inspection between phases may take longer than a database deadline.
+pub(crate) fn sql_phase(conn: &Connection) -> Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let mut ticks = 0u32;
     conn.progress_handler(
@@ -584,18 +606,20 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
             ticks >= 200 || std::time::Instant::now() >= deadline
         }),
     )?;
-    conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH, 8192)?;
+    Ok(())
+}
+fn query_protections(conn: &Connection) -> Result<()> {
+    sql_phase(conn)?;
+    // Composite SQLite rows must accommodate the full legal UTF-8/JSON domain,
+    // not just short CLI examples. The file budget already bounds total input.
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+        REPORT_DATABASE_BYTES as i32,
+    )?;
     conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH, 65536)?;
     conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_COLUMN, 64)?;
-    // Aggregation/integrity queries must not spill SQLite temporary files.
-    conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=5))) || integrity != "ok"
-    {
-        return Err(StoreError::Unsafe);
-    }
-    Ok(conn)
+    conn.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
+    Ok(())
 }
 
 /// Shared existing-authority validation, never bootstrap/migration/repair.
@@ -619,13 +643,6 @@ fn existing_authority(
     if record.version != 1 || !record.initialized || record.store != dir {
         return Err(StoreError::Unsafe);
     }
-    // Recovery may open existing files read-write (including WAL bookkeeping),
-    // but only after validating initialized authority intent; never CREATE.
-    let _registry_writer = if writable {
-        Some(database(registry, "authorities.sqlite", false)?)
-    } else {
-        None
-    };
     let reg = existing_database(registry, "authorities.sqlite")?;
     let mut stmt = reg.prepare("SELECT root,store FROM authorities LIMIT 1025")?;
     let mut rows = stmt.query([])?;
@@ -650,15 +667,26 @@ fn existing_authority(
     {
         return Err(StoreError::Unsafe);
     }
-    let writer = if writable {
-        Some(database(dir, "store.sqlite", false)?)
-    } else {
-        None
-    };
     let conn = existing_database(dir, "store.sqlite")?;
     conn.execute_batch("BEGIN;")?;
-    // Mutable recovery rechecks exact metadata under its IMMEDIATE close lock.
-    Ok((writer.unwrap_or(conn), output_bytes))
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if writable && version != 5 {
+        return Err(StoreError::UpgradeRequired);
+    }
+    validate_existing_schema(&conn, version)?;
+    if writable {
+        // Complete the bounded read-only preflight before any mutable open.
+        // In particular, do not switch a rejected DELETE-mode DB into WAL.
+        drop(rows);
+        drop(stmt);
+        drop(reg);
+        drop(conn);
+        let writer = database(dir, "store.sqlite", false)?;
+        query_protections(&writer)?;
+        Ok((writer, output_bytes))
+    } else {
+        Ok((conn, output_bytes))
+    }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
     if version >= 2 {

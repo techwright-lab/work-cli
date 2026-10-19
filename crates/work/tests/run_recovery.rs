@@ -1,6 +1,188 @@
 #[path = "support/run_fixture.rs"]
 mod support;
 use support::*;
+#[path = "support/lifecycle_regressions.rs"]
+mod regressions;
+
+#[test]
+fn ordinary_lifecycle_status_reads_committed_wal_without_keepers_or_mutation() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    let config = work_cli::config::Config {
+        trusted_registry: Some(dir.path().join(".work-authorities")),
+        store_dir: Some(dir.path().join("private")),
+        roots: vec![dir.path().join("root")],
+        ..Default::default()
+    };
+    let id = uuid::Uuid::parse_str(&r.identity().run.to_string()).unwrap();
+    let n = store.pending_events(100).unwrap().len();
+    // Registry is already closed, while the store's committed intent is in WAL.
+    let before = regressions::files(dir.path());
+    assert!(work_cli::run_recovery::command_status(&config, id).is_ok());
+    assert!(regressions::files(dir.path()) == before);
+    drop(store);
+    let before = regressions::files(dir.path());
+    for _ in 0..2 {
+        let report = work_cli::run_recovery::command_status(&config, id).unwrap();
+        assert!(report.record.request == r);
+        assert!(!report.record.closed);
+        assert!(regressions::files(dir.path()) == before);
+    }
+    let reader = work_cli::store::Store::open_existing_registered_readonly(
+        config.trusted_registry.as_ref().unwrap(),
+        config.store_dir.as_ref().unwrap(),
+        &config.roots,
+    )
+    .unwrap();
+    assert_eq!(reader.pending_events(100).unwrap().len(), n);
+}
+
+#[test]
+fn accepted_large_requests_remain_readable_through_historical_recovery() {
+    for (scalar, entries) in [("x", 1), ("x", 32), ("\"", 32), ("\u{10000}", 32)] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        let text = scalar.repeat(4096);
+        let chain = vec![
+            serde_json::json!({"kind":"executor", "system":text, "session_ref":text});
+            entries
+        ];
+        let r = changed(&r, "execution_chain", serde_json::json!(chain));
+        let bytes = serde_json::to_vec(&r).unwrap().len();
+        assert!(bytes > 8192);
+        assert_eq!(bytes > 16384, entries > 1);
+        store.begin_run(&r).unwrap();
+        assert_eq!(store.begin_run(&r).unwrap(), BeginRun::Existing);
+        let b = binding(&r);
+        store.record_bound(&r, &b).unwrap();
+        assert!(
+            store
+                .run_snapshot(&r.identity().run)
+                .unwrap()
+                .unwrap()
+                .request
+                == r
+        );
+        let os = ClosureOs::new(&r, &b);
+        drop(store);
+        let mut store = work_cli::store::Store::open_existing_registered_mut(
+            &dir.path().join(".work-authorities"),
+            &dir.path().join("private"),
+            &[dir.path().join("root")],
+        )
+        .unwrap();
+        assert!(
+            work_cli::run_recovery::status(&store, &r.identity().run)
+                .unwrap()
+                .record
+                .request
+                == r
+        );
+        assert_eq!(
+            recover(&mut store, &r.identity().run, &os.driver).unwrap(),
+            RecoveryState::Closed
+        );
+        drop(store);
+        let reader = work_cli::store::Store::open_existing_registered_readonly(
+            &dir.path().join(".work-authorities"),
+            &dir.path().join("private"),
+            &[dir.path().join("root")],
+        )
+        .unwrap();
+        assert!(
+            work_cli::run_recovery::status(&reader, &r.identity().run)
+                .unwrap()
+                .record
+                .request
+                == r
+        );
+    }
+}
+
+#[test]
+fn rejected_authority_never_changes_delete_mode_database_or_entries() {
+    for case in ["claims", "v4", "schema"] {
+        let (dir, store, _) = fixture();
+        drop(store);
+        let registry = dir.path().join(".work-authorities");
+        let private = dir.path().join("private");
+        let reg = rusqlite::Connection::open(registry.join("authorities.sqlite")).unwrap();
+        if case == "claims" {
+            reg.execute("UPDATE authorities SET store='wrong'", [])
+                .unwrap();
+        }
+        reg.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        drop(reg);
+        let sql = rusqlite::Connection::open(private.join("store.sqlite")).unwrap();
+        match case {
+            "v4" => sql.execute_batch("PRAGMA user_version=4").unwrap(),
+            "schema" => sql.execute_batch("DROP TABLE runs").unwrap(),
+            _ => (),
+        }
+        sql.execute_batch("PRAGMA journal_mode=DELETE").unwrap();
+        drop(sql);
+        let before = regressions::files(dir.path());
+        assert!(work_cli::store::Store::open_existing_registered_mut(
+            &registry,
+            &private,
+            &[dir.path().join("root")],
+        )
+        .is_err());
+        assert!(regressions::files(dir.path()) == before, "{case}");
+    }
+}
+
+#[test]
+fn existing_recovery_writer_bounds_queries_but_not_os_inspection_age() {
+    for expensive in [false, true] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        store.begin_run(&r).unwrap();
+        let b = binding(&r);
+        store.record_bound(&r, &b).unwrap();
+        let os = ClosureOs::new(&r, &b);
+        drop(store);
+        if expensive {
+            let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+            sql.execute_batch("ALTER TABLE writers RENAME TO real_writers;
+                CREATE VIEW writers AS SELECT * FROM real_writers WHERE
+                (WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<2000000) SELECT sum(x) FROM n)>0;").unwrap();
+            // Do not let a test-only client remove the legitimate bookkeeping.
+            sql.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+        } else {
+            std::fs::write(
+                os.tmp.path().join("manager"),
+                format!(
+                    "#!/bin/sh\n/usr/bin/sleep 0.35\nexec /usr/bin/cat '{}'\n",
+                    os.tmp.path().join("properties").display(),
+                ),
+            )
+            .unwrap();
+        }
+        let mut store = work_cli::store::Store::open_existing_registered_mut(
+            &dir.path().join(".work-authorities"),
+            &dir.path().join("private"),
+            &[dir.path().join("root")],
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        if expensive {
+            assert!(
+                store.group_snapshot(&r.identity().run).is_err(),
+                "expensive schema query must be interrupted"
+            );
+        } else {
+            let result = recover(&mut store, &r.identity().run, &os.driver);
+            assert_eq!(result.unwrap(), RecoveryState::Closed);
+            assert!(started.elapsed() > std::time::Duration::from_millis(500));
+        }
+    }
+}
 use work_cli::{
     run_journal::BeginRun,
     run_recovery::{recover, RecoveryState},
@@ -153,16 +335,7 @@ fn public_historical_commands_need_no_old_actor_profile_or_runtime_for_receipts(
         work_cli::run_recovery::command_recover(&config, id).unwrap(),
         RecoveryState::AlreadyClosed
     );
-    // Keep valid pre-existing sidecars for strict read-only status (no creation).
-    let reg = rusqlite::Connection::open(dir.path().join(".work-authorities/authorities.sqlite"))
-        .unwrap();
-    reg.query_row("SELECT count(*) FROM authorities", [], |r| {
-        r.get::<_, i64>(0)
-    })
-    .unwrap();
-    let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
-        .unwrap();
+    // No keeper connections: normal writable lifecycle must retain bookkeeping.
     let config_path = dir.path().join("config.toml");
     let config_text = format!(
         "store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\n",

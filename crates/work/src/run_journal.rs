@@ -359,14 +359,9 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
     })())
 }
 fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
-    // Bound serialized metadata before SQLite copies it into application memory.
-    let bounded: Option<bool> = conn.query_row(
-        "SELECT length(CAST(request AS BLOB))<=16384 AND coalesce(length(CAST(binding AS BLOB)),0)<=4096 AND coalesce(length(CAST(outcome AS BLOB)),0)<=64 AND length(run_ref)<=512 FROM runs WHERE id=?1",
-        [run.to_string()], |r| r.get(0),
-    ).optional()?;
-    if bounded == Some(false) {
-        return Err(StoreError::Invalid);
-    }
+    crate::store::sql_phase(conn)?;
+    // Typed domain validation is shared with admission. Historical reads must
+    // not impose a smaller serialized size than previously accepted requests.
     conn.query_row(
         &format!("{SELECT} WHERE r.id=?1"),
         [run.to_string()],
@@ -398,6 +393,7 @@ impl Store {
     /// ONE IMMEDIATE transaction. No OS calls occur inside it. On any error,
     /// including uncertain commit durability, recover by RunId; never launch.
     pub fn begin_run(&mut self, request: &RootRunRequest) -> Result<BeginRun> {
+        crate::store::sql_phase(&self.conn)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -497,6 +493,7 @@ impl Store {
     /// Only unresolved groups; closed roots remain historical receipts.
     /// No heartbeat/reboot inference, no reconstructed runtime authority.
     pub fn recovery_runs(&self) -> Result<Vec<RunRecord>> {
+        crate::store::sql_phase(&self.conn)?;
         let mut stmt = self.conn.prepare(&format!("{SELECT} ORDER BY r.rowid"))?;
         let rows = stmt.query_map([], read_row)?;
         // Validate historical receipts too: a malformed closed flag must never
@@ -525,6 +522,7 @@ impl Store {
         snapshot: &GroupSnapshot,
         proof: &GroupEmptyProof,
     ) -> Result<Transition> {
+        crate::store::sql_phase(&self.conn)?;
         if snapshot.record != proof.record {
             return Err(StoreError::Conflict);
         }
@@ -575,6 +573,7 @@ impl Store {
         Ok(Transition::Changed)
     }
     fn transition(&mut self, request: &RootRunRequest, change: Change) -> Result<Transition> {
+        crate::store::sql_phase(&self.conn)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
