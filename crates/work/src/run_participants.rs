@@ -558,9 +558,6 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let record = crate::run_journal::exact(&tx, root)?;
-        if record.closed {
-            return Err(StoreError::Invalid);
-        }
         if let Some(existing) = record
             .children
             .iter()
@@ -572,7 +569,8 @@ impl Store {
                 Err(StoreError::Conflict)
             };
         }
-        if record.stage != crate::run_journal::RunStage::PermitAttempt
+        if record.closed
+            || record.stage != crate::run_journal::RunStage::PermitAttempt
             || request.checkout != root.identity().checkout
             || request.group != root.identity().group
             || record.children.len() >= 256
@@ -641,9 +639,6 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let record = crate::run_journal::exact(&tx, root)?;
-        if record.closed {
-            return Err(StoreError::Invalid);
-        }
         let child = record
             .children
             .iter()
@@ -652,14 +647,19 @@ impl Store {
         if &child.request != request {
             return Err(StoreError::Conflict);
         }
+        // Exact declared-outcome receipts are metadata even after closure.
+        // Holds and new outcomes still require an open group.
+        if let (Some(outcome), Some(existing)) = (outcome, child.outcome) {
+            return if existing == outcome {
+                Ok(Transition::Existing)
+            } else {
+                Err(StoreError::Conflict)
+            };
+        }
+        if record.closed {
+            return Err(StoreError::Invalid);
+        }
         let kind = if let Some(outcome) = outcome {
-            if let Some(existing) = child.outcome {
-                return if existing == outcome {
-                    Ok(Transition::Existing)
-                } else {
-                    Err(StoreError::Conflict)
-                };
-            }
             tx.execute(
                 "UPDATE run_participants SET outcome=?2 WHERE id=?1",
                 (request.run.to_string(), crate::adopted::json(&outcome)?),

@@ -32,7 +32,7 @@ enum Command {
         #[arg(long)]
         run: Option<uuid::Uuid>,
     },
-    /// Try fresh ROOT-ONLY writer handoff; never launch, signal, finish or uncharge
+    /// Try fresh full-roster supervised writer handoff; never launch, signal, finish or uncharge
     Recover {
         #[arg(value_name = "run-id")]
         run: uuid::Uuid,

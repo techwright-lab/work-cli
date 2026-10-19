@@ -3,10 +3,10 @@ mod support;
 use rusqlite::Connection;
 use support::*;
 use work_cli::{
-    run_journal::{RootRunRequest, Transition},
+    run_journal::{BeginRun, RootRunRequest, Transition},
     run_participants::{ChildOutcome, ChildRequest, ExpectedHost},
     runtime_scope::Binding,
-    store::Store,
+    store::{Store, StoreError},
 };
 use work_contract::{RunId, RunRef};
 
@@ -73,6 +73,121 @@ fn enroll(
         .replace("ActiveState=active", "ActiveState=inactive");
     std::fs::write(properties, text).unwrap();
     c
+}
+#[test]
+fn closed_declared_child_retries_are_metadata_only_and_preserve_new_writer() {
+    for outcome in [
+        ChildOutcome::Completed,
+        ChildOutcome::Failed,
+        ChildOutcome::Cancelled,
+    ] {
+        let (dir, mut store, r, b, os) = setup();
+        let c = enroll(&mut store, &r, &b, &os, 43, 20);
+        store.record_child_outcome(&r, &c, outcome).unwrap();
+        let snap = store.group_snapshot(&r.identity().run).unwrap();
+        let proof = snap.certify_empty(&os.driver, &b).unwrap();
+        store.close_supervised_group(&snap, &proof).unwrap();
+        let after = store.run_snapshot(&r.identity().run).unwrap();
+        let next = request(uuid::Uuid::parse_str(&r.identity().checkout.to_string()).unwrap());
+        store.begin_run(&next).unwrap();
+        let events = store.pending_events(100).unwrap();
+        let allocation = allocation_rows(&dir);
+        // Metadata receipts require neither fresh kernel evidence nor the old writer.
+        std::fs::remove_file(os.tmp.path().join("properties")).unwrap();
+        assert_eq!(
+            store.record_child_outcome(&r, &c, outcome).unwrap(),
+            Transition::Existing
+        );
+        assert_eq!(store.register_child(&r, &c).unwrap(), BeginRun::Existing);
+        for other in [
+            ChildOutcome::Completed,
+            ChildOutcome::Failed,
+            ChildOutcome::Cancelled,
+            ChildOutcome::Interrupted,
+        ] {
+            if other != outcome {
+                if other == ChildOutcome::Interrupted {
+                    assert!(matches!(
+                        store.record_child_outcome(&r, &c, other),
+                        Err(StoreError::Invalid)
+                    ));
+                } else {
+                    assert!(matches!(
+                        store.record_child_outcome(&r, &c, other),
+                        Err(StoreError::Conflict)
+                    ));
+                }
+            }
+        }
+        assert!(store.record_child_hold(&r, &c).is_err());
+        for mismatch in ["new", "parent", "parent_ref", "ref", "actor", "host"] {
+            let mut changed = c.clone();
+            match mismatch {
+                "new" => {
+                    changed.run = RunId::generate();
+                    changed.run_ref = RunRef::parse("new-child").unwrap();
+                }
+                "parent" => changed.parent_run = RunId::generate(),
+                "parent_ref" => changed.parent_run_ref = RunRef::parse("wrong-parent").unwrap(),
+                "ref" => changed.run_ref = RunRef::parse("wrong-child").unwrap(),
+                "actor" => {
+                    changed.actor =
+                        Some(serde_json::from_value(serde_json::json!("other-actor")).unwrap())
+                }
+                "host" => changed.expected_host.as_mut().unwrap().start_ticks += 1,
+                _ => unreachable!(),
+            }
+            if mismatch == "new" {
+                assert!(matches!(
+                    store.register_child(&r, &changed),
+                    Err(StoreError::Invalid)
+                ));
+            } else {
+                assert!(
+                    matches!(
+                        store.register_child(&r, &changed),
+                        Err(StoreError::Conflict)
+                    ),
+                    "{mismatch}"
+                );
+            }
+            assert!(
+                store.record_child_outcome(&r, &changed, outcome).is_err(),
+                "{mismatch}"
+            );
+        }
+        assert_eq!(store.pending_events(100).unwrap(), events);
+        assert_eq!(store.run_snapshot(&r.identity().run).unwrap(), after);
+        assert_eq!(allocation_rows(&dir), allocation);
+        assert_eq!(store.charged(&dir.path().join("root"), None).unwrap(), 1);
+        assert!(store
+            .begin_run(&request(
+                uuid::Uuid::parse_str(&r.identity().checkout.to_string()).unwrap()
+            ))
+            .is_err());
+        assert_eq!(
+            reopen(&dir)
+                .unwrap()
+                .run_snapshot(&r.identity().run)
+                .unwrap(),
+            after
+        );
+        assert!(
+            work_cli::run_recovery::status(&store, &r.identity().run)
+                .unwrap()
+                .record
+                .closed
+        );
+        assert_eq!(
+            work_cli::run_recovery::recover(&mut store, &r.identity().run, &os.driver).unwrap(),
+            work_cli::run_recovery::RecoveryState::AlreadyClosed
+        );
+        assert!(!store
+            .recovery_runs()
+            .unwrap()
+            .iter()
+            .any(|record| record.request.identity().run == r.identity().run));
+    }
 }
 fn allocation_rows(dir: &tempfile::TempDir) -> Vec<Vec<rusqlite::types::Value>> {
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
@@ -174,6 +289,30 @@ fn full_roster_disappearance_interrupts_only_open_children_and_exact_retry_prese
         assert_eq!(
             store.close_supervised_group(&snap, &proof).unwrap(),
             Transition::Existing
+        );
+        assert_eq!(store.register_child(&r, &open).unwrap(), BeginRun::Existing);
+        for outcome in [
+            ChildOutcome::Completed,
+            ChildOutcome::Failed,
+            ChildOutcome::Cancelled,
+            ChildOutcome::Interrupted,
+        ] {
+            if outcome == ChildOutcome::Interrupted {
+                assert!(matches!(
+                    store.record_child_outcome(&r, &open, outcome),
+                    Err(StoreError::Invalid)
+                ));
+            } else {
+                assert!(matches!(
+                    store.record_child_outcome(&r, &open, outcome),
+                    Err(StoreError::Conflict)
+                ));
+            }
+        }
+        assert!(store.record_child_hold(&r, &open).is_err());
+        assert_eq!(
+            store.run_snapshot(&r.identity().run).unwrap().unwrap(),
+            after
         );
         assert_eq!(store.pending_events(100).unwrap(), events);
         assert!(store
@@ -379,7 +518,11 @@ fn closed_full_roster_history_validates_before_any_receipt_filtering() {
         "open_interrupted",
     ] {
         let (dir, mut store, r, b, os) = setup();
-        enroll(&mut store, &r, &b, &os, 43, 20);
+        let c = enroll(&mut store, &r, &b, &os, 43, 20);
+        let declared = enroll(&mut store, &r, &b, &os, 44, 30);
+        store
+            .record_child_outcome(&r, &declared, ChildOutcome::Completed)
+            .unwrap();
         let snap = store.group_snapshot(&r.identity().run).unwrap();
         let proof = snap
             .certify_empty(&os.driver, &b)
@@ -442,6 +585,13 @@ fn closed_full_roster_history_validates_before_any_receipt_filtering() {
         }
         assert!(
             store.close_supervised_group(&snap, &proof).is_err(),
+            "{case}"
+        );
+        assert!(store.register_child(&r, &c).is_err(), "{case}");
+        assert!(
+            store
+                .record_child_outcome(&r, &declared, ChildOutcome::Completed)
+                .is_err(),
             "{case}"
         );
         if case != "context" {

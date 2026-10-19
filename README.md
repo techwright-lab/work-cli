@@ -183,7 +183,7 @@ changed immutable inputs conflict. Existing receipts retain original group/conte
 Intent and writer commit before launching. Bound metadata and permit-attempt commit
 separately before gate publication. Root Completed/Failed/Cancelled status is separate
 from writer closure: only fresh, complete whole-scope emptiness against the exact
-scope identity and current root roster/revision can release that group's writer.
+scope identity and current full contained roster/revision can release that group's writer.
 Uncertain evidence or surviving descendants retain a held writer under finite policy.
 A closed group permits a sequential run without another checkout charge. Lease charges
 and task openness are never released here. Capture_sink remains unsupported and fails
@@ -197,16 +197,20 @@ D-state can make owned-child kill/reaping unbounded despite finite userspace pol
 An owned process group isolates non-terminal protocols; interactive TTY/job-control
 has not been qualified and terminal stdio is explicitly refused.
 
-`work recover <uuidv7>` explicitly tries ROOT-ONLY writer handoff after controller loss.
-Store-validated historical scope metadata is only a non-executing candidate for fresh
-manager/boot/invocation/cgroup and double recursive/PID-start inspection. It never
+`work recover <uuidv7>` explicitly tries full-roster supervised writer handoff after
+controller loss. Store-validated historical scope and contained-host metadata are only
+non-executing candidates for fresh kernel-backed manager/boot/invocation/cgroup and
+double recursive/PID-start inspection. Every recorded actual host, including declared
+terminal children, must be freshly absent; pending/unverified or unknown evidence holds.
+Closure atomically records Interrupted only for proven-lost open contained children,
+without fabricating root or declared child outcomes. It never
 reconstructs an execution Binding. Reaped scopes require an explicit inactive/not-found
 manager result and confirmed absence of the exact old cgroup. Live/uncertain, reused or
 escaped PIDs, replacement invocations, unknown queries and boot changes retain the
 writer and charges without fabricating a root outcome or refreshing a heartbeat.
 Unbound intents and legacy bare writers cannot be closed. Already-closed receipts
 require no runtime inspection and cannot remove a subsequent run's writer.
-Recovery never launches, signals, kills, finishes a task, deletes or uncharges.
+Recovery never launches, signals, kills, finishes a task, deletes, uncharges or retires.
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
@@ -226,11 +230,13 @@ Supervised closure covers the full enrolled host roster; adopted participants ca
 The library-only `Store::register_child(root, ChildRequest)` now records an immutable
 supervised child intent before inspection, bumps group revision/child count and appends
 an outbox event in the same IMMEDIATE transaction. Exact retries validate the entire
-child tree without grants/events. It requires the exact open writer and permitted root,
+child tree without grants/events, including after closure. New registration requires
+the exact open writer and permitted root,
 explicit known parent run/ref, same checkout/group, at most 16 levels and 256 children.
 Late metadata remains accepted after root/parent logical completion or a recovery hold
 while the permitted group is open; it preserves those outcomes/holds and invalidates
-older empty proofs. Closed groups reject registration. Child run IDs also cannot become
+older empty proofs. Closed groups reject new children and changed requests, but acknowledge
+exact known-child requests as metadata only. Child run IDs also cannot become
 legacy writer groups or reservation operation IDs, including on exact retries.
 Child Work IDs/refs share the root/adopted/operation/group namespace. Optional actual
 source/session/agent/actor references remain unknown when absent. Expected boot/PID/start
@@ -241,6 +247,10 @@ This is a conservative partial Task6 increment: expected-host children start `pe
 children without an expected host start `unverified`, and `record_child_hold` only tightens
 pending or contained to unverified (retaining prior enrollment audit). `record_child_outcome` records immutable/idempotent declared
 Completed/Failed/Cancelled, never caller-declared Interrupted or physical absence.
+Exact declared-outcome retries remain metadata-only Existing after closure; different
+outcomes conflict (including attempts to override kernel Interrupted). Closed groups
+reject new outcomes and holds. These receipts grant no launch or writer permission,
+perform no fresh kernel inspection and cannot release a newer run's writer.
 Every accepted change bumps revision; no writer, charge, task or checkout state changes.
 Full child requests and parent trees are validated in one SQLite snapshot on root
 lookup/retry/status/recovery. Missing ledger rows, orphan/corrupt metadata and versioned
@@ -402,7 +412,8 @@ exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even a
 logical closures never release the adopted writer, finish a task, change checkout
 state or uncharge it. The writer remains explicitly held until a future qualified
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
-and `work recover` remain supervised-only; registered supervised children block handoff.
+and `work recover` remain supervised-only; the full contained supervised roster requires
+fresh whole-group kernel proof, while pending/unverified children block handoff.
 Use `work adopt status` for adopted metadata. Existing-authority reads require schema v8.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
@@ -414,8 +425,11 @@ string-valued request/event/parent JSON remains compatible without row rewrites.
 
 Actual runtime-hook payload-to-stable-ID mapping, installation and fork coverage
 qualification belong to Task 13 and are not implemented. Positive supervised child
-containment/closure proof remains the next Task6 library slice, before child CLI routing;
-this journal does not complete Task6.
+containment and full-roster closure proof are implemented in the library; child metadata
+CLI/native hook routing remains unimplemented. Earlier root-only recovery and all-child
+barrier increments were intentionally narrower historical stages, not current limits.
+Writer release is not task completion, uncharging or retirement; this journal does not
+complete Task6.
 
 ## Requirements
 
