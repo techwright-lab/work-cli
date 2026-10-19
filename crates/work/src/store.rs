@@ -9,7 +9,8 @@ use std::{
     io::Write,
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -35,6 +36,7 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     pub(crate) conn: Connection,
+    budget: SqlBudget,
 }
 
 // Linux filesystem magic allowlist: ext, Btrfs, XFS, tmpfs and local
@@ -256,6 +258,9 @@ fn roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 impl Store {
+    pub(crate) fn sql_phase(&self) -> SqlPhase {
+        self.budget.enter()
+    }
     /// Existing authority only. No bootstrap, schema migration, event writes or
     /// repair; reads committed WAL through SQLite's ordinary read-only mode.
     pub fn open_existing_registered_readonly(
@@ -263,13 +268,14 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, _) = existing_authority(registry, dir, managed, false)?;
+        let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
+        let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 5 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
-        Ok(Self { conn })
+        Ok(Self { conn, budget })
     }
     /// Recovery can mutate an established v5 authority only; never initializes
     /// an empty authority for an unknown RunId or upgrades historical schemas.
@@ -278,13 +284,14 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, _) = existing_authority(registry, dir, managed, true)?;
+        let (conn, budget, _) = existing_authority(registry, dir, managed, true)?;
+        let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 5 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
-        Ok(Self { conn })
+        Ok(Self { conn, budget })
     }
     /// Uses `.work-authorities` at the store's parent as the trusted registry,
     /// permitting only one authoritative store there, even for disjoint roots.
@@ -460,14 +467,17 @@ impl Store {
             persist_initialization(&registry, &record)?;
         }
         initialization_boundary("initialized");
-        Ok(Self { conn })
+        let budget = SqlBudget::install(&conn)?;
+        Ok(Self { conn, budget })
     }
     pub fn charged(&self, repository: &Path, owner: Option<&str>) -> Result<u64> {
         let repo = canonical(repository)?;
+        let _phase = self.sql_phase();
         count(&self.conn, &repo, owner)
     }
     pub fn find_reusable(&self, actor: &str, repository: &Path, task: &str) -> Result<Vec<Uuid>> {
         let repo = canonical(repository)?;
+        let _phase = self.sql_phase();
         let mut stmt = self.conn.prepare("SELECT id FROM checkouts c WHERE actor=?1 AND COALESCE((SELECT common FROM repository_aliases WHERE alias=c.repository),c.repository)=COALESCE((SELECT common FROM repository_aliases WHERE alias=?2),?2) AND task=?3 AND state!='retired' ORDER BY rowid")?;
         let ids = stmt
             .query_map((actor, repo, task), |r| r.get::<_, String>(0))?
@@ -480,6 +490,7 @@ impl Store {
         if group.get_version_num() != 7 || group.get_variant() != uuid::Variant::RFC4122 {
             return Err(StoreError::Invalid);
         }
+        let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -488,6 +499,7 @@ impl Store {
         Ok(())
     }
     pub fn pending_events(&self, limit: usize) -> Result<Vec<PendingEvent>> {
+        let _phase = self.sql_phase();
         let mut stmt = self.conn.prepare(
             "SELECT sequence,payload FROM outbox WHERE acknowledged=0 ORDER BY sequence LIMIT ?1",
         )?;
@@ -502,6 +514,7 @@ impl Store {
         .collect()
     }
     pub fn acknowledge(&mut self, sequence: i64) -> Result<()> {
+        let _phase = self.sql_phase();
         self.conn.execute(
             "UPDATE outbox SET acknowledged=1 WHERE sequence=?1",
             [sequence],
@@ -534,7 +547,7 @@ fn existing_directory(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
+fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> {
     existing_directory(dir)?;
     let path = dir.join(name);
     check_file(&path)?;
@@ -583,6 +596,8 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
         true,
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
+    let budget = SqlBudget::install(&conn)?;
+    let _phase = budget.enter();
     query_protections(&conn)?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -591,25 +606,59 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     {
         return Err(StoreError::Unsafe);
     }
-    Ok(conn)
+    Ok((conn, budget))
 }
 
-// Install a fresh budget at each SQL phase, not at connection lifetime: valid
-// runtime inspection between phases may take longer than a database deadline.
-pub(crate) fn sql_phase(conn: &Connection) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    let mut ticks = 0u32;
-    conn.progress_handler(
-        1000,
-        Some(move || {
-            ticks += 1;
-            ticks >= 200 || std::time::Instant::now() >= deadline
-        }),
-    )?;
-    Ok(())
+// The installed callback is inert outside a SQL operation. Guards own cloned
+// state, not a Connection borrow, so IMMEDIATE transactions remain available.
+// Nested phases share the outer deadline and instruction allowance.
+#[derive(Clone, Default)]
+struct SqlBudget(Arc<Mutex<BudgetState>>);
+#[derive(Default)]
+struct BudgetState {
+    depth: usize,
+    deadline: Option<Instant>,
+    ticks: u32,
+}
+pub(crate) struct SqlPhase(SqlBudget);
+impl SqlBudget {
+    fn install(conn: &Connection) -> Result<Self> {
+        let budget = Self::default();
+        let callback = budget.clone();
+        conn.progress_handler(
+            1000,
+            Some(move || {
+                let mut state = callback.0.lock().unwrap_or_else(|e| e.into_inner());
+                if state.depth == 0 {
+                    return false;
+                }
+                state.ticks = state.ticks.saturating_add(1);
+                state.ticks >= 200 || state.deadline.is_some_and(|d| Instant::now() >= d)
+            }),
+        )?;
+        Ok(budget)
+    }
+    fn enter(&self) -> SqlPhase {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if state.depth == 0 {
+            state.deadline = Some(Instant::now() + Duration::from_millis(500));
+            state.ticks = 0;
+        }
+        state.depth += 1;
+        SqlPhase(self.clone())
+    }
+}
+impl Drop for SqlPhase {
+    fn drop(&mut self) {
+        let mut state = self.0 .0.lock().unwrap_or_else(|e| e.into_inner());
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.deadline = None;
+            state.ticks = 0;
+        }
+    }
 }
 fn query_protections(conn: &Connection) -> Result<()> {
-    sql_phase(conn)?;
     // Composite SQLite rows must accommodate the full legal UTF-8/JSON domain,
     // not just short CLI examples. The file budget already bounds total input.
     conn.set_limit(
@@ -630,7 +679,7 @@ fn existing_authority(
     dir: &Path,
     managed: &[PathBuf],
     writable: bool,
-) -> Result<(Connection, usize)> {
+) -> Result<(Connection, SqlBudget, usize)> {
     existing_directory(registry)?;
     existing_directory(dir)?;
     let marker = registry.join("initialization.json");
@@ -643,7 +692,8 @@ fn existing_authority(
     if record.version != 1 || !record.initialized || record.store != dir {
         return Err(StoreError::Unsafe);
     }
-    let reg = existing_database(registry, "authorities.sqlite")?;
+    let (reg, reg_budget) = existing_database(registry, "authorities.sqlite")?;
+    let _reg_phase = reg_budget.enter();
     let mut stmt = reg.prepare("SELECT root,store FROM authorities LIMIT 1025")?;
     let mut rows = stmt.query([])?;
     let mut claims = Vec::new();
@@ -667,7 +717,8 @@ fn existing_authority(
     {
         return Err(StoreError::Unsafe);
     }
-    let conn = existing_database(dir, "store.sqlite")?;
+    let (conn, budget) = existing_database(dir, "store.sqlite")?;
+    let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if writable && version != 5 {
@@ -682,10 +733,12 @@ fn existing_authority(
         drop(reg);
         drop(conn);
         let writer = database(dir, "store.sqlite", false)?;
+        let writer_budget = SqlBudget::install(&writer)?;
+        let _writer_phase = writer_budget.enter();
         query_protections(&writer)?;
-        Ok((writer, output_bytes))
+        Ok((writer, writer_budget, output_bytes))
     } else {
-        Ok((conn, output_bytes))
+        Ok((conn, budget, output_bytes))
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
@@ -709,7 +762,8 @@ fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
 }
 /// Strict bounded accounting report using the same existing authority reader.
 pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Vec<Charge>> {
-    let (conn, mut output_bytes) = existing_authority(registry, dir, managed, false)?;
+    let (conn, budget, mut output_bytes) = existing_authority(registry, dir, managed, false)?;
+    let _phase = budget.enter();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     validate_existing_schema(&conn, version)?;
     // Bound aggregate input before SQLite allocates its in-memory sorter.
@@ -861,6 +915,58 @@ pub(crate) fn identity(value: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    const SCAN: &str = "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n";
+
+    #[test]
+    fn nested_sql_phases_share_instruction_budget_and_disarm_on_unwind() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::Store>();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let budget = super::SqlBudget::install(&conn).unwrap();
+        let scan = || conn.query_row(SCAN, [], |r| r.get::<_, i64>(0));
+        let outer = budget.enter();
+        scan().unwrap();
+        let inner = budget.enter();
+        scan().unwrap();
+        drop(inner);
+        assert!(
+            matches!(scan(), Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted)
+        );
+        drop(outer);
+        scan().unwrap();
+        // An error/early return or panic cannot strand an active phase.
+        let fail = || -> super::Result<()> {
+            let _phase = budget.enter();
+            Err(super::StoreError::Invalid)
+        };
+        assert!(fail().is_err());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _phase = budget.enter();
+            panic!("fixture unwind");
+        }));
+        assert_eq!(budget.0.lock().unwrap().depth, 0);
+        assert!(budget.0.lock().unwrap().deadline.is_none());
+        let _fresh = budget.enter();
+        scan().unwrap();
+    }
+
+    #[test]
+    fn nested_sql_phases_cannot_reset_deadline_or_disarm_outer_phase() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let budget = super::SqlBudget::install(&conn).unwrap();
+        let outer = budget.enter();
+        std::thread::sleep(std::time::Duration::from_millis(650));
+        let inner = budget.enter();
+        for phase in [inner, outer] {
+            assert!(matches!(conn.query_row(SCAN, [], |r| r.get::<_, i64>(0)),
+                Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted));
+            drop(phase);
+        }
+        // Outside a phase even a query exceeding the instruction cap is inert.
+        conn.query_row(&SCAN.replace("5000", "20000"), [], |r| r.get::<_, i64>(0))
+            .unwrap();
+    }
+
     #[test]
     fn initialization_worker() {
         let Ok(base) = std::env::var("WORK_INIT_TEST_BASE") else {

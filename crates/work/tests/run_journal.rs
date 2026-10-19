@@ -10,6 +10,76 @@ mod fixture_support;
 use fixture_support::*;
 
 #[test]
+fn lifecycle_sql_budget_does_not_charge_later_accounting_for_idle_time() {
+    let (dir, mut store, checkout) = fixture();
+    let root = dir.path().join("root");
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .unwrap();
+    // Valid rows force progress callbacks in ordinary accounting/outbox scans.
+    for _ in 0..300 {
+        sql.execute("INSERT INTO checkouts SELECT ?1,?2,digest,repository,actor,task,owner,state,ready FROM checkouts WHERE id=?3",
+            (Uuid::now_v7().to_string(), Uuid::now_v7().to_string(), checkout.to_string())).unwrap();
+    }
+    sql.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<600) INSERT INTO outbox(version,payload,acknowledged) SELECT version,payload,1 FROM outbox,n LIMIT 600;").unwrap();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    let group = Uuid::parse_str(&r.identity().group.to_string()).unwrap();
+    for _ in 0..2 {
+        for operation in [
+            "charged",
+            "find_reusable",
+            "pending_events",
+            "acquire_writer",
+        ] {
+            store.run_snapshot(&r.identity().run).unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(650));
+            match operation {
+                "charged" => assert_eq!(store.charged(&root, None).unwrap(), 301),
+                "find_reusable" => assert_eq!(
+                    store
+                        .find_reusable("allocator", &root, "task")
+                        .unwrap()
+                        .len(),
+                    301
+                ),
+                "pending_events" => assert!(!store.pending_events(1000).unwrap().is_empty()),
+                "acquire_writer" => store.acquire_writer(checkout, group).unwrap(),
+                _ => unreachable!(),
+            }
+        }
+    }
+    // Constructors must not return their bounded preflight deadline still armed.
+    for writable in [false, true] {
+        let registry = dir.path().join(".work-authorities");
+        let private = dir.path().join("private");
+        let reopened = if writable {
+            Store::open_existing_registered_mut(&registry, &private, std::slice::from_ref(&root))
+        } else {
+            Store::open_existing_registered_readonly(
+                &registry,
+                &private,
+                std::slice::from_ref(&root),
+            )
+        }
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(650));
+        assert_eq!(reopened.charged(&root, None).unwrap(), 301);
+        assert_eq!(
+            reopened
+                .find_reusable("allocator", &root, "task")
+                .unwrap()
+                .len(),
+            301
+        );
+        assert!(!reopened.pending_events(1000).unwrap().is_empty());
+    }
+}
+
+#[test]
 fn fresh_root_only_proof_hands_off_writer_without_finishing_or_releasing_charge() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);

@@ -359,7 +359,6 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
     })())
 }
 fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
-    crate::store::sql_phase(conn)?;
     // Typed domain validation is shared with admission. Historical reads must
     // not impose a smaller serialized size than previously accepted requests.
     conn.query_row(
@@ -393,7 +392,7 @@ impl Store {
     /// ONE IMMEDIATE transaction. No OS calls occur inside it. On any error,
     /// including uncertain commit durability, recover by RunId; never launch.
     pub fn begin_run(&mut self, request: &RootRunRequest) -> Result<BeginRun> {
-        crate::store::sql_phase(&self.conn)?;
+        let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -464,9 +463,11 @@ impl Store {
         self.transition(request, Change::Hold)
     }
     pub fn run_snapshot(&self, run: &RunId) -> Result<Option<RunRecord>> {
+        let _phase = self.sql_phase();
         read(&self.conn, run)
     }
     pub(crate) fn run_status_record(&self, run: &RunId) -> Result<(RunRecord, bool)> {
+        let _phase = self.sql_phase();
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
         let record = exact(&self.conn, &record.request)?;
         let state: String = self.conn.query_row(
@@ -493,7 +494,7 @@ impl Store {
     /// Only unresolved groups; closed roots remain historical receipts.
     /// No heartbeat/reboot inference, no reconstructed runtime authority.
     pub fn recovery_runs(&self) -> Result<Vec<RunRecord>> {
-        crate::store::sql_phase(&self.conn)?;
+        let _phase = self.sql_phase();
         let mut stmt = self.conn.prepare(&format!("{SELECT} ORDER BY r.rowid"))?;
         let rows = stmt.query_map([], read_row)?;
         // Validate historical receipts too: a malformed closed flag must never
@@ -506,6 +507,7 @@ impl Store {
     }
     /// ROOT-ONLY: no participant registration exists in this version.
     pub fn group_snapshot(&self, run: &RunId) -> Result<GroupSnapshot> {
+        let _phase = self.sql_phase();
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
         let record = exact(&self.conn, &record.request)?;
         if record.closed || record.binding.is_none() {
@@ -522,7 +524,7 @@ impl Store {
         snapshot: &GroupSnapshot,
         proof: &GroupEmptyProof,
     ) -> Result<Transition> {
-        crate::store::sql_phase(&self.conn)?;
+        let _phase = self.sql_phase();
         if snapshot.record != proof.record {
             return Err(StoreError::Conflict);
         }
@@ -573,7 +575,7 @@ impl Store {
         Ok(Transition::Changed)
     }
     fn transition(&mut self, request: &RootRunRequest, change: Change) -> Result<Transition> {
-        crate::store::sql_phase(&self.conn)?;
+        let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

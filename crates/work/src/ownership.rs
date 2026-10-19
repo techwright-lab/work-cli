@@ -9,6 +9,7 @@ use uuid::Uuid;
 impl Store {
     pub fn transfer(&mut self, checkout: Uuid, recipient: &str, limits: Limits) -> Result<()> {
         identity(recipient)?;
+        let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -52,6 +53,7 @@ impl Store {
         limits: Limits,
     ) -> Result<usize> {
         identity(owner)?;
+        let _phase = self.sql_phase();
         let operator = operator.ok_or(StoreError::Invalid)?;
         identity(operator)?;
         if owner == operator {

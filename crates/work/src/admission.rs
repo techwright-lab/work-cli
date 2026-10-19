@@ -59,6 +59,7 @@ impl Store {
             hash.update(field.as_bytes());
         }
         let digest = hash.finalize().to_vec();
+        let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

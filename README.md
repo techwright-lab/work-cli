@@ -70,7 +70,9 @@ SHM files** on last close (no-close-checkpoint), while retaining FULL synchroniz
 and normal autocheckpoint. Ordinary create/write/close therefore remains readable.
 External clients that remove bookkeeping leave strict reads conservatively unknown:
 readers never recreate sidecars or use `immutable=1` (which ignores active WAL). Existing
-SHM lock bookkeeping may change: read-only does not promise byte immutability.
+SHM bookkeeping may change: read-only does not promise byte immutability.
+Lifecycle regression snapshots check directory entries, DB/WAL bytes and events,
+but exclude **all SHM contents**, not merely lock bytes.
 No new files/directories or lifecycle/outbox writes are intended. Missing, corrupt,
 inaccessible or partial authority/store evidence is unknown, not zero charges.
 
@@ -213,7 +215,9 @@ Like doctor, strict read-only access refuses WAL databases lacking existing WAL/
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
 writers retain that bookkeeping. Recovery validates initialized intent, claims and
 schema read-only before opening the existing store writable; it never initializes,
-repairs missing sidecars or migrates authority/schema.
+repairs missing sidecars or migrates authority/schema. SQL budgets are scoped to
+operations/preflight; nested SQL phases share a cumulative limit, and time spent
+between operations inspecting Git or runtime state does not consume that limit.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
 
