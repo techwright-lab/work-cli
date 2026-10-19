@@ -14,7 +14,7 @@ pub struct AdoptedRequest {
     pub identity: RunIdentity,
     pub source: Ref,
     pub session: Ref,
-    pub agent: Ref,
+    pub agent: Option<Ref>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdoptedStatus {
@@ -50,7 +50,7 @@ pub fn begin(
     }
     let (mut store, lock) = crate::allocate::locked(config)?;
     // Exact retries confer no new grant and do not refresh activity or Git metadata.
-    if store.adopted_status(&request.identity.run).is_ok() {
+    if db(store.adopted_status_optional(&request.identity.run))?.is_some() {
         return db(store.begin_adopted(request));
     }
     crate::allocate::verified_checkout(
@@ -154,6 +154,9 @@ impl AdoptedRequest {
         Ref::new(i.run_ref.as_str().into())?;
         if let Some(parent) = &i.parent_run_ref {
             Ref::new(parent.as_str().into())?;
+            if parent == &i.run_ref {
+                return Err(StoreError::Invalid);
+            }
         }
         Ok(())
     }
@@ -223,6 +226,7 @@ impl Store {
                 return Err(StoreError::Conflict);
             }
             held(&tx, request)?;
+            crate::participants::roster(&tx, request)?;
             return Ok(BeginRun::Existing);
         }
         let ids = [
@@ -243,20 +247,35 @@ impl Store {
         crate::store::acquire_writer_tx(&tx, uuid(&i.checkout)?, uuid(&i.group)?, false)?;
         tx.execute("INSERT INTO adopted_groups(id,checkout,run_id,run_ref,operation,request,revision) VALUES(?1,?2,?3,?4,?5,?6,1)",
             (i.group.to_string(),i.checkout.to_string(),i.run.to_string(),i.run_ref.as_str(),request.operation.to_string(),json(request)?))?;
-        tx.execute("INSERT INTO adopted_sessions(group_id,source,session,agent,actor,parent,closed,depth) VALUES(?1,?2,?3,?4,?5,NULL,0,0)",
-            (i.group.to_string(),request.source.as_str(),request.session.as_str(),request.agent.as_str(),i.actor.as_str()))?;
+        tx.execute("INSERT INTO adopted_sessions(group_id,source,session,agent,actor,parent,closed,depth) VALUES(?1,?2,?3,?4,NULL,NULL,0,0)",
+            (i.group.to_string(),request.source.as_str(),request.session.as_str(),crate::participants::db_ref(&request.agent)))?;
         journal_event(&tx, request, 1)?;
         tx.commit()?;
         Ok(BeginRun::Created)
     }
     /// Read-only declarations; never inspect processes or infer physical exit.
     pub fn adopted_status(&self, run: &RunId) -> Result<AdoptedStatus> {
+        self.adopted_status_optional(run)?
+            .ok_or(StoreError::Invalid)
+    }
+    pub(crate) fn adopted_status_optional(&self, run: &RunId) -> Result<Option<AdoptedStatus>> {
         let _phase = self.sql_phase();
-        let (request, revision, reconciliation_requested) =
-            read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
+        // Pin every SELECT to one snapshot, without touching a caller-owned transaction
+        // (including the read-only opener's BEGIN). Our read guard rolls back on drop.
+        let _snapshot = if self.conn.is_autocommit() {
+            Some(rusqlite::Transaction::new_unchecked(
+                &self.conn,
+                rusqlite::TransactionBehavior::Deferred,
+            )?)
+        } else {
+            None
+        };
+        let Some((request, revision, reconciliation_requested)) = read(&self.conn, run)? else {
+            return Ok(None);
+        };
         held(&self.conn, &request)?;
         let participants = crate::participants::roster(&self.conn, &request)?;
-        Ok(AdoptedStatus {
+        Ok(Some(AdoptedStatus {
             request,
             revision,
             reconciliation_requested,
@@ -266,7 +285,7 @@ impl Store {
             runtime: "unknown",
             git_identity_controlled: false,
             automatic_quiescence: false,
-        })
+        }))
     }
 }
 pub(crate) fn held(conn: &rusqlite::Connection, request: &AdoptedRequest) -> Result<()> {
@@ -282,4 +301,102 @@ pub(crate) fn held(conn: &rusqlite::Connection, request: &AdoptedRequest) -> Res
         return Err(StoreError::Invalid);
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn status_uses_one_snapshot_across_revision_and_roster() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::{sync::mpsc, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let private = dir.path().join("private");
+        let mut store = Store::open(&private, std::slice::from_ref(&root)).unwrap();
+        let checkout = store
+            .reserve(
+                &crate::admission::Reservation {
+                    operation: Uuid::now_v7(),
+                    repository: root.clone(),
+                    actor: "allocator".into(),
+                    owner: "owner".into(),
+                    task: "task".into(),
+                },
+                crate::admission::Limits {
+                    repository: 10,
+                    owner: 10,
+                    available_bytes: Some(100),
+                    floor_bytes: 0,
+                    warn_bytes: 0,
+                },
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("UPDATE checkouts SET state='active',ready=1", [])
+            .unwrap();
+        let request: AdoptedRequest = serde_json::from_value(serde_json::json!({
+            "operation": Uuid::now_v7(), "identity": {
+                "checkout":checkout,"group":Uuid::now_v7(),"run":Uuid::now_v7(),
+                "run_ref":"snapshot-root","actor":"declared","parent_run_ref":null,"execution_chain":[{"kind":"executor","system":"test"}]
+            },"source":"sdk","session":"session","agent":null
+        })).unwrap();
+        store.begin_adopted(&request).unwrap();
+        let mut writer = Store::open(&private, &[root]).unwrap();
+        let event: crate::participants::Activity = serde_json::from_value(serde_json::json!({
+            "run":request.identity.run,"group":request.identity.group,"source":"sdk",
+            "participant":{"session":"session","agent":null},"parent":null,"actor":null,
+            "prompt":null,"tool":null,"event_ref":"stop","kind":"stop","observed_at":100
+        }))
+        .unwrap();
+        let (go, start) = mpsc::channel();
+        let (done, ack) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            start.recv_timeout(Duration::from_secs(2)).unwrap();
+            writer.record_activity(&event).unwrap();
+            done.send(()).unwrap();
+        });
+        let mut fired = false;
+        store
+            .conn
+            .authorizer(Some(move |ctx: AuthContext<'_>| {
+                if !fired
+                    && matches!(
+                        ctx.action,
+                        AuthAction::Read {
+                            table_name: "adopted_sessions",
+                            ..
+                        }
+                    )
+                {
+                    fired = true;
+                    go.send(()).unwrap();
+                    ack.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        let result = store.adopted_status(&request.identity.run);
+        store
+            .conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        thread.join().unwrap();
+        let old = result.unwrap();
+        assert_eq!(old.revision, 1);
+        assert_eq!(old.participants[0].heartbeat, None);
+        assert!(store.conn.is_autocommit());
+        let new = store.adopted_status(&request.identity.run).unwrap();
+        assert_eq!(new.revision, 2);
+        assert_eq!(new.participants[0].heartbeat, Some(100));
+        // A caller-owned read transaction stays owned by its caller, even on errors.
+        store.conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(store.adopted_status(&request.identity.run).unwrap(), new);
+        assert!(store.adopted_status(&RunId::generate()).is_err());
+        assert!(!store.conn.is_autocommit());
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        assert!(store.adopted_status(&RunId::generate()).is_err());
+        assert!(store.conn.is_autocommit());
+    }
 }

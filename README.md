@@ -255,7 +255,7 @@ UUIDv7 values, and CHECKOUT with an explicitly allocated checkout UUID):
     "parent_run_ref": null,
     "execution_chain": [{"kind":"executor","system":"declared-sdk"}]
   },
-  "source": "sdk", "session": "stable-session", "agent": "root-agent"
+  "source": "sdk", "session": "actual-runtime-session", "agent": null
 }
 ```
 
@@ -273,27 +273,38 @@ entry point; `Store::begin_adopted` is its low-level active/ready SQL transactio
 ```json
 {
   "run": "RUN_UUIDV7", "group": "GROUP_UUIDV7", "source": "sdk",
-  "participant": {"session":"stable-session","agent":"root-agent"},
-  "parent": null, "actor":"declared-actor",
-  "prompt":"stable-prompt-or-segment", "tool":"stable-tool-reference",
+  "participant": {"session":"actual-runtime-session","agent":null},
+  "parent": null, "actor":null,
+  "prompt":null, "tool":null,
   "event_ref":"stable-event-reference", "kind":"stop", "observed_at":123
 }
 ```
 
 Kinds are `stop`, `subagent_start`, `subagent_stop`, `session_end`, `reconcile`.
+The session-only example also supports root `session_end` and `reconcile`: use the
+actual session ID, without inventing agent, prompt or tool references. Those three
+references may be null or omitted. An absent agent denotes the session root, not a
+made-up runtime agent ID; it remains distinct from every actual agent reference.
+The required `identity.actor` declares run accountability, not runtime attribution.
+New root participants have unknown (`null`) runtime actor; child actors may likewise
+remain unknown. Historical explicit v6 root actor declarations are preserved.
+A child without an agent ID needs a distinct session from its parent; otherwise it
+cannot identify a distinct child and is refused. No runtime IDs are generated.
 A child event explicitly supplies the already-registered parent's session/agent
 key and the child's own key; its declared actor may be null (unknown remains
 unknown). Known participant actor/parent claims cannot change. Self/cross-group,
 foreign-source, reparenting and unknown-parent claims are refused. The roster is
 bounded to 256 participants including root, at most 16 child levels. Sources,
-session/agent/event/prompt/tool references, actor and run references are nonblank,
+session/event references, present agent/prompt/tool references, actor and run references are nonblank,
 control-free and at most 256 Unicode scalars. Chains retain their existing typed
 limits. JSON stdin is bounded to 4 MiB, covering the full UTF-8/JSON domain of these
 limits; unknown fields and raw payloads are refused with value-free CLI errors.
 
-Idempotency includes source/group/session/agent/prompt/tool/kind/event_ref, not
-just time. Same key and normalized body returns `existing` with no heartbeat,
-revision or event change; changed body conflicts. Unique accepted events increment
+Idempotency includes source/group/session/optional-agent/prompt/tool/kind/event_ref,
+not time. Same key and typed immutable context (including parent and actor) returns
+`existing` even with a newer or older observation timestamp. The first stored body,
+heartbeat, revision and outbox remain unchanged; changed parent/actor claims conflict.
+Different event references are never coalesced. Unique accepted events increment
 the group revision. Stop appends a segment/heartbeat only. SubagentStop retains a
 terminal tombstone even if Start arrives later. SessionEnd records that session
 participant's logical closure and requests reconciliation; open/unknown children
@@ -301,6 +312,9 @@ remain visible. Reconcile never refreshes a heartbeat. Session IDs may span many
 checkouts, with separate group-scoped journals. Shared output is group/root-based,
 not individual authorship inferred from timestamps or email.
 
+Status reads revision, writer and validated roster in one database snapshot. All
+retry paths validate durable declarations before returning success; corruption is
+an error, never absence or authority to reverify/update the allocation.
 Status is read-only existing-v6-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
@@ -311,7 +325,10 @@ handoff path (operator quiescence/retirement approval is Task 10). `work status 
 and `work recover` remain supervised ROOT-ONLY; use `work adopt status` for adopted
 metadata. Schema v6 is additive: supervised proof tables are not rebuilt or weakened,
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned
-tables fail closed, and read APIs never initialize or migrate.
+tables fail closed, and read APIs never initialize or migrate. Optional references
+reuse v6 columns without migration: absence is stored as an empty SQL key (not a
+user-facing reference), present refs retain their original text, and historical
+string-valued request/event/parent JSON remains compatible without row rewrites.
 
 Actual runtime-hook payload-to-stable-ID mapping, installation and fork coverage
 qualification belong to Task 13 and are not implemented. Supervised child coverage

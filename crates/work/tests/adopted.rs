@@ -11,7 +11,7 @@ fn adopted(checkout: Uuid) -> AdoptedRequest {
         identity: request(checkout).identity().clone(),
         source: Ref::new("sdk".into()).unwrap(),
         session: Ref::new("session".into()).unwrap(),
-        agent: Ref::new("agent".into()).unwrap(),
+        agent: Some(Ref::new("agent".into()).unwrap()),
     }
 }
 #[test]
@@ -24,7 +24,7 @@ fn adopted_retry_and_two_connection_writer_contention() {
     assert_eq!(other.begin_adopted(&r).unwrap(), BeginRun::Existing);
     assert_eq!(store.pending_events(1000).unwrap(), before);
     let mut changed = r.clone();
-    changed.agent = Ref::new("different".into()).unwrap();
+    changed.agent = Some(Ref::new("different".into()).unwrap());
     assert!(other.begin_adopted(&changed).is_err());
     assert!(other.begin_adopted(&adopted(checkout)).is_err());
     assert!(other.begin_run(&request(checkout)).is_err());
@@ -38,6 +38,79 @@ fn adopted_retry_and_two_connection_writer_contention() {
     let mut adopted_store = reopen(&dir2).unwrap();
     sup.begin_run(&request(checkout2)).unwrap();
     assert!(adopted_store.begin_adopted(&adopted(checkout2)).is_err());
+}
+#[test]
+fn adopted_root_cannot_declare_itself_its_run_parent() {
+    let (dir, mut store, checkout) = fixture();
+    let mut r = adopted(checkout);
+    r.identity.parent_run_ref = Some(r.identity.run_ref.clone());
+    let before = store.pending_events(1000).unwrap();
+    assert!(store.begin_adopted(&r).is_err());
+    assert_eq!(store.pending_events(1000).unwrap(), before);
+    assert_eq!(
+        store
+            .charged(&dir.path().join("root"), Some("owner"))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn existing_begin_validates_the_entire_roster() {
+    let (dir, mut store, checkout) = fixture();
+    let r = adopted(checkout);
+    store.begin_adopted(&r).unwrap();
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.execute(
+        "UPDATE adopted_sessions SET actor='another-valid-actor'",
+        [],
+    )
+    .unwrap();
+    let before = store.pending_events(1000).unwrap();
+    assert!(store.adopted_status(&r.identity.run).is_err());
+    assert!(store.begin_adopted(&r).is_err());
+    assert_eq!(store.pending_events(1000).unwrap(), before);
+}
+#[test]
+fn integrated_begin_does_not_verify_checkout_after_corrupt_existing_declaration() {
+    let f = support::Fixture::new();
+    let out = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+    assert!(out.status.success());
+    let allocation: work_cli::allocate::Allocation = serde_json::from_slice(&out.stdout).unwrap();
+    let r = adopted(allocation.checkout);
+    let body = serde_json::to_string(&r).unwrap();
+    assert!(cli_input(&f, &["adopt", "begin"], &body).status.success());
+    let sql = Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    sql.execute(
+        "UPDATE adopted_sessions SET actor='another-valid-actor'",
+        [],
+    )
+    .unwrap();
+    for advance in [false, true] {
+        if advance {
+            support::git(
+                &allocation.destination,
+                &["commit", "--allow-empty", "-m", "advance"],
+            );
+        }
+        let events = f.store().pending_events(1000).unwrap();
+        let checkout_before: String = sql
+            .query_row(
+                "SELECT record FROM allocations WHERE checkout=?1",
+                [allocation.checkout.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!cli_input(&f, &["adopt", "begin"], &body).status.success());
+        let checkout_after: String = sql
+            .query_row(
+                "SELECT record FROM allocations WHERE checkout=?1",
+                [allocation.checkout.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkout_after, checkout_before);
+        assert_eq!(f.store().pending_events(1000).unwrap(), events);
+    }
 }
 #[test]
 fn namespace_and_readonly_authority_cover_both_modes() {
@@ -125,7 +198,7 @@ fn adopted_cli_is_metadata_only_and_refuses_stale_lease_capture_and_secret_paylo
     assert_eq!(value["adopted_basis"], "checkout/session declaration");
     assert_eq!(value["runtime"], "unknown");
     assert_eq!(f.store().pending_events(1000).unwrap(), before);
-    let event = serde_json::json!({"run":r.identity.run,"group":r.identity.group,"source":r.source,"participant":{"session":r.session,"agent":r.agent},"parent":null,"actor":r.identity.actor,"prompt":"p","tool":"t","event_ref":"e","kind":"stop","observed_at":1});
+    let event = serde_json::json!({"run":r.identity.run,"group":r.identity.group,"source":r.source,"participant":{"session":r.session,"agent":r.agent},"parent":null,"actor":null,"prompt":"p","tool":"t","event_ref":"e","kind":"stop","observed_at":1});
     assert!(cli_input(&f, &["adopt", "event"], &event.to_string())
         .status
         .success());
@@ -180,7 +253,7 @@ fn cli_and_readonly_status_accept_the_full_utf8_typed_domain() {
     r.identity.run_ref = work_contract::RunRef::parse(&refs).unwrap();
     r.source = Ref::new(refs.clone()).unwrap();
     r.session = Ref::new(refs.clone()).unwrap();
-    r.agent = Ref::new(refs).unwrap();
+    r.agent = Some(Ref::new(refs).unwrap());
     let body = serde_json::to_string(&r).unwrap();
     assert!(body.len() > 1024 * 1024);
     assert!(cli_input(&f, &["adopt", "begin"], &body).status.success());

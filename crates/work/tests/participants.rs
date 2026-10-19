@@ -16,7 +16,7 @@ fn adopted(checkout: Uuid) -> AdoptedRequest {
         identity: request(checkout).identity().clone(),
         source: text("test-sdk"),
         session: text("session"),
-        agent: text("root"),
+        agent: Some(text("root")),
     }
 }
 fn event(r: &AdoptedRequest, kind: ActivityKind) -> Activity {
@@ -29,9 +29,9 @@ fn event(r: &AdoptedRequest, kind: ActivityKind) -> Activity {
             agent: r.agent.clone(),
         },
         parent: None,
-        actor: Some(r.identity.actor.clone()),
-        prompt: text("prompt"),
-        tool: text("tool"),
+        actor: None,
+        prompt: Some(text("prompt")),
+        tool: Some(text("tool")),
         event_ref: text("event"),
         kind,
         observed_at: 100,
@@ -49,16 +49,33 @@ fn stop_is_idempotent_metadata_not_completion() {
     assert_eq!(store.record_activity(&e).unwrap(), Transition::Existing);
     assert_eq!(store.adopted_status(&r.identity.run).unwrap(), before);
     assert_eq!(store.pending_events(1000).unwrap(), events);
-    let mut changed = e.clone();
-    changed.observed_at += 1;
-    assert!(store.record_activity(&changed).is_err());
+    for observed_at in [99, 101] {
+        let mut changed = e.clone();
+        changed.observed_at = observed_at;
+        assert_eq!(
+            store.record_activity(&changed).unwrap(),
+            Transition::Existing
+        );
+        assert_eq!(store.adopted_status(&r.identity.run).unwrap(), before);
+        assert_eq!(store.pending_events(1000).unwrap(), events);
+    }
+    for field in ["actor", "parent"] {
+        let mut changed = serde_json::to_value(&e).unwrap();
+        changed[field] = if field == "actor" {
+            serde_json::json!("different-actor")
+        } else {
+            serde_json::json!({"session":"other", "agent":"other"})
+        };
+        let changed = serde_json::from_value(changed).unwrap();
+        assert!(store.record_activity(&changed).is_err());
+    }
     let mut repeated = e.clone();
-    repeated.prompt = text("next-prompt");
+    repeated.prompt = Some(text("next-prompt"));
     assert_eq!(
         store.record_activity(&repeated).unwrap(),
         Transition::Changed
     );
-    repeated.tool = text("next-tool");
+    repeated.tool = Some(text("next-tool"));
     assert_eq!(
         store.record_activity(&repeated).unwrap(),
         Transition::Changed
@@ -93,7 +110,7 @@ fn children_tombstones_parent_context_and_session_end_never_release_writer() {
     store.begin_adopted(&r).unwrap();
     let root = event(&r, ActivityKind::Stop).participant;
     let mut child = event(&r, ActivityKind::SubagentStop);
-    child.participant.agent = text("child");
+    child.participant.agent = Some(text("child"));
     child.parent = Some(root.clone());
     child.actor = None;
     store.record_activity(&child).unwrap();
@@ -105,12 +122,12 @@ fn children_tombstones_parent_context_and_session_end_never_release_writer() {
             .unwrap()
             .participants
             .iter()
-            .find(|p| p.key.agent == text("child"))
+            .find(|p| p.key.agent == Some(text("child")))
             .unwrap()
             .declared_closed
     );
     let mut other = child.clone();
-    other.participant.agent = text("other");
+    other.participant.agent = Some(text("other"));
     other.participant.session = text("another-session");
     store.record_activity(&other).unwrap();
     store
@@ -137,12 +154,12 @@ fn children_tombstones_parent_context_and_session_end_never_release_writer() {
     bad.actor = Some(work_contract::ActorId::parse("forged").unwrap());
     assert!(store.record_activity(&bad).is_err());
     let mut unknown = event(&r, ActivityKind::Stop);
-    unknown.participant.agent = text("not-registered");
+    unknown.participant.agent = Some(text("not-registered"));
     assert!(store.record_activity(&unknown).is_err());
     unknown.kind = ActivityKind::SubagentStart;
     unknown.parent = Some(ParticipantKey {
         session: text("foreign-session"),
-        agent: text("missing-parent"),
+        agent: Some(text("missing-parent")),
     });
     assert!(store.record_activity(&unknown).is_err());
     let before = store.adopted_status(&r.identity.run).unwrap();
@@ -189,7 +206,7 @@ fn all_session_ends_are_declarations_without_any_writer_delete_or_checkout_updat
     child.parent = Some(child.participant.clone());
     child.participant = ParticipantKey {
         session: text("child-session"),
-        agent: text("child"),
+        agent: Some(text("child")),
     };
     child.actor = None;
     store.record_activity(&child).unwrap();
@@ -226,18 +243,18 @@ fn explicit_parent_depth_and_child_count_are_bounded() {
     child.actor = None;
     for depth in 1..=16 {
         child.parent = Some(child.participant.clone());
-        child.participant.agent = text(&format!("depth-{depth}"));
+        child.participant.agent = Some(text(&format!("depth-{depth}")));
         store.record_activity(&child).unwrap();
     }
     child.parent = Some(child.participant.clone());
-    child.participant.agent = text("too-deep");
+    child.participant.agent = Some(text("too-deep"));
     assert!(store.record_activity(&child).is_err());
     child.parent = Some(event(&r, ActivityKind::Stop).participant);
     for n in 17..256 {
-        child.participant.agent = text(&format!("child-{n}"));
+        child.participant.agent = Some(text(&format!("child-{n}")));
         store.record_activity(&child).unwrap();
     }
-    child.participant.agent = text("too-many");
+    child.participant.agent = Some(text("too-many"));
     assert!(store.record_activity(&child).is_err());
     assert_eq!(
         store
@@ -247,6 +264,240 @@ fn explicit_parent_depth_and_child_count_are_bounded() {
             .len(),
         256
     );
+}
+#[test]
+fn session_only_root_metadata_parses_stores_and_remains_absent() {
+    for omit in [false, true] {
+        let (dir, mut store, checkout) = fixture();
+        let mut value = serde_json::to_value(adopted(checkout)).unwrap();
+        value["agent"] = serde_json::Value::Null;
+        if omit {
+            value.as_object_mut().unwrap().remove("agent");
+        }
+        let r: AdoptedRequest = serde_json::from_value(value).unwrap();
+        store.begin_adopted(&r).unwrap();
+        for kind in [
+            ActivityKind::Stop,
+            ActivityKind::SessionEnd,
+            ActivityKind::Reconcile,
+        ] {
+            let mut value = serde_json::to_value(event(&r, kind)).unwrap();
+            value["participant"]["agent"] = serde_json::Value::Null;
+            value["actor"] = serde_json::Value::Null;
+            for field in ["prompt", "tool"] {
+                value[field] = serde_json::Value::Null;
+                if omit {
+                    value.as_object_mut().unwrap().remove(field);
+                }
+            }
+            if omit {
+                value["participant"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("agent");
+            }
+            let e: Activity = serde_json::from_value(value).unwrap();
+            store.record_activity(&e).unwrap();
+            assert_eq!(store.record_activity(&e).unwrap(), Transition::Existing);
+        }
+        let status = serde_json::to_value(store.adopted_status(&r.identity.run).unwrap()).unwrap();
+        assert!(status["request"]["agent"].is_null());
+        assert!(status["participants"][0]["key"]["agent"].is_null());
+        assert!(status["participants"][0]["actor"].is_null());
+        assert_eq!(status["participants"][0]["heartbeat"], 100);
+        assert_eq!(status["runtime"], "unknown");
+        let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        assert_eq!(
+            sql.query_row(
+                "SELECT count(*) FROM adopted_segments WHERE agent='' AND prompt='' AND tool=''",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+    }
+}
+#[test]
+fn v6_string_requests_parents_and_bodies_are_not_rewritten_by_retries() {
+    let (dir, mut store, checkout) = fixture();
+    let r = adopted(checkout);
+    store.begin_adopted(&r).unwrap();
+    let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    // Exact pre-fix v6 JSON representations: string refs, an explicit root actor,
+    // and noncanonical whitespace. There is no migration or historical row rewrite.
+    let historical_request = serde_json::to_string_pretty(&r).unwrap();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&historical_request).unwrap()["agent"]
+            .is_string()
+    );
+    sql.execute(
+        "UPDATE adopted_groups SET request=?1",
+        [&historical_request],
+    )
+    .unwrap();
+    sql.execute(
+        "UPDATE adopted_sessions SET actor=?1 WHERE depth=0",
+        [r.identity.actor.as_str()],
+    )
+    .unwrap();
+    let mut e = event(&r, ActivityKind::Stop);
+    e.actor = Some(r.identity.actor.clone());
+    store.record_activity(&e).unwrap();
+    let historical_body = serde_json::to_string_pretty(&e).unwrap();
+    sql.execute("UPDATE adopted_segments SET body=?1", [&historical_body])
+        .unwrap();
+    let mut child = event(&r, ActivityKind::SubagentStop);
+    child.parent = Some(child.participant.clone());
+    child.participant.agent = Some(text("historical-child"));
+    store.record_activity(&child).unwrap();
+    let historical_parent: String = sql
+        .query_row(
+            "SELECT parent FROM adopted_sessions WHERE depth=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&historical_parent).unwrap()["agent"].is_string()
+    );
+    let before = durable_rows(&sql);
+    let status = store.adopted_status(&r.identity.run).unwrap();
+    drop(store);
+    let mut store = reopen(&dir).unwrap();
+    assert_eq!(store.begin_adopted(&r).unwrap(), BeginRun::Existing);
+    for observed_at in [99, 101] {
+        e.observed_at = observed_at;
+        assert_eq!(store.record_activity(&e).unwrap(), Transition::Existing);
+        child.observed_at = observed_at;
+        assert_eq!(store.record_activity(&child).unwrap(), Transition::Existing);
+    }
+    assert_eq!(store.adopted_status(&r.identity.run).unwrap(), status);
+    assert_eq!(durable_rows(&sql), before);
+    let mut invalid = e.clone();
+    invalid.observed_at = u64::MAX;
+    assert!(store.record_activity(&invalid).is_err());
+    invalid = e.clone();
+    invalid.event_ref = text("different-transport-event");
+    assert_eq!(
+        store.record_activity(&invalid).unwrap(),
+        Transition::Changed
+    );
+    assert_eq!(
+        store.adopted_status(&r.identity.run).unwrap().revision,
+        status.revision + 1
+    );
+}
+#[test]
+fn agentless_children_require_distinct_sessions_and_absence_keys_do_not_collide() {
+    let (_dir, mut store, checkout) = fixture();
+    let r = adopted(checkout);
+    store.begin_adopted(&r).unwrap();
+    let mut child = event(&r, ActivityKind::SubagentStart);
+    child.parent = Some(child.participant.clone());
+    child.participant.agent = None;
+    child.actor = None;
+    assert!(store.record_activity(&child).is_err());
+    child.participant.session = text("distinct-child-session");
+    store.record_activity(&child).unwrap();
+    let status = store.adopted_status(&r.identity.run).unwrap();
+    let record = status
+        .participants
+        .iter()
+        .find(|p| p.key == child.participant)
+        .unwrap();
+    assert!(record.actor.is_none() && record.key.agent.is_none());
+    let mut e = event(&r, ActivityKind::Stop);
+    for (prompt, tool) in [
+        (None, None),
+        (Some(text("prompt")), None),
+        (None, Some(text("tool"))),
+        (Some(text("prompt")), Some(text("tool"))),
+    ] {
+        e.prompt = prompt;
+        e.tool = tool;
+        assert_eq!(store.record_activity(&e).unwrap(), Transition::Changed);
+        assert_eq!(store.record_activity(&e).unwrap(), Transition::Existing);
+    }
+    let mut same_session = child.clone();
+    same_session.participant.agent = Some(text("actual-child-agent"));
+    assert_eq!(
+        store.record_activity(&same_session).unwrap(),
+        Transition::Changed
+    );
+    assert_eq!(
+        store
+            .adopted_status(&r.identity.run)
+            .unwrap()
+            .participants
+            .len(),
+        3
+    );
+}
+fn durable_rows(sql: &rusqlite::Connection) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let names: Vec<String> = sql
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut stmt = sql
+                .prepare(&format!("SELECT * FROM \"{name}\" ORDER BY rowid"))
+                .unwrap();
+            let count = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| {
+                    (0..count)
+                        .map(|i| r.get(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            (name, rows)
+        })
+        .collect()
+}
+#[test]
+fn corrupt_rosters_reject_all_retries_without_mutation() {
+    for corruption in [
+        "UPDATE adopted_sessions SET actor='another-valid-actor' WHERE depth=0",
+        "UPDATE adopted_sessions SET parent='{\"session\":\"elsewhere\",\"agent\":null}' WHERE depth=0",
+        "DELETE FROM adopted_sessions WHERE depth=0",
+        "UPDATE adopted_sessions SET actor='another-valid-actor' WHERE depth=1",
+        "UPDATE adopted_sessions SET parent='{\"session\":\"elsewhere\",\"agent\":null}' WHERE depth=1",
+        "DELETE FROM adopted_sessions WHERE depth=1",
+    ] {
+        let (dir, mut store, checkout) = fixture();
+        let r = adopted(checkout);
+        store.begin_adopted(&r).unwrap();
+        let root = event(&r, ActivityKind::Stop);
+        store.record_activity(&root).unwrap();
+        let mut child = event(&r, ActivityKind::SubagentStop);
+        child.parent = Some(child.participant.clone());
+        child.participant.agent = Some(text("child"));
+        child.actor = None;
+        store.record_activity(&child).unwrap();
+        let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        sql.execute_batch(corruption).unwrap();
+        let before = durable_rows(&sql);
+        assert!(store.record_activity(&child).is_err(), "duplicate accepted: {corruption}");
+        assert_eq!(durable_rows(&sql), before);
+        assert!(store.adopted_status(&r.identity.run).is_err(), "{corruption}");
+        assert!(store.record_activity(&root).is_err(), "{corruption}");
+        assert!(store.begin_adopted(&r).is_err(), "begin accepted: {corruption}");
+        assert_eq!(durable_rows(&sql), before);
+    }
 }
 #[test]
 fn supervised_groups_reject_adopted_activity_and_bad_refs_fail_closed() {
