@@ -9,7 +9,7 @@ channels.
 
 ## Status
 
-Early construction. Read-only `work --help`, `work status` and `work doctor` are
+Early construction. Read-only `work --help`, `work status [--run <uuidv7>]` and `work doctor` are
 available, plus configured `work start` allocation. Start never launches a writer.
 Configured root-only `work run` coordination is available for construction/testing,
 not production activation. Finish/removal and capture integration are not implemented.
@@ -177,8 +177,8 @@ changed immutable inputs conflict. Existing receipts retain original group/conte
 
 Intent and writer commit before launching. Bound metadata and permit-attempt commit
 separately before gate publication. Root Completed/Failed/Cancelled status is separate
-from writer closure: only fresh, complete whole-scope emptiness against the original
-opaque binding and current root roster/revision can release that group's writer.
+from writer closure: only fresh, complete whole-scope emptiness against the exact
+scope identity and current root roster/revision can release that group's writer.
 Uncertain evidence or surviving descendants retain a held writer under finite policy.
 A closed group permits a sequential run without another checkout charge. Lease charges
 and task openness are never released here. Capture_sink remains unsupported and fails
@@ -192,9 +192,29 @@ D-state can make owned-child kill/reaping unbounded despite finite userspace pol
 An owned process group isolates non-terminal protocols; interactive TTY/job-control
 has not been qualified and terminal stdio is explicitly refused.
 
+`work recover <uuidv7>` explicitly tries ROOT-ONLY writer handoff after controller loss.
+Store-validated historical scope metadata is only a non-executing candidate for fresh
+manager/boot/invocation/cgroup and double recursive/PID-start inspection. It never
+reconstructs an execution Binding. Reaped scopes require an explicit inactive/not-found
+manager result and confirmed absence of the exact old cgroup. Live/uncertain, reused or
+escaped PIDs, replacement invocations, unknown queries and boot changes retain the
+writer and charges without fabricating a root outcome or refreshing a heartbeat.
+Unbound intents and legacy bare writers cannot be closed. Already-closed receipts
+require no runtime inspection and cannot remove a subsequent run's writer.
+Recovery never launches, signals, kills, finishes a task, deletes or uncharges.
+
+`work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
+hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
+runtime qualification claim. It requires an existing initialized trusted v5 authority;
+missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
+Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
+bookkeeping rather than creating files or ignoring committed WAL. Recovery may open
+existing database bookkeeping, but never initializes or migrates authority/schema.
+Neither command needs the original actor's current Git profile. Existing `work run`
+retries remain receipts/holds, not relaunches or automatic recovery.
+
 No external/adopted participants, bridge, task finish, retirement or automatic recovery
-is supported. Crashed runs retain writer records; historical serialized bindings grant
-no cancellation/closure authority. There is no read-only `status --run` inventory yet.
+is supported. Serialized metadata alone grants no cancellation/closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
 do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
 

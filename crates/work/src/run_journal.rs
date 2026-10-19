@@ -145,7 +145,66 @@ pub struct GroupEmptyProof {
     record: RunRecord,
     collected_at: Instant,
 }
+/// A non-executing candidate made only from a Store-validated group snapshot.
+/// Not serializable; cannot authorize launch, cancellation, or delegation.
+pub(crate) struct RecordedScopeExpectation {
+    identity: ScopeIdentity,
+    boot: String,
+}
+impl RecordedScopeExpectation {
+    pub(crate) fn identity(&self) -> &ScopeIdentity {
+        &self.identity
+    }
+    pub(crate) fn boot(&self) -> &str {
+        &self.boot
+    }
+}
 impl GroupSnapshot {
+    /// Reinspect historical ROOT-ONLY metadata without restoring a Binding.
+    /// The stored exact root roster is a candidate, never an absence assertion.
+    pub fn certify_historical_empty(&self, driver: &Driver) -> Result<GroupEmptyProof> {
+        let r = &self.record;
+        if r.closed {
+            return Err(StoreError::Invalid);
+        }
+        let b = r.binding.as_ref().ok_or(StoreError::Invalid)?;
+        let expected = RecordedScopeExpectation {
+            identity: ScopeIdentity {
+                unit: b.unit.clone(),
+                invocation: b.invocation.clone(),
+                cgroup: b.cgroup.clone(),
+            },
+            boot: b.boot.clone(),
+        };
+        let intent = LaunchIntent::new(r.request.identity.run.clone(), &r.request.input.boot)
+            .map_err(|_| StoreError::Invalid)?;
+        let roster = [Participant {
+            status: if r.outcome.is_some() {
+                ParticipantStatus::Closed
+            } else {
+                ParticipantStatus::ProvenAbsent
+            },
+            identity: Some(ChildIdentity {
+                pid: b.root_pid,
+                start_ticks: b.root_start_ticks,
+                boot: b.boot.clone(),
+                cgroup: b.root_cgroup.clone(),
+            }),
+        }];
+        let observation = driver.observe_recorded(&intent, &expected, &roster);
+        crate::runtime_scope::verify_empty_evidence(
+            expected.identity(),
+            expected.boot(),
+            &observation,
+            Instant::now(),
+            EMPTY_MAX_AGE,
+        )
+        .map_err(|_| StoreError::Invalid)?;
+        Ok(GroupEmptyProof {
+            record: r.clone(),
+            collected_at: observation.observed_at,
+        })
+    }
     /// Collect fresh evidence using this snapshot's internally owned exact root
     /// roster, never caller-supplied participant claims. Requires the original
     /// opaque Binding; historical JSON cannot restore runtime authority.
@@ -300,6 +359,14 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
     })())
 }
 fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
+    // Bound serialized metadata before SQLite copies it into application memory.
+    let bounded: Option<bool> = conn.query_row(
+        "SELECT length(CAST(request AS BLOB))<=16384 AND coalesce(length(CAST(binding AS BLOB)),0)<=4096 AND coalesce(length(CAST(outcome AS BLOB)),0)<=64 AND length(run_ref)<=512 FROM runs WHERE id=?1",
+        [run.to_string()], |r| r.get(0),
+    ).optional()?;
+    if bounded == Some(false) {
+        return Err(StoreError::Invalid);
+    }
     conn.query_row(
         &format!("{SELECT} WHERE r.id=?1"),
         [run.to_string()],
@@ -402,6 +469,30 @@ impl Store {
     }
     pub fn run_snapshot(&self, run: &RunId) -> Result<Option<RunRecord>> {
         read(&self.conn, run)
+    }
+    pub(crate) fn run_status_record(&self, run: &RunId) -> Result<(RunRecord, bool)> {
+        let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
+        let record = exact(&self.conn, &record.request)?;
+        let state: String = self.conn.query_row(
+            "SELECT CASE WHEN length(state)<=32 THEN state ELSE '' END FROM checkouts WHERE id=?1",
+            [record.request.identity.checkout.to_string()],
+            |r| r.get(0),
+        )?;
+        if !matches!(
+            state.as_str(),
+            "reserved"
+                | "partial"
+                | "active"
+                | "expired"
+                | "interrupted"
+                | "held"
+                | "quarantined"
+                | "partially_deleted"
+                | "retired"
+        ) {
+            return Err(StoreError::Invalid);
+        }
+        Ok((record, state != "retired"))
     }
     /// Only unresolved groups; closed roots remain historical receipts.
     /// No heartbeat/reboot inference, no reconstructed runtime authority.

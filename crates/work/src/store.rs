@@ -29,6 +29,8 @@ pub enum StoreError {
     Writer,
     #[error("invalid store record")]
     Invalid,
+    #[error("historical run status unknown: schema upgrade required")]
+    UpgradeRequired,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
@@ -248,6 +250,36 @@ fn roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 impl Store {
+    /// Existing authority only. No bootstrap, schema migration, event writes or
+    /// repair; reads committed WAL through SQLite's ordinary read-only mode.
+    pub fn open_existing_registered_readonly(
+        registry: &Path,
+        dir: &Path,
+        managed: &[PathBuf],
+    ) -> Result<Self> {
+        let (conn, _) = existing_authority(registry, dir, managed, false)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != 5 {
+            return Err(StoreError::UpgradeRequired);
+        }
+        validate_existing_schema(&conn, version)?;
+        Ok(Self { conn })
+    }
+    /// Recovery can mutate an established v5 authority only; never initializes
+    /// an empty authority for an unknown RunId or upgrades historical schemas.
+    pub fn open_existing_registered_mut(
+        registry: &Path,
+        dir: &Path,
+        managed: &[PathBuf],
+    ) -> Result<Self> {
+        let (conn, _) = existing_authority(registry, dir, managed, true)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != 5 {
+            return Err(StoreError::UpgradeRequired);
+        }
+        validate_existing_schema(&conn, version)?;
+        Ok(Self { conn })
+    }
     /// Uses `.work-authorities` at the store's parent as the trusted registry,
     /// permitting only one authoritative store there, even for disjoint roots.
     /// Callers spanning different parents MUST use `open_registered` with their
@@ -488,12 +520,16 @@ const REPORT_GROUPS: usize = 256;
 const REPORT_ROWS: i64 = 4096;
 const REPORT_OUTPUT_BYTES: usize = 256 * 1024;
 
-fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
+fn existing_directory(dir: &Path) -> Result<()> {
     crate::config::validate_path(dir, true).map_err(|_| StoreError::Unsafe)?;
     let m = fs::symlink_metadata(dir)?;
     if m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
         return Err(StoreError::Unsafe);
     }
+    Ok(())
+}
+fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
+    existing_directory(dir)?;
     let path = dir.join(name);
     check_file(&path)?;
     let mut bytes = fs::symlink_metadata(&path)?.len();
@@ -562,12 +598,17 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Strict existing-evidence reader: no bootstrap, migration, locks created on
-/// disk, writes, repair, event generation or acknowledgments. Existing WAL SHM
-/// lock bookkeeping can change; this is not a byte-immutability guarantee.
-pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Vec<Charge>> {
-    crate::config::validate_path(registry, true).map_err(|_| StoreError::Unsafe)?;
-    crate::config::validate_path(dir, true).map_err(|_| StoreError::Unsafe)?;
+/// Shared existing-authority validation, never bootstrap/migration/repair.
+/// Read-only callers cannot create even WAL bookkeeping; recovery may open
+/// existing files read-write only after initialized intent/claims validation.
+fn existing_authority(
+    registry: &Path,
+    dir: &Path,
+    managed: &[PathBuf],
+    writable: bool,
+) -> Result<(Connection, usize)> {
+    existing_directory(registry)?;
+    existing_directory(dir)?;
     let marker = registry.join("initialization.json");
     check_file(&marker)?;
     if fs::metadata(&marker)?.len() > 8192 {
@@ -578,6 +619,13 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
     if record.version != 1 || !record.initialized || record.store != dir {
         return Err(StoreError::Unsafe);
     }
+    // Recovery may open existing files read-write (including WAL bookkeeping),
+    // but only after validating initialized authority intent; never CREATE.
+    let _registry_writer = if writable {
+        Some(database(registry, "authorities.sqlite", false)?)
+    } else {
+        None
+    };
     let reg = existing_database(registry, "authorities.sqlite")?;
     let mut stmt = reg.prepare("SELECT root,store FROM authorities LIMIT 1025")?;
     let mut rows = stmt.query([])?;
@@ -602,9 +650,17 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
     {
         return Err(StoreError::Unsafe);
     }
+    let writer = if writable {
+        Some(database(dir, "store.sqlite", false)?)
+    } else {
+        None
+    };
     let conn = existing_database(dir, "store.sqlite")?;
     conn.execute_batch("BEGIN;")?;
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    // Mutable recovery rechecks exact metadata under its IMMEDIATE close lock.
+    Ok((writer.unwrap_or(conn), output_bytes))
+}
+fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
     if version >= 2 {
         conn.prepare("SELECT ready FROM checkouts LIMIT 0")?;
         conn.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
@@ -613,7 +669,7 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
         conn.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
     }
     if version >= 4 {
-        validate_run_schema(&conn)?;
+        validate_run_schema(conn)?;
     }
     conn.prepare(
         "SELECT id,operation,digest,repository,actor,task,owner,state FROM checkouts LIMIT 0",
@@ -621,6 +677,13 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
     conn.prepare("SELECT checkout,group_id FROM writers LIMIT 0")?;
     conn.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
     conn.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
+    Ok(())
+}
+/// Strict bounded accounting report using the same existing authority reader.
+pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Vec<Charge>> {
+    let (conn, mut output_bytes) = existing_authority(registry, dir, managed, false)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    validate_existing_schema(&conn, version)?;
     // Bound aggregate input before SQLite allocates its in-memory sorter.
     let rows: i64 = conn.query_row(
         "SELECT count(*) FROM (SELECT 1 FROM checkouts LIMIT 4097)",

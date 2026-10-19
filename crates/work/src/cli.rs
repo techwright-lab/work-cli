@@ -22,7 +22,16 @@ enum Command {
     /// Run an explicitly attributed command in a verified allocated checkout
     Run(crate::supervisor::Run),
     /// Show lifecycle status without changing state
-    Status,
+    Status {
+        /// Historical UUIDv7 metadata only; runtime is NOT INSPECTED
+        #[arg(long)]
+        run: Option<uuid::Uuid>,
+    },
+    /// Try fresh ROOT-ONLY writer handoff; never launch, signal, finish or uncharge
+    Recover {
+        #[arg(value_name = "run-id")]
+        run: uuid::Uuid,
+    },
     /// Bounded read-only inventory; no initialization, repair or enforcement
     Doctor {
         #[arg(long)]
@@ -49,7 +58,10 @@ pub fn run() {
         eprintln!("scope child held");
         std::process::exit(1);
     }
-    let cli = if args.first().is_some_and(|a| a == "run") {
+    let cli = if args
+        .first()
+        .is_some_and(|a| a == "run" || a == "recover" || a == "status")
+    {
         match Cli::try_parse() {
             Ok(cli) => cli,
             Err(error)
@@ -61,7 +73,7 @@ pub fn run() {
                 error.exit()
             }
             Err(_) => {
-                eprintln!("invalid run arguments; see work run --help (delegate argv requires --)");
+                eprintln!("invalid command arguments; see work run/status/recover --help (delegate argv requires --)");
                 std::process::exit(2);
             }
         }
@@ -105,7 +117,46 @@ pub fn run() {
                 }
             }
         }
-        Command::Status => print_status(),
+        Command::Status { run: None } => print_status(),
+        Command::Status { run: Some(run) } => {
+            let result = Config::load()
+                .map_err(|_| crate::store::StoreError::Unsafe)
+                .and_then(|config| crate::run_recovery::command_status(&config, run));
+            match result {
+                Ok(report) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).expect("status serialization")
+                ),
+                Err(crate::store::StoreError::UpgradeRequired) => {
+                    eprintln!("historical status unknown: authority schema upgrade required");
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    eprintln!("historical status unknown: existing trusted authority unavailable or invalid");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Recover { run } => {
+            let result = Config::load()
+                .map_err(|_| crate::store::StoreError::Unsafe)
+                .and_then(|config| crate::run_recovery::command_recover(&config, run));
+            match result {
+                Ok(state) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&state).expect("recovery serialization")
+                    );
+                    if matches!(state, crate::run_recovery::RecoveryState::Held { .. }) {
+                        std::process::exit(1);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("recovery held: existing trusted authority, schema or runtime unavailable; no launch, task completion or charge release");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Doctor {
             json,
             repositories,

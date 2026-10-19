@@ -127,6 +127,26 @@ impl Driver {
         binding: Option<&Binding>,
         roster: Option<&[Participant]>,
     ) -> Observation {
+        self.observe_expected(intent, binding.map(|b| (b.identity(), b.boot_id())), roster)
+    }
+    pub(crate) fn observe_recorded(
+        &self,
+        intent: &LaunchIntent,
+        expected: &crate::run_journal::RecordedScopeExpectation,
+        roster: &[Participant],
+    ) -> Observation {
+        self.observe_expected(
+            intent,
+            Some((expected.identity(), expected.boot())),
+            Some(roster),
+        )
+    }
+    fn observe_expected(
+        &self,
+        intent: &LaunchIntent,
+        binding: Option<(&ScopeIdentity, &str)>,
+        roster: Option<&[Participant]>,
+    ) -> Observation {
         let observed_at = Instant::now();
         let mut obs = Observation {
             boot: String::new(),
@@ -206,7 +226,7 @@ impl Driver {
     fn collect(
         &self,
         intent: &LaunchIntent,
-        binding: Option<&Binding>,
+        binding: Option<(&ScopeIdentity, &str)>,
         roster: Option<&[Participant]>,
         obs: &mut Observation,
     ) -> Result<()> {
@@ -222,14 +242,15 @@ impl Driver {
             .to_owned();
         obs.boot = boot.clone();
         if boot != intent.boot_id()
-            || binding
-                .is_some_and(|b| b.boot_id() != boot || b.identity().unit != intent.unit_name())
+            || binding.is_some_and(|(identity, expected_boot)| {
+                expected_boot != boot || identity.unit != intent.unit_name()
+            })
         {
             return Err(HOLD);
         }
         let manager = self.manager(intent, &mut budget)?;
         let identity = if manager.reaped {
-            let bound = binding.ok_or(HOLD)?.identity();
+            let bound = binding.ok_or(HOLD)?.0;
             if (!manager.identity.invocation.is_empty()
                 && manager.identity.invocation != bound.invocation)
                 || (!manager.identity.cgroup.is_empty() && manager.identity.cgroup != bound.cgroup)
@@ -238,7 +259,7 @@ impl Driver {
             }
             bound.clone()
         } else {
-            if binding.is_some_and(|b| b.identity() != &manager.identity) {
+            if binding.is_some_and(|(identity, _)| identity != &manager.identity) {
                 return Err(HOLD);
             }
             manager.identity.clone()

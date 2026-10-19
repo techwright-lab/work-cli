@@ -97,6 +97,35 @@ fn combined(output: &Output) -> String {
 }
 
 #[test]
+fn historical_commands_are_explicit_sanitized_and_do_not_initialize_missing_authority() {
+    let root = IsolatedRoot::new();
+    let before = root.snapshot();
+    let help = run_work(&root, &["status", "--help"]);
+    assert!(help.status.success());
+    assert!(stdout_str(&help).contains("--run"));
+    let help = run_work(&root, &["recover", "--help"]);
+    assert!(help.status.success());
+    assert!(stdout_str(&help).contains("run-id"));
+    for args in [
+        vec!["status", "--run", "0194aabd-aaaa-7000-8000-000000000001"],
+        vec!["recover", "0194aabd-aaaa-7000-8000-000000000001"],
+    ] {
+        let output = run_work(&root, &args);
+        assert!(!output.status.success());
+        assert!(combined(&output).contains("authority"));
+    }
+    for args in [
+        vec!["status", "--run", "secret-not-an-id"],
+        vec!["recover", "secret-not-an-id"],
+    ] {
+        let output = run_work(&root, &args);
+        assert!(!output.status.success());
+        assert!(!combined(&output).contains("secret-not-an-id"));
+    }
+    assert_eq!(before, root.snapshot());
+}
+
+#[test]
 fn help_exits_zero_and_names_the_work_binary() {
     let root = IsolatedRoot::new();
     let output = run_work(&root, &["--help"]);

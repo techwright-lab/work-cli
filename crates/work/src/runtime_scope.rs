@@ -231,35 +231,7 @@ impl Binding {
         now: Instant,
         max_age: Duration,
     ) -> Result<VerifiedEmpty<'_>, HoldReason> {
-        fresh(obs, &self.boot, now, max_age)?;
-        match &obs.unit {
-            UnitPresence::AutoReaped(identity) => {
-                self.matches(identity)?;
-                if obs.membership != Membership::Absent {
-                    return Err(HoldReason::ReapedGroupNotAbsent);
-                }
-            }
-            _ => self.matches(present_identity(&obs.unit)?)?,
-        }
-        if obs.recursive_coverage != Coverage::Complete {
-            return Err(HoldReason::IncompleteMembership);
-        }
-        if obs.participant_coverage != Coverage::Complete
-            || obs.participants.iter().any(|p| {
-                !matches!(
-                    p,
-                    ParticipantStatus::Closed | ParticipantStatus::ProvenAbsent
-                )
-            })
-        {
-            return Err(HoldReason::ParticipantUncertain);
-        }
-        match &obs.membership {
-            Membership::Absent => {}
-            Membership::Present(members) if members.is_empty() => {}
-            Membership::Present(_) => return Err(HoldReason::Populated),
-            Membership::Unknown => return Err(HoldReason::MembershipUnknown),
-        }
+        verify_empty_evidence(&self.identity, &self.boot, obs, now, max_age)?;
         Ok(VerifiedEmpty { _binding: self })
     }
     fn matches(&self, identity: &ScopeIdentity) -> Result<(), HoldReason> {
@@ -268,6 +240,52 @@ impl Binding {
         }
         Ok(())
     }
+}
+/// Shared pure emptiness invariants; returns no execution or cancellation authority.
+pub(crate) fn verify_empty_evidence(
+    expected: &ScopeIdentity,
+    boot: &str,
+    obs: &Observation,
+    now: Instant,
+    max_age: Duration,
+) -> Result<(), HoldReason> {
+    let matches = |identity: &ScopeIdentity| {
+        if identity == expected {
+            Ok(())
+        } else {
+            Err(HoldReason::UnitMismatch)
+        }
+    };
+    fresh(obs, boot, now, max_age)?;
+    match &obs.unit {
+        UnitPresence::AutoReaped(identity) => {
+            matches(identity)?;
+            if obs.membership != Membership::Absent {
+                return Err(HoldReason::ReapedGroupNotAbsent);
+            }
+        }
+        _ => matches(present_identity(&obs.unit)?)?,
+    }
+    if obs.recursive_coverage != Coverage::Complete {
+        return Err(HoldReason::IncompleteMembership);
+    }
+    if obs.participant_coverage != Coverage::Complete
+        || obs.participants.iter().any(|p| {
+            !matches!(
+                p,
+                ParticipantStatus::Closed | ParticipantStatus::ProvenAbsent
+            )
+        })
+    {
+        return Err(HoldReason::ParticipantUncertain);
+    }
+    match &obs.membership {
+        Membership::Absent => {}
+        Membership::Present(members) if members.is_empty() => {}
+        Membership::Present(_) => return Err(HoldReason::Populated),
+        Membership::Unknown => return Err(HoldReason::MembershipUnknown),
+    }
+    Ok(())
 }
 fn fresh(obs: &Observation, boot: &str, now: Instant, max_age: Duration) -> Result<(), HoldReason> {
     if obs.boot != boot {
