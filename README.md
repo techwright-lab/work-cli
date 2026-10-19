@@ -222,7 +222,7 @@ between operations inspecting Git or runtime state does not consume that limit.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
 
-Supervised closure authority remains root-only; adopted participants cannot join it.
+Supervised closure covers the full enrolled host roster; adopted participants cannot join it.
 The library-only `Store::register_child(root, ChildRequest)` now records an immutable
 supervised child intent before inspection, bumps group revision/child count and appends
 an outbox event in the same IMMEDIATE transaction. Exact retries validate the entire
@@ -245,9 +245,10 @@ Every accepted change bumps revision; no writer, charge, task or checkout state 
 Full child requests and parent trees are validated in one SQLite snapshot on root
 lookup/retry/status/recovery. Missing ledger rows, orphan/corrupt metadata and versioned
 views fail closed. Status includes `record.children` and still says `not_inspected`.
-All registered children block both live and historical empty proof, even after logical
+Pending/Unverified children block both live and historical empty proof, even after logical
 closure or expected shared-root-host declarations; a pre-registration proof fails CAS.
-Thus no child is silently dropped by terminal/grace/cancellation/recovery closure.
+Contained children require fresh absence of every recorded actual host, including declared
+terminal hosts. No child is silently dropped by terminal/grace/cancellation/recovery closure.
 
 Positive enrollment is library-only: `Driver::identify(pid)` uses bounded no-follow
 proc inspection (production fixed `/proc`, explicit library fixture IO otherwise).
@@ -260,7 +261,7 @@ capped at two seconds. Membership still covers every recursive kernel member;
 the full root record and complete child ledger still bind validation and commit CAS.
 An absent original root process or unrelated unknown, unverified, missing or dead
 sibling does not veto positive target facts or mutate sibling metadata. This is target
-enrollment, not entire-group quiescence; all children remain closure barriers.
+enrollment, not entire-group quiescence; enrollment receipts alone cannot release a writer.
 Without the original
 root Binding, the actual registrar process must also be freshly present in that scope;
 there is no caller-selected registrar PID or environment lease. Shared root hosts need
@@ -281,12 +282,29 @@ remains group/root/unknown. Schema8 transactionally rebuilds the v7 child table,
 all rows and other journals/accounting; malformed/missing/view schemas and corrupt host,
 scope or parent metadata fail closed. There is no row removal or repair.
 
-**Not implemented:** contained-host full-roster absence proof, atomic Interrupted-child/
-group closure, child metadata CLI/native hook routing, bridge, task finish, retirement
-or automatic recovery. **Every child, including Contained, still blocks all live and
-historical root-only closure paths.** Positive enrollment cannot release a writer.
-This does not complete Task6. Serialized metadata alone grants no launch, cancellation
-or closure authority.
+`GroupSnapshot::certify_empty(driver, original_binding)` and
+`certify_historical_empty(driver)` construct the same complete actual-host roster internally.
+Exact shared physical hosts deduplicate without inventing child PIDs; different birth
+identities are never dropped. Every host (including the original root, whether its outcome
+is known or not) must be freshly absent, with complete recursive empty-scope and participant
+coverage. Historical candidates never reconstruct Binding/permit/signal authority.
+
+The private `GroupEmptyProof` binds the entire child snapshot and mandatory open-child loss
+set. `Store::close_supervised_group(snapshot, proof)` uses one IMMEDIATE transaction to
+revalidate exact context/revision and the original two-second evidence age after locking,
+mark only proven-lost open Contained children `Interrupted`, emit `ChildrenInterrupted`,
+remove only this group's writer, and emit `GroupClosed` at one new revision. Freshness is
+checked again near writer removal. Failures roll back outcomes/writer/events together;
+no OS calls occur under SQL lock. Declared child outcomes, unknown root outcomes, retained
+child count/rows and checkout/task/owner/charge metadata are preserved. Exact closed retries
+normalize the proof's interruptions, acknowledge even expired committed receipts, and cannot
+affect a newer writer. Corrupt closed child history fails before recovery filtering;
+Interrupted is illegal in open groups and rejected by public child outcome declarations.
+No time, heartbeat or missing SessionEnd is an exit proof.
+
+**Not implemented:** child metadata CLI/native hook routing, bridge, task finish, retirement
+or scheduled automatic recovery. This does not complete Task6 or qualify live activation.
+Serialized metadata alone grants no launch, cancellation or closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
 do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
 

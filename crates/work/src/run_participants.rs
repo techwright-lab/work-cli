@@ -1,6 +1,5 @@
 //! Supervised child declarations. These grant no launch, writer or OS authority.
-//! Positive enrollment is historical host metadata only. Every child remains
-//! a closure barrier until complete child-aware closure is implemented.
+//! Positive enrollment is historical host metadata only, never fresh absence.
 #[cfg(test)]
 #[path = "run_enrollment_tests.rs"]
 mod enrollment_tests;
@@ -52,6 +51,8 @@ pub enum ChildOutcome {
     Completed,
     Failed,
     Cancelled,
+    /// Kernel-confirmed host loss, writable only by atomic whole-group closure.
+    Interrupted,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -615,6 +616,9 @@ impl Store {
         request: &ChildRequest,
         outcome: ChildOutcome,
     ) -> Result<Transition> {
+        if outcome == ChildOutcome::Interrupted {
+            return Err(StoreError::Invalid);
+        }
         self.child_change(root, request, Some(outcome))
     }
     /// Tighten a failed/uncertain enrollment to a durable unverified barrier.

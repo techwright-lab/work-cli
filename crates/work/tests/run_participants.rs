@@ -453,7 +453,10 @@ fn unknown_host_and_declared_end_remain_unverified_without_fabricated_attributio
     assert_eq!(record.record.children[0].enrollment, Enrollment::Unverified);
     assert!(record.record.children[0].request.actor.is_none());
     assert!(record.record.children[0].request.session.is_none());
-    assert!(serde_json::from_str::<ChildOutcome>("\"interrupted\"").is_err());
+    let events = store.pending_events(100).unwrap();
+    let interrupted = serde_json::from_str::<ChildOutcome>("\"interrupted\"").unwrap();
+    assert!(store.record_child_outcome(&r, &c, interrupted).is_err());
+    assert_eq!(store.pending_events(100).unwrap(), events);
     let config = work_cli::config::Config {
         trusted_registry: Some(dir.path().join(".work-authorities")),
         store_dir: Some(dir.path().join("private")),

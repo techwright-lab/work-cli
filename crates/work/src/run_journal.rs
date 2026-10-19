@@ -1,5 +1,5 @@
 //! Durable supervised journal and fresh OS-proof writer handoff.
-//! Child declarations are full-roster barriers, never OS containment authority.
+//! Unknown child hosts are barriers; recorded hosts require fresh full-roster absence.
 //! No launch, task-finish or retirement authority.
 use crate::{
     runtime_scope::{validate_structure, Binding, ChildIdentity, LaunchIntent, ScopeIdentity},
@@ -129,6 +129,7 @@ pub enum JournalChange {
     ChildDeclaredOutcome,
     ChildHold,
     ChildEnrolled,
+    ChildrenInterrupted,
 }
 
 use crate::{
@@ -148,6 +149,7 @@ pub struct GroupSnapshot {
 #[derive(Debug)]
 pub struct GroupEmptyProof {
     record: RunRecord,
+    interrupted_children: Vec<RunId>,
     collected_at: Instant,
 }
 /// A non-executing candidate made only from a Store-validated group snapshot.
@@ -173,11 +175,53 @@ impl GroupSnapshot {
     ) -> Result<crate::run_participants::EnrollmentProof> {
         crate::run_participants::certify(&self.record, driver, child_run, controller)
     }
-    /// Reinspect historical ROOT-ONLY metadata without restoring a Binding.
-    /// The stored exact root roster is a candidate, never an absence assertion.
+    /// Actual validated hosts only, never raw expected_host or a caller roster.
+    /// Keep same-PID/different-start identities; exact shared hosts may dedup.
+    fn closure_roster(&self, root: ChildIdentity) -> Result<Vec<Participant>> {
+        use crate::run_participants::Enrollment;
+        let mut identities = vec![root];
+        for child in &self.record.children {
+            if child.enrollment != Enrollment::Contained {
+                return Err(StoreError::Invalid);
+            }
+            let host = &child.host.as_ref().ok_or(StoreError::Invalid)?.host;
+            let identity = ChildIdentity {
+                pid: host.pid,
+                start_ticks: host.start_ticks,
+                boot: host.boot.clone(),
+                cgroup: host.cgroup.clone(),
+            };
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        Ok(identities
+            .into_iter()
+            .map(|identity| Participant {
+                // Candidate only, inspected twice even for declared terminal hosts.
+                status: ParticipantStatus::ProvenAbsent,
+                identity: Some(identity),
+            })
+            .collect())
+    }
+    fn empty_proof(&self, collected_at: Instant) -> GroupEmptyProof {
+        GroupEmptyProof {
+            record: self.record.clone(),
+            interrupted_children: self
+                .record
+                .children
+                .iter()
+                .filter(|child| child.outcome.is_none())
+                .map(|child| child.request.run.clone())
+                .collect(),
+            collected_at,
+        }
+    }
+    /// Reinspect historical full-roster metadata without restoring a Binding.
+    /// The stored roster is a candidate, never an absence assertion.
     pub fn certify_historical_empty(&self, driver: &Driver) -> Result<GroupEmptyProof> {
         let r = &self.record;
-        if r.closed || !r.children.is_empty() {
+        if r.closed {
             return Err(StoreError::Invalid);
         }
         let b = r.binding.as_ref().ok_or(StoreError::Invalid)?;
@@ -191,19 +235,12 @@ impl GroupSnapshot {
         };
         let intent = LaunchIntent::new(r.request.identity.run.clone(), &r.request.input.boot)
             .map_err(|_| StoreError::Invalid)?;
-        let roster = [Participant {
-            status: if r.outcome.is_some() {
-                ParticipantStatus::Closed
-            } else {
-                ParticipantStatus::ProvenAbsent
-            },
-            identity: Some(ChildIdentity {
-                pid: b.root_pid,
-                start_ticks: b.root_start_ticks,
-                boot: b.boot.clone(),
-                cgroup: b.root_cgroup.clone(),
-            }),
-        }];
+        let roster = self.closure_roster(ChildIdentity {
+            pid: b.root_pid,
+            start_ticks: b.root_start_ticks,
+            boot: b.boot.clone(),
+            cgroup: b.root_cgroup.clone(),
+        })?;
         let observation = driver.observe_recorded(&intent, &expected, &roster);
         crate::runtime_scope::verify_empty_evidence(
             expected.identity(),
@@ -213,42 +250,24 @@ impl GroupSnapshot {
             EMPTY_MAX_AGE,
         )
         .map_err(|_| StoreError::Invalid)?;
-        Ok(GroupEmptyProof {
-            record: r.clone(),
-            collected_at: observation.observed_at,
-        })
+        Ok(self.empty_proof(observation.observed_at))
     }
-    /// Collect fresh evidence using this snapshot's internally owned exact root
+    /// Collect fresh evidence using this snapshot's internally owned full host
     /// roster, never caller-supplied participant claims. Requires the original
     /// opaque Binding; historical JSON cannot restore runtime authority.
     pub fn certify_empty(&self, driver: &Driver, binding: &Binding) -> Result<GroupEmptyProof> {
         let r = &self.record;
-        if !r.children.is_empty() {
-            return Err(StoreError::Invalid);
-        }
         if r.closed || r.binding.as_ref() != Some(&BoundSnapshot::capture(&r.request, binding)?) {
             return Err(StoreError::Conflict);
         }
         let intent = LaunchIntent::new(r.request.identity.run.clone(), &r.request.input.boot)
             .map_err(|_| StoreError::Invalid)?;
-        // ProvenAbsent is a candidate only: Driver checks this exact PID/start/
-        // boot/cgroup twice; live, escaped, reused or unreadable roots hold.
-        let roster = [Participant {
-            status: if r.outcome.is_some() {
-                ParticipantStatus::Closed
-            } else {
-                ParticipantStatus::ProvenAbsent
-            },
-            identity: Some(binding.trusted_child().clone()),
-        }];
+        let roster = self.closure_roster(binding.trusted_child().clone())?;
         let observation = driver.observe(&intent, Some(binding), Some(&roster));
         binding
             .verify_empty(&observation, Instant::now(), EMPTY_MAX_AGE)
             .map_err(|_| StoreError::Invalid)?;
-        Ok(GroupEmptyProof {
-            record: r.clone(),
-            collected_at: observation.observed_at,
-        })
+        Ok(self.empty_proof(observation.observed_at))
     }
 }
 
@@ -375,10 +394,46 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
         })
     })())
 }
+fn validate_child_history(record: &RunRecord) -> Result<()> {
+    use crate::run_participants::{ChildOutcome, Enrollment};
+    for child in &record.children {
+        if (record.closed
+            && (child.enrollment != Enrollment::Contained
+                || child.host.is_none()
+                || child.outcome.is_none()))
+            || (!record.closed && child.outcome == Some(ChildOutcome::Interrupted))
+        {
+            return Err(StoreError::Invalid);
+        }
+    }
+    Ok(())
+}
+fn apply_interruptions(record: &mut RunRecord, ids: &[RunId]) -> Result<()> {
+    use crate::run_participants::{ChildOutcome, Enrollment};
+    let required = record
+        .children
+        .iter()
+        .filter(|c| c.outcome.is_none())
+        .map(|c| c.request.run.clone())
+        .collect::<Vec<_>>();
+    if required != ids {
+        return Err(StoreError::Conflict);
+    }
+    for child in &mut record.children {
+        if child.enrollment != Enrollment::Contained || child.host.is_none() {
+            return Err(StoreError::Invalid);
+        }
+        if child.outcome.is_none() {
+            child.outcome = Some(ChildOutcome::Interrupted);
+        }
+    }
+    Ok(())
+}
 fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     // Typed domain validation is shared with admission. Historical reads must
     // not impose a smaller serialized size than previously accepted requests.
     let _snapshot = read_transaction(conn)?;
+    crate::run_participants::validate_orphans(conn)?;
     let mut record = conn
         .query_row(
             &format!("{SELECT} WHERE r.id=?1"),
@@ -389,9 +444,7 @@ fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
         .transpose()?;
     if let Some(r) = &mut record {
         r.children = crate::run_participants::roster(conn, &r.request, r.binding.as_ref())?;
-        if r.closed && !r.children.is_empty() {
-            return Err(StoreError::Invalid);
-        }
+        validate_child_history(r)?;
     }
     Ok(record)
 }
@@ -565,9 +618,7 @@ impl Store {
                 &record.request,
                 record.binding.as_ref(),
             )?;
-            if record.closed && !record.children.is_empty() {
-                return Err(StoreError::Invalid);
-            }
+            validate_child_history(record)?;
         }
         records.retain(|record| !record.closed);
         Ok(records)
@@ -583,7 +634,7 @@ impl Store {
         }
         Ok(GroupSnapshot { record })
     }
-    /// Atomically close only this supervised ROOT-ONLY group and release only
+    /// Atomically interrupt proven-lost open children, close this group and release only
     /// its writer. Revalidate freshness after the IMMEDIATE lock. Identical
     /// terminal retries acknowledge metadata without consuming a new writer;
     /// Existing is never execution permission. Checkout accounting is untouched.
@@ -611,6 +662,7 @@ impl Store {
             receipt.closed = true;
             receipt.recovery_hold = false;
             receipt.revision = revision;
+            apply_interruptions(&mut receipt, &proof.interrupted_children)?;
             return if current == receipt {
                 Ok(Transition::Existing)
             } else {
@@ -623,6 +675,32 @@ impl Store {
             || Instant::now()
                 .checked_duration_since(proof.collected_at)
                 .is_none_or(|age| age > EMPTY_MAX_AGE)
+        {
+            return Err(StoreError::Conflict);
+        }
+        let mut receipt = expected.clone();
+        apply_interruptions(&mut receipt, &proof.interrupted_children)?;
+        for run in &proof.interrupted_children {
+            let updated = tx.execute(
+                "UPDATE run_participants SET outcome=?2 WHERE id=?1 AND group_id=?3 AND enrollment='contained' AND outcome IS NULL",
+                (run.to_string(), json(&crate::run_participants::ChildOutcome::Interrupted)?, expected.request.identity.group.to_string()),
+            )?;
+            if updated != 1 {
+                return Err(StoreError::Conflict);
+            }
+        }
+        if !proof.interrupted_children.is_empty() {
+            journal_event(
+                &tx,
+                &expected.request,
+                revision,
+                JournalChange::ChildrenInterrupted,
+            )?;
+        }
+        // Child updates/outbox work consume the original evidence window too.
+        if Instant::now()
+            .checked_duration_since(proof.collected_at)
+            .is_none_or(|age| age > EMPTY_MAX_AGE)
         {
             return Err(StoreError::Conflict);
         }

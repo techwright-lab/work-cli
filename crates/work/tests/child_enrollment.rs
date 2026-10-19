@@ -608,7 +608,7 @@ fn logical_child_outcomes_do_not_veto_live_host_enrollment() {
     }
 }
 #[test]
-fn exact_host_enrollment_is_metadata_only_idempotent_and_still_blocks_every_closure() {
+fn exact_live_host_enrollment_is_metadata_only_idempotent_and_blocks_closure() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);
     let b = binding(&r);

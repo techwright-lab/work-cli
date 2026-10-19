@@ -331,8 +331,15 @@ fn actual_pipeline_projects_git_identity_commits_before_exec_and_closes_only_sco
     assert!(!db.windows(15).any(|b| b == b"secret-argument"));
 }
 #[test]
-fn registered_children_including_contained_hold_live_terminal_and_cancellation_closure() {
-    for (cancelled, contained) in [(false, false), (true, false), (false, true), (true, true)] {
+fn full_roster_coordinator_closes_only_after_enrolled_host_disappears_even_on_cancellation() {
+    for (cancelled, contained, gone) in [
+        (false, false, true),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+        (false, true, false),
+        (true, true, false),
+    ] {
         let h = Harness::new();
         let token = CancelToken::default();
         let worker = if cancelled {
@@ -371,8 +378,8 @@ fn registered_children_including_contained_hold_live_terminal_and_cancellation_c
                         let b = record.binding.as_ref().unwrap();
                         work_cli::run_participants::ExpectedHost {
                             boot: b.boot.clone(),
-                            pid: b.root_pid,
-                            start_ticks: b.root_start_ticks,
+                            pid: 43,
+                            start_ticks: 20,
                         }
                     }),
                 };
@@ -391,13 +398,21 @@ fn registered_children_including_contained_hold_live_terminal_and_cancellation_c
                     )
                     .unwrap();
                     fs::write(p.join("cgroup"), format!("0::{}\n", b.cgroup)).unwrap();
+                    let host = h.f.temp.path().join("proc/43");
+                    fs::create_dir_all(&host).unwrap();
+                    fs::write(
+                        host.join("stat"),
+                        format!("43 (host) S {} 20 0\n", vec!["0"; 18].join(" ")),
+                    )
+                    .unwrap();
+                    fs::write(host.join("cgroup"), format!("0::{}\n", b.cgroup)).unwrap();
                     fs::write(
                         h.f.temp
                             .path()
                             .join("cg")
                             .join(b.cgroup.trim_start_matches('/'))
                             .join("cgroup.procs"),
-                        format!("{}\n{pid}\n", b.root_pid),
+                        format!("{}\n{pid}\n43\n", b.root_pid),
                     )
                     .unwrap();
                     let proof = store
@@ -408,10 +423,22 @@ fn registered_children_including_contained_hold_live_terminal_and_cancellation_c
                     store
                         .record_child_enrollment(&record.request, &child, &proof)
                         .unwrap();
+                    if !gone {
+                        store
+                            .record_child_outcome(
+                                &record.request,
+                                &child,
+                                work_cli::run_participants::ChildOutcome::Completed,
+                            )
+                            .unwrap();
+                    }
                 }
             }
             if boundary == Boundary::RootTerminal {
                 h.empty(record);
+                if contained && gone {
+                    fs::remove_dir_all(h.f.temp.path().join("proc/43")).unwrap();
+                }
             }
         });
         if let Some(worker) = worker {
@@ -426,8 +453,20 @@ fn registered_children_including_contained_hold_live_terminal_and_cancellation_c
                 RootOutcome::Completed
             })
         );
-        assert!(!report.record.closed);
-        assert!(report.record.recovery_hold);
+        assert_eq!(report.record.closed, contained && gone);
+        assert_eq!(report.record.recovery_hold, !(contained && gone));
+        if contained && gone {
+            assert_eq!(
+                report.record.children[0].outcome,
+                Some(work_cli::run_participants::ChildOutcome::Interrupted)
+            );
+            let retry = h
+                .execute(h.request(), &CancelToken::default(), |_, _| {
+                    panic!("closed child receipt relaunched")
+                })
+                .unwrap();
+            assert!(retry.existing && retry.record.closed);
+        }
         assert_eq!(report.record.children.len(), 1);
         assert_eq!(
             report.record.children[0].enrollment,

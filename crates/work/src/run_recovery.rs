@@ -1,4 +1,4 @@
-//! Historical reconciliation. Child declarations remain explicit proof barriers.
+//! Historical reconciliation. Unknown child hosts remain explicit proof barriers.
 //! Never launch, signal, finish or uncharge.
 use crate::{
     scope_driver::{Driver, RuntimeContext},
@@ -91,7 +91,11 @@ fn historical_receipt(store: &Store, run: &RunId) -> Result<Option<RecoveryState
             reason: "unbound intent: historical proof unsupported",
             charges_retained: true,
         })
-    } else if !record.children.is_empty() {
+    } else if record
+        .children
+        .iter()
+        .any(|child| child.enrollment != crate::run_participants::Enrollment::Contained)
+    {
         Some(RecoveryState::Held {
             reason: "unverified child execution host; charges retained",
             charges_retained: true,
