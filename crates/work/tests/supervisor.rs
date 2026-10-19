@@ -34,6 +34,7 @@ fn run_is_a_public_command_with_explicit_chain_and_retry_identity() {
 struct Collector {
     root: PathBuf,
     context: serde_json::Value,
+    initialized: std::cell::Cell<bool>,
 }
 impl LibraryCollector for Collector {
     fn identities(&self) -> Result<(ChildIdentity, ChildIdentity), &'static str> {
@@ -54,7 +55,7 @@ impl LibraryCollector for Collector {
         // Collector is called again immediately before exec. Rewriting the
         // synthetic kernel files then would create impossible truncation races
         // with the parent's census (real proc/cgroup files are not truncated).
-        if !self.root.join(format!("proc/{pid}")).exists() {
+        if !self.initialized.replace(true) {
             fs::create_dir_all(&cg).unwrap();
             fs::write(cg.join("cgroup.type"), "domain\n").unwrap();
             fs::write(cg.join("cgroup.procs"), format!("{pid}\n")).unwrap();
@@ -86,6 +87,25 @@ impl LibraryCollector for Collector {
     }
 }
 #[test]
+fn collector_initializes_synthetic_kernel_once_even_after_pid_tree_removed() {
+    let temp = tempfile::tempdir().unwrap();
+    let collector = Collector {
+        root: temp.path().into(),
+        initialized: std::cell::Cell::new(false),
+        context: serde_json::json!({"unit":"work-fixture.scope", "parent":{"pid":std::process::id(),"start_ticks":1,"boot":"fixture","cgroup":"/"}}),
+    };
+    let first = collector.identities().unwrap();
+    let pid_tree = temp.path().join(format!("proc/{}", std::process::id()));
+    assert!(pid_tree.exists());
+    fs::remove_dir_all(&pid_tree).unwrap();
+    let second = collector.identities().unwrap();
+    assert_eq!(first, second);
+    assert!(
+        !pid_tree.exists(),
+        "collector recreated synthetic kernel after cleanup"
+    );
+}
+#[test]
 fn fixture_child() {
     let Some(context) = std::env::var_os("SUPERVISOR_CONTEXT") else {
         return;
@@ -102,6 +122,7 @@ fn fixture_child() {
     let collector = Collector {
         root,
         context: value,
+        initialized: std::cell::Cell::new(false),
     };
     if run_with_collector(&context, &argv, &collector).is_err() {
         std::process::exit(42);
@@ -663,7 +684,7 @@ fn malformed_ready_allocation_without_source_is_refused_not_panicked() {
 fn released_root_cancellation_records_actual_exit_and_only_closes_on_fresh_empty_scope() {
     let h = Harness::new();
     let root = h.f.temp.path();
-    fs::write(root.join("delegate"), format!("#!/bin/sh\n/usr/bin/touch '{0}/executed'\nwhile [ ! -e '{0}/stop' ]; do /usr/bin/sleep 0.005; done\nexit 143\n",root.display())).unwrap();
+    fs::write(root.join("delegate"), format!("#!/bin/sh\n/usr/bin/touch '{0}/executed'\nwhile [ ! -e '{0}/stop' ]; do /usr/bin/sleep 0.005; done\nexit 0\n",root.display())).unwrap();
     fs::write(root.join("manager"), format!("#!/bin/sh\nif [ \"$4\" = kill ]; then /usr/bin/touch '{0}/stop' '{0}/signals'; exit 0; fi\nexec /usr/bin/cat '{0}/properties'\n",root.display())).unwrap();
     let token = CancelToken::default();
     let thread_token = token.clone();
@@ -684,9 +705,17 @@ fn released_root_cancellation_records_actual_exit_and_only_closes_on_fresh_empty
     worker.join().unwrap();
     let report = result.unwrap();
     assert_eq!(report.record.outcome, Some(RootOutcome::Cancelled));
-    assert_eq!(report.exit_code, Some(143));
+    assert_eq!(report.exit_code, Some(0));
     assert!(report.record.closed && !report.record.recovery_hold);
-    assert_eq!(report.process_exit_code(), 143);
+    assert_ne!(report.process_exit_code(), 0);
+    let retry = h
+        .execute(h.request(), &CancelToken::default(), |_, _| {
+            panic!("cancelled receipt launched")
+        })
+        .unwrap();
+    assert!(retry.existing && retry.record.closed);
+    assert_eq!(retry.record.outcome, Some(RootOutcome::Cancelled));
+    assert_ne!(retry.process_exit_code(), 0);
     assert!(root.join("signals").exists());
 }
 #[test]
@@ -793,6 +822,74 @@ fn blocked_cancellation_still_collects_whole_scope_before_closing_writer() {
     assert!(report.record.closed && !report.record.recovery_hold);
     assert!(!h.f.temp.path().join("executed").exists());
     assert_eq!(h.f.store().charged(&h.f.repo, None).unwrap(), 1);
+}
+#[test]
+fn ready_preflights_atomically_refresh_descendant_head_without_changing_lease_base_or_receipt() {
+    let mut h = Harness::new();
+    let old_command = h.request();
+    let first = h
+        .execute(old_command.clone(), &CancelToken::default(), |b, r| {
+            if b == Boundary::RootTerminal {
+                h.empty(r);
+            }
+        })
+        .unwrap();
+    let path = h.f.root.join("task");
+    let marker_path = h
+        .allocation
+        .identity
+        .as_ref()
+        .unwrap()
+        .private_git_dir
+        .join("work-lease.json");
+    let marker = fs::read(&marker_path).unwrap();
+    git(&path, &["commit", "--allow-empty", "-m", "between runs"]);
+    let advanced = git(&path, &["rev-parse", "HEAD"]);
+    let mut release_head = None;
+    h.run = Uuid::now_v7();
+    fs::remove_file(h.f.temp.path().join("executed")).unwrap();
+    let second = h.execute(h.request(), &CancelToken::default(), |b,r| {
+        if b==Boundary::Intent || b==Boundary::PermitAttempt {
+            assert!(!h.f.temp.path().join("executed").exists());
+            let conn = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+            let record: String = conn.query_row("SELECT record FROM allocations WHERE checkout=?1",[h.checkout.to_string()],|row|row.get(0)).unwrap();
+            let allocation: work_cli::allocate::Allocation = serde_json::from_str(&record).unwrap();
+            assert_eq!(allocation.identity.as_ref().unwrap().head, advanced, "preflight discarded fresh HEAD identity");
+            assert_eq!(allocation.stage,"ready");
+            assert_eq!(allocation.base_commit,h.allocation.base_commit);
+            assert!(h.f.store().pending_events(1000).unwrap().iter().any(|e| matches!(&e.event, work_cli::events::Event::HeadAdvanced {checkout,old,new} if *checkout==h.checkout && old==&h.allocation.identity.as_ref().unwrap().head && new==&advanced)));
+        }
+        if b==Boundary::PermitAttempt {
+            git(&path, &["commit", "--allow-empty", "-m", "near release"]);
+            release_head = Some(git(&path, &["rev-parse", "HEAD"]));
+        }
+        if b==Boundary::RootTerminal {h.empty(r);}
+    }).unwrap();
+    assert!(second.record.closed);
+    let conn = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    let record: String = conn
+        .query_row(
+            "SELECT record FROM allocations WHERE checkout=?1",
+            [h.checkout.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let allocation: work_cli::allocate::Allocation = serde_json::from_str(&record).unwrap();
+    assert_eq!(
+        allocation.identity.as_ref().unwrap().head,
+        release_head.unwrap()
+    );
+    assert_eq!(allocation.base_commit, h.allocation.base_commit);
+    assert_eq!(fs::read(marker_path).unwrap(), marker);
+    let heads = h.f.store().pending_events(1000).unwrap().into_iter().filter(|e| matches!(&e.event,work_cli::events::Event::HeadAdvanced {checkout,..} if *checkout==h.checkout)).count();
+    assert_eq!(heads, 2);
+    let receipt = h
+        .execute(old_command, &CancelToken::default(), |_, _| {
+            panic!("old receipt launched")
+        })
+        .unwrap();
+    assert!(receipt.existing);
+    assert_eq!(receipt.record.request, first.record.request);
 }
 #[test]
 fn fresh_lease_damage_refuses_before_intent_and_never_revives_holds() {

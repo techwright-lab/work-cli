@@ -84,7 +84,12 @@ pub struct RunReport {
 }
 impl RunReport {
     pub fn process_exit_code(&self) -> i32 {
-        if !self.record.closed {
+        if !self.record.closed
+            || (self.record.outcome == Some(RootOutcome::Cancelled)
+                && self.exit_code.unwrap_or(0) == 0)
+        {
+            // A delegate may handle TERM and exit zero. Preserve that observed
+            // code in the report, but cancellation is never CLI success.
             1
         } else {
             self.exit_code

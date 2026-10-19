@@ -155,15 +155,70 @@ pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result
     .filter(|a| a.checkout == checkout && a.stage == "ready")
     .ok_or_else(|| err("checkout allocation not ready"))?;
     source_authority(store, &mut a)?;
-    if crate::recovery::verify(&a).is_err() {
-        crate::recovery::hold(
-            store,
-            &mut a,
-            "fresh lease identity verification failed; charge retained",
-        )?;
-        return Err(err("lease identity changed; held"));
-    }
+    let current = match crate::recovery::verify(&a) {
+        Ok(current) => current,
+        Err(_) => {
+            crate::recovery::hold(
+                store,
+                &mut a,
+                "fresh lease identity verification failed; charge retained",
+            )?;
+            return Err(err("lease identity changed; held"));
+        }
+    };
+    refresh_ready_identity(store, &mut a, current)?;
     Ok(a)
+}
+/// Identity evidence only: atomically refresh a still-active/ready allocation
+/// and its HEAD event. Never changes checkout eligibility, stage, or lease base.
+fn refresh_ready_identity(
+    store: &mut Store,
+    a: &mut Allocation,
+    current: CheckoutIdentity,
+) -> io::Result<()> {
+    let tx = sql(store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+    let stored: Option<(String, String)> = sql(tx
+        .query_row(
+            "SELECT a.request,a.record FROM allocations a JOIN checkouts c ON c.id=a.checkout
+         WHERE c.id=?1 AND c.operation=?2 AND c.state='active' AND c.ready=1",
+            (a.checkout.to_string(), a.request.operation.to_string()),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional())?;
+    let (request, record) =
+        stored.ok_or_else(|| err("checkout eligibility changed during verification"))?;
+    if serde_json::from_str::<Start>(&request)? != a.request
+        || serde_json::from_str::<serde_json::Value>(&record)? != serde_json::to_value(&*a)?
+    {
+        return Err(err("allocation changed during verification"));
+    }
+    let mut refreshed = a.clone();
+    if a.identity.as_ref() != Some(&current) {
+        let prior = a
+            .identity
+            .as_ref()
+            .ok_or_else(|| err("missing prior identity"))?;
+        if prior.head != current.head {
+            db(crate::store::emit(
+                &tx,
+                &crate::events::Event::HeadAdvanced {
+                    checkout: a.checkout,
+                    old: prior.head.clone(),
+                    new: current.head.clone(),
+                },
+            ))?;
+        }
+        refreshed.identity = Some(current);
+        sql(tx.execute(
+            "UPDATE allocations SET record=?2 WHERE checkout=?1",
+            (a.checkout.to_string(), serde_json::to_string(&refreshed)?),
+        ))?;
+    }
+    sql(tx.commit())?;
+    *a = refreshed;
+    Ok(())
 }
 pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
     let dir = config
