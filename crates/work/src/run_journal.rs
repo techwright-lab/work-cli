@@ -1,6 +1,6 @@
-//! Durable supervised ROOT-ONLY journal and fresh OS-proof writer handoff.
-//! No launch, participant registration, task-finish or retirement authority.
-//! Coverage must be extended BEFORE supporting participants outside RootScope.
+//! Durable supervised journal and fresh OS-proof writer handoff.
+//! Child declarations are full-roster barriers, never OS containment authority.
+//! No launch, task-finish or retirement authority.
 use crate::{
     runtime_scope::{validate_structure, Binding, ChildIdentity, LaunchIntent, ScopeIdentity},
     store::{Result, Store, StoreError},
@@ -114,6 +114,7 @@ pub struct RunRecord {
     pub recovery_hold: bool,
     pub closed: bool,
     pub revision: u64,
+    pub children: Vec<crate::run_participants::ChildRecord>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +125,9 @@ pub enum JournalChange {
     RootTerminal,
     RecoveryHold,
     GroupClosed,
+    ChildRegistered,
+    ChildDeclaredOutcome,
+    ChildHold,
 }
 
 use crate::{
@@ -164,7 +168,7 @@ impl GroupSnapshot {
     /// The stored exact root roster is a candidate, never an absence assertion.
     pub fn certify_historical_empty(&self, driver: &Driver) -> Result<GroupEmptyProof> {
         let r = &self.record;
-        if r.closed {
+        if r.closed || !r.children.is_empty() {
             return Err(StoreError::Invalid);
         }
         let b = r.binding.as_ref().ok_or(StoreError::Invalid)?;
@@ -210,6 +214,9 @@ impl GroupSnapshot {
     /// opaque Binding; historical JSON cannot restore runtime authority.
     pub fn certify_empty(&self, driver: &Driver, binding: &Binding) -> Result<GroupEmptyProof> {
         let r = &self.record;
+        if !r.children.is_empty() {
+            return Err(StoreError::Invalid);
+        }
         if r.closed || r.binding.as_ref() != Some(&BoundSnapshot::capture(&r.request, binding)?) {
             return Err(StoreError::Conflict);
         }
@@ -270,7 +277,7 @@ impl BoundSnapshot {
         })
     }
 }
-fn journal_event(
+pub(crate) fn journal_event(
     conn: &Connection,
     request: &RootRunRequest,
     revision: u64,
@@ -355,21 +362,42 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
             recovery_hold: hold == 1,
             closed: closed == 1,
             revision: revision as u64,
+            children: Vec::new(),
         })
     })())
 }
 fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     // Typed domain validation is shared with admission. Historical reads must
     // not impose a smaller serialized size than previously accepted requests.
-    conn.query_row(
-        &format!("{SELECT} WHERE r.id=?1"),
-        [run.to_string()],
-        read_row,
-    )
-    .optional()?
-    .transpose()
+    let _snapshot = read_transaction(conn)?;
+    let mut record = conn
+        .query_row(
+            &format!("{SELECT} WHERE r.id=?1"),
+            [run.to_string()],
+            read_row,
+        )
+        .optional()?
+        .transpose()?;
+    if let Some(r) = &mut record {
+        r.children = crate::run_participants::roster(conn, &r.request)?;
+        if r.closed && !r.children.is_empty() {
+            return Err(StoreError::Invalid);
+        }
+    }
+    Ok(record)
 }
-fn exact(conn: &Connection, request: &RootRunRequest) -> Result<RunRecord> {
+pub(crate) fn read_transaction(conn: &Connection) -> Result<Option<rusqlite::Transaction<'_>>> {
+    if conn.is_autocommit() {
+        Ok(Some(rusqlite::Transaction::new_unchecked(
+            conn,
+            TransactionBehavior::Deferred,
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+pub(crate) fn exact(conn: &Connection, request: &RootRunRequest) -> Result<RunRecord> {
+    let _snapshot = read_transaction(conn)?;
     let record = read(conn, &request.identity.run)?.ok_or(StoreError::Invalid)?;
     if &record.request != request {
         return Err(StoreError::Conflict);
@@ -406,6 +434,7 @@ impl Store {
             OR EXISTS(SELECT 1 FROM checkouts WHERE id IN (?2,?3) OR operation IN (?2,?3))
             OR EXISTS(SELECT 1 FROM adopted_groups WHERE run_ref=?1 OR id IN (?2,?3) OR run_id IN (?2,?3) OR operation IN (?2,?3))
             OR EXISTS(SELECT 1 FROM writers WHERE group_id IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM run_participants WHERE run_ref=?1 OR id IN (?2,?3))
             ",
             (i.run_ref.as_str(), i.group.to_string(), i.run.to_string()), |r| r.get(0))?;
         if conflict {
@@ -471,6 +500,7 @@ impl Store {
     }
     pub(crate) fn run_status_record(&self, run: &RunId) -> Result<(RunRecord, bool)> {
         let _phase = self.sql_phase();
+        let _snapshot = read_transaction(&self.conn)?;
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
         let record = exact(&self.conn, &record.request)?;
         let state: String = self.conn.query_row(
@@ -498,6 +528,8 @@ impl Store {
     /// No heartbeat/reboot inference, no reconstructed runtime authority.
     pub fn recovery_runs(&self) -> Result<Vec<RunRecord>> {
         let _phase = self.sql_phase();
+        let _snapshot = read_transaction(&self.conn)?;
+        crate::run_participants::validate_orphans(&self.conn)?;
         let mut stmt = self.conn.prepare(&format!("{SELECT} ORDER BY r.rowid"))?;
         let rows = stmt.query_map([], read_row)?;
         // Validate historical receipts too: a malformed closed flag must never
@@ -505,12 +537,19 @@ impl Store {
         let mut records = rows
             .map(|r| r.map_err(StoreError::from).and_then(|v| v))
             .collect::<Result<Vec<_>>>()?;
+        for record in &mut records {
+            record.children = crate::run_participants::roster(&self.conn, &record.request)?;
+            if record.closed && !record.children.is_empty() {
+                return Err(StoreError::Invalid);
+            }
+        }
         records.retain(|record| !record.closed);
         Ok(records)
     }
-    /// ROOT-ONLY: no participant registration exists in this version.
+    /// Exact root and complete child ledger, pinned to one SQLite snapshot.
     pub fn group_snapshot(&self, run: &RunId) -> Result<GroupSnapshot> {
         let _phase = self.sql_phase();
+        let _snapshot = read_transaction(&self.conn)?;
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
         let record = exact(&self.conn, &record.request)?;
         if record.closed || record.binding.is_none() {

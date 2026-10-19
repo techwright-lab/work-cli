@@ -295,7 +295,7 @@ fn v5_migration_preserves_supervised_history_accounting_legacy_writers_and_outbo
     let active_before = store.run_snapshot(&active.identity().run).unwrap();
     let closed_before = store.run_snapshot(&closed.identity().run).unwrap();
     let events = store.pending_events(1000).unwrap();
-    sql.execute_batch("DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; PRAGMA user_version=5").unwrap();
+    sql.execute_batch("DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; PRAGMA user_version=5").unwrap();
     drop(store);
     assert!(work_cli::store::Store::open_existing_registered_readonly(
         &dir.path().join(".work-authorities"),
@@ -391,7 +391,10 @@ fn schema_v6_is_additive_and_missing_tables_fail_closed() {
     let version: i64 = sql
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 6, "adopted journal needs a distinct schema");
+    assert_eq!(
+        version, 7,
+        "supervised child journal needs a distinct schema"
+    );
     assert_eq!(
         store
             .charged(&dir.path().join("root"), Some("owner"))

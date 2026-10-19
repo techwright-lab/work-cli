@@ -331,6 +331,74 @@ fn actual_pipeline_projects_git_identity_commits_before_exec_and_closes_only_sco
     assert!(!db.windows(15).any(|b| b == b"secret-argument"));
 }
 #[test]
+fn registered_unknown_children_hold_live_terminal_and_cancellation_closure() {
+    for cancelled in [false, true] {
+        let h = Harness::new();
+        let token = CancelToken::default();
+        let worker = if cancelled {
+            let root = h.f.temp.path();
+            fs::write(root.join("delegate"), format!("#!/bin/sh\n/usr/bin/touch '{0}/executed'\nwhile [ ! -e '{0}/stop' ]; do /usr/bin/sleep 0.005; done\n",root.display())).unwrap();
+            fs::write(root.join("manager"), format!("#!/bin/sh\nif [ \"$4\" = kill ]; then /usr/bin/touch '{0}/stop' '{0}/signals'; exit 0; fi\nexec /usr/bin/cat '{0}/properties'\n",root.display())).unwrap();
+            let marker = root.join("executed");
+            let requested = token.clone();
+            Some(std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !marker.exists() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                requested.request();
+            }))
+        } else {
+            None
+        };
+        let result = h.execute(h.request(), &token, |boundary, record| {
+            if boundary == Boundary::PermitAttempt {
+                let i = record.request.identity();
+                let child = work_cli::run_participants::ChildRequest {
+                    checkout: i.checkout.clone(),
+                    group: i.group.clone(),
+                    run: work_contract::RunId::generate(),
+                    run_ref: work_contract::RunRef::parse("fixture-child").unwrap(),
+                    parent_run: i.run.clone(),
+                    parent_run_ref: i.run_ref.clone(),
+                    execution_chain: i.execution_chain.clone(),
+                    source: None,
+                    session: None,
+                    agent: None,
+                    actor: None,
+                    expected_host: None,
+                };
+                h.f.store().register_child(&record.request, &child).unwrap();
+            }
+            if boundary == Boundary::RootTerminal {
+                h.empty(record);
+            }
+        });
+        if let Some(worker) = worker {
+            worker.join().unwrap();
+        }
+        let report = result.unwrap();
+        assert_eq!(
+            report.record.outcome,
+            Some(if cancelled {
+                RootOutcome::Cancelled
+            } else {
+                RootOutcome::Completed
+            })
+        );
+        assert!(!report.record.closed);
+        assert!(report.record.recovery_hold);
+        assert_eq!(report.record.children.len(), 1);
+        assert_eq!(
+            report.record.children[0].enrollment,
+            work_cli::run_participants::Enrollment::Unverified
+        );
+        assert_eq!(h.f.store().charged(&h.f.repo, None).unwrap(), 1);
+    }
+}
+
+#[test]
 fn root_exit_with_descendants_holds_writer_and_exact_retry_never_executes() {
     let h = Harness::new();
     let delegate = h.f.temp.path().join("delegate");

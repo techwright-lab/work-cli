@@ -20,6 +20,7 @@ pub mod ownership;
 pub mod participants;
 pub mod recovery;
 pub mod run_journal;
+pub mod run_participants;
 pub mod run_recovery;
 pub mod runtime_scope;
 pub mod scope_child;

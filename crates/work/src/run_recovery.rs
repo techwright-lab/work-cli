@@ -1,4 +1,5 @@
-//! Historical ROOT-ONLY reconciliation. Never launch, signal, finish or uncharge.
+//! Historical reconciliation. Child declarations remain explicit proof barriers.
+//! Never launch, signal, finish or uncharge.
 use crate::{
     scope_driver::{Driver, RuntimeContext},
     store::{Result, Store, StoreError},
@@ -21,7 +22,7 @@ pub struct HistoricalStatus {
     pub record: crate::run_journal::RunRecord,
     pub runtime: &'static str,
     pub lease_charged: bool,
-    /// This ROOT-ONLY journal has no task-completion transition.
+    /// This journal has no task-completion transition.
     pub task_open: bool,
 }
 /// Historical metadata only: never scope inspection or an actual exit-code claim.
@@ -81,6 +82,11 @@ fn historical_receipt(store: &Store, run: &RunId) -> Result<Option<RecoveryState
     } else if record.binding.is_none() {
         Some(RecoveryState::Held {
             reason: "unbound intent: historical proof unsupported",
+            charges_retained: true,
+        })
+    } else if !record.children.is_empty() {
+        Some(RecoveryState::Held {
+            reason: "unverified child execution host; charges retained",
             charges_retained: true,
         })
     } else {

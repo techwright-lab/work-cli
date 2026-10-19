@@ -210,7 +210,7 @@ Recovery never launches, signals, kills, finishes a task, deletes or uncharges.
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted v6 authority;
+runtime qualification claim. It requires an existing initialized trusted v7 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -222,9 +222,34 @@ between operations inspecting Git or runtime state does not consume that limit.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
 
-Supervised groups remain ROOT-ONLY: attaching external/adopted participants is refused.
-Supervised child coverage, bridge, task finish, retirement and automatic recovery
-are not implemented. Serialized metadata alone grants no cancellation/closure authority.
+Supervised closure authority remains root-only; adopted participants cannot join it.
+The library-only `Store::register_child(root, ChildRequest)` now records an immutable
+supervised child intent before inspection, bumps group revision/child count and appends
+an outbox event in the same IMMEDIATE transaction. Exact retries validate the entire
+child tree without grants/events. It requires the exact open writer and permitted root,
+explicit known parent run/ref, same checkout/group, at most 16 levels and 256 children.
+Child Work IDs/refs share the root/adopted/operation/group namespace. Optional actual
+source/session/agent/actor references remain unknown when absent. Expected boot/PID/start
+is a candidate host identity, **not** observed containment or individual authorship;
+logical children can name the same physical host without inventing child PIDs.
+
+This is a conservative partial Task6 increment: expected-host children remain `pending`,
+children without an expected host start `unverified`, and `record_child_hold` only tightens
+pending to unverified. `record_child_outcome` records immutable/idempotent declared
+Completed/Failed/Cancelled, never caller-declared Interrupted or physical absence.
+Every accepted change bumps revision; no writer, charge, task or checkout state changes.
+Full child requests and parent trees are validated in one SQLite snapshot on root
+lookup/retry/status/recovery. Missing ledger rows, orphan/corrupt metadata and versioned
+views fail closed. Status includes `record.children` and still says `not_inspected`.
+All registered children block both live and historical empty proof, even after logical
+closure or expected shared-root-host declarations; a pre-registration proof fails CAS.
+Thus no child is silently dropped by terminal/grace/cancellation/recovery closure.
+
+**Not implemented:** trusted fresh host enrollment, contained-host full-roster absence
+proof, atomic Interrupted-child/group closure, child metadata CLI/native hook routing,
+bridge, task finish, retirement or automatic recovery. Children cannot yet be positively
+certified or removed to release their writer. This does not complete increment A or
+Task6. Serialized metadata alone grants no launch, cancellation or closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
 do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
 
@@ -315,15 +340,16 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-v6-authority metadata, with
+Status is read-only existing-v7-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
 logical closures never release the adopted writer, finish a task, change checkout
 state or uncharge it. The writer remains explicitly held until a future qualified
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
-and `work recover` remain supervised ROOT-ONLY; use `work adopt status` for adopted
-metadata. Schema v6 is additive: supervised proof tables are not rebuilt or weakened,
+and `work recover` remain supervised-only; registered supervised children block handoff.
+Use `work adopt status` for adopted metadata. Schema v7 adds the supervised child ledger
+and retained child count without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned
 tables fail closed, and read APIs never initialize or migrate. Optional references
 reuse v6 columns without migration: absence is stored as an empty SQL key (not a
@@ -331,8 +357,9 @@ user-facing reference), present refs retain their original text, and historical
 string-valued request/event/parent JSON remains compatible without row rewrites.
 
 Actual runtime-hook payload-to-stable-ID mapping, installation and fork coverage
-qualification belong to Task 13 and are not implemented. Supervised child coverage
-is the next Task 6 slice; this journal does not complete Task 6.
+qualification belong to Task 13 and are not implemented. Positive supervised child
+containment/closure proof remains the next Task6 library slice, before child CLI routing;
+this journal does not complete Task6.
 
 ## Requirements
 

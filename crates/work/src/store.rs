@@ -135,7 +135,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=6))
+        || (name == "store.sqlite" && matches!(version, 2..=7))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -271,13 +271,13 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 6 {
+        if version != 7 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
         Ok(Self { conn, budget })
     }
-    /// Recovery can mutate an established v6 authority only; never initializes
+    /// Recovery can mutate an established v7 authority only; never initializes
     /// an empty authority for an unknown RunId or upgrades historical schemas.
     pub fn open_existing_registered_mut(
         registry: &Path,
@@ -287,7 +287,7 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 6 {
+        if version != 7 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
@@ -402,7 +402,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=6) {
+        if !matches!(version, 0..=7) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -466,7 +466,18 @@ impl Store {
                 PRIMARY KEY(group_id,source,session,agent,prompt,tool,kind,event_ref));
                 PRAGMA user_version=6;")?;
         }
-        validate_existing_schema(&tx, 6)?;
+        if version < 7 {
+            validate_existing_schema(&tx, 6)?;
+            tx.execute_batch("ALTER TABLE run_groups ADD COLUMN child_count INTEGER NOT NULL DEFAULT 0 CHECK(child_count BETWEEN 0 AND 256);
+                CREATE TABLE run_participants(
+                id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES run_groups(id),
+                run_ref TEXT NOT NULL UNIQUE, parent_run TEXT NOT NULL, request TEXT NOT NULL,
+                enrollment TEXT NOT NULL CHECK(enrollment IN ('pending','unverified')),
+                outcome TEXT, depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 16));
+                PRAGMA user_version=7;")?;
+            initialization_boundary("participant_schema");
+        }
+        validate_existing_schema(&tx, 7)?;
         tx.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
         tx.prepare("SELECT ready FROM checkouts LIMIT 0")?;
         tx.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
@@ -623,7 +634,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> 
     conn.execute_batch("PRAGMA query_only=ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=6))) || integrity != "ok"
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=7))) || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
@@ -742,7 +753,7 @@ fn existing_authority(
     let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if writable && version != 6 {
+    if writable && version != 7 {
         return Err(StoreError::UpgradeRequired);
     }
     validate_existing_schema(&conn, version)?;
@@ -763,6 +774,18 @@ fn existing_authority(
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
+    if version >= 7 {
+        let table: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='run_participants' AND type='table')", [], |r| r.get(0))?;
+        if !table {
+            return Err(StoreError::Invalid);
+        }
+        conn.prepare("SELECT child_count FROM run_groups LIMIT 0")?;
+        conn.prepare("SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth FROM run_participants LIMIT 0")?;
+        let orphan: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_participants p LEFT JOIN run_groups g ON g.id=p.group_id LEFT JOIN runs r ON r.group_id=p.group_id WHERE g.id IS NULL OR r.id IS NULL OR g.mode!='supervised')", [], |r| r.get(0))?;
+        if orphan {
+            return Err(StoreError::Invalid);
+        }
+    }
     if version >= 6 {
         for name in ["adopted_groups", "adopted_sessions", "adopted_segments"] {
             let table: bool = conn.query_row(
@@ -1065,6 +1088,65 @@ mod tests {
     }
 
     #[test]
+    fn killed_v6_migration_rolls_back_child_schema_without_touching_accounting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut store =
+            super::Store::open(&dir.path().join("private"), std::slice::from_ref(&root)).unwrap();
+        store
+            .reserve(
+                &crate::admission::Reservation {
+                    operation: uuid::Uuid::now_v7(),
+                    repository: root.clone(),
+                    actor: "allocator".into(),
+                    owner: "owner".into(),
+                    task: "task".into(),
+                },
+                crate::admission::Limits {
+                    repository: 2,
+                    owner: 2,
+                    available_bytes: Some(10),
+                    floor_bytes: 0,
+                    warn_bytes: 0,
+                },
+            )
+            .unwrap();
+        let events = store.pending_events(100).unwrap();
+        store.conn.execute_batch("DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::initialization_worker"])
+            .env("WORK_INIT_TEST_BASE", dir.path())
+            .env("WORK_INIT_TEST_BOUNDARY", "participant_schema")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(6));
+        let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        assert_eq!(
+            sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            sql.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='run_participants'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert!(sql.prepare("SELECT child_count FROM run_groups").is_err());
+        let store =
+            super::Store::open(&dir.path().join("private"), std::slice::from_ref(&root)).unwrap();
+        assert_eq!(store.charged(&root, Some("owner")).unwrap(), 1);
+        assert_eq!(store.pending_events(100).unwrap(), events);
+    }
+
+    #[test]
     fn killed_v3_migration_rolls_back_partial_schema_and_preserves_accounting() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
@@ -1092,7 +1174,7 @@ mod tests {
         let events = store.pending_events(100).unwrap();
         store
             .conn
-            .execute_batch("DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
+            .execute_batch("DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
             .unwrap();
         drop(store);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
