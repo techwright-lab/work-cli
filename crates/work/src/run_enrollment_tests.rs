@@ -177,6 +177,22 @@ fn enrollment_freshness_is_evaluated_after_immediate_lock_at_the_two_second_boun
     }
 }
 #[test]
+fn pending_host_commit_preserves_each_logical_outcome() {
+    for outcome in [
+        ChildOutcome::Completed,
+        ChildOutcome::Failed,
+        ChildOutcome::Cancelled,
+    ] {
+        let (_dir, mut store, r, c, mut proof) = fixture();
+        store.record_child_outcome(&r, &c, outcome).unwrap();
+        proof.record = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+        store.record_child_enrollment(&r, &c, &proof).unwrap();
+        let after = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+        assert_eq!(after.children[0].outcome, Some(outcome));
+        assert_eq!(after.children[0].enrollment, Enrollment::Contained);
+    }
+}
+#[test]
 fn enrollment_event_failure_rolls_back_host_revision_and_every_durable_row() {
     let (_dir, mut store, r, c, proof) = fixture();
     let before = store.run_snapshot(&r.identity().run).unwrap().unwrap();

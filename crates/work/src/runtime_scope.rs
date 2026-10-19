@@ -293,6 +293,9 @@ pub struct ValidatedHost {
     pub(crate) host: ChildIdentity,
     pub(crate) observed_at: Instant,
 }
+/// The involved roster is only the target host and, without the original controller,
+/// the actual registrar, deduplicated by physical identity. It is not the full child
+/// ledger or a group-quiescence claim. Recursive membership still covers all OS members.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_enrollment_host(
     intent: &LaunchIntent,

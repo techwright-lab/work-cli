@@ -254,11 +254,21 @@ proc inspection (production fixed `/proc`, explicit library fixture IO otherwise
 `GroupSnapshot::certify_child_enrollment(driver, child_run, optional_original_binding)`
 returns a private, nonserializable `EnrollmentProof` only after exact original host
 boot/PID/start matching, fresh active exact scope inspection and complete recursive/
-participant coverage. Membership may include other processes. Without the original
+participant coverage for the target execution host and necessary actual registrar only.
+Identification and census share one cumulative byte budget and earliest deadline,
+capped at two seconds. Membership still covers every recursive kernel member;
+the full root record and complete child ledger still bind validation and commit CAS.
+An absent original root process or unrelated unknown, unverified, missing or dead
+sibling does not veto positive target facts or mutate sibling metadata. This is target
+enrollment, not entire-group quiescence; all children remain closure barriers.
+Without the original
 root Binding, the actual registrar process must also be freshly present in that scope;
 there is no caller-selected registrar PID or environment lease. Shared root hosts need
 the same fresh evidence, not invented child PIDs. Terminal root outcomes/recovery holds
-are retained and do not grant execution. Unknown/unverified/ended children cannot upgrade.
+are retained and do not grant execution. Exact declared Completed/Failed/Cancelled
+child outcomes are also retained and do not veto enrollment of a still-live pending
+host. Unknown/unverified targets cannot upgrade. No new native IDs, individual
+authorship, launch permission or cancellation permission are created.
 
 `Store::record_child_enrollment(root, child, proof)` revalidates the exact full snapshot,
 writer, immutable child, root binding and revision under IMMEDIATE locking, checks the
@@ -367,7 +377,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-v7-authority metadata, with
+Status is read-only existing-v8-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -375,8 +385,9 @@ logical closures never release the adopted writer, finish a task, change checkou
 state or uncharge it. The writer remains explicitly held until a future qualified
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; registered supervised children block handoff.
-Use `work adopt status` for adopted metadata. Schema v7 adds the supervised child ledger
-and retained child count without rebuilding the v6 adopted/supervised proof tables;
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema v8.
+Schema v7 added the supervised child ledger and retained child count; v8 adds positive
+host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned
 tables fail closed, and read APIs never initialize or migrate. Optional references
 reuse v6 columns without migration: absence is stored as an empty SQL key (not a

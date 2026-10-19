@@ -123,12 +123,19 @@ impl Driver {
     }
     /// Bounded identity inspection only; grants no process or scope authority.
     pub fn identify(&self, pid: u32) -> Result<ChildIdentity> {
-        let mut budget = Budget {
-            start: Instant::now(),
-            limits: &self.limits,
-            bytes: 0,
-        };
-        identify_at(&self.io.proc_root, pid, &mut budget)
+        let mut budget = Budget::new(&self.limits, Instant::now(), self.limits.duration);
+        self.identify_with(pid, &mut budget)
+    }
+    pub(crate) fn enrollment_budget(&self, start: Instant) -> Budget<'_> {
+        Budget::new(
+            &self.limits,
+            start,
+            self.limits.duration.min(Duration::from_secs(2)),
+        )
+    }
+    pub(crate) fn identify_with(&self, pid: u32, budget: &mut Budget<'_>) -> Result<ChildIdentity> {
+        budget.check()?;
+        identify_at(&self.io.proc_root, pid, budget)
     }
     pub fn observe(
         &self,
@@ -150,13 +157,37 @@ impl Driver {
             Some(roster),
         )
     }
+    pub(crate) fn observe_recorded_with(
+        &self,
+        intent: &LaunchIntent,
+        expected: &crate::run_journal::RecordedScopeExpectation,
+        roster: &[Participant],
+        budget: &mut Budget<'_>,
+    ) -> Observation {
+        self.observe_expected_with(
+            intent,
+            Some((expected.identity(), expected.boot())),
+            Some(roster),
+            budget,
+        )
+    }
     fn observe_expected(
         &self,
         intent: &LaunchIntent,
         binding: Option<(&ScopeIdentity, &str)>,
         roster: Option<&[Participant]>,
     ) -> Observation {
-        let observed_at = Instant::now();
+        let mut budget = Budget::new(&self.limits, Instant::now(), self.limits.duration);
+        self.observe_expected_with(intent, binding, roster, &mut budget)
+    }
+    fn observe_expected_with(
+        &self,
+        intent: &LaunchIntent,
+        binding: Option<(&ScopeIdentity, &str)>,
+        roster: Option<&[Participant]>,
+        budget: &mut Budget<'_>,
+    ) -> Observation {
+        let observed_at = budget.start;
         let mut obs = Observation {
             boot: String::new(),
             observed_at,
@@ -167,7 +198,7 @@ impl Driver {
             participants: vec![],
         };
         // Keep partial evidence unknown on any error. Never infer absence from a query error.
-        let _ = self.collect(intent, binding, roster, &mut obs);
+        let _ = self.collect(intent, binding, roster, &mut obs, budget);
         obs
     }
     /// Freshly validate the private manager context. Never mutates process environment.
@@ -207,6 +238,7 @@ impl Driver {
         Ok(())
     }
     fn manager(&self, intent: &LaunchIntent, budget: &mut Budget<'_>) -> Result<Manager> {
+        budget.check()?;
         self.context.validate()?;
         budget.check()?;
         let mut command = Command::new(&self.io.systemctl);
@@ -220,8 +252,12 @@ impl Driver {
             ])
             .env("XDG_RUNTIME_DIR", &self.context.directory)
             .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
-        let output = bounded_process::output(&mut command, budget.remaining()?, 16_384)
-            .map_err(|_| "scope manager command unavailable or exceeded capture/runtime limit")?;
+        let output = bounded_process::output(
+            &mut command,
+            budget.remaining()?,
+            (budget.limits.total_bytes - budget.bytes).min(16_384),
+        )
+        .map_err(|_| "scope manager command unavailable or exceeded capture/runtime limit")?;
         budget.charge(output.stdout.len() + output.stderr.len())?;
         let manager = Manager::parse(
             std::str::from_utf8(&output.stdout).map_err(|_| HOLD)?,
@@ -238,15 +274,12 @@ impl Driver {
         binding: Option<(&ScopeIdentity, &str)>,
         roster: Option<&[Participant]>,
         obs: &mut Observation,
+        budget: &mut Budget<'_>,
     ) -> Result<()> {
-        let mut budget = Budget {
-            start: obs.observed_at,
-            limits: &self.limits,
-            bytes: 0,
-        };
+        budget.check()?;
         let proc = canonical_dir(&self.io.proc_root)?;
         let cg = canonical_dir(&self.io.cgroup_root)?;
-        let boot = read(&proc, "sys/kernel/random/boot_id", &mut budget)?
+        let boot = read(&proc, "sys/kernel/random/boot_id", budget)?
             .trim()
             .to_owned();
         obs.boot = boot.clone();
@@ -257,7 +290,7 @@ impl Driver {
         {
             return Err(HOLD);
         }
-        let manager = self.manager(intent, &mut budget)?;
+        let manager = self.manager(intent, budget)?;
         let identity = if manager.reaped {
             let bound = binding.ok_or(HOLD)?.0;
             if (!manager.identity.invocation.is_empty()
@@ -273,7 +306,7 @@ impl Driver {
             }
             manager.identity.clone()
         };
-        let first = census(&cg, &identity.cgroup, &mut budget)?;
+        let first = census(&cg, &identity.cgroup, budget)?;
         if (manager.reaped && first.is_some())
             || (first.is_none() && (binding.is_none() || manager.active != ActiveStatus::Inactive))
         {
@@ -284,7 +317,7 @@ impl Driver {
                 let mut members = Vec::new();
                 for (path, (_, _, pids)) in &c.groups {
                     for pid in pids {
-                        let child = process(&proc, *pid, &boot, &mut budget)?.ok_or(HOLD)?;
+                        let child = process(&proc, *pid, &boot, budget)?.ok_or(HOLD)?;
                         if child.cgroup != *path {
                             return Err(HOLD);
                         }
@@ -296,11 +329,11 @@ impl Driver {
             }
             None => vec![],
         };
-        let participants = participant_states(roster, &proc, &boot, &identity.cgroup, &mut budget)?;
+        let participants = participant_states(roster, &proc, &boot, &identity.cgroup, budget)?;
         if let Some(checkpoint) = &self.io.between_censuses {
             checkpoint();
         }
-        let second = census(&cg, &identity.cgroup, &mut budget)?;
+        let second = census(&cg, &identity.cgroup, budget)?;
         if first.as_ref().map(|c| &c.groups) != second.as_ref().map(|c| &c.groups) {
             return Err(HOLD);
         }
@@ -309,13 +342,13 @@ impl Driver {
             first.revalidate()?;
         }
         for child in &members {
-            if process(&proc, child.pid, &boot, &mut budget)?.as_ref() != Some(child) {
+            if process(&proc, child.pid, &boot, budget)?.as_ref() != Some(child) {
                 return Err(HOLD);
             }
         }
-        if participants != participant_states(roster, &proc, &boot, &identity.cgroup, &mut budget)?
-            || manager != self.manager(intent, &mut budget)?
-            || read(&proc, "sys/kernel/random/boot_id", &mut budget)?.trim() != boot
+        if participants != participant_states(roster, &proc, &boot, &identity.cgroup, budget)?
+            || manager != self.manager(intent, budget)?
+            || read(&proc, "sys/kernel/random/boot_id", budget)?.trim() != boot
         {
             return Err(HOLD);
         }
@@ -441,18 +474,29 @@ fn open(dir: &File, path: &str, directory: bool) -> std::result::Result<File, ru
     )
     .map(File::from)
 }
-struct Budget<'a> {
+pub(crate) struct Budget<'a> {
     start: Instant,
     limits: &'a Limits,
     bytes: usize,
+    duration: Duration,
 }
-impl Budget<'_> {
+impl<'a> Budget<'a> {
+    fn new(limits: &'a Limits, start: Instant, duration: Duration) -> Self {
+        Self {
+            start,
+            limits,
+            bytes: 0,
+            duration,
+        }
+    }
     fn check(&self) -> Result<()> {
         self.remaining().map(|_| ())
     }
     fn remaining(&self) -> Result<Duration> {
-        self.limits
-            .duration
+        if self.bytes >= self.limits.total_bytes {
+            return Err(HOLD);
+        }
+        self.duration
             .checked_sub(self.start.elapsed())
             .filter(|d| !d.is_zero())
             .ok_or(HOLD)
@@ -476,7 +520,8 @@ fn read(dir: &File, path: &str, budget: &mut Budget<'_>) -> Result<String> {
     loop {
         let mut buf = [0; 4096];
         budget.check()?;
-        let n = file.read(&mut buf).map_err(|_| HOLD)?;
+        let capacity = buf.len().min(budget.limits.total_bytes - budget.bytes);
+        let n = file.read(&mut buf[..capacity]).map_err(|_| HOLD)?;
         budget.charge(n)?;
         if n == 0 {
             break;
@@ -616,11 +661,7 @@ fn process(
 /// Fixed production procfs reader shared with the pre-exec child. No caller roots.
 pub(crate) fn live_process(pid: u32) -> Result<ChildIdentity> {
     let limits = Limits::default();
-    let mut budget = Budget {
-        start: Instant::now(),
-        limits: &limits,
-        bytes: 0,
-    };
+    let mut budget = Budget::new(&limits, Instant::now(), limits.duration);
     identify_at(Path::new("/proc"), pid, &mut budget)
 }
 fn identify_at(root: &Path, pid: u32, budget: &mut Budget<'_>) -> Result<ChildIdentity> {
@@ -732,6 +773,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enrollment_deadline_is_shared_and_stops_later_identification_and_manager() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let _bus = std::os::unix::net::UnixListener::bind(runtime.join("bus")).unwrap();
+        let proc = root.path().join("proc");
+        fs::create_dir_all(proc.join("sys/kernel/random")).unwrap();
+        fs::create_dir(proc.join("42")).unwrap();
+        let boot = "550e8400-e29b-41d4-a716-446655440000";
+        fs::write(proc.join("sys/kernel/random/boot_id"), boot).unwrap();
+        fs::write(
+            proc.join("42/stat"),
+            format!("42 (root) S {} 123 0\n", vec!["0"; 18].join(" ")),
+        )
+        .unwrap();
+        fs::write(proc.join("42/cgroup"), "0::/\n").unwrap();
+        let manager = root.path().join("manager");
+        let called = root.path().join("called");
+        fs::write(
+            &manager,
+            format!("#!/bin/sh\nprintf called > '{}'\n", called.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+        let cg = root.path().join("cg");
+        fs::create_dir(&cg).unwrap();
+        let driver = Driver::with_io(
+            RuntimeContext::new(
+                runtime.clone(),
+                format!("unix:path={}/bus", runtime.display()),
+            )
+            .unwrap(),
+            LibraryIo {
+                systemctl: manager,
+                proc_root: proc,
+                cgroup_root: cg,
+                between_censuses: Some(Box::new(|| panic!("census must not start"))),
+            },
+            Limits {
+                duration: Duration::from_secs(30),
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let mut budget = driver.enrollment_budget(Instant::now());
+        assert_eq!(budget.duration, Duration::from_secs(2));
+        driver.identify_with(42, &mut budget).unwrap();
+        let bytes = budget.bytes;
+        // Private deterministic seam: expire the same session after phase one.
+        budget.start = Instant::now() - Duration::from_secs(3);
+        assert!(driver.identify_with(42, &mut budget).is_err());
+        let intent = LaunchIntent::new(work_contract::RunId::generate(), boot).unwrap();
+        let obs = driver.observe_expected_with(&intent, None, None, &mut budget);
+        assert_eq!(obs.recursive_coverage, Coverage::Unknown);
+        assert_eq!(obs.observed_at, budget.start);
+        assert_eq!(budget.bytes, bytes, "no later proc/cgroup reads");
+        assert!(!called.exists(), "no manager command after deadline");
+        let mut short = driver.enrollment_budget(Instant::now());
+        short.bytes = short.limits.total_bytes;
+        assert!(driver.identify_with(42, &mut short).is_err());
+        assert_eq!(
+            driver
+                .observe_expected_with(&intent, None, None, &mut short)
+                .recursive_coverage,
+            Coverage::Unknown
+        );
+        assert!(!called.exists());
+    }
+    #[test]
     fn generic_process_reader_accepts_root_cgroup() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join("42")).unwrap();
@@ -742,11 +854,7 @@ mod tests {
         .unwrap();
         fs::write(root.path().join("42/cgroup"), "0::/\n").unwrap();
         let limits = Limits::default();
-        let mut budget = Budget {
-            start: Instant::now(),
-            limits: &limits,
-            bytes: 0,
-        };
+        let mut budget = Budget::new(&limits, Instant::now(), limits.duration);
         let identity = process(
             &canonical_dir(root.path()).unwrap(),
             42,

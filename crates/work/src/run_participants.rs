@@ -111,6 +111,10 @@ fn validate_host(
         || host.pid != expected.pid
         || host.start_ticks != expected.start_ticks
         || host.boot != expected.boot
+        || (host.pid == b.root_pid
+            && (host.start_ticks != b.root_start_ticks
+                || host.boot != b.boot
+                || host.cgroup != b.root_cgroup))
     {
         return Err(StoreError::Invalid);
     }
@@ -141,7 +145,7 @@ pub(crate) fn certify(
 ) -> Result<EnrollmentProof> {
     use crate::{
         run_journal::{BoundSnapshot, RecordedScopeExpectation, RunStage},
-        runtime_scope::{ChildIdentity, LaunchIntent, ParticipantStatus, ScopeIdentity},
+        runtime_scope::{LaunchIntent, ParticipantStatus, ScopeIdentity},
         scope_driver::Participant,
     };
     let began = std::time::Instant::now();
@@ -153,7 +157,7 @@ pub(crate) fn certify(
         .iter()
         .find(|c| &c.request.run == run)
         .ok_or(StoreError::Invalid)?;
-    if child.enrollment != Enrollment::Pending || child.outcome.is_some() {
+    if child.enrollment != Enrollment::Pending {
         return Err(StoreError::Invalid);
     }
     let expected_host = child
@@ -180,36 +184,25 @@ pub(crate) fn certify(
         &record.request.input().boot,
     )
     .map_err(|_| StoreError::Invalid)?;
-    let mut identities = vec![ChildIdentity {
-        pid: b.root_pid,
-        start_ticks: b.root_start_ticks,
-        boot: b.boot.clone(),
-        cgroup: b.root_cgroup.clone(),
-    }];
-    let mut host = None;
-    for c in &record.children {
-        let e = c
-            .request
-            .expected_host
-            .as_ref()
-            .ok_or(StoreError::Invalid)?;
-        if c.enrollment == Enrollment::Unverified {
-            return Err(StoreError::Invalid);
-        }
-        let identity = driver.identify(e.pid).map_err(|_| StoreError::Invalid)?;
-        // Never reinterpret the original identity after PID reuse.
-        if identity.pid != e.pid || identity.start_ticks != e.start_ticks || identity.boot != e.boot
-        {
-            return Err(StoreError::Conflict);
-        }
-        if c.request.run == *run {
-            host = Some(identity.clone());
-        }
-        add_identity(&mut identities, identity)?;
-    }
-    if controller.is_none() {
+    let mut budget = driver.enrollment_budget(began);
+    let host = driver
+        .identify_with(expected_host.pid, &mut budget)
+        .map_err(|_| StoreError::Invalid)?;
+    // Preserve the immutable original root identity even when it is not observed.
+    let enrollment = EnrollmentRecord {
+        root: b.clone(),
+        host: HostSnapshot {
+            pid: host.pid,
+            start_ticks: host.start_ticks,
+            boot: host.boot.clone(),
+            cgroup: host.cgroup.clone(),
+        },
+    };
+    validate_host(&record.request, Some(b), &child.request, &enrollment)?;
+    let mut identities = vec![host.clone()];
+    if controller.is_none() && host.pid != std::process::id() {
         let registrar = driver
-            .identify(std::process::id())
+            .identify_with(std::process::id(), &mut budget)
             .map_err(|_| StoreError::Invalid)?;
         add_identity(&mut identities, registrar)?;
     }
@@ -220,13 +213,13 @@ pub(crate) fn certify(
             identity: Some(i.clone()),
         })
         .collect::<Vec<_>>();
-    let mut obs = driver.observe_recorded(&intent, &expected, &roster);
+    let mut obs = driver.observe_recorded_with(&intent, &expected, &roster, &mut budget);
     obs.observed_at = began; // Includes identification, never refreshed at census completion.
     let validated = crate::runtime_scope::validate_enrollment_host(
         &intent,
         expected.identity(),
         expected_host,
-        &host.ok_or(StoreError::Invalid)?,
+        &host,
         &identities,
         &obs,
         std::time::Instant::now(),
@@ -528,7 +521,6 @@ impl Store {
         }
         if current != proof.record
             || stored.enrollment != Enrollment::Pending
-            || stored.outcome.is_some()
             || now()
                 .checked_duration_since(proof.observed_at)
                 .is_none_or(|age| age > std::time::Duration::from_secs(2))
