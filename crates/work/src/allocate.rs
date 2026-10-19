@@ -1,4 +1,7 @@
 //! Cooperative allocation only. No writer is launched, capture prepared or payload removed.
+#[cfg(test)]
+#[path = "allocation_finish_tests.rs"]
+mod finish_tests;
 use crate::{
     admission::{Limits, Reservation},
     config::Config,
@@ -146,10 +149,26 @@ pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allo
         "malformed allocation metadata; held with charge retained",
     ))
 }
+// Completion is an independent durable fence, even if readiness was corrupted
+// or the receipt body cannot be decoded. Never infer eligibility from its JSON.
+fn refuse_finished(store: &Store, checkout: Uuid) -> io::Result<()> {
+    let finished: bool = sql(store.conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",
+        [checkout.to_string()],
+        |row| row.get(0),
+    ))?;
+    if finished {
+        return Err(err(
+            "checkout has durable task completion; no allocation authority",
+        ));
+    }
+    Ok(())
+}
 /// Fresh checkout-by-ID validation. Caller holds allocation lock only for a
 /// short preflight/transaction, never for the supervised actor lifetime.
 /// Unlike allocation reconciliation this never revives held/quarantined rows.
 pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result<Allocation> {
+    refuse_finished(store, checkout)?;
     let (operation, state, ready): (String, String, bool) = sql(store.conn.query_row(
         "SELECT operation,state,ready FROM checkouts WHERE id=?1",
         [checkout.to_string()],
@@ -192,7 +211,8 @@ fn refresh_ready_identity(
     let stored: Option<(String, String)> = sql(tx
         .query_row(
             "SELECT a.request,a.record FROM allocations a JOIN checkouts c ON c.id=a.checkout
-         WHERE c.id=?1 AND c.operation=?2 AND c.state='active' AND c.ready=1",
+         WHERE c.id=?1 AND c.operation=?2 AND c.state='active' AND c.ready=1
+         AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=c.id)",
             (a.checkout.to_string(), a.request.operation.to_string()),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -330,6 +350,7 @@ pub fn start_observed(
     let r = normalize(config, request)?;
     let (mut store, _lock) = locked(config)?;
     if let Some(mut a) = load(&mut store, r.operation)? {
+        refuse_finished(&store, a.checkout)?;
         if a.request != r {
             return Err(err("operation request conflicts"));
         }
@@ -454,6 +475,7 @@ pub fn start_observed(
                 "ambiguous matching allocations; hold for reconciliation",
             ));
         }
+        refuse_finished(&store, matches[0])?;
         let (operation, state): (String, String) = sql(store.conn.query_row(
             "SELECT operation,state FROM checkouts WHERE id=?1",
             [matches[0].to_string()],

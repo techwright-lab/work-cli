@@ -357,6 +357,136 @@ fn malformed_receipt_never_becomes_existing_success() {
         assert!(!finish(&f, id).status.success(), "{case}");
     }
 }
+// Compare logical authority, not SQLite bookkeeping. Every admission refusal
+// must preserve charges, receipts, journal, identity and all existing events.
+fn authority_rows(sql: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "checkouts",
+        "allocations",
+        "writers",
+        "run_groups",
+        "runs",
+        "adopted_groups",
+        "adopted_sessions",
+        "adopted_segments",
+        "outbox",
+        "task_finishes",
+        "repository_aliases",
+        "retired_owners",
+        "run_participants",
+    ]
+    .iter()
+    .map(|table| {
+        let mut statement = sql
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    })
+    .collect()
+}
+fn finished_with_corrupt_readiness(
+    f: &Fixture,
+    malformed: bool,
+) -> (serde_json::Value, rusqlite::Connection) {
+    let a = allocated(f);
+    let id = Uuid::parse_str(a["checkout"].as_str().unwrap()).unwrap();
+    assert!(finish(f, id).status.success());
+    let sql = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    sql.execute("UPDATE checkouts SET state='active',ready=1", [])
+        .unwrap();
+    if malformed {
+        sql.execute("UPDATE task_finishes SET record='{}'", [])
+            .unwrap();
+    }
+    (a, sql)
+}
+#[test]
+fn durable_finish_row_blocks_all_direct_writer_admissions_despite_corrupt_readiness() {
+    let mut failures = Vec::new();
+    for malformed in [false, true] {
+        for api in ["legacy", "legacy_existing", "root", "adopted"] {
+            let f = Fixture::new();
+            let (a, sql) = finished_with_corrupt_readiness(&f, malformed);
+            let id = Uuid::parse_str(a["checkout"].as_str().unwrap()).unwrap();
+            let group = Uuid::now_v7();
+            if api == "legacy_existing" {
+                // A damaged writer row must not turn the finish fence into an
+                // exact same-group acknowledgement of execution authority.
+                sql.execute(
+                    "INSERT INTO writers VALUES(?1,?2)",
+                    (id.to_string(), group.to_string()),
+                )
+                .unwrap();
+            }
+            let before = authority_rows(&sql);
+            let mut store = f.store();
+            let result = match api {
+                "root" => store.begin_run(&run_fixture::request(id)).map(|_| ()),
+                "adopted" => store.begin_adopted(&adopted(id)).map(|_| ()),
+                _ => store.acquire_writer(id, group),
+            };
+            if result.is_ok() {
+                failures.push(format!("malformed={malformed} {api}: admitted"));
+            }
+            if authority_rows(&sql) != before {
+                failures.push(format!("malformed={malformed} {api}: authority changed"));
+            }
+            assert_eq!(store.charged(&f.repo, None).unwrap(), 1);
+            assert!(std::path::Path::new(a["destination"].as_str().unwrap()).is_dir());
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+#[test]
+fn durable_finish_row_blocks_integrated_preflight_and_allocation_reuse_before_head_refresh() {
+    let mut failures = Vec::new();
+    for malformed in [false, true] {
+        for api in ["adopted_preflight", "exact_allocation", "matching_task"] {
+            let f = Fixture::new();
+            let (a, sql) = finished_with_corrupt_readiness(&f, malformed);
+            let id = Uuid::parse_str(a["checkout"].as_str().unwrap()).unwrap();
+            let path = std::path::Path::new(a["destination"].as_str().unwrap());
+            support::git(
+                path,
+                &["commit", "--allow-empty", "-m", "advance after finish"],
+            );
+            let head = support::git(path, &["rev-parse", "HEAD"]);
+            let before = authority_rows(&sql);
+            let refused = match api {
+                "adopted_preflight" => work_cli::adopted::begin(&config(&f), &adopted(id)).is_err(),
+                _ => {
+                    let mut request: work_cli::allocate::Start =
+                        serde_json::from_value(a["request"].clone()).unwrap();
+                    if api == "matching_task" {
+                        request.operation = Uuid::now_v7();
+                    }
+                    work_cli::allocate::start(&config(&f), request).is_err()
+                }
+            };
+            if !refused {
+                failures.push(format!(
+                    "malformed={malformed} {api}: returned authority/Ready"
+                ));
+            }
+            if authority_rows(&sql) != before {
+                failures.push(format!(
+                    "malformed={malformed} {api}: authority/HeadAdvanced changed"
+                ));
+            }
+            assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+            assert_eq!(support::git(path, &["rev-parse", "HEAD"]), head);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 #[test]
 fn production_configured_capture_is_explicit_unsupported_not_off() {
     let f = Fixture::new();

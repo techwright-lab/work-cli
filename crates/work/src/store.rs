@@ -976,7 +976,8 @@ pub(crate) fn acquire_writer_tx(
     // managed requests retry through their journal API, never as bare writers.
     exclude_journal_identity(conn, group)?;
     let eligible: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1)",
+        "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1
+         AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1))",
         [checkout.to_string()],
         |r| r.get(0),
     )?;
