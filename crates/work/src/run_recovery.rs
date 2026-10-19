@@ -21,6 +21,7 @@ pub enum RecoveryState {
 pub struct HistoricalStatus {
     pub record: crate::run_journal::RunRecord,
     pub runtime: &'static str,
+    pub child_enrollment: &'static str,
     pub lease_charged: bool,
     /// This journal has no task-completion transition.
     pub task_open: bool,
@@ -28,7 +29,13 @@ pub struct HistoricalStatus {
 /// Historical metadata only: never scope inspection or an actual exit-code claim.
 pub fn status(store: &Store, run: &RunId) -> Result<HistoricalStatus> {
     let (record, lease_charged) = store.run_status_record(run)?;
+    let child_enrollment = if record.children.iter().any(|child| child.host.is_some()) {
+        "enrollment recorded; runtime not inspected now"
+    } else {
+        "no positive enrollment recorded; runtime not inspected now"
+    };
     Ok(HistoricalStatus {
+        child_enrollment,
         record,
         runtime: "not_inspected",
         lease_charged,

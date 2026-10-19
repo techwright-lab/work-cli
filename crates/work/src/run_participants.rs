@@ -1,6 +1,9 @@
 //! Supervised child declarations. These grant no launch, writer or OS authority.
-//! Enrollment is intentionally fail-closed: pending/unverified are permanent
-//! closure barriers until fresh execution-host proof support is implemented.
+//! Positive enrollment is historical host metadata only. Every child remains
+//! a closure barrier until complete child-aware closure is implemented.
+#[cfg(test)]
+#[path = "run_enrollment_tests.rs"]
+mod enrollment_tests;
 #[cfg(test)]
 #[path = "run_participants_tests.rs"]
 mod tests;
@@ -40,6 +43,7 @@ pub struct ChildRequest {
 #[serde(rename_all = "snake_case")]
 pub enum Enrollment {
     Pending,
+    Contained,
     Unverified,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,8 +60,208 @@ pub struct ChildRecord {
     pub enrollment: Enrollment,
     pub outcome: Option<ChildOutcome>,
     pub depth: u8,
+    pub host: Option<EnrollmentRecord>,
+}
+/// Plain historical host metadata; never current containment or runtime authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSnapshot {
+    pub pid: u32,
+    pub start_ticks: u64,
+    pub boot: String,
+    pub cgroup: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentRecord {
+    pub root: crate::run_journal::BoundSnapshot,
+    pub host: HostSnapshot,
+}
+/// Exact snapshot and earliest observation, nonserializable and privately built.
+/// Serialized metadata cannot manufacture a proof:
+/// ```compile_fail
+/// let _: work_cli::run_participants::EnrollmentProof = serde_json::from_str("{}").unwrap();
+/// ```
+/// Nor can a plain host snapshot be committed as evidence:
+/// ```compile_fail
+/// fn forged(store: &mut work_cli::store::Store, root: &work_cli::run_journal::RootRunRequest,
+///     child: &work_cli::run_participants::ChildRequest, host: &work_cli::run_participants::HostSnapshot) {
+///     store.record_child_enrollment(root, child, host);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct EnrollmentProof {
+    record: crate::run_journal::RunRecord,
+    child: ChildRequest,
+    enrollment: EnrollmentRecord,
+    observed_at: std::time::Instant,
 }
 
+fn validate_host(
+    root: &RootRunRequest,
+    binding: Option<&crate::run_journal::BoundSnapshot>,
+    child: &ChildRequest,
+    enrollment: &EnrollmentRecord,
+) -> Result<()> {
+    use crate::runtime_scope::{validate_structure, ChildIdentity, LaunchIntent, ScopeIdentity};
+    let b = binding.ok_or(StoreError::Invalid)?;
+    let host = &enrollment.host;
+    let expected = child.expected_host.as_ref().ok_or(StoreError::Invalid)?;
+    if &enrollment.root != b
+        || host.pid != expected.pid
+        || host.start_ticks != expected.start_ticks
+        || host.boot != expected.boot
+    {
+        return Err(StoreError::Invalid);
+    }
+    let intent = LaunchIntent::new(root.identity().run.clone(), &root.input().boot)
+        .map_err(|_| StoreError::Invalid)?;
+    validate_structure(
+        &intent,
+        &ScopeIdentity {
+            unit: b.unit.clone(),
+            invocation: b.invocation.clone(),
+            cgroup: b.cgroup.clone(),
+        },
+        &ChildIdentity {
+            pid: host.pid,
+            start_ticks: host.start_ticks,
+            boot: host.boot.clone(),
+            cgroup: host.cgroup.clone(),
+        },
+    )
+    .map_err(|_| StoreError::Invalid)
+}
+
+pub(crate) fn certify(
+    record: &crate::run_journal::RunRecord,
+    driver: &crate::scope_driver::Driver,
+    run: &RunId,
+    controller: Option<&crate::runtime_scope::Binding>,
+) -> Result<EnrollmentProof> {
+    use crate::{
+        run_journal::{BoundSnapshot, RecordedScopeExpectation, RunStage},
+        runtime_scope::{ChildIdentity, LaunchIntent, ParticipantStatus, ScopeIdentity},
+        scope_driver::Participant,
+    };
+    let began = std::time::Instant::now();
+    if record.closed || record.stage != RunStage::PermitAttempt {
+        return Err(StoreError::Invalid);
+    }
+    let child = record
+        .children
+        .iter()
+        .find(|c| &c.request.run == run)
+        .ok_or(StoreError::Invalid)?;
+    if child.enrollment != Enrollment::Pending || child.outcome.is_some() {
+        return Err(StoreError::Invalid);
+    }
+    let expected_host = child
+        .request
+        .expected_host
+        .as_ref()
+        .ok_or(StoreError::Invalid)?;
+    let b = record.binding.as_ref().ok_or(StoreError::Invalid)?;
+    if let Some(controller) = controller {
+        if BoundSnapshot::capture(&record.request, controller)?.ne(b) {
+            return Err(StoreError::Conflict);
+        }
+    }
+    let expected = RecordedScopeExpectation {
+        identity: ScopeIdentity {
+            unit: b.unit.clone(),
+            invocation: b.invocation.clone(),
+            cgroup: b.cgroup.clone(),
+        },
+        boot: b.boot.clone(),
+    };
+    let intent = LaunchIntent::new(
+        record.request.identity().run.clone(),
+        &record.request.input().boot,
+    )
+    .map_err(|_| StoreError::Invalid)?;
+    let mut identities = vec![ChildIdentity {
+        pid: b.root_pid,
+        start_ticks: b.root_start_ticks,
+        boot: b.boot.clone(),
+        cgroup: b.root_cgroup.clone(),
+    }];
+    let mut host = None;
+    for c in &record.children {
+        let e = c
+            .request
+            .expected_host
+            .as_ref()
+            .ok_or(StoreError::Invalid)?;
+        if c.enrollment == Enrollment::Unverified {
+            return Err(StoreError::Invalid);
+        }
+        let identity = driver.identify(e.pid).map_err(|_| StoreError::Invalid)?;
+        // Never reinterpret the original identity after PID reuse.
+        if identity.pid != e.pid || identity.start_ticks != e.start_ticks || identity.boot != e.boot
+        {
+            return Err(StoreError::Conflict);
+        }
+        if c.request.run == *run {
+            host = Some(identity.clone());
+        }
+        add_identity(&mut identities, identity)?;
+    }
+    if controller.is_none() {
+        let registrar = driver
+            .identify(std::process::id())
+            .map_err(|_| StoreError::Invalid)?;
+        add_identity(&mut identities, registrar)?;
+    }
+    let roster = identities
+        .iter()
+        .map(|i| Participant {
+            status: ParticipantStatus::Open,
+            identity: Some(i.clone()),
+        })
+        .collect::<Vec<_>>();
+    let mut obs = driver.observe_recorded(&intent, &expected, &roster);
+    obs.observed_at = began; // Includes identification, never refreshed at census completion.
+    let validated = crate::runtime_scope::validate_enrollment_host(
+        &intent,
+        expected.identity(),
+        expected_host,
+        &host.ok_or(StoreError::Invalid)?,
+        &identities,
+        &obs,
+        std::time::Instant::now(),
+        std::time::Duration::from_secs(2),
+    )
+    .map_err(|_| StoreError::Invalid)?;
+    let h = validated.host;
+    Ok(EnrollmentProof {
+        record: record.clone(),
+        child: child.request.clone(),
+        enrollment: EnrollmentRecord {
+            root: b.clone(),
+            host: HostSnapshot {
+                pid: h.pid,
+                start_ticks: h.start_ticks,
+                boot: h.boot,
+                cgroup: h.cgroup,
+            },
+        },
+        observed_at: validated.observed_at,
+    })
+}
+fn add_identity(
+    identities: &mut Vec<crate::runtime_scope::ChildIdentity>,
+    identity: crate::runtime_scope::ChildIdentity,
+) -> Result<()> {
+    if let Some(existing) = identities.iter().find(|i| i.pid == identity.pid) {
+        if existing != &identity {
+            return Err(StoreError::Conflict);
+        }
+    } else {
+        identities.push(identity);
+    }
+    Ok(())
+}
 impl ChildRequest {
     fn validate(&self) -> Result<()> {
         if self.run == self.parent_run
@@ -77,7 +281,70 @@ impl ChildRequest {
         Ok(())
     }
 }
+pub(crate) fn validate_schema(conn: &rusqlite::Connection) -> Result<()> {
+    validate_schema_version(conn, true)
+}
+pub(crate) fn validate_v7_schema(conn: &rusqlite::Connection) -> Result<()> {
+    validate_schema_version(conn, false)
+}
+fn validate_schema_version(conn: &rusqlite::Connection, contained: bool) -> Result<()> {
+    let definition: String = conn.query_row(
+        "SELECT sql FROM sqlite_schema WHERE name='run_participants' AND type='table'",
+        [],
+        |r| r.get(0),
+    )?;
+    let compact: String = definition
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"')
+        .collect();
+    let enrollment = if contained {
+        "CHECK(enrollmentIN('pending','contained','unverified'))"
+    } else {
+        "CHECK(enrollmentIN('pending','unverified'))"
+    };
+    if contained && !compact.contains("CHECK((enrollment='pending'ANDhostISNULL)OR(enrollment='contained'ANDhostISNOTNULL)ORenrollment='unverified')") { return Err(StoreError::Invalid); }
+    for constraint in [
+        "idTEXTPRIMARYKEY",
+        "group_idTEXTNOTNULLREFERENCESrun_groups(id)",
+        "run_refTEXTNOTNULLUNIQUE",
+        "parent_runTEXTNOTNULL",
+        "requestTEXTNOTNULL",
+        "enrollmentTEXTNOTNULL",
+        enrollment,
+        "depthINTEGERNOTNULLCHECK(depthBETWEEN1AND16)",
+    ] {
+        if !compact.contains(constraint) {
+            return Err(StoreError::Invalid);
+        }
+    }
+    let mut stmt = conn.prepare("PRAGMA table_info(run_participants)")?;
+    let columns = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = [
+        ("id", "TEXT"),
+        ("group_id", "TEXT"),
+        ("run_ref", "TEXT"),
+        ("parent_run", "TEXT"),
+        ("request", "TEXT"),
+        ("enrollment", "TEXT"),
+        ("outcome", "TEXT"),
+        ("depth", "INTEGER"),
+        ("host", "TEXT"),
+    ];
+    let expected = &expected[..if contained { 9 } else { 8 }];
+    if columns.len() != expected.len()
+        || columns
+            .iter()
+            .zip(expected)
+            .any(|((name, ty), (e, t))| name != e || ty != t)
+    {
+        return Err(StoreError::Invalid);
+    }
+    Ok(())
+}
 pub(crate) fn validate_orphans(conn: &rusqlite::Connection) -> Result<()> {
+    validate_schema(conn)?;
     let invalid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_participants p LEFT JOIN run_groups g ON g.id=p.group_id LEFT JOIN runs r ON r.group_id=p.group_id WHERE g.id IS NULL OR r.id IS NULL OR g.mode!='supervised')", [], |r| r.get(0))?;
     if invalid {
         Err(StoreError::Invalid)
@@ -98,6 +365,7 @@ fn namespace_conflict(conn: &rusqlite::Connection, request: &ChildRequest) -> Re
 pub(crate) fn roster(
     conn: &rusqlite::Connection,
     root: &RootRunRequest,
+    binding: Option<&crate::run_journal::BoundSnapshot>,
 ) -> Result<Vec<ChildRecord>> {
     validate_orphans(conn)?;
     let count: i64 = conn.query_row(
@@ -105,7 +373,7 @@ pub(crate) fn roster(
         [root.identity().group.to_string()],
         |r| r.get(0),
     )?;
-    let mut stmt = conn.prepare("SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth FROM run_participants WHERE group_id=?1 ORDER BY rowid LIMIT 257")?;
+    let mut stmt = conn.prepare("SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth,host FROM run_participants WHERE group_id=?1 ORDER BY rowid LIMIT 257")?;
     let mut rows = stmt.query([root.identity().group.to_string()])?;
     let mut records = Vec::new();
     while let Some(row) = rows.next()? {
@@ -115,9 +383,22 @@ pub(crate) fn roster(
         let state: String = row.get(5)?;
         let enrollment = match state.as_str() {
             "pending" => Enrollment::Pending,
+            "contained" => Enrollment::Contained,
             "unverified" => Enrollment::Unverified,
             _ => return Err(StoreError::Invalid),
         };
+        let host: Option<String> = row.get(8)?;
+        let host: Option<EnrollmentRecord> = host
+            .map(|s| serde_json::from_str(&s).map_err(|_| StoreError::Invalid))
+            .transpose()?;
+        if (enrollment == Enrollment::Pending && host.is_some())
+            || (enrollment == Enrollment::Contained && host.is_none())
+        {
+            return Err(StoreError::Invalid);
+        }
+        if let Some(host) = &host {
+            validate_host(root, binding, &request, host)?;
+        }
         let outcome: Option<String> = row.get(6)?;
         let outcome = outcome
             .map(|s| serde_json::from_str(&s).map_err(|_| StoreError::Invalid))
@@ -138,6 +419,7 @@ pub(crate) fn roster(
             enrollment,
             outcome,
             depth: row.get(7)?,
+            host,
         });
     }
     if count < 0 || count as usize != records.len() || records.len() > 256 {
@@ -193,6 +475,82 @@ fn bump(
     crate::run_journal::journal_event(conn, root, revision, change)
 }
 impl Store {
+    /// Commit positive historical enrollment only. No OS inspection, authority
+    /// creation, heartbeat or writer release occurs within the transaction.
+    pub fn record_child_enrollment(
+        &mut self,
+        root: &RootRunRequest,
+        child: &ChildRequest,
+        proof: &EnrollmentProof,
+    ) -> Result<Transition> {
+        self.record_child_enrollment_using(root, child, proof, std::time::Instant::now)
+    }
+    // Private clock seam permits deterministic post-lock boundary tests; callers
+    // cannot select the clock or refresh an observation.
+    fn record_child_enrollment_using(
+        &mut self,
+        root: &RootRunRequest,
+        child: &ChildRequest,
+        proof: &EnrollmentProof,
+        now: impl FnOnce() -> std::time::Instant,
+    ) -> Result<Transition> {
+        let _phase = self.sql_phase();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current = crate::run_journal::exact(&tx, root)?;
+        if &proof.record.request != root || &proof.child != child || current.closed {
+            return Err(StoreError::Conflict);
+        }
+        validate_host(root, current.binding.as_ref(), child, &proof.enrollment)
+            .map_err(|_| StoreError::Conflict)?;
+        let stored = current
+            .children
+            .iter()
+            .find(|c| c.request.run == child.run)
+            .ok_or(StoreError::Conflict)?;
+        if &stored.request != child {
+            return Err(StoreError::Conflict);
+        }
+        // A committed receipt is metadata only, not refreshed evidence. Accept
+        // only the exact post-commit snapshot, never a changed hold/outcome/tree.
+        let mut receipt = proof.record.clone();
+        let enrolled = receipt
+            .children
+            .iter_mut()
+            .find(|c| c.request.run == child.run)
+            .ok_or(StoreError::Conflict)?;
+        enrolled.enrollment = Enrollment::Contained;
+        enrolled.host = Some(proof.enrollment.clone());
+        receipt.revision = receipt.revision.checked_add(1).ok_or(StoreError::Invalid)?;
+        if stored.enrollment == Enrollment::Contained && current == receipt {
+            return Ok(Transition::Existing);
+        }
+        if current != proof.record
+            || stored.enrollment != Enrollment::Pending
+            || stored.outcome.is_some()
+            || now()
+                .checked_duration_since(proof.observed_at)
+                .is_none_or(|age| age > std::time::Duration::from_secs(2))
+        {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE run_participants SET enrollment='contained',host=?2 WHERE id=?1",
+            (
+                child.run.to_string(),
+                crate::adopted::json(&proof.enrollment)?,
+            ),
+        )?;
+        bump(
+            &tx,
+            root,
+            current.revision,
+            crate::run_journal::JournalChange::ChildEnrolled,
+        )?;
+        tx.commit()?;
+        Ok(Transition::Changed)
+    }
     /// Commit a durable barrier BEFORE any execution-host inspection. This is
     /// metadata registration, not permission to launch, join or write. No OS calls.
     /// Existing validates the entire tree and grants nothing, even on retry.

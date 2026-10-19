@@ -210,7 +210,7 @@ Recovery never launches, signals, kills, finishes a task, deletes or uncharges.
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted v7 authority;
+runtime qualification claim. It requires an existing initialized trusted v8 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -237,9 +237,9 @@ source/session/agent/actor references remain unknown when absent. Expected boot/
 is a candidate host identity, **not** observed containment or individual authorship;
 logical children can name the same physical host without inventing child PIDs.
 
-This is a conservative partial Task6 increment: expected-host children remain `pending`,
+This is a conservative partial Task6 increment: expected-host children start `pending`,
 children without an expected host start `unverified`, and `record_child_hold` only tightens
-pending to unverified. `record_child_outcome` records immutable/idempotent declared
+pending or contained to unverified (retaining prior enrollment audit). `record_child_outcome` records immutable/idempotent declared
 Completed/Failed/Cancelled, never caller-declared Interrupted or physical absence.
 Every accepted change bumps revision; no writer, charge, task or checkout state changes.
 Full child requests and parent trees are validated in one SQLite snapshot on root
@@ -249,11 +249,34 @@ All registered children block both live and historical empty proof, even after l
 closure or expected shared-root-host declarations; a pre-registration proof fails CAS.
 Thus no child is silently dropped by terminal/grace/cancellation/recovery closure.
 
-**Not implemented:** trusted fresh host enrollment, contained-host full-roster absence
-proof, atomic Interrupted-child/group closure, child metadata CLI/native hook routing,
-bridge, task finish, retirement or automatic recovery. Children cannot yet be positively
-certified or removed to release their writer. This does not complete increment A or
-Task6. Serialized metadata alone grants no launch, cancellation or closure authority.
+Positive enrollment is library-only: `Driver::identify(pid)` uses bounded no-follow
+proc inspection (production fixed `/proc`, explicit library fixture IO otherwise).
+`GroupSnapshot::certify_child_enrollment(driver, child_run, optional_original_binding)`
+returns a private, nonserializable `EnrollmentProof` only after exact original host
+boot/PID/start matching, fresh active exact scope inspection and complete recursive/
+participant coverage. Membership may include other processes. Without the original
+root Binding, the actual registrar process must also be freshly present in that scope;
+there is no caller-selected registrar PID or environment lease. Shared root hosts need
+the same fresh evidence, not invented child PIDs. Terminal root outcomes/recovery holds
+are retained and do not grant execution. Unknown/unverified/ended children cannot upgrade.
+
+`Store::record_child_enrollment(root, child, proof)` revalidates the exact full snapshot,
+writer, immutable child, root binding and revision under IMMEDIATE locking, checks the
+original observation's two-second age after locking, then atomically stores `contained`
+host metadata with revision/outbox. An exact committed retry is `Existing` metadata only,
+without events, heartbeat or renewed evidence. Serializable `HostSnapshot` and
+`EnrollmentRecord` are historical audit, never execution or current-containment tokens.
+Status labels this **enrollment recorded; runtime not inspected now**; attribution
+remains group/root/unknown. Schema8 transactionally rebuilds the v7 child table, preserving
+all rows and other journals/accounting; malformed/missing/view schemas and corrupt host,
+scope or parent metadata fail closed. There is no row removal or repair.
+
+**Not implemented:** contained-host full-roster absence proof, atomic Interrupted-child/
+group closure, child metadata CLI/native hook routing, bridge, task finish, retirement
+or automatic recovery. **Every child, including Contained, still blocks all live and
+historical root-only closure paths.** Positive enrollment cannot release a writer.
+This does not complete Task6. Serialized metadata alone grants no launch, cancellation
+or closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
 do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
 

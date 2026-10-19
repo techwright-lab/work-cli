@@ -392,7 +392,7 @@ fn schema_v6_is_additive_and_missing_tables_fail_closed() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 7,
+        version, 8,
         "supervised child journal needs a distinct schema"
     );
     assert_eq!(

@@ -287,6 +287,83 @@ pub(crate) fn verify_empty_evidence(
     }
     Ok(())
 }
+/// Nonexecuting validated host evidence. Not a Binding or an emptiness token.
+#[derive(Debug)]
+pub struct ValidatedHost {
+    pub(crate) host: ChildIdentity,
+    pub(crate) observed_at: Instant,
+}
+#[allow(clippy::too_many_arguments)]
+pub fn validate_enrollment_host(
+    intent: &LaunchIntent,
+    scope: &ScopeIdentity,
+    expected: &crate::run_participants::ExpectedHost,
+    host: &ChildIdentity,
+    participants: &[ChildIdentity],
+    obs: &Observation,
+    now: Instant,
+    max_age: Duration,
+) -> Result<ValidatedHost, HoldReason> {
+    fresh(obs, intent.boot_id(), now, max_age)?;
+    if present_identity(&obs.unit)? != scope {
+        return Err(HoldReason::UnitMismatch);
+    }
+    if !matches!(
+        obs.unit,
+        UnitPresence::Present {
+            active: ActiveStatus::Active,
+            ..
+        }
+    ) {
+        return Err(HoldReason::UnitUnknown);
+    }
+    validate_structure(intent, scope, host)?;
+    if host.pid != expected.pid
+        || host.start_ticks != expected.start_ticks
+        || host.boot != expected.boot
+    {
+        return Err(HoldReason::ChildIdentity);
+    }
+    if obs.recursive_coverage != Coverage::Complete {
+        return Err(HoldReason::IncompleteMembership);
+    }
+    if participants.is_empty()
+        || obs.participant_coverage != Coverage::Complete
+        || obs.participants.len() != participants.len()
+        || obs
+            .participants
+            .iter()
+            .any(|p| *p != ParticipantStatus::Open)
+    {
+        return Err(HoldReason::ParticipantUncertain);
+    }
+    let Membership::Present(members) = &obs.membership else {
+        return Err(HoldReason::MembershipUnknown);
+    };
+    if !participants.contains(host) || !members.contains(host) {
+        return Err(HoldReason::ChildIdentity);
+    }
+    for (index, participant) in participants.iter().enumerate() {
+        validate_structure(intent, scope, participant)?;
+        if participants[..index]
+            .iter()
+            .any(|p| p.pid == participant.pid)
+            || !members.contains(participant)
+        {
+            return Err(HoldReason::ChildIdentity);
+        }
+    }
+    for (index, member) in members.iter().enumerate() {
+        validate_structure(intent, scope, member)?;
+        if members[..index].iter().any(|p| p.pid == member.pid) {
+            return Err(HoldReason::ChildIdentity);
+        }
+    }
+    Ok(ValidatedHost {
+        host: host.clone(),
+        observed_at: obs.observed_at,
+    })
+}
 fn fresh(obs: &Observation, boot: &str, now: Instant, max_age: Duration) -> Result<(), HoldReason> {
     if obs.boot != boot {
         return Err(HoldReason::BootMismatch);

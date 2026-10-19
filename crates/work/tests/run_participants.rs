@@ -693,7 +693,7 @@ fn malformed_child_metadata_is_never_hidden_by_root_reads_or_retries() {
     store.record_bound(&r, &binding(&r)).unwrap();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
     sql.execute(
-        "INSERT INTO run_participants VALUES(?1,?2,'child',?3,'{}','pending',NULL,1)",
+        "INSERT INTO run_participants(id,group_id,run_ref,parent_run,request,enrollment,outcome,depth) VALUES(?1,?2,'child',?3,'{}','pending',NULL,1)",
         (
             uuid::Uuid::now_v7().to_string(),
             r.identity().group.to_string(),
@@ -817,7 +817,7 @@ fn v6_migration_preserves_closed_and_active_roots_adopted_legacy_aliases_and_out
 }
 
 #[test]
-fn v7_child_ledger_is_additive_and_versioned_tables_fail_closed() {
+fn v8_child_ledger_is_additive_and_versioned_tables_fail_closed() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);
     store.begin_run(&r).unwrap();
@@ -826,7 +826,7 @@ fn v7_child_ledger_is_additive_and_versioned_tables_fail_closed() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     sql.execute_batch("DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
     drop(store);

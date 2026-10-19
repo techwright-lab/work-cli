@@ -331,8 +331,8 @@ fn actual_pipeline_projects_git_identity_commits_before_exec_and_closes_only_sco
     assert!(!db.windows(15).any(|b| b == b"secret-argument"));
 }
 #[test]
-fn registered_unknown_children_hold_live_terminal_and_cancellation_closure() {
-    for cancelled in [false, true] {
+fn registered_children_including_contained_hold_live_terminal_and_cancellation_closure() {
+    for (cancelled, contained) in [(false, false), (true, false), (false, true), (true, true)] {
         let h = Harness::new();
         let token = CancelToken::default();
         let worker = if cancelled {
@@ -367,9 +367,48 @@ fn registered_unknown_children_hold_live_terminal_and_cancellation_closure() {
                     session: None,
                     agent: None,
                     actor: None,
-                    expected_host: None,
+                    expected_host: contained.then(|| {
+                        let b = record.binding.as_ref().unwrap();
+                        work_cli::run_participants::ExpectedHost {
+                            boot: b.boot.clone(),
+                            pid: b.root_pid,
+                            start_ticks: b.root_start_ticks,
+                        }
+                    }),
                 };
-                h.f.store().register_child(&record.request, &child).unwrap();
+                let mut store = h.f.store();
+                store.register_child(&record.request, &child).unwrap();
+                if contained {
+                    // Controlled fixture IO: actual registrar PID in the same
+                    // synthetic root scope; no Binding reconstructed from JSON.
+                    let b = record.binding.as_ref().unwrap();
+                    let pid = std::process::id();
+                    let p = h.f.temp.path().join(format!("proc/{pid}"));
+                    fs::create_dir_all(&p).unwrap();
+                    fs::write(
+                        p.join("stat"),
+                        format!("{pid} (registrar) S {} 10 0\n", vec!["0"; 18].join(" ")),
+                    )
+                    .unwrap();
+                    fs::write(p.join("cgroup"), format!("0::{}\n", b.cgroup)).unwrap();
+                    fs::write(
+                        h.f.temp
+                            .path()
+                            .join("cg")
+                            .join(b.cgroup.trim_start_matches('/'))
+                            .join("cgroup.procs"),
+                        format!("{}\n{pid}\n", b.root_pid),
+                    )
+                    .unwrap();
+                    let proof = store
+                        .group_snapshot(&i.run)
+                        .unwrap()
+                        .certify_child_enrollment(&h.driver, &child.run, None)
+                        .unwrap();
+                    store
+                        .record_child_enrollment(&record.request, &child, &proof)
+                        .unwrap();
+                }
             }
             if boundary == Boundary::RootTerminal {
                 h.empty(record);
@@ -392,7 +431,11 @@ fn registered_unknown_children_hold_live_terminal_and_cancellation_closure() {
         assert_eq!(report.record.children.len(), 1);
         assert_eq!(
             report.record.children[0].enrollment,
-            work_cli::run_participants::Enrollment::Unverified
+            if contained {
+                work_cli::run_participants::Enrollment::Contained
+            } else {
+                work_cli::run_participants::Enrollment::Unverified
+            }
         );
         assert_eq!(h.f.store().charged(&h.f.repo, None).unwrap(), 1);
     }

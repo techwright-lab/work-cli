@@ -449,7 +449,7 @@ fn closure_schema_preserves_existing_charges_and_writer() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     assert_eq!(
         sql.query_row("SELECT closed FROM run_groups", [], |row| row
@@ -1015,8 +1015,8 @@ fn schema_five_is_durable_and_missing_versioned_tables_fail_closed() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 7,
-        "supervised child declarations require a durable v7 migration"
+        version, 8,
+        "positive child enrollment requires a durable v8 migration"
     );
     for table in ["run_groups", "runs"] {
         sql.execute_batch(&format!("ALTER TABLE {table} RENAME TO missing_{table}"))

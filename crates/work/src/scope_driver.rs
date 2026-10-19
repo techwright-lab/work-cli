@@ -121,6 +121,15 @@ impl Driver {
             limits,
         })
     }
+    /// Bounded identity inspection only; grants no process or scope authority.
+    pub fn identify(&self, pid: u32) -> Result<ChildIdentity> {
+        let mut budget = Budget {
+            start: Instant::now(),
+            limits: &self.limits,
+            bytes: 0,
+        };
+        identify_at(&self.io.proc_root, pid, &mut budget)
+    }
     pub fn observe(
         &self,
         intent: &LaunchIntent,
@@ -576,6 +585,16 @@ fn process(
     };
     let stat = read(&dir, "stat", budget)?;
     let start_ticks = start_ticks(&stat, pid)?;
+    if matches!(
+        stat.rsplit_once(')')
+            .ok_or(HOLD)?
+            .1
+            .split_whitespace()
+            .next(),
+        Some("Z" | "X" | "x")
+    ) {
+        return Err(HOLD);
+    }
     let raw = read(&dir, "cgroup", budget)?;
     let mut lines = raw.lines();
     let cgroup = lines
@@ -602,12 +621,20 @@ pub(crate) fn live_process(pid: u32) -> Result<ChildIdentity> {
         limits: &limits,
         bytes: 0,
     };
-    let proc = canonical_dir(Path::new("/proc"))?;
-    let boot = read(&proc, "sys/kernel/random/boot_id", &mut budget)?
+    identify_at(Path::new("/proc"), pid, &mut budget)
+}
+fn identify_at(root: &Path, pid: u32, budget: &mut Budget<'_>) -> Result<ChildIdentity> {
+    let proc = canonical_dir(root)?;
+    let boot = read(&proc, "sys/kernel/random/boot_id", budget)?
         .trim()
         .to_owned();
-    let identity = process(&proc, pid, &boot, &mut budget)?.ok_or(HOLD)?;
-    let stat = read(&proc, &format!("{pid}/stat"), &mut budget)?;
+    if !uuid::Uuid::parse_str(&boot)
+        .is_ok_and(|id| !id.is_nil() && id.hyphenated().to_string() == boot)
+    {
+        return Err(HOLD);
+    }
+    let identity = process(&proc, pid, &boot, budget)?.ok_or(HOLD)?;
+    let stat = read(&proc, &format!("{pid}/stat"), budget)?;
     let state = stat
         .rsplit_once(')')
         .ok_or(HOLD)?
@@ -617,14 +644,24 @@ pub(crate) fn live_process(pid: u32) -> Result<ChildIdentity> {
         .ok_or(HOLD)?;
     if matches!(state, "Z" | "X" | "x")
         || start_ticks(&stat, pid)? != identity.start_ticks
-        || read(&proc, "sys/kernel/random/boot_id", &mut budget)?.trim() != boot
+        || process(&proc, pid, &boot, budget)?.as_ref() != Some(&identity)
+        || read(&proc, "sys/kernel/random/boot_id", budget)?.trim() != boot
     {
         return Err(HOLD);
     }
+    budget.check()?;
     Ok(identity)
 }
 fn validate_stat_pair(first: &str, second: &str, pid: u32) -> Result<()> {
-    if start_ticks(first, pid)? != start_ticks(second, pid)? {
+    if start_ticks(first, pid)? != start_ticks(second, pid)?
+        || [first, second].iter().any(|stat| {
+            matches!(
+                stat.rsplit_once(')')
+                    .and_then(|(_, fields)| fields.split_whitespace().next()),
+                Some("Z" | "X" | "x")
+            )
+        })
+    {
         return Err(HOLD);
     }
     Ok(())
@@ -738,6 +775,7 @@ mod tests {
         for (case, second, expected) in [
             ("unchanged", first.clone(), Ok(())),
             ("state", stat(42, "R", 123, &fields), Ok(())),
+            ("reaped", stat(42, "Z", 123, &fields), Err(HOLD)),
             ("cpu and faults", stat(42, "S", 123, &active_fields), Ok(())),
             ("start time", stat(42, "S", 124, &fields), Err(HOLD)),
             ("pid", stat(43, "S", 123, &fields), Err(HOLD)),

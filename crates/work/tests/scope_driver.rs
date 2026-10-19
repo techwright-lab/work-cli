@@ -111,6 +111,20 @@ impl Fixture {
     }
 }
 #[test]
+fn identify_uses_injected_proc_and_preserves_generic_root_cgroup() {
+    let f = Fixture::new();
+    f.process(42, 123, "/");
+    let driver = f.driver(Limits::default());
+    let host = driver.identify(42).unwrap();
+    assert_eq!(host.pid, 42);
+    assert_eq!(host.start_ticks, 123);
+    assert_eq!(host.boot, BOOT);
+    assert_eq!(host.cgroup, "/");
+    assert!(driver.identify(43).is_err());
+    fs::write(f.root.join("proc/sys/kernel/random/boot_id"), "invalid").unwrap();
+    assert!(driver.identify(42).is_err());
+}
+#[test]
 fn stable_census_rejects_membership_identity_and_process_churn() {
     for case in ["birth", "exit", "replacement", "reuse", "boot", "subgroup"] {
         let f = Fixture::new();

@@ -128,6 +128,7 @@ pub enum JournalChange {
     ChildRegistered,
     ChildDeclaredOutcome,
     ChildHold,
+    ChildEnrolled,
 }
 
 use crate::{
@@ -152,8 +153,8 @@ pub struct GroupEmptyProof {
 /// A non-executing candidate made only from a Store-validated group snapshot.
 /// Not serializable; cannot authorize launch, cancellation, or delegation.
 pub(crate) struct RecordedScopeExpectation {
-    identity: ScopeIdentity,
-    boot: String,
+    pub(crate) identity: ScopeIdentity,
+    pub(crate) boot: String,
 }
 impl RecordedScopeExpectation {
     pub(crate) fn identity(&self) -> &ScopeIdentity {
@@ -164,6 +165,14 @@ impl RecordedScopeExpectation {
     }
 }
 impl GroupSnapshot {
+    pub fn certify_child_enrollment(
+        &self,
+        driver: &Driver,
+        child_run: &RunId,
+        controller: Option<&Binding>,
+    ) -> Result<crate::run_participants::EnrollmentProof> {
+        crate::run_participants::certify(&self.record, driver, child_run, controller)
+    }
     /// Reinspect historical ROOT-ONLY metadata without restoring a Binding.
     /// The stored exact root roster is a candidate, never an absence assertion.
     pub fn certify_historical_empty(&self, driver: &Driver) -> Result<GroupEmptyProof> {
@@ -259,7 +268,7 @@ fn uuid(value: &impl ToString) -> Result<Uuid> {
     Uuid::parse_str(&value.to_string()).map_err(|_| StoreError::Invalid)
 }
 impl BoundSnapshot {
-    fn capture(request: &RootRunRequest, binding: &Binding) -> Result<Self> {
+    pub(crate) fn capture(request: &RootRunRequest, binding: &Binding) -> Result<Self> {
         let intent = LaunchIntent::new(request.identity.run.clone(), &request.input.boot)
             .map_err(|_| StoreError::Invalid)?;
         if binding.identity().unit != intent.unit_name() || binding.boot_id() != intent.boot_id() {
@@ -379,12 +388,25 @@ fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
         .optional()?
         .transpose()?;
     if let Some(r) = &mut record {
-        r.children = crate::run_participants::roster(conn, &r.request)?;
+        r.children = crate::run_participants::roster(conn, &r.request, r.binding.as_ref())?;
         if r.closed && !r.children.is_empty() {
             return Err(StoreError::Invalid);
         }
     }
     Ok(record)
+}
+pub(crate) fn validate_enrollment_rosters(conn: &Connection) -> Result<()> {
+    crate::run_participants::validate_orphans(conn)?;
+    let mut stmt = conn.prepare("SELECT id FROM runs")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
+        let record = read(conn, &run)?.ok_or(StoreError::Invalid)?;
+        exact(conn, &record.request)?;
+    }
+    Ok(())
 }
 pub(crate) fn read_transaction(conn: &Connection) -> Result<Option<rusqlite::Transaction<'_>>> {
     if conn.is_autocommit() {
@@ -538,7 +560,11 @@ impl Store {
             .map(|r| r.map_err(StoreError::from).and_then(|v| v))
             .collect::<Result<Vec<_>>>()?;
         for record in &mut records {
-            record.children = crate::run_participants::roster(&self.conn, &record.request)?;
+            record.children = crate::run_participants::roster(
+                &self.conn,
+                &record.request,
+                record.binding.as_ref(),
+            )?;
             if record.closed && !record.children.is_empty() {
                 return Err(StoreError::Invalid);
             }
