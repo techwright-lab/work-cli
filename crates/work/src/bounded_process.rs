@@ -12,13 +12,31 @@ pub(crate) fn output(
 ) -> Result<Output, &'static str> {
     use std::os::unix::process::CommandExt;
     const IO_ERROR: &str = "Git process I/O unavailable; inventory incomplete";
-    let mut child = command
+    let start = Instant::now();
+    command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| IO_ERROR)?;
+        .stderr(Stdio::piped());
+    let mut child = loop {
+        if start.elapsed() >= timeout {
+            return Err("Git runtime limit reached; inventory incomplete");
+        }
+        match command.spawn() {
+            Ok(child) => break child,
+            // Internal callers use fixed programs without pre_exec callbacks.
+            // ETXTBSY is a failed exec: no helper code or stdin protocol ran.
+            // Reuse Command; std closes each failed attempt's capture pipes.
+            Err(error)
+                if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error()) =>
+            {
+                std::thread::sleep(
+                    Duration::from_millis(2).min(timeout.saturating_sub(start.elapsed())),
+                );
+            }
+            Err(_) => return Err(IO_ERROR),
+        }
+    };
     let group = rustix::process::Pid::from_raw(child.id() as i32).ok_or(IO_ERROR)?;
     let result = (|| {
         let mut stdout = child.stdout.take().ok_or(IO_ERROR)?;
@@ -29,7 +47,6 @@ pub(crate) fn output(
         ] {
             rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).map_err(|_| IO_ERROR)?;
         }
-        let start = Instant::now();
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut eof = [false; 2];
@@ -104,6 +121,93 @@ pub(crate) fn output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn writable_script(temp: &tempfile::TempDir, body: &str) -> (Command, std::fs::File) {
+        use std::{io::Write, os::unix::fs::PermissionsExt};
+        let path = temp.path().join("helper");
+        let mut writer = std::fs::File::create(&path).unwrap();
+        write!(writer, "#!/bin/sh\n{body}\n").unwrap();
+        writer
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let mut command = Command::new(path);
+        command.arg(temp.path().join("called"));
+        (command, writer)
+    }
+
+    #[test]
+    fn retries_busy_executable_until_writer_closes_then_executes_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, writer) = writable_script(
+            &temp,
+            "printf 'called\\n' >> \"$1\"; printf captured; printf diagnostic >&2",
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            drop(writer);
+        });
+        let result = output(&mut command, Duration::from_secs(2), 32);
+        release.join().unwrap();
+        let result = result.unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, b"captured");
+        assert_eq!(result.stderr, b"diagnostic");
+        assert_eq!(
+            std::fs::read(temp.path().join("called")).unwrap(),
+            b"called\n"
+        );
+    }
+
+    #[test]
+    fn busy_executable_held_through_deadline_never_starts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, _writer) = writable_script(&temp, "printf called > \"$1\"");
+        let start = Instant::now();
+        assert_eq!(
+            output(&mut command, Duration::from_millis(40), 32).unwrap_err(),
+            "Git runtime limit reached; inventory incomplete"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(40));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!temp.path().join("called").exists());
+    }
+
+    #[test]
+    fn busy_spawn_and_capture_share_one_runtime_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, writer) = writable_script(
+            &temp,
+            "printf called > \"$1\"; /usr/bin/sleep 0.2; printf finished",
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(writer);
+        });
+        let result = output(&mut command, Duration::from_millis(350), 32);
+        release.join().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "Git runtime limit reached; inventory incomplete"
+        );
+        assert!(temp.path().join("called").exists());
+    }
+
+    #[test]
+    fn other_spawn_errors_return_io_error_without_waiting_for_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("helper");
+        for exists in [false, true] {
+            if exists {
+                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            }
+            let start = Instant::now();
+            assert_eq!(
+                output(&mut Command::new(&path), Duration::from_secs(2), 32).unwrap_err(),
+                "Git process I/O unavailable; inventory incomplete"
+            );
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+    }
+
     #[test]
     fn timeout_kills_descendants_holding_capture_pipes() {
         let temp = tempfile::tempdir().unwrap();
