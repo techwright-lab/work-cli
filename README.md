@@ -227,7 +227,7 @@ Neither command needs the original actor's current Git profile. Existing `work r
 retries remain receipts/holds, not relaunches or automatic recovery.
 
 Supervised closure covers the full enrolled host roster; adopted participants cannot join it.
-The library-only `Store::register_child(root, ChildRequest)` now records an immutable
+`Store::register_child(root, ChildRequest)` records an immutable
 supervised child intent before inspection, bumps group revision/child count and appends
 an outbox event in the same IMMEDIATE transaction. Exact retries validate the entire
 child tree without grants/events, including after closure. New registration requires
@@ -260,7 +260,7 @@ closure or expected shared-root-host declarations; a pre-registration proof fail
 Contained children require fresh absence of every recorded actual host, including declared
 terminal hosts. No child is silently dropped by terminal/grace/cancellation/recovery closure.
 
-Positive enrollment is library-only: `Driver::identify(pid)` uses bounded no-follow
+Positive enrollment uses reviewed library proofs: `Driver::identify(pid)` uses bounded no-follow
 proc inspection (production fixed `/proc`, explicit library fixture IO otherwise).
 `GroupSnapshot::certify_child_enrollment(driver, child_run, optional_original_binding)`
 returns a private, nonserializable `EnrollmentProof` only after exact original host
@@ -312,7 +312,53 @@ affect a newer writer. Corrupt closed child history fails before recovery filter
 Interrupted is illegal in open groups and rejected by public child outcome declarations.
 No time, heartbeat or missing SessionEnd is an exit proof.
 
-**Not implemented:** child metadata CLI/native hook routing, bridge, task finish, retirement
+### Explicit child metadata CLI (partial Task6; not activation)
+
+```sh
+work participant register < child-request.json
+work participant enroll < child-request.json
+work participant close < child-outcome.json
+work participant status ROOT_RUN_UUIDV7
+```
+
+Registration/enrollment use the strict envelope `{ "root_run": "ROOT_RUN_UUIDV7",
+"child": { ... } }`. The child object requires every field: `checkout`, `group`,
+`run`, `run_ref`, `parent_run`, `parent_run_ref`, `execution_chain`, `source`,
+`session`, `agent`, `actor`, `expected_host`. Unknown native references are explicit
+JSON `null`, never generated IDs. `execution_chain` is the existing typed Work
+execution chain; `expected_host` is either `null` or the complete object
+`{ "boot": "BOOT_UUID", "pid": 42, "start_ticks": 10 }`. These are declared
+metadata, not prompts, commands, arbitrary payloads or environment. Close adds
+`"outcome": "completed"`, `"failed"` or `"cancelled"` to the envelope;
+`"interrupted"` is always rejected, including on retries.
+
+Dedicated stdin must reach EOF and is limited to 4 MiB (including legal Unicode
+chains); a producer that never closes stdin is not time-bounded. Unknown/duplicate
+fields, malformed/trailing input and oversized input fail with sanitized errors.
+Explicit `root_run` resolves an existing stored supervised root; environment lease
+IDs, automatic group joins, adopted roots and invented context are never accepted.
+Mutators require existing registered current-schema authority: no bootstrap,
+migration or new allocation. Registration commits a pending/unverified barrier
+without runtime/Git calls, including when optional capture cannot execute.
+Close only declares immutable logical metadata: it never runs recovery, proves
+absence, finishes a task, releases a writer or removes charges.
+
+Enroll requires an exact previously registered pending child and explicit validated
+`supervisor.runtime_directory`/`supervisor.bus_address`. It uses fixed production OS
+paths, no original Binding, no caller-selected registrar PID and no actor Git-profile
+lookup; the actual CLI process must be in scope. Missing runtime or uncertain host/
+registrar facts durably tighten the target to unverified and return nonzero `held`.
+Unverified targets cannot upgrade. A post-inspection CAS conflict keeps the existing
+barrier and reports held without hidden retries. Previously contained exact metadata
+returns `already_recorded` history only, without constructing a Driver or claiming a
+fresh proof. Reports distinguish `changed`, `existing`, `already_recorded`, `held`,
+carry static reason codes, `no_execution_permission: true` and
+`fresh_runtime_claim: false`. Status needs neither runtime nor actor profiles and
+returns full validated historical children with `runtime: "not_inspected"`; it does
+not write DB/WAL, directory entries, events, acknowledgements or heartbeats.
+Help/version are read-only throughout the participant command tree.
+
+**Not implemented:** native hook routing, bridge, task finish, retirement
 or scheduled automatic recovery. This does not complete Task6 or qualify live activation.
 Serialized metadata alone grants no launch, cancellation or closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and

@@ -17,6 +17,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Child metadata only: no launch, writer permission or automatic handoff
+    #[command(version, propagate_version = true)]
+    Participant {
+        #[command(subcommand)]
+        command: crate::participant_cli::Command,
+    },
     /// Adopted declarations only: no process control, Git identity or automatic handoff
     Adopt {
         #[command(subcommand)]
@@ -63,10 +69,9 @@ pub fn run() {
         eprintln!("scope child held");
         std::process::exit(1);
     }
-    let cli = if args
-        .first()
-        .is_some_and(|a| a == "run" || a == "recover" || a == "status" || a == "adopt")
-    {
+    let cli = if args.first().is_some_and(|a| {
+        a == "run" || a == "recover" || a == "status" || a == "adopt" || a == "participant"
+    }) {
         match Cli::try_parse() {
             Ok(cli) => cli,
             Err(error)
@@ -86,6 +91,26 @@ pub fn run() {
         Cli::parse()
     };
     match cli.command {
+        Command::Participant { command } => {
+            let result = Config::load()
+                .map_err(|_| crate::store::StoreError::Unsafe)
+                .and_then(|config| crate::participant_cli::command(&config, command));
+            match result {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("participant serialization")
+                    );
+                    if report.is_held() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("participant refused: invalid_metadata_or_existing_authority; inspect explicit root/child context and current schema; no execution permission");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Adopt { command } => {
             let result = Config::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)

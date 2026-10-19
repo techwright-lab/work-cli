@@ -17,6 +17,7 @@ pub mod events;
 pub mod identity;
 pub mod linux_scope;
 pub mod ownership;
+pub mod participant_cli;
 pub mod participants;
 pub mod recovery;
 pub mod run_journal;
