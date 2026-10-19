@@ -238,12 +238,14 @@ while the permitted group is open; it preserves those outcomes/holds and invalid
 older empty proofs. Closed groups reject new children and changed requests, but acknowledge
 exact known-child requests as metadata only. Child run IDs also cannot become
 legacy writer groups or reservation operation IDs, including on exact retries.
-Child Work IDs/refs share the root/adopted/operation/group namespace. Optional actual
-source/session/agent/actor references remain unknown when absent. Expected boot/PID/start
+Child Work IDs/refs share the global root/adopted-run/group/operation/child namespace.
+Those IDs stay reserved on reverse admission and legacy writer paths, including
+historical IDs; genuine bare writers and immutable allocation retries remain valid.
+Optional actual source/session/agent/actor references remain unknown when absent. Expected boot/PID/start
 is a candidate host identity, **not** observed containment or individual authorship;
 logical children can name the same physical host without inventing child PIDs.
 
-This is a conservative partial Task6 increment: expected-host children start `pending`,
+The reviewed Task6 supervised metadata implementation is conservative: expected-host children start `pending`,
 children without an expected host start `unverified`, and `record_child_hold` only tightens
 pending or contained to unverified (retaining prior enrollment audit). `record_child_outcome` records immutable/idempotent declared
 Completed/Failed/Cancelled, never caller-declared Interrupted or physical absence.
@@ -312,7 +314,7 @@ affect a newer writer. Corrupt closed child history fails before recovery filter
 Interrupted is illegal in open groups and rejected by public child outcome declarations.
 No time, heartbeat or missing SessionEnd is an exit proof.
 
-### Explicit child metadata CLI (partial Task6; not activation)
+### Explicit child metadata CLI (reviewed Task6 implementation; not activation)
 
 ```sh
 work participant register < child-request.json
@@ -359,7 +361,7 @@ not write DB/WAL, directory entries, events, acknowledgements or heartbeats.
 Help/version are read-only throughout the participant command tree.
 
 **Not implemented:** native hook routing, bridge, task finish, retirement
-or scheduled automatic recovery. This does not complete Task6 or qualify live activation.
+or scheduled automatic recovery. Task6 metadata implementation review does not qualify live activation.
 Serialized metadata alone grants no launch, cancellation or closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
 do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
@@ -473,11 +475,12 @@ Actual runtime-hook payload-to-stable-ID mapping, installation and fork coverage
 qualification belong to Task 13 and are not implemented. Positive supervised child
 containment and full-roster closure proof are implemented in the library; explicit
 `work participant` child metadata CLI is available. Native-hook mapping, routing,
-qualification and installation remain unimplemented (Task 13). This does not activate
-live execution, finish tasks or retire checkouts; Task6 remains pending integrated review. Earlier root-only recovery and all-child
-barrier increments were intentionally narrower historical stages, not current limits.
-Writer release is not task completion, uncharging or retirement; this journal does not
-complete Task6.
+qualification and installation remain unimplemented (Task 13). Task6 supervised,
+adopted and participant metadata implementation is reviewed; this is not production
+deployment, live-hook or capture-bridge activation, explicit task finish, or retirement readiness.
+Earlier root-only recovery and all-child barrier increments were intentionally narrower
+historical stages, not current limits. Writer release is not task completion, uncharging
+or retirement.
 
 ## Requirements
 
