@@ -471,8 +471,10 @@ string-valued request/event/parent JSON remains compatible without row rewrites.
 
 Actual runtime-hook payload-to-stable-ID mapping, installation and fork coverage
 qualification belong to Task 13 and are not implemented. Positive supervised child
-containment and full-roster closure proof are implemented in the library; child metadata
-CLI/native hook routing remains unimplemented. Earlier root-only recovery and all-child
+containment and full-roster closure proof are implemented in the library; explicit
+`work participant` child metadata CLI is available. Native-hook mapping, routing,
+qualification and installation remain unimplemented (Task 13). This does not activate
+live execution, finish tasks or retire checkouts; Task6 remains pending integrated review. Earlier root-only recovery and all-child
 barrier increments were intentionally narrower historical stages, not current limits.
 Writer release is not task completion, uncharging or retirement; this journal does not
 complete Task6.
