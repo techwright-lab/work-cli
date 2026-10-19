@@ -5,10 +5,37 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) fn output_aggregate(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+) -> Result<Output, &'static str> {
+    output_mode(command, timeout, limit, true)
+}
+
+// Aggregate capture cannot probe EOF at an exhausted boundary: even a one-byte
+// lookahead violates the caller's OS-read budget. Exact-cap output is held.
+fn capture_read(pipe: &mut dyn Read, buffer: &mut [u8], remaining: usize) -> io::Result<usize> {
+    if remaining == 0 {
+        return Err(io::Error::other("capture capacity exhausted"));
+    }
+    let length = buffer.len().min(remaining).min(8192);
+    pipe.read(&mut buffer[..length])
+}
+
 pub(crate) fn output(
     command: &mut Command,
     timeout: Duration,
     limit: usize,
+) -> Result<Output, &'static str> {
+    output_mode(command, timeout, limit, false)
+}
+
+fn output_mode(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    aggregate: bool,
 ) -> Result<Output, &'static str> {
     use std::os::unix::process::CommandExt;
     const IO_ERROR: &str = "Git process I/O unavailable; inventory incomplete";
@@ -50,6 +77,7 @@ pub(crate) fn output(
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut eof = [false; 2];
+        let mut remaining = limit;
         loop {
             if start.elapsed() >= timeout {
                 return Err("Git runtime limit reached; inventory incomplete");
@@ -66,13 +94,27 @@ pub(crate) fn output(
                     continue;
                 }
                 let mut buffer = [0; 8192];
-                match pipe.read(&mut buffer) {
+                if aggregate && remaining == 0 {
+                    return Err("Git capture limit reached; inventory incomplete");
+                }
+                let read = if aggregate {
+                    capture_read(pipe, &mut buffer, remaining)
+                } else {
+                    pipe.read(&mut buffer)
+                };
+                match read {
                     Ok(0) => eof[index] = true,
                     Ok(n) => {
                         if n > limit.saturating_sub(bytes.len()) {
                             return Err("Git capture limit reached; inventory incomplete");
                         }
                         bytes.extend_from_slice(&buffer[..n]);
+                        if aggregate {
+                            remaining -= n;
+                            if remaining == 0 {
+                                return Err("Git capture limit reached; inventory incomplete");
+                            }
+                        }
                         progressed = true;
                     }
                     Err(e)
@@ -132,6 +174,141 @@ mod tests {
         let mut command = Command::new(path);
         command.arg(temp.path().join("called"));
         (command, writer)
+    }
+
+    #[test]
+    fn aggregate_capture_shares_capacity_but_per_stream_capture_does_not() {
+        let body = format!(
+            "printf '{}'; printf '{}' >&2",
+            "o".repeat(80),
+            "e".repeat(80)
+        );
+        let per_stream = output(
+            Command::new("/bin/sh").args(["-c", &body]),
+            Duration::from_secs(2),
+            100,
+        )
+        .unwrap();
+        assert_eq!(per_stream.stdout.len() + per_stream.stderr.len(), 160);
+        assert_eq!(
+            output_aggregate(
+                Command::new("/bin/sh").args(["-c", &body]),
+                Duration::from_secs(2),
+                100
+            )
+            .unwrap_err(),
+            "Git capture limit reached; inventory incomplete"
+        );
+    }
+
+    #[test]
+    fn aggregate_boundary_is_conservative_without_eof_lookahead() {
+        for (stdout, stderr, limit, success) in [
+            (80, 80, 161, true),
+            (80, 80, 160, false),
+            (0, 0, 0, false),
+            (0, 0, 1, true),
+        ] {
+            let body = format!(
+                "printf '{}'; printf '{}' >&2",
+                "o".repeat(stdout),
+                "e".repeat(stderr)
+            );
+            let result = output_aggregate(
+                Command::new("/bin/sh").args(["-c", &body]),
+                Duration::from_secs(2),
+                limit,
+            );
+            if success {
+                let output = result.unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stdout.len(), stdout);
+                assert_eq!(output.stderr.len(), stderr);
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "Git capture limit reached; inventory incomplete"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_exhaustion_kills_owned_descendants_and_reaps_leader() {
+        for _ in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let pids = temp.path().join("pids");
+            let body = format!(
+                "sleep 30 & child=$!; printf '%s %s' $$ $child > '{}'; printf '{}'; wait",
+                pids.display(),
+                "x".repeat(160)
+            );
+            assert_eq!(
+                output_aggregate(
+                    Command::new("/bin/sh").args(["-c", &body]),
+                    Duration::from_secs(2),
+                    100
+                )
+                .unwrap_err(),
+                "Git capture limit reached; inventory incomplete"
+            );
+            let pids = std::fs::read_to_string(pids).unwrap();
+            let mut pids = pids.split_whitespace();
+            let leader = pids.next().unwrap();
+            assert!(
+                !std::path::Path::new(&format!("/proc/{leader}")).exists(),
+                "leader not reaped"
+            );
+            let child = pids.next().unwrap();
+            // A killed orphan may remain a zombie until init reaps it. Wait for
+            // the delivered SIGKILL, not an outer elapsed-time success oracle.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match std::fs::read_to_string(format!("/proc/{child}/stat")) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    Ok(stat)
+                        if stat.rsplit_once(')').unwrap().1.split_whitespace().next()
+                            == Some("Z") =>
+                    {
+                        break
+                    }
+                    state => {
+                        assert!(Instant::now() < deadline, "descendant survived: {state:?}");
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capture_read_never_requests_or_consumes_beyond_remaining() {
+        struct CountRead {
+            requests: Vec<usize>,
+            consumed: usize,
+        }
+        impl Read for CountRead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.requests.push(buf.len());
+                buf.fill(b'x');
+                self.consumed += buf.len();
+                Ok(buf.len())
+            }
+        }
+        let mut reader = CountRead {
+            requests: vec![],
+            consumed: 0,
+        };
+        let mut buffer = [0; 16384];
+        assert_eq!(capture_read(&mut reader, &mut buffer, 100).unwrap(), 100);
+        assert_eq!(reader.requests, [100]);
+        assert_eq!(reader.consumed, 100);
+        assert!(capture_read(&mut reader, &mut buffer, 0).is_err());
+        assert_eq!(
+            reader.requests,
+            [100],
+            "zero capacity must not read or infer EOF"
+        );
     }
 
     #[test]

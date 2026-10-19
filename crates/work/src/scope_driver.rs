@@ -252,7 +252,7 @@ impl Driver {
             ])
             .env("XDG_RUNTIME_DIR", &self.context.directory)
             .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
-        let output = bounded_process::output(
+        let output = bounded_process::output_aggregate(
             &mut command,
             budget.remaining()?,
             (budget.limits.total_bytes - budget.bytes).min(16_384),
@@ -771,6 +771,69 @@ fn participant_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_manager_streams_exhaust_shared_budget_before_later_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let _bus = std::os::unix::net::UnixListener::bind(runtime.join("bus")).unwrap();
+        let proc = root.path().join("proc");
+        fs::create_dir_all(proc.join("sys/kernel/random")).unwrap();
+        let boot = "550e8400-e29b-41d4-a716-446655440000";
+        fs::write(proc.join("sys/kernel/random/boot_id"), boot).unwrap();
+        let cg = root.path().join("cg");
+        fs::create_dir(&cg).unwrap();
+        let manager = root.path().join("manager");
+        let called = root.path().join("called");
+        fs::write(
+            &manager,
+            format!(
+                "#!/bin/sh\nprintf 'called\\n' >> '{}'\nprintf '{}'\nprintf '{}' >&2\n",
+                called.display(),
+                "o".repeat(80),
+                "e".repeat(80)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&manager, fs::Permissions::from_mode(0o700)).unwrap();
+        let driver = Driver::with_io(
+            RuntimeContext::new(
+                runtime.clone(),
+                format!("unix:path={}/bus", runtime.display()),
+            )
+            .unwrap(),
+            LibraryIo {
+                systemctl: manager,
+                proc_root: proc,
+                cgroup_root: cg,
+                between_censuses: Some(Box::new(|| panic!("later inspection must not start"))),
+            },
+            Limits {
+                total_bytes: boot.len() + 100,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        let intent = LaunchIntent::new(work_contract::RunId::generate(), boot).unwrap();
+        let mut budget = driver.enrollment_budget(Instant::now());
+        let obs = driver.observe_expected_with(&intent, None, None, &mut budget);
+        assert_eq!(obs.unit, UnitPresence::Unknown);
+        assert_eq!(obs.membership, Membership::Unknown);
+        assert_eq!(obs.recursive_coverage, Coverage::Unknown);
+        assert_eq!(
+            budget.bytes,
+            boot.len(),
+            "aggregate failure must precede charging oversized capture"
+        );
+        assert_eq!(
+            fs::read(called).unwrap(),
+            b"called\n",
+            "no second manager query"
+        );
+    }
 
     #[test]
     fn enrollment_deadline_is_shared_and_stops_later_identification_and_manager() {
