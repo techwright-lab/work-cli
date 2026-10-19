@@ -135,7 +135,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=8))
+        || (name == "store.sqlite" && matches!(version, 2..=9))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -271,13 +271,13 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 8 {
+        if version != 9 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
         Ok(Self { conn, budget })
     }
-    /// Recovery can mutate an established v8 authority only; never initializes
+    /// Recovery can mutate an established v9 authority only; never initializes
     /// an empty authority for an unknown RunId or upgrades historical schemas.
     pub fn open_existing_registered_mut(
         registry: &Path,
@@ -287,11 +287,39 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 8 {
+        if version != 9 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
         Ok(Self { conn, budget })
+    }
+    /// Finish may upgrade a proven established v8 authority, never bootstrap or
+    /// repair an invalid authority. The read-only preflight precedes mutable open.
+    pub(crate) fn open_finish_authority(
+        registry: &Path,
+        dir: &Path,
+        managed: &[PathBuf],
+    ) -> Result<Self> {
+        let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
+        {
+            let (reg, reg_budget) = existing_database(registry, "authorities.sqlite")?;
+            let _reg_phase = reg_budget.enter();
+            let _phase = budget.enter();
+            for db in [&conn, &reg] {
+                let mode: String = db.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+                if mode != "wal" {
+                    return Err(StoreError::Unsafe);
+                }
+            }
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if !matches!(version, 8 | 9) {
+                return Err(StoreError::UpgradeRequired);
+            }
+            validate_existing_schema(&conn, version)?;
+            crate::run_journal::validate_enrollment_rosters(&conn)?;
+        }
+        drop(conn);
+        Self::open_registered(registry, dir, managed)
     }
     /// Uses `.work-authorities` at the store's parent as the trusted registry,
     /// permitting only one authoritative store there, even for disjoint roots.
@@ -402,7 +430,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=8) {
+        if !matches!(version, 0..=9) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -493,7 +521,12 @@ impl Store {
                 PRAGMA user_version=8;")?;
             initialization_boundary("enrollment_schema");
         }
-        validate_existing_schema(&tx, 8)?;
+        if version < 9 {
+            validate_existing_schema(&tx, 8)?;
+            tx.execute_batch(crate::finish::SCHEMA)?;
+            initialization_boundary("finish_schema");
+        }
+        validate_existing_schema(&tx, 9)?;
         if version < 8 {
             crate::run_journal::validate_enrollment_rosters(&tx)?;
         }
@@ -653,7 +686,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> 
     conn.execute_batch("PRAGMA query_only=ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=8))) || integrity != "ok"
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=9))) || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
@@ -772,11 +805,15 @@ fn existing_authority(
     let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if writable && version != 8 {
+    if writable && version != 9 {
         return Err(StoreError::UpgradeRequired);
     }
     validate_existing_schema(&conn, version)?;
     if writable {
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if mode != "wal" {
+            return Err(StoreError::Unsafe);
+        }
         // Complete the bounded read-only preflight before any mutable open.
         // In particular, do not switch a rejected DELETE-mode DB into WAL.
         drop(rows);
@@ -793,6 +830,9 @@ fn existing_authority(
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
+    if version >= 9 {
+        crate::finish::validate_schema(conn)?;
+    }
     if version >= 8 {
         crate::run_participants::validate_schema(conn)?;
     }
@@ -905,7 +945,8 @@ pub(crate) fn exclude_journal_identity(conn: &Connection, id: Uuid) -> Result<()
         "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1)
             OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1)
             OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1)
-            OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1)",
+            OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1)
+            OR EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)",
         [id.to_string()],
         |r| r.get(0),
     )?;
@@ -1150,7 +1191,7 @@ mod tests {
                 )
                 .unwrap();
             let events = store.pending_events(100).unwrap();
-            store.conn.execute_batch("DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
+            store.conn.execute_batch("DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
             drop(store);
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "store::tests::initialization_worker"])
@@ -1213,7 +1254,7 @@ mod tests {
         let events = store.pending_events(100).unwrap();
         store
             .conn
-            .execute_batch("DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
+            .execute_batch("DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
             .unwrap();
         drop(store);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1246,6 +1287,48 @@ mod tests {
         assert_eq!(store.pending_events(100).unwrap(), events);
     }
 
+    #[test]
+    fn interrupted_v8_finish_migration_is_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let store =
+            super::Store::open(&dir.path().join("private"), std::slice::from_ref(&root)).unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE task_finishes; PRAGMA user_version=8")
+            .unwrap();
+        drop(store);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "store::tests::initialization_worker"])
+            .env("WORK_INIT_TEST_BASE", dir.path())
+            .env("WORK_INIT_TEST_BOUNDARY", "finish_schema")
+            .status()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(6));
+        let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        assert_eq!(
+            sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            sql.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='task_finishes'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        super::Store::open(&dir.path().join("private"), &[root]).unwrap();
+        assert_eq!(
+            sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+    }
     #[test]
     fn remote_and_unknown_filesystems_are_not_store_authorities() {
         for magic in [0x6969, 0xff534d42, 0x65735546, 0] {

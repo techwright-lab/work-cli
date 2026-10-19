@@ -195,15 +195,64 @@ fn request(
 fn record(store: &Store, request: &RootRunRequest) -> io::Result<RunRecord> {
     db(store.run_snapshot(&request.identity().run))?.ok_or_else(|| err("missing run journal"))
 }
-fn report(record: RunRecord, existing: bool, exit_code: Option<i32>) -> RunReport {
-    RunReport {
+fn report(
+    store: &Store,
+    run: &RunId,
+    existing: bool,
+    exit_code: Option<i32>,
+) -> io::Result<RunReport> {
+    let _phase = store.sql_phase();
+    let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
+    let (record, lease_charged, task_open) = db(store.run_status_record(run))?;
+    let attribution_not_configured = db(crate::finish::capture_not_configured(
+        &store.conn,
+        Uuid::parse_str(&record.request.identity().checkout.to_string())
+            .map_err(|_| err("invalid checkout"))?,
+    ))?;
+    Ok(RunReport {
         record,
         existing,
         exit_code,
-        lease_charged: true,
-        task_open: true,
-        attribution_not_configured: true,
+        lease_charged,
+        task_open,
+        attribution_not_configured,
+    })
+}
+/// Historical finished-task receipt, without restoring actor/runtime authority.
+pub fn existing_report(config: &Config, command: &RootCommand) -> io::Result<Option<RunReport>> {
+    let (Some(registry), Some(dir)) = (
+        config.trusted_registry.as_deref(),
+        config.store_dir.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    if !dir.exists() {
+        return Ok(None);
     }
+    let store = db(Store::open_existing_registered_readonly(
+        registry,
+        dir,
+        &config.roots,
+    ))?;
+    let run = RunId::parse(&command.run_id.to_string()).map_err(|_| err("invalid run"))?;
+    let Some(record) = db(store.run_snapshot(&run))? else {
+        return Ok(None);
+    };
+    let result = report(&store, &run, true, None)?;
+    if result.task_open {
+        return Ok(None);
+    }
+    if record.request.identity().checkout.to_string() != command.checkout.to_string()
+        || command
+            .actor
+            .as_ref()
+            .is_some_and(|a| a != record.request.identity().actor.as_str())
+        || record.request.identity().execution_chain != command.execution_chain
+        || record.request.input().command_digest != command_digest(&command.argv)?
+    {
+        return Err(err("historical request conflicts"));
+    }
+    Ok(Some(result))
 }
 /// Actual accepted backend with explicit library-only IO fixtures. Production
 /// never reads manager/launcher selectors from flags or the environment.
@@ -225,6 +274,12 @@ fn supervise(
     cancel: &CancelToken,
     mut observer: impl FnMut(Boundary, &RunRecord),
 ) -> io::Result<RunReport> {
+    // Optional read-only finished receipt. Otherwise retain the ordinary run
+    // preflight, which independently validates authority and cannot revive a
+    // held finish fence (including when strict reader bookkeeping is absent).
+    if let Ok(Some(report)) = existing_report(config, &command) {
+        return Ok(report);
+    }
     let settings = config
         .supervisor
         .as_ref()
@@ -259,7 +314,7 @@ fn supervise(
         if !record(&store, &request)?.closed {
             db(store.record_recovery_hold(&request))?;
         }
-        return Ok(report(record(&store, &request)?, true, None));
+        return report(&store, &request.identity().run, true, None);
     }
     observer(Boundary::Intent, &record(&store, &request)?);
     // All failures after intent retain writer and charge; never invent an outcome.
@@ -381,7 +436,7 @@ fn supervise(
                 ) {
                     db(store.close_supervised_group(&snapshot, &proof))?;
                     observer(Boundary::Closed, &record(&store, &request)?);
-                    return Ok(report(record(&store, &request)?, false, root_code));
+                    return report(&store, &request.identity().run, false, root_code);
                 }
             }
             if cancel_at.is_some_and(|at: Instant| {
@@ -390,7 +445,7 @@ fn supervise(
                 at.elapsed() >= Duration::from_millis(settings.closure_grace_ms)
             }) {
                 db(store.record_recovery_hold(&request))?;
-                return Ok(report(record(&store, &request)?, false, root_code));
+                return report(&store, &request.identity().run, false, root_code);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -412,6 +467,16 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
         .map_err(|_| err("execution chain file unreadable or oversized"))?;
     let execution_chain: ExecutionChain =
         serde_json::from_slice(&bytes).map_err(|_| err("invalid typed execution chain JSON"))?;
+    let command = RootCommand {
+        checkout: request.checkout,
+        actor: request.actor,
+        run_id: request.run_id,
+        execution_chain,
+        argv: request.argv,
+    };
+    if let Ok(Some(report)) = existing_report(config, &command) {
+        return Ok(print_report(&report));
+    }
     let settings = config
         .supervisor
         .as_ref()
@@ -436,24 +501,30 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
             }
         }
     }
-    let result = supervise(
-        config,
-        RootCommand {
-            checkout: request.checkout,
-            actor: request.actor,
-            run_id: request.run_id,
-            execution_chain,
-            argv: request.argv,
-        },
-        &driver,
-        None,
-        &cancel,
-        |_, _| {},
-    );
+    let result = supervise(config, command, &driver, None, &cancel, |_, _| {});
     for id in handlers {
         signal_hook::low_level::unregister(id);
     }
     let report = result?;
-    eprintln!("run {}: root={:?}; writer_group={}; lease=charged; task=open; attribution=not_configured; receipt={}", report.record.request.identity().run, report.record.outcome, if report.record.closed {"closed"} else {"held; inspect durable journal; historical binding restoration unsupported"}, report.existing);
-    Ok(report.process_exit_code())
+    Ok(print_report(&report))
+}
+fn print_report(report: &RunReport) -> i32 {
+    eprintln!(
+        "run {}: root={:?}; writer_group={}; lease=charged; task={}; attribution={}; receipt={}",
+        report.record.request.identity().run,
+        report.record.outcome,
+        if report.record.closed {
+            "closed"
+        } else {
+            "held; inspect durable journal; historical binding restoration unsupported"
+        },
+        if report.task_open { "open" } else { "finished" },
+        if report.attribution_not_configured {
+            "not_configured"
+        } else {
+            "see finish receipt"
+        },
+        report.existing
+    );
+    report.process_exit_code()
 }

@@ -3,6 +3,14 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    TaskFinished {
+        checkout: Uuid,
+        operation: Uuid,
+    },
+    FinishCaptureResult {
+        checkout: Uuid,
+        operation: Uuid,
+    },
     AdoptedJournalChanged {
         checkout: Uuid,
         group: Uuid,

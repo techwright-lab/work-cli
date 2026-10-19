@@ -14,6 +14,7 @@ pub mod config;
 pub mod doctor;
 pub mod error;
 pub mod events;
+pub mod finish;
 pub mod identity;
 pub mod linux_scope;
 pub mod ownership;

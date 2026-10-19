@@ -68,7 +68,17 @@ fn component(s: &str) -> bool {
 pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
     let record = serde_json::to_string(a)?;
     let request = serde_json::to_string(&a.request)?;
-    let tx = sql(store.conn.transaction())?;
+    let tx = sql(store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+    let finished: bool = sql(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",
+        [a.checkout.to_string()],
+        |r| r.get(0),
+    ))?;
+    if finished {
+        return Err(err("explicit finish fence forbids allocation mutation"));
+    }
     sql(tx.execute("INSERT INTO allocations VALUES(?1,?2,?3) ON CONFLICT(checkout) DO UPDATE SET record=excluded.record", rusqlite::params![a.checkout.to_string(), request, record]))?;
     sql(tx.execute(
         "UPDATE checkouts SET state=?2,ready=?3 WHERE id=?1",
@@ -230,6 +240,10 @@ pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
         .as_ref()
         .ok_or_else(|| err("configure trusted_registry in WORK_CONFIG"))?;
     let store = db(Store::open_registered(registry, dir, &config.roots))?;
+    let lock = lifecycle_lock(dir)?;
+    Ok((store, lock))
+}
+pub(crate) fn lifecycle_lock(dir: &std::path::Path) -> io::Result<fs::File> {
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -251,7 +265,7 @@ pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok((store, lock))
+    Ok(lock)
 }
 fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {
     let policy = config

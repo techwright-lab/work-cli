@@ -240,7 +240,8 @@ impl Store {
             OR EXISTS(SELECT 1 FROM adopted_groups WHERE run_ref=?1 OR id IN (?2,?3,?4) OR run_id IN (?2,?3,?4) OR operation IN (?2,?3,?4))
             OR EXISTS(SELECT 1 FROM checkouts WHERE id IN (?2,?3,?4) OR operation IN (?2,?3,?4))
             OR EXISTS(SELECT 1 FROM writers WHERE group_id IN (?2,?3,?4))
-            OR EXISTS(SELECT 1 FROM run_participants WHERE run_ref=?1 OR id IN (?2,?3,?4))",
+            OR EXISTS(SELECT 1 FROM run_participants WHERE run_ref=?1 OR id IN (?2,?3,?4))
+            OR EXISTS(SELECT 1 FROM task_finishes WHERE operation IN (?2,?3,?4))",
             (i.run_ref.as_str(), &ids[0], &ids[1], &ids[2]), |r| r.get(0))?;
         if conflict {
             return Err(StoreError::Conflict);

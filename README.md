@@ -13,7 +13,9 @@ Early construction. Read-only `work --help`, `work status [--run <uuidv7>]` and 
 available, plus configured `work start` allocation. Start never launches a writer.
 Configured root-only `work run` coordination is available for construction/testing,
 not production activation. Adopted-only declarations (`work adopt begin/event/status`) are
-available without process control. Finish/removal and capture integration are not implemented.
+available without process control. Explicit `work finish <checkout-id>` records task completion;
+retirement is disabled and every finished checkout retains its tree and charge.
+Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
@@ -214,7 +216,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted v8 authority;
+runtime qualification claim. It requires an existing initialized trusted v9 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -225,6 +227,48 @@ operations/preflight; nested SQL phases share a cumulative limit, and time spent
 between operations inspecting Git or runtime state does not consume that limit.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
+
+### Explicit task finish (retirement disabled)
+
+`work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
+It never initializes missing authority. A read-only established-authority preflight can
+upgrade a valid v8 store to v9; malformed schemas, missing tables, views, incorrect
+claims and non-WAL authority fail closed, without repair. Other historical commands
+remain read-only and report upgrade-required for older schemas.
+
+Finish refuses active/unknown/bare/adopted writers and incomplete or contradictory
+root/child journals, even when a writer row is missing. Stop, SessionEnd, root exit
+and timeouts never finish a task. Fresh marker, source, branch and checkout identity
+verification precedes first completion. One IMMEDIATE transaction rechecks eligibility,
+records the immutable finish operation/identity/capture-binding digest and exactly one
+private `TaskFinished` outbox event, and fences the lease `held`, not ready, with
+`retirement-disabled`. Run outcomes, ownership, aliases and charges are unchanged.
+Task completion is separate from run completion. Historical status and finished-run
+retry receipts derive task openness from the same snapshot as run/accounting metadata;
+finished retries require no original actor Git profile or runtime.
+
+No sink is a valid completion (exit 0). Configured production capture is explicitly
+unsupported: completion remains durable, local freeze is Failed, evidence is incomplete,
+and the sanitized held report exits nonzero. Configured capture never silently becomes
+no-sink. A trusted library-only `LocalSink` seam supports future local capture; it is
+not selected from CLI/environment/plugins and grants no receiver/network authority.
+Local freeze runs only **after** the durable completion fence, outside SQL transactions
+and the lifecycle flock. Local Frozen/Failed and delivery Pending/Delivered/Failed are
+separate: no delivery queue/session is invented. Pending/Failed retries can call an
+explicit local sink only with the original binding and Work-owned idempotency key;
+Frozen never refreezes. Changed configuration returns stored evidence, never retargets it.
+No raw sink URI, prompt or environment is persisted. A second exact-context transaction
+records the capture result without another task-completion event.
+
+Reports distinguish task completion, unchanged run outcomes, local freeze/delivery,
+incomplete evidence, held lease, retained charge and retirement `disabled`/action `none`.
+Retries return the same durable operation after lost acknowledgements. Allocation
+recovery/start and writer APIs cannot reopen the fence; finish IDs stay reserved across
+allocation, root/adopted/child and legacy-writer namespaces. Dirty/untracked no-sink
+checkouts remain in place: completion is **not preservation proof or deletion permission**.
+There are no force/delete options, retirement callbacks, moves, quarantines, Git writes,
+branch changes or charge releases. Tasks 8 and 10 must qualify real capture and shared
+retirement separately; this construction milestone authorizes neither activation nor cleanup.
 
 Supervised closure covers the full enrolled host roster; adopted participants cannot join it.
 `Store::register_child(root, ChildRequest)` records an immutable
@@ -360,7 +404,7 @@ returns full validated historical children with `runtime: "not_inspected"`; it d
 not write DB/WAL, directory entries, events, acknowledgements or heartbeats.
 Help/version are read-only throughout the participant command tree.
 
-**Not implemented:** native hook routing, bridge, task finish, retirement
+**Not implemented:** native hook routing, bridge, retirement
 or scheduled automatic recovery. Task6 metadata implementation review does not qualify live activation.
 Serialized metadata alone grants no launch, cancellation or closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
@@ -462,7 +506,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema v8.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema v9.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned
@@ -477,7 +521,8 @@ containment and full-roster closure proof are implemented in the library; explic
 `work participant` child metadata CLI is available. Native-hook mapping, routing,
 qualification and installation remain unimplemented (Task 13). Task6 supervised,
 adopted and participant metadata implementation is reviewed; this is not production
-deployment, live-hook or capture-bridge activation, explicit task finish, or retirement readiness.
+deployment, live-hook or capture-bridge activation, or retirement readiness.
+Explicit task finish is a separate construction milestone above, with retirement disabled.
 Earlier root-only recovery and all-child barrier increments were intentionally narrower
 historical stages, not current limits. Writer release is not task completion, uncharging
 or retirement.

@@ -23,12 +23,12 @@ pub struct HistoricalStatus {
     pub runtime: &'static str,
     pub child_enrollment: &'static str,
     pub lease_charged: bool,
-    /// This journal has no task-completion transition.
+    /// Explicit completion is recorded separately from root run outcomes.
     pub task_open: bool,
 }
 /// Historical metadata only: never scope inspection or an actual exit-code claim.
 pub fn status(store: &Store, run: &RunId) -> Result<HistoricalStatus> {
-    let (record, lease_charged) = store.run_status_record(run)?;
+    let (record, lease_charged, task_open) = store.run_status_record(run)?;
     let child_enrollment = if record.children.iter().any(|child| child.host.is_some()) {
         "enrollment recorded; runtime not inspected now"
     } else {
@@ -39,7 +39,7 @@ pub fn status(store: &Store, run: &RunId) -> Result<HistoricalStatus> {
         record,
         runtime: "not_inspected",
         lease_charged,
-        task_open: true,
+        task_open,
     })
 }
 fn configured_paths(
@@ -83,7 +83,7 @@ pub fn command_recover(config: &crate::config::Config, run: uuid::Uuid) -> Resul
     recover(&mut store, &run, &driver)
 }
 fn historical_receipt(store: &Store, run: &RunId) -> Result<Option<RecoveryState>> {
-    let (record, _) = store.run_status_record(run)?;
+    let (record, _, _) = store.run_status_record(run)?;
     Ok(if record.closed {
         Some(RecoveryState::AlreadyClosed)
     } else if record.binding.is_none() {

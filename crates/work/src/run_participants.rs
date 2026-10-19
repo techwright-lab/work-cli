@@ -347,6 +347,9 @@ pub(crate) fn validate_orphans(conn: &rusqlite::Connection) -> Result<()> {
     }
 }
 fn namespace_conflict(conn: &rusqlite::Connection, request: &ChildRequest) -> Result<bool> {
+    if crate::finish::operation_reserved(conn, &request.run.to_string())? {
+        return Ok(true);
+    }
     conn.query_row("SELECT
         EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1 OR run_ref=?2)
         OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1)

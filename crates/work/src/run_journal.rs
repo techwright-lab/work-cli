@@ -510,6 +510,7 @@ impl Store {
             OR EXISTS(SELECT 1 FROM adopted_groups WHERE run_ref=?1 OR id IN (?2,?3) OR run_id IN (?2,?3) OR operation IN (?2,?3))
             OR EXISTS(SELECT 1 FROM writers WHERE group_id IN (?2,?3))
             OR EXISTS(SELECT 1 FROM run_participants WHERE run_ref=?1 OR id IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM task_finishes WHERE operation IN (?2,?3))
             ",
             (i.run_ref.as_str(), i.group.to_string(), i.run.to_string()), |r| r.get(0))?;
         if conflict {
@@ -573,7 +574,7 @@ impl Store {
         let _phase = self.sql_phase();
         read(&self.conn, run)
     }
-    pub(crate) fn run_status_record(&self, run: &RunId) -> Result<(RunRecord, bool)> {
+    pub(crate) fn run_status_record(&self, run: &RunId) -> Result<(RunRecord, bool, bool)> {
         let _phase = self.sql_phase();
         let _snapshot = read_transaction(&self.conn)?;
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
@@ -597,7 +598,9 @@ impl Store {
         ) {
             return Err(StoreError::Invalid);
         }
-        Ok((record, state != "retired"))
+        let task_open =
+            crate::finish::task_open(&self.conn, uuid(&record.request.identity.checkout)?)?;
+        Ok((record, state != "retired", task_open))
     }
     /// Only unresolved groups; closed roots remain historical receipts.
     /// No heartbeat/reboot inference, no reconstructed runtime authority.
