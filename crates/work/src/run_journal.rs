@@ -1,7 +1,6 @@
-//! Durable supervised root intent and recovery metadata only. No backend calls,
-//! launch permission, participant registration or group-closure authority.
-//! All groups remain writer-held, even after root exit; roster-bound fresh empty
-//! proof integration is intentionally unsupported in this increment.
+//! Durable supervised ROOT-ONLY journal and fresh OS-proof writer handoff.
+//! No launch, participant registration, task-finish or retirement authority.
+//! Coverage must be extended BEFORE supporting participants outside RootScope.
 use crate::{
     runtime_scope::{validate_structure, Binding, ChildIdentity, LaunchIntent, ScopeIdentity},
     store::{Result, Store, StoreError},
@@ -113,6 +112,7 @@ pub struct RunRecord {
     pub binding: Option<BoundSnapshot>,
     pub outcome: Option<RootOutcome>,
     pub recovery_hold: bool,
+    pub closed: bool,
     pub revision: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +123,58 @@ pub enum JournalChange {
     PermitAttempt,
     RootTerminal,
     RecoveryHold,
+    GroupClosed,
+}
+
+use crate::{
+    runtime_scope::ParticipantStatus,
+    scope_driver::{Driver, Participant},
+};
+use std::time::{Duration, Instant};
+const EMPTY_MAX_AGE: Duration = Duration::from_secs(2);
+
+/// Store-validated exact root roster context. Not serializable or caller-built.
+#[derive(Debug)]
+pub struct GroupSnapshot {
+    record: RunRecord,
+}
+/// Writer handoff only, bound to the exact immutable context and group revision.
+/// Never task completion, quota release, deletion or retirement authorization.
+#[derive(Debug)]
+pub struct GroupEmptyProof {
+    record: RunRecord,
+    collected_at: Instant,
+}
+impl GroupSnapshot {
+    /// Collect fresh evidence using this snapshot's internally owned exact root
+    /// roster, never caller-supplied participant claims. Requires the original
+    /// opaque Binding; historical JSON cannot restore runtime authority.
+    pub fn certify_empty(&self, driver: &Driver, binding: &Binding) -> Result<GroupEmptyProof> {
+        let r = &self.record;
+        if r.closed || r.binding.as_ref() != Some(&BoundSnapshot::capture(&r.request, binding)?) {
+            return Err(StoreError::Conflict);
+        }
+        let intent = LaunchIntent::new(r.request.identity.run.clone(), &r.request.input.boot)
+            .map_err(|_| StoreError::Invalid)?;
+        // ProvenAbsent is a candidate only: Driver checks this exact PID/start/
+        // boot/cgroup twice; live, escaped, reused or unreadable roots hold.
+        let roster = [Participant {
+            status: if r.outcome.is_some() {
+                ParticipantStatus::Closed
+            } else {
+                ParticipantStatus::ProvenAbsent
+            },
+            identity: Some(binding.trusted_child().clone()),
+        }];
+        let observation = driver.observe(&intent, Some(binding), Some(&roster));
+        binding
+            .verify_empty(&observation, Instant::now(), EMPTY_MAX_AGE)
+            .map_err(|_| StoreError::Invalid)?;
+        Ok(GroupEmptyProof {
+            record: r.clone(),
+            collected_at: observation.observed_at,
+        })
+    }
 }
 
 use crate::{
@@ -177,7 +229,7 @@ fn journal_event(
     )
 }
 const SELECT: &str = "SELECT r.request,r.stage,r.binding,r.outcome,g.recovery_hold,g.revision,
-    r.id,r.group_id,r.run_ref,g.checkout,g.mode FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id";
+    r.id,r.group_id,r.run_ref,g.checkout,g.mode,g.closed FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id";
 fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
     let request: String = row.get(0)?;
     let stage: String = row.get(1)?;
@@ -190,6 +242,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
     let run_ref: String = row.get(8)?;
     let checkout: String = row.get(9)?;
     let mode: String = row.get(10)?;
+    let closed: i64 = row.get(11)?;
     Ok((|| {
         let request: RootRunRequest = parse(&request)?;
         let stage = match stage.as_str() {
@@ -206,6 +259,8 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
             || request.identity.run_ref.as_str() != run_ref
             || mode != "supervised"
             || !matches!(hold, 0 | 1)
+            || !matches!(closed, 0 | 1)
+            || (closed == 1 && (hold != 0 || binding.is_none()))
             || revision < 1
             || (stage == RunStage::Intent) != binding.is_none()
             || (outcome == Some(RootOutcome::Completed) && stage != RunStage::PermitAttempt)
@@ -239,6 +294,7 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
             binding,
             outcome,
             recovery_hold: hold == 1,
+            closed: closed == 1,
             revision: revision as u64,
         })
     })())
@@ -265,7 +321,7 @@ fn exact(conn: &Connection, request: &RootRunRequest) -> Result<RunRecord> {
         ),
         |r| r.get(0),
     )?;
-    if !writer {
+    if writer == record.closed {
         return Err(StoreError::Invalid);
     }
     Ok(record)
@@ -347,19 +403,91 @@ impl Store {
     pub fn run_snapshot(&self, run: &RunId) -> Result<Option<RunRecord>> {
         read(&self.conn, run)
     }
-    /// All groups remain unresolved until roster-aware closure is implemented.
+    /// Only unresolved groups; closed roots remain historical receipts.
     /// No heartbeat/reboot inference, no reconstructed runtime authority.
     pub fn recovery_runs(&self) -> Result<Vec<RunRecord>> {
-        let mut stmt = self.conn.prepare(&format!("{SELECT} ORDER BY r.rowid"))?;
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT} WHERE g.closed IS NOT 1 ORDER BY r.rowid"
+        ))?;
         let rows = stmt.query_map([], read_row)?;
         rows.map(|r| r.map_err(StoreError::from).and_then(|v| v))
             .collect()
+    }
+    /// ROOT-ONLY: no participant registration exists in this version.
+    pub fn group_snapshot(&self, run: &RunId) -> Result<GroupSnapshot> {
+        let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
+        let record = exact(&self.conn, &record.request)?;
+        if record.closed || record.binding.is_none() {
+            return Err(StoreError::Invalid);
+        }
+        Ok(GroupSnapshot { record })
+    }
+    /// Atomically close only this supervised ROOT-ONLY group and release only
+    /// its writer. Revalidate freshness after the IMMEDIATE lock. Identical
+    /// terminal retries acknowledge metadata without consuming a new writer;
+    /// Existing is never execution permission. Checkout accounting is untouched.
+    pub fn close_supervised_group(
+        &mut self,
+        snapshot: &GroupSnapshot,
+        proof: &GroupEmptyProof,
+    ) -> Result<Transition> {
+        if snapshot.record != proof.record {
+            return Err(StoreError::Conflict);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let expected = &snapshot.record;
+        let current = exact(&tx, &expected.request)?;
+        let revision = expected
+            .revision
+            .checked_add(1)
+            .filter(|v| *v <= i64::MAX as u64)
+            .ok_or(StoreError::Invalid)?;
+        if current.closed {
+            let mut receipt = expected.clone();
+            receipt.closed = true;
+            receipt.recovery_hold = false;
+            receipt.revision = revision;
+            return if current == receipt {
+                Ok(Transition::Existing)
+            } else {
+                Err(StoreError::Conflict)
+            };
+        }
+        // Revalidate AFTER acquiring the database writer lock; waiting may have
+        // consumed the entire proof lifetime or allowed journal activity.
+        if &current != expected
+            || Instant::now()
+                .checked_duration_since(proof.collected_at)
+                .is_none_or(|age| age > EMPTY_MAX_AGE)
+        {
+            return Err(StoreError::Conflict);
+        }
+        let i = &expected.request.identity;
+        let removed = tx.execute(
+            "DELETE FROM writers WHERE checkout=?1 AND group_id=?2",
+            (i.checkout.to_string(), i.group.to_string()),
+        )?;
+        if removed != 1 {
+            return Err(StoreError::Conflict);
+        }
+        tx.execute(
+            "UPDATE run_groups SET closed=1,recovery_hold=0,revision=?2 WHERE id=?1",
+            (i.group.to_string(), revision as i64),
+        )?;
+        journal_event(&tx, &expected.request, revision, JournalChange::GroupClosed)?;
+        tx.commit()?;
+        Ok(Transition::Changed)
     }
     fn transition(&mut self, request: &RootRunRequest, change: Change) -> Result<Transition> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let record = exact(&tx, request)?;
+        if record.closed {
+            return Err(StoreError::Invalid);
+        }
         let run = request.identity.run.to_string();
         let group = request.identity.group.to_string();
         let kind = match change {

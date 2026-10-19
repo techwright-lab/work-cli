@@ -125,7 +125,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=4))
+        || (name == "store.sqlite" && matches!(version, 2..=5))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -357,7 +357,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=4) {
+        if !matches!(version, 0..=5) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -395,6 +395,10 @@ impl Store {
                 binding TEXT, outcome TEXT);
                 PRAGMA user_version=4;",
             )?;
+        }
+        if version < 5 {
+            validate_run_schema(&tx)?;
+            tx.execute_batch("ALTER TABLE run_groups ADD COLUMN closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1)); PRAGMA user_version=5;")?;
         }
         validate_run_schema(&tx)?;
         tx.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
@@ -551,7 +555,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<Connection> {
     conn.execute_batch("PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-1024; PRAGMA mmap_size=0;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=4))) || integrity != "ok"
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=5))) || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
@@ -676,6 +680,14 @@ pub(crate) fn acquire_writer_tx(
     group: Uuid,
     allow_existing: bool,
 ) -> Result<()> {
+    let closed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_groups WHERE id=?1 AND closed=1)",
+        [group.to_string()],
+        |r| r.get(0),
+    )?;
+    if closed {
+        return Err(StoreError::Invalid);
+    }
     let eligible: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1)",
         [checkout.to_string()],
@@ -718,6 +730,10 @@ fn validate_run_schema(conn: &Connection) -> Result<()> {
     }
     conn.prepare("SELECT id,checkout,mode,revision,recovery_hold FROM run_groups LIMIT 0")?;
     conn.prepare("SELECT id,group_id,run_ref,request,stage,binding,outcome FROM runs LIMIT 0")?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 5 {
+        conn.prepare("SELECT closed FROM run_groups LIMIT 0")?;
+    }
     Ok(())
 }
 

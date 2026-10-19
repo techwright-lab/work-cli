@@ -80,6 +80,9 @@ fn changed(r: &RootRunRequest, field: &str, value: serde_json::Value) -> RootRun
     serde_json::from_value(json).unwrap()
 }
 fn binding(r: &RootRunRequest) -> Binding {
+    binding_child(r, 42, 10)
+}
+fn binding_child(r: &RootRunRequest, pid: u32, start_ticks: u64) -> Binding {
     let intent = LaunchIntent::new(r.identity().run.clone(), &r.input().boot).unwrap();
     let identity = ScopeIdentity {
         unit: intent.unit_name().into(),
@@ -87,8 +90,8 @@ fn binding(r: &RootRunRequest) -> Binding {
         cgroup: format!("/test/{}", intent.unit_name()),
     };
     let child = ChildIdentity {
-        pid: 42,
-        start_ticks: 10,
+        pid,
+        start_ticks,
         boot: r.input().boot.clone(),
         cgroup: identity.cgroup.clone(),
     };
@@ -113,6 +116,425 @@ fn binding(r: &RootRunRequest) -> Binding {
         Duration::from_secs(1),
     )
     .unwrap()
+}
+
+// Private fake manager/proc/cgroup fixture: never contacts a real user manager.
+struct ClosureOs {
+    tmp: tempfile::TempDir,
+    _bus: std::os::unix::net::UnixListener,
+    driver: work_cli::scope_driver::Driver,
+}
+impl ClosureOs {
+    fn new(r: &RootRunRequest, b: &Binding) -> Self {
+        use std::{fs, os::unix::fs::PermissionsExt};
+        use work_cli::scope_driver::{Driver, LibraryIo, Limits, RuntimeContext};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("runtime")).unwrap();
+        fs::set_permissions(root.join("runtime"), fs::Permissions::from_mode(0o700)).unwrap();
+        let bus = std::os::unix::net::UnixListener::bind(root.join("runtime/bus")).unwrap();
+        fs::create_dir_all(root.join("proc/sys/kernel/random")).unwrap();
+        fs::write(root.join("proc/sys/kernel/random/boot_id"), &r.input().boot).unwrap();
+        let cg = root
+            .join("cg")
+            .join(b.identity().cgroup.trim_start_matches('/'));
+        fs::create_dir_all(&cg).unwrap();
+        fs::write(cg.join("cgroup.procs"), "").unwrap();
+        fs::write(cg.join("cgroup.type"), "domain\n").unwrap();
+        fs::write(
+            root.join("properties"),
+            format!(
+                "Id={}\nInvocationID={}\nControlGroup={}\nLoadState=loaded\nActiveState=inactive\n",
+                b.identity().unit,
+                b.identity().invocation,
+                b.identity().cgroup
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("manager"),
+            format!(
+                "#!/bin/sh\nexec /usr/bin/cat '{}'\n",
+                root.join("properties").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(root.join("manager"), fs::Permissions::from_mode(0o700)).unwrap();
+        let driver = Driver::with_io(
+            RuntimeContext::new(
+                root.join("runtime"),
+                format!("unix:path={}/runtime/bus", root.display()),
+            )
+            .unwrap(),
+            LibraryIo {
+                systemctl: root.join("manager"),
+                proc_root: root.join("proc"),
+                cgroup_root: root.join("cg"),
+                between_censuses: None,
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        Self {
+            tmp,
+            _bus: bus,
+            driver,
+        }
+    }
+    fn process(&self, b: &Binding, ticks: u64, group: &str) {
+        self.process_pid(b.trusted_child().pid, ticks, group);
+    }
+    fn process_pid(&self, pid: u32, ticks: u64, group: &str) {
+        use std::fs;
+        let p = self.tmp.path().join("proc").join(pid.to_string());
+        fs::create_dir_all(&p).unwrap();
+        fs::write(
+            p.join("stat"),
+            format!("{pid} (root) S {} {ticks} 0\n", vec!["0"; 18].join(" ")),
+        )
+        .unwrap();
+        fs::write(p.join("cgroup"), format!("0::{group}\n")).unwrap();
+    }
+}
+
+#[test]
+fn fresh_root_only_proof_hands_off_writer_without_finishing_or_releasing_charge() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    assert!(store.group_snapshot(&r.identity().run).is_err());
+    let b = binding(&r);
+    store.record_bound(&r, &b).unwrap();
+    let os = ClosureOs::new(&r, &b);
+    let snap = store.group_snapshot(&r.identity().run).unwrap();
+    let proof = snap.certify_empty(&os.driver, &b).unwrap();
+    let n = store.pending_events(100).unwrap().len();
+    assert_eq!(
+        store.close_supervised_group(&snap, &proof).unwrap(),
+        Transition::Changed
+    );
+    let closed = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+    assert!(closed.closed);
+    assert_eq!(closed.outcome, None);
+    assert!(store.recovery_runs().unwrap().is_empty());
+    assert_eq!(store.begin_run(&r).unwrap(), BeginRun::Existing);
+    assert!(store.record_permit_attempt(&r, &b).is_err());
+    assert!(store.record_recovery_hold(&r).is_err());
+    assert_eq!(store.pending_events(100).unwrap().len(), n + 1);
+    assert!(
+        store
+            .acquire_writer(
+                checkout,
+                Uuid::parse_str(&r.identity().group.to_string()).unwrap()
+            )
+            .is_err(),
+        "a legacy writer call must not reopen a closed journal group"
+    );
+    let next = request(checkout);
+    assert_eq!(store.begin_run(&next).unwrap(), BeginRun::Created);
+    let n = store.pending_events(100).unwrap().len();
+    assert_eq!(
+        store.close_supervised_group(&snap, &proof).unwrap(),
+        Transition::Existing
+    );
+    assert_eq!(store.pending_events(100).unwrap().len(), n);
+    assert_eq!(store.begin_run(&r).unwrap(), BeginRun::Existing);
+    assert_eq!(store.begin_run(&next).unwrap(), BeginRun::Existing);
+    assert!(store.begin_run(&request(checkout)).is_err());
+    assert_eq!(store.charged(&dir.path().join("root"), None).unwrap(), 1);
+    assert_eq!(
+        reopen(&dir)
+            .unwrap()
+            .run_snapshot(&r.identity().run)
+            .unwrap()
+            .unwrap(),
+        closed
+    );
+}
+
+#[test]
+fn root_roster_cannot_be_omitted_and_uncertain_os_evidence_never_certifies() {
+    for case in [
+        "live",
+        "escaped",
+        "reused",
+        "boot",
+        "manager",
+        "replacement",
+        "unknown",
+        "descendant",
+        "foreign",
+        "binding_pid",
+        "binding_start",
+        "binding_boot",
+    ] {
+        let (_dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        store.begin_run(&r).unwrap();
+        let b = binding(&r);
+        store.record_bound(&r, &b).unwrap();
+        store.record_root_outcome(&r, RootOutcome::Failed).unwrap();
+        let os = ClosureOs::new(&r, &b);
+        let p = os.tmp.path();
+        match case {
+            "live" => os.process(&b, 10, &b.identity().cgroup),
+            "escaped" => os.process(&b, 10, "/escaped"),
+            "reused" => os.process(&b, 11, &b.identity().cgroup),
+            "boot" => std::fs::write(
+                p.join("proc/sys/kernel/random/boot_id"),
+                "650e8400-e29b-41d4-a716-446655440000",
+            )
+            .unwrap(),
+            "manager" => std::fs::remove_file(p.join("manager")).unwrap(),
+            "replacement" => {
+                let props = p.join("properties");
+                let s = std::fs::read_to_string(&props).unwrap();
+                std::fs::write(
+                    props,
+                    s.replace(
+                        "550e8400e29b41d4a716446655440000",
+                        "650e8400e29b41d4a716446655440000",
+                    ),
+                )
+                .unwrap();
+            }
+            "unknown" => {
+                std::fs::create_dir(p.join("proc/42")).unwrap();
+            }
+            "descendant" => {
+                let group = format!("{}/child", b.identity().cgroup);
+                os.process_pid(43, 20, &group);
+                let cg = p.join("cg").join(group.trim_start_matches('/'));
+                std::fs::create_dir_all(&cg).unwrap();
+                std::fs::write(cg.join("cgroup.type"), "domain\n").unwrap();
+                std::fs::write(cg.join("cgroup.procs"), "43\n").unwrap();
+            }
+            _ => (),
+        }
+        let snap = store.group_snapshot(&r.identity().run).unwrap();
+        let mut different_boot = serde_json::to_value(&r).unwrap();
+        different_boot["input"]["boot"] = serde_json::json!("650e8400-e29b-41d4-a716-446655440000");
+        let different_boot: RootRunRequest = serde_json::from_value(different_boot).unwrap();
+        let other = match case {
+            "binding_pid" => binding_child(&r, 43, 10),
+            "binding_start" => binding_child(&r, 42, 11),
+            "binding_boot" => binding(&different_boot),
+            _ => binding(&request(checkout)),
+        };
+        let supplied = if case == "foreign" || case.starts_with("binding_") {
+            &other
+        } else {
+            &b
+        };
+        assert!(snap.certify_empty(&os.driver, supplied).is_err(), "{case}");
+        assert!(store.begin_run(&request(checkout)).is_err(), "{case}");
+    }
+}
+
+#[test]
+fn closure_proof_is_snapshot_specific_and_invalidated_by_activity_or_age() {
+    for activity in ["hold", "outcome", "age", "held"] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        store.begin_run(&r).unwrap();
+        let b = binding(&r);
+        store.record_bound(&r, &b).unwrap();
+        let os = ClosureOs::new(&r, &b);
+        let snap = store.group_snapshot(&r.identity().run).unwrap();
+        let proof = snap.certify_empty(&os.driver, &b).unwrap();
+        match activity {
+            "hold" => {
+                store.record_recovery_hold(&r).unwrap();
+            }
+            "outcome" => {
+                store.record_root_outcome(&r, RootOutcome::Failed).unwrap();
+            }
+            "age" => std::thread::sleep(Duration::from_millis(2100)),
+            _ => {
+                let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+                sql.execute("UPDATE checkouts SET state='held'", [])
+                    .unwrap();
+            }
+        }
+        if activity != "held" {
+            assert!(
+                store.close_supervised_group(&snap, &proof).is_err(),
+                "{activity}"
+            );
+            assert!(store.begin_run(&request(checkout)).is_err());
+        }
+        let current = store.group_snapshot(&r.identity().run).unwrap();
+        if activity == "hold" || activity == "outcome" {
+            assert!(store.close_supervised_group(&current, &proof).is_err());
+        }
+        let fresh = current.certify_empty(&os.driver, &b).unwrap();
+        store.close_supervised_group(&current, &fresh).unwrap();
+        assert!(
+            !store
+                .run_snapshot(&r.identity().run)
+                .unwrap()
+                .unwrap()
+                .recovery_hold
+        );
+        if activity == "held" {
+            assert!(store.begin_run(&request(checkout)).is_err());
+        }
+    }
+}
+
+#[test]
+fn v4_migration_preserves_runs_and_fails_closed_on_missing_v5_state() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    store.record_bound(&r, &binding(&r)).unwrap();
+    let original = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+    let events = store.pending_events(100).unwrap();
+    // Retain an existing WAL/SHM reader, as strict reporting never creates them.
+    let registry =
+        Connection::open(dir.path().join(".work-authorities/authorities.sqlite")).unwrap();
+    registry
+        .query_row("SELECT count(*) FROM authorities", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+    let report = || {
+        work_cli::store::report_existing(
+            &dir.path().join(".work-authorities"),
+            &dir.path().join("private"),
+            &[dir.path().join("root")],
+        )
+    };
+    drop(store);
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.execute_batch("ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
+        .unwrap();
+    assert!(
+        report().is_ok(),
+        "read-only v4 reporting must not require closed"
+    );
+    let migrated = reopen(&dir).unwrap();
+    assert!(
+        report().is_ok(),
+        "read-only v5 reporting must recognize closed"
+    );
+    assert_eq!(
+        migrated.run_snapshot(&r.identity().run).unwrap().unwrap(),
+        original
+    );
+    assert_eq!(migrated.pending_events(100).unwrap(), events);
+    assert_eq!(migrated.charged(&dir.path().join("root"), None).unwrap(), 1);
+    drop(migrated);
+    drop(sql);
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.execute_batch("ALTER TABLE run_groups DROP COLUMN closed")
+        .unwrap();
+    assert!(reopen(&dir).is_err());
+    assert!(report().is_err());
+}
+
+#[test]
+fn proof_age_is_checked_after_waiting_for_the_writer_lock() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    let b = binding(&r);
+    store.record_bound(&r, &b).unwrap();
+    let os = ClosureOs::new(&r, &b);
+    let snap = store.group_snapshot(&r.identity().run).unwrap();
+    let proof = snap.certify_empty(&os.driver, &b).unwrap();
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.execute_batch("BEGIN IMMEDIATE").unwrap();
+    std::thread::sleep(Duration::from_millis(1850));
+    let thread = std::thread::spawn(move || store.close_supervised_group(&snap, &proof));
+    std::thread::sleep(Duration::from_millis(250));
+    sql.execute_batch("COMMIT").unwrap();
+    assert!(matches!(
+        thread.join().unwrap(),
+        Err(work_cli::store::StoreError::Conflict)
+    ));
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sql.query_row("SELECT closed FROM run_groups", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn concurrent_close_and_new_root_are_serialized_without_losing_a_writer() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    let b = binding(&r);
+    store.record_bound(&r, &b).unwrap();
+    let os = ClosureOs::new(&r, &b);
+    let snap = store.group_snapshot(&r.identity().run).unwrap();
+    let proof = snap.certify_empty(&os.driver, &b).unwrap();
+    let mut other = reopen(&dir).unwrap();
+    let next = request(checkout);
+    let retry = next.clone();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let ready = barrier.clone();
+    let thread = std::thread::spawn(move || {
+        ready.wait();
+        let result = other.begin_run(&next);
+        (other, result)
+    });
+    barrier.wait();
+    store.close_supervised_group(&snap, &proof).unwrap();
+    let (mut other, first) = thread.join().unwrap();
+    if first.is_err() {
+        assert_eq!(other.begin_run(&retry).unwrap(), BeginRun::Created);
+    }
+    assert_eq!(other.begin_run(&retry).unwrap(), BeginRun::Existing);
+    let n = other.pending_events(100).unwrap().len();
+    assert_eq!(
+        other.close_supervised_group(&snap, &proof).unwrap(),
+        Transition::Existing
+    );
+    assert_eq!(other.pending_events(100).unwrap().len(), n);
+    assert!(other.begin_run(&request(checkout)).is_err());
+}
+
+#[test]
+fn recovery_does_not_hide_orphaned_or_invalid_group_state() {
+    for corrupt in [
+        "PRAGMA foreign_keys=OFF; DELETE FROM run_groups",
+        "PRAGMA ignore_check_constraints=ON; UPDATE run_groups SET closed=2",
+    ] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        store.begin_run(&r).unwrap();
+        let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        sql.execute_batch(corrupt).unwrap();
+        assert!(store.run_snapshot(&r.identity().run).is_err());
+        assert!(store.recovery_runs().is_err(), "{corrupt}");
+    }
+}
+
+#[test]
+fn closure_schema_preserves_existing_charges_and_writer() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    assert_eq!(
+        sql.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        sql.query_row("SELECT closed FROM run_groups", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.charged(&dir.path().join("root"), None).unwrap(), 1);
 }
 
 #[test]
@@ -562,6 +984,21 @@ fn failed_event_insert_rolls_back_writer_intent_and_transitions_together() {
     assert_eq!(snapshot.stage, RunStage::Intent);
     assert_eq!(snapshot.revision, 1);
     assert!(snapshot.binding.is_none());
+    sql.execute_batch("DROP TRIGGER reject_journal").unwrap();
+    let b = binding(&r);
+    store.record_bound(&r, &b).unwrap();
+    let os = ClosureOs::new(&r, &b);
+    let snap = store.group_snapshot(&r.identity().run).unwrap();
+    let proof = snap.certify_empty(&os.driver, &b).unwrap();
+    let before = store.run_snapshot(&r.identity().run).unwrap();
+    let events = store.pending_events(100).unwrap();
+    sql.execute_batch("CREATE TRIGGER reject_close BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'test disk failure'); END;").unwrap();
+    assert!(store.close_supervised_group(&snap, &proof).is_err());
+    assert_eq!(store.run_snapshot(&r.identity().run).unwrap(), before);
+    assert_eq!(store.pending_events(100).unwrap(), events);
+    assert!(store.begin_run(&request(checkout)).is_err());
+    sql.execute_batch("DROP TRIGGER reject_close").unwrap();
+    store.close_supervised_group(&snap, &proof).unwrap();
 }
 #[test]
 fn old_schemas_preserve_charges_outbox_legacy_writers_and_aliases() {
@@ -648,13 +1085,13 @@ fn failed_migration_rolls_back_new_tables_and_version_without_repairing_old_loss
 }
 
 #[test]
-fn schema_four_is_durable_and_missing_versioned_tables_fail_closed() {
+fn schema_five_is_durable_and_missing_versioned_tables_fail_closed() {
     let (dir, store, _) = fixture();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
     let version: i64 = sql
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 4, "journal requires a durable v4 migration");
+    assert_eq!(version, 5, "closure requires a durable v5 migration");
     for table in ["run_groups", "runs"] {
         sql.execute_batch(&format!("ALTER TABLE {table} RENAME TO missing_{table}"))
             .unwrap();
