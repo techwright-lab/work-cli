@@ -204,6 +204,21 @@ fn persist_initialization(registry: &Path, record: &Initialization) -> Result<()
 fn initialization_boundary(_name: &str) {
     #[cfg(test)]
     if std::env::var("WORK_INIT_TEST_BOUNDARY").as_deref() == Ok(_name) {
+        // Worker-local only: retain SIGABRT crash semantics without costly core dumps.
+        use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+        setrlimit(
+            Resource::Core,
+            Rlimit {
+                current: Some(0),
+                ..getrlimit(Resource::Core)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            getrlimit(Resource::Core).current,
+            Some(0),
+            "intentional fault worker must not dump core"
+        );
         std::process::abort();
     }
 }

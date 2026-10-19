@@ -18,6 +18,21 @@ fn allocation_worker() {
     .unwrap();
     start_observed(&config, request, |boundary| {
         if std::env::var("WORK_ALLOCATION_BOUNDARY").as_deref() == Ok(boundary) {
+            // Worker-local only: retain SIGABRT crash semantics without costly core dumps.
+            use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+            setrlimit(
+                Resource::Core,
+                Rlimit {
+                    current: Some(0),
+                    ..getrlimit(Resource::Core)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                getrlimit(Resource::Core).current,
+                Some(0),
+                "intentional fault worker must not dump core"
+            );
             std::process::abort();
         }
     })

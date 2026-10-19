@@ -60,6 +60,21 @@ fn crash_worker() {
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM outbox; DELETE FROM checkouts;")
         .unwrap();
+    // Worker-local only: retain SIGABRT crash semantics without costly core dumps.
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            ..getrlimit(Resource::Core)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        getrlimit(Resource::Core).current,
+        Some(0),
+        "intentional fault worker must not dump core"
+    );
     std::process::abort();
 }
 
@@ -77,7 +92,8 @@ fn committed_outbox_survives_process_death_and_ack_is_idempotent() {
         .current_dir(f._dir.path())
         .status()
         .unwrap();
-    assert!(!status.success());
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(6));
     let mut store = f.open();
     assert_eq!(
         store

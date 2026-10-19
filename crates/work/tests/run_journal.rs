@@ -488,6 +488,21 @@ fn journal_crash_worker() {
     if stage == "permit" {
         store.record_permit_attempt(&r, &binding(&r)).unwrap();
     }
+    // Worker-local only: retain SIGABRT crash semantics without costly core dumps.
+    use rustix::process::{getrlimit, setrlimit, Resource, Rlimit};
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            ..getrlimit(Resource::Core)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        getrlimit(Resource::Core).current,
+        Some(0),
+        "intentional fault worker must not dump core"
+    );
     std::process::abort();
 }
 #[test]
