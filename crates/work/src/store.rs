@@ -898,6 +898,24 @@ pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Resu
     Ok(charges)
 }
 
+/// Caller owns the IMMEDIATE transaction. Journal identities stay reserved
+/// across terminal outcomes and closure, including before exact retry acks.
+pub(crate) fn exclude_journal_identity(conn: &Connection, id: Uuid) -> Result<()> {
+    let reserved: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1)
+            OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1)
+            OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1)
+            OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1)",
+        [id.to_string()],
+        |r| r.get(0),
+    )?;
+    if reserved {
+        Err(StoreError::Conflict)
+    } else {
+        Ok(())
+    }
+}
+
 /// Caller owns the IMMEDIATE transaction. A journal may never adopt an older
 /// bare writer, even when its group identifier happens to match.
 pub(crate) fn acquire_writer_tx(
@@ -906,23 +924,9 @@ pub(crate) fn acquire_writer_tx(
     group: Uuid,
     allow_existing: bool,
 ) -> Result<()> {
-    // Child metadata reserves its run ID even against an existing bare writer.
-    let child: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM run_participants WHERE id=?1)",
-        [group.to_string()],
-        |r| r.get(0),
-    )?;
-    if child {
-        return Err(StoreError::Conflict);
-    }
-    let closed: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM run_groups WHERE id=?1 AND closed=1)",
-        [group.to_string()],
-        |r| r.get(0),
-    )?;
-    if closed {
-        return Err(StoreError::Invalid);
-    }
+    // New managed groups acquire before inserting their journal. Existing
+    // managed requests retry through their journal API, never as bare writers.
+    exclude_journal_identity(conn, group)?;
     let eligible: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1)",
         [checkout.to_string()],

@@ -27,7 +27,18 @@ fn lifecycle_sql_budget_does_not_charge_later_accounting_for_idle_time() {
     sql.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<600) INSERT INTO outbox(version,payload,acknowledged) SELECT version,payload,1 FROM outbox,n LIMIT 600;").unwrap();
     let r = request(checkout);
     store.begin_run(&r).unwrap();
-    let group = Uuid::parse_str(&r.identity().group.to_string()).unwrap();
+    // Exercise a genuine bare-writer retry: managed identities may only retry
+    // through begin_run, not acquire_writer, even on their original checkout.
+    let bare_checkout: String = sql
+        .query_row(
+            "SELECT id FROM checkouts WHERE id!=?1 LIMIT 1",
+            [checkout.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let bare_checkout = Uuid::parse_str(&bare_checkout).unwrap();
+    let group = Uuid::now_v7();
+    store.acquire_writer(bare_checkout, group).unwrap();
     for _ in 0..2 {
         for operation in [
             "charged",
@@ -47,7 +58,7 @@ fn lifecycle_sql_budget_does_not_charge_later_accounting_for_idle_time() {
                     301
                 ),
                 "pending_events" => assert!(!store.pending_events(1000).unwrap().is_empty()),
-                "acquire_writer" => store.acquire_writer(checkout, group).unwrap(),
+                "acquire_writer" => store.acquire_writer(bare_checkout, group).unwrap(),
                 _ => unreachable!(),
             }
         }

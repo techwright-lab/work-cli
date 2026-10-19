@@ -1,6 +1,8 @@
 use crate::{
     events::Event,
-    store::{canonical, count, emit, identity, Result, Store, StoreError},
+    store::{
+        canonical, count, emit, exclude_journal_identity, identity, Result, Store, StoreError,
+    },
 };
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -64,14 +66,18 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Check before exact retry acknowledgement as well as new charging.
-        let child: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_participants WHERE id=?1)",
+        exclude_journal_identity(&tx, request.operation)?;
+        let reserved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1)
+                OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)",
             [request.operation.to_string()],
             |r| r.get(0),
         )?;
-        if child {
+        if reserved {
             return Err(StoreError::Conflict);
         }
+        // Its own prior checkouts.operation is deliberately not excluded:
+        // immutable-digest reservation retries precede current capacity checks.
         let prior: Option<(String, Vec<u8>)> = tx
             .query_row(
                 "SELECT id,digest FROM checkouts WHERE operation=?1",
@@ -101,12 +107,14 @@ impl Store {
             return Err(StoreError::Capacity);
         }
         let checkout = Uuid::now_v7();
-        let child: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_participants WHERE id=?1)",
+        exclude_journal_identity(&tx, checkout)?;
+        let reserved: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1)
+                OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)",
             [checkout.to_string()],
             |r| r.get(0),
         )?;
-        if child {
+        if reserved || checkout == request.operation {
             return Err(StoreError::Conflict);
         }
         // Keep the original request digest immutable, including for pre-mapping
