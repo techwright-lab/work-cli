@@ -8,6 +8,18 @@ use work_cli::{
 };
 use work_contract::{RunId, RunRef};
 
+fn table_rows(sql: &Connection, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let mut statement = sql
+        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+        .unwrap();
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
 fn child(root: &work_cli::run_journal::RootRunRequest) -> ChildRequest {
     let i = root.identity();
     ChildRequest {
@@ -139,8 +151,6 @@ fn child_admission_requires_permitted_open_exact_context_and_known_parent() {
     for case in [
         "intent",
         "bound",
-        "terminal",
-        "held",
         "checkout",
         "group",
         "parent",
@@ -160,14 +170,6 @@ fn child_admission_requires_permitted_open_exact_context_and_known_parent() {
         }
         let mut c = child(&r);
         match case {
-            "terminal" => {
-                store
-                    .record_root_outcome(&r, work_cli::run_journal::RootOutcome::Failed)
-                    .unwrap();
-            }
-            "held" => {
-                store.record_recovery_hold(&r).unwrap();
-            }
             "checkout" => c.checkout = work_contract::CheckoutId::generate(),
             "group" => c.group = work_contract::GroupId::generate(),
             "parent" => c.parent_run = RunId::generate(),
@@ -195,6 +197,235 @@ fn child_admission_requires_permitted_open_exact_context_and_known_parent() {
         assert_eq!(store.pending_events(100).unwrap(), before, "{case}");
         assert_eq!(store.charged(&dir.path().join("root"), None).unwrap(), 1);
     }
+}
+
+#[test]
+fn late_metadata_after_logical_completion_or_hold_still_adds_a_barrier() {
+    use work_cli::run_journal::RootOutcome;
+    let mut failures = Vec::new();
+    for case in ["root_completed", "root_held", "parent_completed"] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        let b = binding(&r);
+        store.begin_run(&r).unwrap();
+        store.record_bound(&r, &b).unwrap();
+        store.record_permit_attempt(&r, &b).unwrap();
+        let mut c = child(&r);
+        c.expected_host = None;
+        match case {
+            "root_completed" => {
+                store
+                    .record_root_outcome(&r, RootOutcome::Completed)
+                    .unwrap();
+            }
+            "root_held" => {
+                store.record_recovery_hold(&r).unwrap();
+            }
+            "parent_completed" => {
+                let parent = child(&r);
+                store.register_child(&r, &parent).unwrap();
+                store
+                    .record_child_outcome(&r, &parent, ChildOutcome::Completed)
+                    .unwrap();
+                c.parent_run = parent.run;
+                c.parent_run_ref = parent.run_ref;
+            }
+            _ => unreachable!(),
+        }
+        let before = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+        let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        let checkouts = table_rows(&sql, "checkouts");
+        let writers = table_rows(&sql, "writers");
+        let events = store.pending_events(100).unwrap();
+        let os = ClosureOs::new(&r, &b);
+        // Capture AFTER terminal/hold, not a proof already stale from that change.
+        let snap = store.group_snapshot(&r.identity().run).unwrap();
+        let proof = if case == "parent_completed" {
+            None // The existing unverified parent already blocks certification.
+        } else {
+            Some(snap.certify_empty(&os.driver, &b).unwrap())
+        };
+        let result = store.register_child(&r, &c);
+        if !matches!(result, Ok(BeginRun::Created)) {
+            failures.push(format!("{case}: {result:?}"));
+            continue;
+        }
+        if let Some(proof) = proof {
+            assert!(
+                store.close_supervised_group(&snap, &proof).is_err(),
+                "{case}"
+            );
+        }
+        let after = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+        let mut expected = before.clone();
+        expected.revision += 1;
+        expected
+            .children
+            .push(after.children.last().unwrap().clone());
+        assert_eq!(after, expected, "only revision and children change: {case}");
+        assert_eq!(after.children.last().unwrap().request, c);
+        assert_eq!(
+            after.children.last().unwrap().enrollment,
+            Enrollment::Unverified
+        );
+        assert_eq!(store.pending_events(100).unwrap().len(), events.len() + 1);
+        assert_eq!(store.register_child(&r, &c).unwrap(), BeginRun::Existing);
+        let fresh = store.group_snapshot(&r.identity().run).unwrap();
+        assert!(fresh.certify_empty(&os.driver, &b).is_err(), "{case}");
+        assert!(
+            fresh.certify_historical_empty(&os.driver).is_err(),
+            "{case}"
+        );
+        assert_eq!(
+            store
+                .charged(&dir.path().join("root"), Some("owner"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(table_rows(&sql, "checkouts"), checkouts, "{case}");
+        assert_eq!(table_rows(&sql, "writers"), writers, "{case}");
+        assert_eq!(
+            sql.query_row("SELECT child_count FROM run_groups", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            after.children.len() as i64
+        );
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM writers", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
+fn registered_child_run_ids_cannot_become_legacy_writers_or_reservation_operations() {
+    use work_cli::{
+        admission::{Limits, Reservation},
+        store::StoreError,
+    };
+    let mut failures = Vec::new();
+    for path in ["writer", "reservation"] {
+        for corrupt_existing in [false, true] {
+            let (dir, mut store, checkout) = fixture();
+            let limits = Limits {
+                repository: 10,
+                owner: 10,
+                available_bytes: Some(100),
+                floor_bytes: 0,
+                warn_bytes: 0,
+            };
+            let mut reservation = Reservation {
+                operation: uuid::Uuid::now_v7(),
+                repository: dir.path().join("root"),
+                actor: "allocator".into(),
+                owner: "owner".into(),
+                task: "other".into(),
+            };
+            let other = store.reserve(&reservation, limits).unwrap();
+            let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+            sql.execute(
+                "UPDATE checkouts SET state='active',ready=1 WHERE id=?1",
+                [other.to_string()],
+            )
+            .unwrap();
+            let r = request(checkout);
+            store.begin_run(&r).unwrap();
+            store.record_bound(&r, &binding(&r)).unwrap();
+            store.record_permit_attempt(&r, &binding(&r)).unwrap();
+            let c = child(&r);
+            store.register_child(&r, &c).unwrap();
+            let before = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+            let recovery = store.recovery_runs().unwrap();
+            let group = uuid::Uuid::parse_str(&c.run.to_string()).unwrap();
+            reservation.operation = group;
+            if corrupt_existing {
+                if path == "writer" {
+                    sql.execute(
+                        "INSERT INTO writers VALUES(?1,?2)",
+                        (other.to_string(), group.to_string()),
+                    )
+                    .unwrap();
+                } else {
+                    // Preserve the original digest so this would be an exact retry.
+                    sql.execute(
+                        "UPDATE checkouts SET operation=?1 WHERE id=?2",
+                        (group.to_string(), other.to_string()),
+                    )
+                    .unwrap();
+                }
+            }
+            let tables = [
+                "checkouts",
+                "writers",
+                "runs",
+                "run_groups",
+                "run_participants",
+                "outbox",
+                "repository_aliases",
+            ];
+            let durable_before: Vec<_> =
+                tables.iter().map(|table| table_rows(&sql, table)).collect();
+            let events = store.pending_events(100).unwrap();
+            let charged = store.charged(&dir.path().join("root"), None).unwrap();
+            let writers = sql
+                .query_row("SELECT count(*) FROM writers", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            let result = if path == "writer" {
+                store.acquire_writer(other, group)
+            } else {
+                store.reserve(&reservation, limits).map(|_| ())
+            };
+            if !matches!(result, Err(StoreError::Conflict)) {
+                failures.push(format!(
+                    "{path}, corrupt_existing={corrupt_existing}: {result:?}"
+                ));
+                continue;
+            }
+            let durable_after: Vec<_> =
+                tables.iter().map(|table| table_rows(&sql, table)).collect();
+            assert_eq!(
+                durable_after, durable_before,
+                "{path}, corrupt_existing={corrupt_existing}"
+            );
+            assert_eq!(store.pending_events(100).unwrap(), events);
+            assert_eq!(
+                store.charged(&dir.path().join("root"), None).unwrap(),
+                charged
+            );
+            assert_eq!(
+                sql.query_row("SELECT count(*) FROM writers", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                writers
+            );
+            if corrupt_existing {
+                // The guard rejects, but must not repair/reclassify existing corruption.
+                if path == "writer" {
+                    sql.execute("DELETE FROM writers WHERE checkout=?1", [other.to_string()])
+                        .unwrap();
+                } else {
+                    sql.execute(
+                        "UPDATE checkouts SET operation=?1 WHERE id=?2",
+                        (uuid::Uuid::now_v7().to_string(), other.to_string()),
+                    )
+                    .unwrap();
+                }
+            }
+            assert_eq!(
+                store.run_snapshot(&r.identity().run).unwrap().unwrap(),
+                before
+            );
+            assert_eq!(store.recovery_runs().unwrap(), recovery);
+            assert_eq!(store.register_child(&r, &c).unwrap(), BeginRun::Existing);
+            assert_eq!(store.pending_events(100).unwrap(), events);
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }
 
 #[test]

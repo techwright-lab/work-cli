@@ -884,6 +884,15 @@ pub(crate) fn acquire_writer_tx(
     group: Uuid,
     allow_existing: bool,
 ) -> Result<()> {
+    // Child metadata reserves its run ID even against an existing bare writer.
+    let child: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM run_participants WHERE id=?1)",
+        [group.to_string()],
+        |r| r.get(0),
+    )?;
+    if child {
+        return Err(StoreError::Conflict);
+    }
     let closed: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM run_groups WHERE id=?1 AND closed=1)",
         [group.to_string()],

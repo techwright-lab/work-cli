@@ -228,6 +228,10 @@ supervised child intent before inspection, bumps group revision/child count and 
 an outbox event in the same IMMEDIATE transaction. Exact retries validate the entire
 child tree without grants/events. It requires the exact open writer and permitted root,
 explicit known parent run/ref, same checkout/group, at most 16 levels and 256 children.
+Late metadata remains accepted after root/parent logical completion or a recovery hold
+while the permitted group is open; it preserves those outcomes/holds and invalidates
+older empty proofs. Closed groups reject registration. Child run IDs also cannot become
+legacy writer groups or reservation operation IDs, including on exact retries.
 Child Work IDs/refs share the root/adopted/operation/group namespace. Optional actual
 source/session/agent/actor references remain unknown when absent. Expected boot/PID/start
 is a candidate host identity, **not** observed containment or individual authorship;

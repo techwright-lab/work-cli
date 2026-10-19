@@ -222,8 +222,6 @@ impl Store {
             };
         }
         if record.stage != crate::run_journal::RunStage::PermitAttempt
-            || record.outcome.is_some()
-            || record.recovery_hold
             || request.checkout != root.identity().checkout
             || request.group != root.identity().group
             || record.children.len() >= 256
@@ -239,13 +237,6 @@ impl Store {
             return Err(StoreError::Conflict);
         }
         let depth = parent_depth(root, &record.children, request)?;
-        if record
-            .children
-            .iter()
-            .any(|p| p.request.run == request.parent_run && p.outcome.is_some())
-        {
-            return Err(StoreError::Invalid);
-        }
         let state = if request.expected_host.is_some() {
             "pending"
         } else {
