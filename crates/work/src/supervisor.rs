@@ -304,9 +304,10 @@ fn supervise(
             launch.binding().ok_or_else(|| err("missing binding"))?,
         ))?;
         observer(Boundary::Bound, &record(&store, &request)?);
-        if cancel.requested() {
+        let cancelled_blocked = if cancel.requested() {
             // Before permit, cancel() also reaps the exclusively owned blocked
-            // launcher. Record Cancelled only after observing that actual exit.
+            // launcher. Record Cancelled only after observing that actual exit,
+            // then use the same whole-scope proof path as a released root.
             launch.cancel(driver).map_err(err)?;
             let status = launch
                 .try_wait()
@@ -314,35 +315,36 @@ fn supervise(
                 .ok_or_else(|| err("cancel root status unknown"))?;
             db(store.record_root_outcome(&request, RootOutcome::Cancelled))?;
             observer(Boundary::RootTerminal, &record(&store, &request)?);
-            db(store.record_recovery_hold(&request))?;
-            return Ok(report(record(&store, &request)?, false, status.code()));
-        }
-        db(store.record_permit_attempt(
-            &request,
-            launch.binding().ok_or_else(|| err("missing binding"))?,
-        ))?;
-        observer(Boundary::PermitAttempt, &record(&store, &request)?);
-        // Do not reconcile/revive holds at the irreversible boundary. Other
-        // checkouts remain allocatable for the entire running actor lifetime.
-        let (mut fresh_store, lock) = allocate::locked(config)?;
-        let fresh = verified_checkout(&mut fresh_store, command.checkout)?;
-        let current = record(&fresh_store, &request)?;
-        if fresh.destination != allocation.destination
-            || current.closed
-            || current.recovery_hold
-            || current.outcome.is_some()
-            || cancel.requested()
-        {
-            return Err(err("release held"));
-        }
-        launch.release(driver).map_err(err)?;
-        drop(lock);
-        drop(fresh_store);
+            Some(status)
+        } else {
+            db(store.record_permit_attempt(
+                &request,
+                launch.binding().ok_or_else(|| err("missing binding"))?,
+            ))?;
+            observer(Boundary::PermitAttempt, &record(&store, &request)?);
+            // Do not reconcile/revive holds at the irreversible boundary. Other
+            // checkouts remain allocatable for the entire running actor lifetime.
+            let (mut fresh_store, lock) = allocate::locked(config)?;
+            let fresh = verified_checkout(&mut fresh_store, command.checkout)?;
+            let current = record(&fresh_store, &request)?;
+            if fresh.destination != allocation.destination
+                || current.closed
+                || current.recovery_hold
+                || current.outcome.is_some()
+                || cancel.requested()
+            {
+                return Err(err("release held"));
+            }
+            launch.release(driver).map_err(err)?;
+            drop(lock);
+            drop(fresh_store);
+            None
+        };
         let deadline = Instant::now() + Duration::from_secs(settings.runtime_max_seconds);
-        let mut cancel_at = None;
-        let mut root_code = None;
-        let mut root_seen = false;
-        let mut root_at = None;
+        let mut cancel_at = cancelled_blocked.as_ref().map(|_| Instant::now());
+        let mut root_code = cancelled_blocked.as_ref().and_then(|status| status.code());
+        let mut root_seen = cancelled_blocked.is_some();
+        let mut root_at = cancel_at;
         loop {
             let now = Instant::now();
             if (cancel.requested() || now >= deadline) && cancel_at.is_none() {

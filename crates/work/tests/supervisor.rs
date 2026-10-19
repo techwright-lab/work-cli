@@ -776,6 +776,25 @@ fn existing_receipt_preserves_original_context_references_instead_of_minting_the
     );
 }
 #[test]
+fn blocked_cancellation_still_collects_whole_scope_before_closing_writer() {
+    let h = Harness::new();
+    let token = CancelToken::default();
+    let report = h
+        .execute(h.request(), &token, |b, r| {
+            if b == Boundary::Bound {
+                token.request();
+            }
+            if b == Boundary::RootTerminal {
+                h.empty(r);
+            }
+        })
+        .unwrap();
+    assert_eq!(report.record.outcome, Some(RootOutcome::Cancelled));
+    assert!(report.record.closed && !report.record.recovery_hold);
+    assert!(!h.f.temp.path().join("executed").exists());
+    assert_eq!(h.f.store().charged(&h.f.repo, None).unwrap(), 1);
+}
+#[test]
 fn fresh_lease_damage_refuses_before_intent_and_never_revives_holds() {
     for damage in ["marker", "path", "held", "source", "capture"] {
         let mut h = Harness::new();
