@@ -286,9 +286,11 @@ impl OwnedLaunch {
         if self.permit_attempted {
             return Err(HOLD);
         }
-        self.check_owned()?;
-        let result = self.gate.poll_blocked();
-        self.preexec_result(result)
+        self.check_owned_root()?;
+        let result = self.gate.poll_blocked_owned(self.pid);
+        let blocked = self.preexec_result(result)?;
+        self.check_owned_root()?;
+        Ok(blocked)
     }
     pub fn bind(&mut self, driver: &Driver) -> Result<()> {
         if self.permit_attempted {
@@ -360,6 +362,17 @@ impl OwnedLaunch {
         result
     }
     fn check_owned(&mut self) -> Result<()> {
+        self.check_owned_root()?;
+        let result = self.gate.ready_pid().and_then(|ready| {
+            if ready.is_some_and(|pid| pid != self.pid) {
+                Err(HOLD)
+            } else {
+                Ok(())
+            }
+        });
+        self.preexec_result(result)
+    }
+    fn check_owned_root(&mut self) -> Result<()> {
         let result = (|| {
             if self.gate.outcome() != Outcome::Pending || Instant::now() >= self.deadline {
                 return Err(HOLD);
@@ -372,9 +385,6 @@ impl OwnedLaunch {
                 .map_err(|_| HOLD)?
                 .is_some()
             {
-                return Err(HOLD);
-            }
-            if self.gate.ready_pid()?.is_some_and(|pid| pid != self.pid) {
                 return Err(HOLD);
             }
             Ok(())

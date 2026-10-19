@@ -64,17 +64,28 @@ impl GuardedLaunch {
     pub fn binding(&self) -> Option<&Binding> {
         self.binding.as_ref()
     }
+    pub(crate) fn poll_blocked_owned(&mut self, expected_pid: u32) -> Result<bool> {
+        self.poll_blocked_for(Some(expected_pid))
+    }
     pub fn poll_blocked(&mut self) -> Result<bool> {
+        self.poll_blocked_for(None)
+    }
+    fn poll_blocked_for(&mut self, expected_pid: Option<u32>) -> Result<bool> {
         if self.outcome != Outcome::Pending
             || !matches!(self.phase, Phase::Prepared | Phase::Blocked)
         {
             return Err(HOLD);
         }
-        let result = self.gate.read_ready().map(|ready| {
-            if ready.is_some() {
+        let result = self.gate.read_ready().and_then(|ready| {
+            if let Some(ready) = ready {
+                if expected_pid.is_some_and(|pid| ready.child().pid != pid) {
+                    return Err(HOLD);
+                }
                 self.phase = Phase::Blocked;
+                Ok(true)
+            } else {
+                Ok(false)
             }
-            ready.is_some()
         });
         self.record(result)
     }
@@ -167,5 +178,98 @@ impl GuardedLaunch {
             self.outcome = Outcome::RecoveryHold;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        runtime_scope::ChildIdentity,
+        scope_child::{prepare, OriginalRuntime},
+    };
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    };
+    use work_contract::RunId;
+
+    #[test]
+    fn owned_poll_validates_the_ready_record_that_declares_blocked() {
+        for (ready_pid, expected_pid) in [
+            (None, Some(41)),
+            (Some(41), Some(41)),
+            (Some(42), Some(41)),
+            (Some(42), None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let intent = LaunchIntent::new(
+                RunId::parse("019281b2-67de-7000-8000-000000000001").unwrap(),
+                "f312459a-9346-4d02-9139-c80a7017d962",
+            )
+            .unwrap();
+            let child = ChildIdentity {
+                pid: 41,
+                start_ticks: 123,
+                boot: intent.boot_id().into(),
+                cgroup: format!("/user.slice/{}", intent.unit_name()),
+            };
+            let gate = prepare(
+                tmp.path(),
+                &intent,
+                &child,
+                tmp.path(),
+                OriginalRuntime::new(None, None),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            let context: serde_json::Value =
+                serde_json::from_slice(&fs::read(gate.context_path()).unwrap()).unwrap();
+            let mut launch = GuardedLaunch::adopt_prepared(intent, gate);
+            // Model the old ownership precheck, then publish before the poll's read.
+            assert_eq!(launch.ready_pid().unwrap(), None);
+            if let Some(pid) = ready_pid {
+                let ready_child = serde_json::json!({
+                    "pid": pid, "start_ticks": child.start_ticks,
+                    "boot": child.boot, "cgroup": child.cgroup,
+                });
+                let ready = serde_json::json!({
+                    "nonce": context["nonce"], "cwd": context["cwd"], "child": ready_child,
+                });
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(tmp.path().join("ready.json"))
+                    .unwrap();
+                file.write_all(&serde_json::to_vec(&ready).unwrap())
+                    .unwrap();
+                file.sync_all().unwrap();
+            }
+            let result = match expected_pid {
+                Some(pid) => launch.poll_blocked_owned(pid),
+                None => launch.poll_blocked(),
+            };
+            if ready_pid.is_some() && expected_pid.is_some() && ready_pid != expected_pid {
+                assert!(result.is_err(), "foreign ready must not report Blocked");
+                assert_eq!(launch.phase(), Phase::Prepared);
+                assert_eq!(launch.outcome(), Outcome::RecoveryHold);
+            } else {
+                assert_eq!(result, Ok(ready_pid.is_some()));
+                assert_eq!(
+                    launch.phase(),
+                    if ready_pid.is_some() {
+                        Phase::Blocked
+                    } else {
+                        Phase::Prepared
+                    }
+                );
+                assert_eq!(launch.outcome(), Outcome::Pending);
+            }
+            assert!(launch.binding().is_none());
+            assert!(!tmp.path().join("permit.json").exists());
+        }
     }
 }
