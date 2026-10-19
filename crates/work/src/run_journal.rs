@@ -3,7 +3,7 @@
 //! All groups remain writer-held, even after root exit; roster-bound fresh empty
 //! proof integration is intentionally unsupported in this increment.
 use crate::{
-    runtime_scope::{Binding, LaunchIntent},
+    runtime_scope::{validate_structure, Binding, ChildIdentity, LaunchIntent, ScopeIdentity},
     store::{Result, Store, StoreError},
 };
 use serde::{Deserialize, Serialize};
@@ -208,19 +208,30 @@ fn read_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<RunRecord>> {
             || !matches!(hold, 0 | 1)
             || revision < 1
             || (stage == RunStage::Intent) != binding.is_none()
+            || (outcome == Some(RootOutcome::Completed) && stage != RunStage::PermitAttempt)
         {
             return Err(StoreError::Invalid);
         }
         if let Some(b) = &binding {
             let intent = LaunchIntent::new(request.identity.run.clone(), &request.input.boot)
                 .map_err(|_| StoreError::Invalid)?;
-            if b.unit != intent.unit_name()
-                || b.boot != intent.boot_id()
-                || b.root_pid == 0
-                || b.root_start_ticks == 0
-            {
-                return Err(StoreError::Invalid);
-            }
+            // Plain metadata values feed the same structural checks as live
+            // bind; this never reconstructs a Binding or observation/authority.
+            validate_structure(
+                &intent,
+                &ScopeIdentity {
+                    unit: b.unit.clone(),
+                    invocation: b.invocation.clone(),
+                    cgroup: b.cgroup.clone(),
+                },
+                &ChildIdentity {
+                    pid: b.root_pid,
+                    start_ticks: b.root_start_ticks,
+                    boot: b.boot.clone(),
+                    cgroup: b.root_cgroup.clone(),
+                },
+            )
+            .map_err(|_| StoreError::Invalid)?;
         }
         Ok(RunRecord {
             request,

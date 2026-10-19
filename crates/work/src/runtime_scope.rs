@@ -155,23 +155,7 @@ pub fn bind(
 ) -> Result<Binding, HoldReason> {
     fresh(obs, &intent.boot, now, max_age)?;
     let identity = present_identity(&obs.unit)?;
-    if identity.unit != intent.unit {
-        return Err(HoldReason::UnitMismatch);
-    }
-    if !uuid_text(&identity.invocation, false) {
-        return Err(HoldReason::InvalidInvocation);
-    }
-    if !normalized(&identity.cgroup) || !identity.cgroup.ends_with(&format!("/{}", intent.unit)) {
-        return Err(HoldReason::InvalidCgroup);
-    }
-    if child.pid == 0
-        || child.pid > i32::MAX as u32
-        || child.start_ticks == 0
-        || child.boot != intent.boot
-        || !within(&child.cgroup, &identity.cgroup)
-    {
-        return Err(HoldReason::ChildIdentity);
-    }
+    validate_structure(intent, identity, child)?;
     if obs.recursive_coverage != Coverage::Complete {
         return Err(HoldReason::IncompleteMembership);
     }
@@ -194,6 +178,32 @@ pub fn bind(
         boot: intent.boot.clone(),
         child: child.clone(),
     })
+}
+/// Shared structural invariants for live binding and historical journal reads.
+/// This checks metadata ONLY: no freshness, OS observation, or authority token.
+pub(crate) fn validate_structure(
+    intent: &LaunchIntent,
+    identity: &ScopeIdentity,
+    child: &ChildIdentity,
+) -> Result<(), HoldReason> {
+    if identity.unit != intent.unit {
+        return Err(HoldReason::UnitMismatch);
+    }
+    if !uuid_text(&identity.invocation, false) {
+        return Err(HoldReason::InvalidInvocation);
+    }
+    if !normalized(&identity.cgroup) || !identity.cgroup.ends_with(&format!("/{}", intent.unit)) {
+        return Err(HoldReason::InvalidCgroup);
+    }
+    if child.pid == 0
+        || child.pid > i32::MAX as u32
+        || child.start_ticks == 0
+        || child.boot != intent.boot
+        || !within(&child.cgroup, &identity.cgroup)
+    {
+        return Err(HoldReason::ChildIdentity);
+    }
+    Ok(())
 }
 impl Binding {
     pub fn trusted_child(&self) -> &ChildIdentity {

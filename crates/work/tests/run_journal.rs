@@ -116,6 +116,172 @@ fn binding(r: &RootRunRequest) -> Binding {
 }
 
 #[test]
+fn corrupt_persisted_run_metadata_fails_closed_at_every_recovery_entrypoint() {
+    use serde_json::json;
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    store.record_bound(&r, &binding(&r)).unwrap();
+    let original = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+    let snapshot = serde_json::to_value(original.binding.as_ref().unwrap()).unwrap();
+    let scope = snapshot["cgroup"].as_str().unwrap();
+    let unit = snapshot["unit"].as_str().unwrap();
+    let mut cases = Vec::new();
+    for (field, bad) in [
+        ("invocation", json!("")),
+        ("invocation", json!("00000000000000000000000000000000")),
+        ("invocation", json!("550E8400E29B41D4A716446655440000")),
+        ("invocation", json!(BOOT)),
+        ("unit", json!("work-run-other.scope")),
+        ("cgroup", json!(format!("test/{unit}"))),
+        ("cgroup", json!(format!("/test//{unit}"))),
+        ("cgroup", json!(format!("/test/./{unit}"))),
+        ("cgroup", json!(format!("/test/../{unit}"))),
+        ("cgroup", json!(format!("/test/\n/{unit}"))),
+        ("cgroup", json!(format!("{scope}/"))),
+        ("cgroup", json!("/unrelated.scope")),
+        ("root_cgroup", json!("/unrelated")),
+        ("root_cgroup", json!(format!("{scope}-other/child"))),
+        ("root_cgroup", json!(format!("{scope}//child"))),
+        ("root_cgroup", json!(format!("{scope}/../child"))),
+        ("root_cgroup", json!(format!("{scope}/child/"))),
+        ("root_pid", json!(0)),
+        ("root_pid", json!(i32::MAX as u32 + 1)),
+        ("root_start_ticks", json!(0)),
+        ("boot", json!("650e8400-e29b-41d4-a716-446655440000")),
+    ] {
+        let mut corrupt = snapshot.clone();
+        corrupt[field] = bad.clone();
+        cases.push((format!("{field}={bad}"), "bound", Some(corrupt), None));
+    }
+    for stage in ["intent", "bound"] {
+        cases.push((
+            format!("completed at {stage}"),
+            stage,
+            if stage == "intent" {
+                None
+            } else {
+                Some(snapshot.clone())
+            },
+            Some("\"completed\""),
+        ));
+    }
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    let events = store.pending_events(100).unwrap();
+    let mut accepted = Vec::new();
+    for (label, stage, bound, outcome) in cases {
+        sql.execute(
+            "UPDATE runs SET stage=?1,binding=?2,outcome=?3 WHERE id=?4",
+            (
+                stage,
+                bound
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .unwrap(),
+                outcome,
+                r.identity().run.to_string(),
+            ),
+        )
+        .unwrap();
+        if store.run_snapshot(&r.identity().run).is_ok() {
+            accepted.push(format!("snapshot: {label}"));
+        }
+        if store.recovery_runs().is_ok() {
+            accepted.push(format!("recovery: {label}"));
+        }
+        if store.begin_run(&r).is_ok() {
+            accepted.push(format!("retry: {label}"));
+        }
+        assert_eq!(store.pending_events(100).unwrap(), events, "{label}");
+        let writer: String = sql
+            .query_row(
+                "SELECT group_id FROM writers WHERE checkout=?1",
+                [checkout.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer, r.identity().group.to_string(), "{label}");
+        assert_eq!(
+            store
+                .charged(&dir.path().join("root"), Some("owner"))
+                .unwrap(),
+            1,
+            "{label}"
+        );
+    }
+    sql.execute(
+        "UPDATE runs SET stage='bound',binding=?1,outcome=NULL",
+        [serde_json::to_string(&snapshot).unwrap()],
+    )
+    .unwrap();
+    assert_eq!(
+        store.run_snapshot(&r.identity().run).unwrap().unwrap(),
+        original
+    );
+    assert!(
+        accepted.is_empty(),
+        "corrupt metadata accepted:\n{}",
+        accepted.join("\n")
+    );
+}
+
+#[test]
+fn legal_stage_outcomes_and_structural_boundary_values_remain_readable() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    store.record_bound(&r, &binding(&r)).unwrap();
+    let mut snapshot = serde_json::to_value(
+        store
+            .run_snapshot(&r.identity().run)
+            .unwrap()
+            .unwrap()
+            .binding
+            .unwrap(),
+    )
+    .unwrap();
+    snapshot["root_pid"] = serde_json::json!(i32::MAX);
+    snapshot["root_cgroup"] = serde_json::json!(format!(
+        "{}/child/nested",
+        snapshot["cgroup"].as_str().unwrap()
+    ));
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    let events = store.pending_events(100).unwrap();
+    for stage in ["intent", "bound", "permit_attempt"] {
+        for outcome in [
+            None,
+            Some(RootOutcome::Failed),
+            Some(RootOutcome::Cancelled),
+            Some(RootOutcome::Completed),
+        ] {
+            if outcome == Some(RootOutcome::Completed) && stage != "permit_attempt" {
+                continue;
+            }
+            sql.execute(
+                "UPDATE runs SET stage=?1,binding=?2,outcome=?3 WHERE id=?4",
+                (
+                    stage,
+                    if stage == "intent" {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&snapshot).unwrap())
+                    },
+                    outcome.map(|o| serde_json::to_string(&o).unwrap()),
+                    r.identity().run.to_string(),
+                ),
+            )
+            .unwrap();
+            let record = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+            assert_eq!(record.outcome, outcome);
+            assert_eq!(store.recovery_runs().unwrap(), vec![record]);
+            assert_eq!(store.begin_run(&r).unwrap(), BeginRun::Existing);
+        }
+    }
+    assert_eq!(store.pending_events(100).unwrap(), events);
+}
+
+#[test]
 fn begin_is_atomic_idempotent_and_conflicts_on_every_immutable_dimension() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);
