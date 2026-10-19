@@ -406,12 +406,15 @@ impl Store {
     /// Only unresolved groups; closed roots remain historical receipts.
     /// No heartbeat/reboot inference, no reconstructed runtime authority.
     pub fn recovery_runs(&self) -> Result<Vec<RunRecord>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "{SELECT} WHERE g.closed IS NOT 1 ORDER BY r.rowid"
-        ))?;
+        let mut stmt = self.conn.prepare(&format!("{SELECT} ORDER BY r.rowid"))?;
         let rows = stmt.query_map([], read_row)?;
-        rows.map(|r| r.map_err(StoreError::from).and_then(|v| v))
-            .collect()
+        // Validate historical receipts too: a malformed closed flag must never
+        // hide corrupt bound/hold metadata from recovery.
+        let mut records = rows
+            .map(|r| r.map_err(StoreError::from).and_then(|v| v))
+            .collect::<Result<Vec<_>>>()?;
+        records.retain(|record| !record.closed);
+        Ok(records)
     }
     /// ROOT-ONLY: no participant registration exists in this version.
     pub fn group_snapshot(&self, run: &RunId) -> Result<GroupSnapshot> {

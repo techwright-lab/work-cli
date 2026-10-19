@@ -518,6 +518,47 @@ fn recovery_does_not_hide_orphaned_or_invalid_group_state() {
 }
 
 #[test]
+fn recovery_validates_malformed_closed_receipts_before_omitting_them() {
+    let mut hidden = Vec::new();
+    for case in ["unbound_intent", "bound_recovery_hold"] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        store.begin_run(&r).unwrap();
+        if case == "bound_recovery_hold" {
+            store.record_bound(&r, &binding(&r)).unwrap();
+            store.record_recovery_hold(&r).unwrap();
+        }
+        let events = store.pending_events(100).unwrap();
+        let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        sql.execute("UPDATE run_groups SET closed=1", []).unwrap();
+        assert!(store.run_snapshot(&r.identity().run).is_err(), "{case}");
+        if store.recovery_runs().is_ok() {
+            hidden.push(case);
+        }
+        let writer: String = sql
+            .query_row(
+                "SELECT group_id FROM writers WHERE checkout=?1",
+                [checkout.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writer, r.identity().group.to_string(), "{case}");
+        assert_eq!(
+            store
+                .charged(&dir.path().join("root"), Some("owner"))
+                .unwrap(),
+            1,
+            "{case}"
+        );
+        assert_eq!(store.pending_events(100).unwrap(), events, "{case}");
+    }
+    assert!(
+        hidden.is_empty(),
+        "malformed closed receipts silently hidden: {hidden:?}"
+    );
+}
+
+#[test]
 fn closure_schema_preserves_existing_charges_and_writer() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);
