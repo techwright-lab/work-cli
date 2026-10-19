@@ -135,7 +135,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=5))
+        || (name == "store.sqlite" && matches!(version, 2..=6))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -271,13 +271,13 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 5 {
+        if version != 6 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
         Ok(Self { conn, budget })
     }
-    /// Recovery can mutate an established v5 authority only; never initializes
+    /// Recovery can mutate an established v6 authority only; never initializes
     /// an empty authority for an unknown RunId or upgrades historical schemas.
     pub fn open_existing_registered_mut(
         registry: &Path,
@@ -287,7 +287,7 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 5 {
+        if version != 6 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
@@ -402,7 +402,7 @@ impl Store {
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=5) {
+        if !matches!(version, 0..=6) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -445,7 +445,28 @@ impl Store {
             validate_run_schema(&tx)?;
             tx.execute_batch("ALTER TABLE run_groups ADD COLUMN closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0,1)); PRAGMA user_version=5;")?;
         }
-        validate_run_schema(&tx)?;
+        if version < 6 {
+            validate_existing_schema(&tx, 5)?;
+            tx.execute_batch("CREATE TABLE adopted_groups(
+                id TEXT PRIMARY KEY, checkout TEXT NOT NULL REFERENCES checkouts(id),
+                run_id TEXT NOT NULL UNIQUE, run_ref TEXT NOT NULL UNIQUE,
+                operation TEXT NOT NULL UNIQUE, request TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK(revision>=1), reconcile INTEGER NOT NULL DEFAULT 0 CHECK(reconcile IN (0,1)));
+                CREATE TABLE adopted_sessions(
+                group_id TEXT NOT NULL REFERENCES adopted_groups(id), source TEXT NOT NULL,
+                session TEXT NOT NULL, agent TEXT NOT NULL, actor TEXT,
+                parent TEXT, closed INTEGER NOT NULL CHECK(closed IN (0,1)),
+                heartbeat INTEGER, depth INTEGER NOT NULL CHECK(depth BETWEEN 0 AND 16),
+                PRIMARY KEY(group_id,source,session,agent));
+                CREATE TABLE adopted_segments(
+                group_id TEXT NOT NULL REFERENCES adopted_groups(id), source TEXT NOT NULL,
+                session TEXT NOT NULL, agent TEXT NOT NULL, prompt TEXT NOT NULL,
+                tool TEXT NOT NULL, kind TEXT NOT NULL, event_ref TEXT NOT NULL, body TEXT NOT NULL,
+                FOREIGN KEY(group_id,source,session,agent) REFERENCES adopted_sessions(group_id,source,session,agent),
+                PRIMARY KEY(group_id,source,session,agent,prompt,tool,kind,event_ref));
+                PRAGMA user_version=6;")?;
+        }
+        validate_existing_schema(&tx, 6)?;
         tx.prepare("SELECT alias,common FROM repository_aliases LIMIT 0")?;
         tx.prepare("SELECT ready FROM checkouts LIMIT 0")?;
         tx.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
@@ -602,7 +623,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> 
     conn.execute_batch("PRAGMA query_only=ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=5))) || integrity != "ok"
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=6))) || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
@@ -721,7 +742,7 @@ fn existing_authority(
     let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if writable && version != 5 {
+    if writable && version != 6 {
         return Err(StoreError::UpgradeRequired);
     }
     validate_existing_schema(&conn, version)?;
@@ -742,6 +763,21 @@ fn existing_authority(
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
+    if version >= 6 {
+        for name in ["adopted_groups", "adopted_sessions", "adopted_segments"] {
+            let table: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1 AND type='table')",
+                [name],
+                |r| r.get(0),
+            )?;
+            if !table {
+                return Err(StoreError::Unsafe);
+            }
+        }
+        conn.prepare("SELECT id,checkout,run_id,run_ref,operation,request,revision,reconcile FROM adopted_groups LIMIT 0")?;
+        conn.prepare("SELECT group_id,source,session,agent,actor,parent,closed,heartbeat,depth FROM adopted_sessions LIMIT 0")?;
+        conn.prepare("SELECT group_id,source,session,agent,prompt,tool,kind,event_ref,body FROM adopted_segments LIMIT 0")?;
+    }
     if version >= 2 {
         conn.prepare("SELECT ready FROM checkouts LIMIT 0")?;
         conn.prepare("SELECT checkout,request,record FROM allocations LIMIT 0")?;
@@ -1056,7 +1092,7 @@ mod tests {
         let events = store.pending_events(100).unwrap();
         store
             .conn
-            .execute_batch("DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
+            .execute_batch("DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
             .unwrap();
         drop(store);
         let status = std::process::Command::new(std::env::current_exe().unwrap())

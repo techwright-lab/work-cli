@@ -12,7 +12,8 @@ channels.
 Early construction. Read-only `work --help`, `work status [--run <uuidv7>]` and `work doctor` are
 available, plus configured `work start` allocation. Start never launches a writer.
 Configured root-only `work run` coordination is available for construction/testing,
-not production activation. Finish/removal and capture integration are not implemented.
+not production activation. Adopted-only declarations (`work adopt begin/event/status`) are
+available without process control. Finish/removal and capture integration are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
@@ -209,7 +210,7 @@ Recovery never launches, signals, kills, finishes a task, deletes or uncharges.
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted v5 authority;
+runtime qualification claim. It requires an existing initialized trusted v6 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -221,10 +222,100 @@ between operations inspecting Git or runtime state does not consume that limit.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
 
-No external/adopted participants, bridge, task finish, retirement or automatic recovery
-is supported. Serialized metadata alone grants no cancellation/closure authority.
+Supervised groups remain ROOT-ONLY: attaching external/adopted participants is refused.
+Supervised child coverage, bridge, task finish, retirement and automatic recovery
+are not implemented. Serialized metadata alone grants no cancellation/closure authority.
 Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
 do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
+
+## Adopted declarations (Task 6.4a; not activation)
+
+Already-running interactive sessions are **not retroactively supervised**. Adopted
+metadata never controls cwd, OS environment, Git identity or process lifetime and
+never provides ScopeRoot/physical-exit proof. This is cooperative attestation, not a
+same-UID security sandbox. No supervisor bus, Git profile or LLM is required.
+
+Use dedicated hook-process stdin (never delegate protocol stdin):
+
+```sh
+work adopt begin < adopted-request.json
+work adopt event < typed-activity.json
+work adopt status RUN_UUIDV7
+```
+
+`begin` takes this strict typed JSON shape (replace UUID placeholders with distinct
+UUIDv7 values, and CHECKOUT with an explicitly allocated checkout UUID):
+
+```json
+{
+  "operation": "OPERATION_UUIDV7",
+  "identity": {
+    "checkout": "CHECKOUT_UUIDV7", "group": "GROUP_UUIDV7", "run": "RUN_UUIDV7",
+    "run_ref": "sdk:stable-run-reference", "actor": "declared-actor",
+    "parent_run_ref": null,
+    "execution_chain": [{"kind":"executor","system":"declared-sdk"}]
+  },
+  "source": "sdk", "session": "stable-session", "agent": "root-agent"
+}
+```
+
+The CLI freshly verifies active/ready allocation, marker, source and branch under
+its short allocator lock before claiming the **same** exclusive writer used by
+supervised runs. The immutable adopted root, root session and outbox commit with
+that writer. Exact retries return `existing` without new events, grants or activity;
+changed claims conflict. Another independent writer is refused, never merged.
+Quota owner/charges remain unchanged. Capture-enabled begin/event are unsupported
+and refused; there is no sink bypass. Library `adopted::begin` is the integrated
+entry point; `Store::begin_adopted` is its low-level active/ready SQL transaction.
+
+`event` takes only typed references and declaration metadata, for example:
+
+```json
+{
+  "run": "RUN_UUIDV7", "group": "GROUP_UUIDV7", "source": "sdk",
+  "participant": {"session":"stable-session","agent":"root-agent"},
+  "parent": null, "actor":"declared-actor",
+  "prompt":"stable-prompt-or-segment", "tool":"stable-tool-reference",
+  "event_ref":"stable-event-reference", "kind":"stop", "observed_at":123
+}
+```
+
+Kinds are `stop`, `subagent_start`, `subagent_stop`, `session_end`, `reconcile`.
+A child event explicitly supplies the already-registered parent's session/agent
+key and the child's own key; its declared actor may be null (unknown remains
+unknown). Known participant actor/parent claims cannot change. Self/cross-group,
+foreign-source, reparenting and unknown-parent claims are refused. The roster is
+bounded to 256 participants including root, at most 16 child levels. Sources,
+session/agent/event/prompt/tool references, actor and run references are nonblank,
+control-free and at most 256 Unicode scalars. Chains retain their existing typed
+limits. JSON stdin is bounded to 4 MiB, covering the full UTF-8/JSON domain of these
+limits; unknown fields and raw payloads are refused with value-free CLI errors.
+
+Idempotency includes source/group/session/agent/prompt/tool/kind/event_ref, not
+just time. Same key and normalized body returns `existing` with no heartbeat,
+revision or event change; changed body conflicts. Unique accepted events increment
+the group revision. Stop appends a segment/heartbeat only. SubagentStop retains a
+terminal tombstone even if Start arrives later. SessionEnd records that session
+participant's logical closure and requests reconciliation; open/unknown children
+remain visible. Reconcile never refreshes a heartbeat. Session IDs may span many
+checkouts, with separate group-scoped journals. Shared output is group/root-based,
+not individual authorship inferred from timestamps or email.
+
+Status is read-only existing-v6-authority metadata, with
+`adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
+`automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
+exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
+logical closures never release the adopted writer, finish a task, change checkout
+state or uncharge it. The writer remains explicitly held until a future qualified
+handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
+and `work recover` remain supervised ROOT-ONLY; use `work adopt status` for adopted
+metadata. Schema v6 is additive: supervised proof tables are not rebuilt or weakened,
+old charges/history/outbox/aliases/unknown writers are retained, missing versioned
+tables fail closed, and read APIs never initialize or migrate.
+
+Actual runtime-hook payload-to-stable-ID mapping, installation and fork coverage
+qualification belong to Task 13 and are not implemented. Supervised child coverage
+is the next Task 6 slice; this journal does not complete Task 6.
 
 ## Requirements
 

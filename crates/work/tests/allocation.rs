@@ -182,7 +182,7 @@ fn sibling_alias_and_legacy_path_charge_share_capacity() {
             // Recreate the actual pre-v2 schema, retaining the charge and digest.
             let conn =
                 rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
-            conn.execute_batch("DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;").unwrap();
+            conn.execute_batch("DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;").unwrap();
         } else {
             assert!(f
                 .start(&Uuid::now_v7().to_string(), "first", "first", &[])

@@ -17,6 +17,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Adopted declarations only: no process control, Git identity or automatic handoff
+    Adopt {
+        #[command(subcommand)]
+        command: crate::adopted::Command,
+    },
     /// Reserve and create a configured checkout; does not launch a writer
     Start(crate::allocate::Start),
     /// Run an explicitly attributed command in a verified allocated checkout
@@ -60,7 +65,7 @@ pub fn run() {
     }
     let cli = if args
         .first()
-        .is_some_and(|a| a == "run" || a == "recover" || a == "status")
+        .is_some_and(|a| a == "run" || a == "recover" || a == "status" || a == "adopt")
     {
         match Cli::try_parse() {
             Ok(cli) => cli,
@@ -73,7 +78,7 @@ pub fn run() {
                 error.exit()
             }
             Err(_) => {
-                eprintln!("invalid command arguments; see work run/status/recover --help (delegate argv requires --)");
+                eprintln!("invalid command arguments; see work --help (delegate argv requires --)");
                 std::process::exit(2);
             }
         }
@@ -81,6 +86,18 @@ pub fn run() {
         Cli::parse()
     };
     match cli.command {
+        Command::Adopt { command } => {
+            let result = Config::load()
+                .map_err(|_| crate::store::StoreError::Unsafe)
+                .and_then(|config| crate::adopted::command(&config, command));
+            match result {
+                Ok(report) => println!("{report}"),
+                Err(_) => {
+                    eprintln!("adopted declaration refused/unknown; inspect explicit IDs, existing authority and held lease; no runtime authority granted");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Start(request) => {
             eprintln!(
                 "allocation operation: {} (retain for retries)",

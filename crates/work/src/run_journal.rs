@@ -403,7 +403,10 @@ impl Store {
         let i = &request.identity;
         let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE run_ref=?1 OR id=?2 OR group_id=?2 OR group_id=?3)
             OR EXISTS(SELECT 1 FROM run_groups WHERE id=?2 OR id=?3)
-            OR EXISTS(SELECT 1 FROM checkouts WHERE id IN (?2,?3) OR operation IN (?2,?3))",
+            OR EXISTS(SELECT 1 FROM checkouts WHERE id IN (?2,?3) OR operation IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM adopted_groups WHERE run_ref=?1 OR id IN (?2,?3) OR run_id IN (?2,?3) OR operation IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM writers WHERE group_id IN (?2,?3))
+            ",
             (i.run_ref.as_str(), i.group.to_string(), i.run.to_string()), |r| r.get(0))?;
         if conflict {
             return Err(StoreError::Conflict);
