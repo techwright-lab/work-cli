@@ -350,6 +350,7 @@ fn readiness_rechecks_marker_after_external_side_effects() {
             trusted_registry: Some(f.temp.path().join("registry")),
             roots: vec![f.root.clone()],
             repositories: vec![f.repo.clone()],
+            supervisor: None,
             allocation: Some(work_cli::config::AllocationPolicy {
                 repository_limit: 10,
                 owner_limit: 10,
@@ -511,6 +512,7 @@ fn moved_reuse_branch_boundary_is_persistently_held() {
         trusted_registry: Some(f.temp.path().join("registry")),
         roots: vec![f.root.clone()],
         repositories: vec![f.repo.clone()],
+        supervisor: None,
         allocation: Some(work_cli::config::AllocationPolicy {
             repository_limit: 10,
             owner_limit: 10,

@@ -159,6 +159,41 @@ fn status_does_not_create_files_or_write_config() {
 }
 
 #[test]
+fn configured_status_does_not_claim_initialization_or_runtime_qualification() {
+    let root = IsolatedRoot::new();
+    fs::create_dir_all(root.root.join("config/work")).unwrap();
+    fs::write(
+        root.root.join("config/work/config.toml"),
+        format!("store_dir={:?}\n", root.root.join("state/not-created")),
+    )
+    .unwrap();
+    let before = root.snapshot();
+    let output = run_work(&root, &["status"]);
+    assert!(output.status.success());
+    let text = stdout_str(&output);
+    assert!(!text.contains("status: not initialized"));
+    assert!(text.contains("not inspected"));
+    assert!(text.contains("runtime qualification not verified"));
+    assert_eq!(before, root.snapshot());
+}
+#[test]
+fn run_parse_errors_do_not_echo_raw_command_or_emit_protocol_stdout() {
+    let root = IsolatedRoot::new();
+    let before = root.snapshot();
+    let output = run_work(
+        &root,
+        &[
+            "run",
+            "019281b2-67de-7000-8000-000000000001",
+            "secret-delegate-argument",
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!combined(&output).contains("secret-delegate-argument"));
+    assert_eq!(before, root.snapshot());
+}
+#[test]
 fn status_is_secret_free_and_has_no_host_defaults() {
     let root = IsolatedRoot::new();
     let output = run_work(&root, &["status"]);
@@ -210,8 +245,8 @@ fn status_reports_linux_qualification() {
         "status should report linux platform: {stdout}"
     );
     assert!(
-        stdout.contains("qualification: qualified"),
-        "linux hosts are the qualified platform: {stdout}"
+        stdout.contains("qualification: runtime qualification not verified"),
+        "Linux alone is not evidence of runtime qualification: {stdout}"
     );
 }
 

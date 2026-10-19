@@ -24,3 +24,4 @@ pub mod scope_driver;
 pub mod scope_launch;
 pub mod scope_spawn;
 pub mod store;
+pub mod supervisor;

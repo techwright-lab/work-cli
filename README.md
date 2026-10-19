@@ -11,8 +11,10 @@ channels.
 
 Early construction. Read-only `work --help`, `work status` and `work doctor` are
 available, plus configured `work start` allocation. Start never launches a writer.
-Run/finish/removal and capture integration are not implemented. Status remains an
-uninitialized capability report, not a lifecycle inventory; use doctor for accounting.
+Configured root-only `work run` coordination is available for construction/testing,
+not production activation. Finish/removal and capture integration are not implemented.
+Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
+for read-only accounting. Historical run bindings cannot be restored.
 
 ## Read-only inventory
 
@@ -127,10 +129,80 @@ containment against malicious `setsid` descendants or concurrent same-UID mutati
 Private marker/backlink reads require nonblocking, no-follow regular descriptors
 and a 16-KiB byte bound. Uncertainty retains the charge and never triggers deletion.
 
+## Supervised root commands (not activation)
+
+A previously allocated, active/ready checkout ID is required. No implicit allocation,
+path reuse, repository discovery or held-lease revival occurs. Extend host configuration
+with explicit finite policy and named actor Git profiles (values below are examples,
+not compiled defaults):
+
+```toml
+[supervisor]
+runtime_directory = "/absolute/private/user-runtime"
+bus_address = "unix:path=/absolute/private/user-runtime/bus"
+runtime_max_seconds = 3600
+preexec_ms = 5000
+closure_grace_ms = 2000
+cancel_grace_ms = 2000
+
+[supervisor.actors.developer]
+author_name = "Configured Actor"
+author_email = "actor@example.invalid"
+committer_name = "Configured Actor"
+committer_email = "actor@example.invalid"
+```
+
+The existing private runtime directory must be owned by the current UID, mode 0700,
+with its owned `bus` socket. RuntimeMaxSec is 1..86400 whole seconds; each other budget
+is 1..30000 milliseconds. Actor selection is explicit `--actor` or the lease actor;
+an exact registered Git profile is mandatory, independently of executor/model metadata.
+All four Git identity variables are projected only into the launched command, with no
+global Git/process-environment changes. Original presence/bytes of XDG_RUNTIME_DIR and
+DBUS_SESSION_BUS_ADDRESS are restored for the delegate, not replaced by manager context.
+
+Supply a bounded typed execution-chain JSON **file**, not stdin. For example, declare
+`[{"kind":"executor","system":"declared-executor"}]`; declare actual model/provider
+entries explicitly when applicable. No model/provider is inferred. Generate and retain
+one UUIDv7 before invoking:
+
+```sh
+work run CHECKOUT_UUID --run-id RUN_UUIDV7 --execution-chain /absolute/chain.json -- command arg
+```
+
+The CLI prints the retry ID and completion/hold metadata to stderr only; protocol
+stdin/stdout/stderr otherwise pass through unchanged. Raw argv, environment and prompts
+are not journaled. Command digests use length-prefixed raw OS bytes, preserving empty
+and non-UTF8 arguments. Exact retries are metadata receipts, **never relaunch authority**;
+changed immutable inputs conflict. Existing receipts retain original group/context/boot.
+
+Intent and writer commit before launching. Bound metadata and permit-attempt commit
+separately before gate publication. Root Completed/Failed/Cancelled status is separate
+from writer closure: only fresh, complete whole-scope emptiness against the original
+opaque binding and current root roster/revision can release that group's writer.
+Uncertain evidence or surviving descendants retain a held writer under finite policy.
+A closed group permits a sequential run without another checkout charge. Lease charges
+and task openness are never released here. Capture_sink remains unsupported and fails
+closed before any delegate; attribution capture is not configured.
+
+SIGINT/SIGTERM request cancellation through an atomic token. Cancellation freshly
+revalidates exact unit/invocation/boot/cgroup identity before requesting scope SIGTERM;
+never killpg or a historical PID. No hard-kill escalation is configured. Acknowledgement
+is not emptiness proof. Bounded grace exhaustion/failures retain recovery holds. Kernel
+D-state can make owned-child kill/reaping unbounded despite finite userspace policy.
+An owned process group isolates non-terminal protocols; interactive TTY/job-control
+has not been qualified and terminal stdio is explicitly refused.
+
+No external/adopted participants, bridge, task finish, retirement or automatic recovery
+is supported. Crashed runs retain writer records; historical serialized bindings grant
+no cancellation/closure authority. There is no read-only `status --run` inventory yet.
+Library fixtures use actual child birth identity with synthetic manager/cgroup IO and
+do **not** qualify a live systemd backend. No CLI fake-manager selector exists.
+
 ## Requirements
 
 - Rust 1.98.1
-- Linux is the qualified platform. Other operating systems are unsupported.
+- Linux is the supported platform; live runtime qualification is not implied by Linux.
+  Other operating systems are unsupported.
 
 ## License
 

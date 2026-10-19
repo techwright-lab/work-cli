@@ -63,7 +63,7 @@ pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()>
         Err(_) => hold(store, a, "identity/marker/registration incomplete or changed; operator reconciliation required (slot retained)"),
     }
 }
-fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
+pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
     let fail = || allocate::err("insufficient allocation identity");
     let prior = a.identity.as_ref().ok_or_else(fail)?;
     for path in [

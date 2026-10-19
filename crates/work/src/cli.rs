@@ -19,6 +19,8 @@ struct Cli {
 enum Command {
     /// Reserve and create a configured checkout; does not launch a writer
     Start(crate::allocate::Start),
+    /// Run an explicitly attributed command in a verified allocated checkout
+    Run(crate::supervisor::Run),
     /// Show lifecycle status without changing state
     Status,
     /// Bounded read-only inventory; no initialization, repair or enforcement
@@ -47,7 +49,25 @@ pub fn run() {
         eprintln!("scope child held");
         std::process::exit(1);
     }
-    let cli = Cli::parse();
+    let cli = if args.first().is_some_and(|a| a == "run") {
+        match Cli::try_parse() {
+            Ok(cli) => cli,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+            {
+                error.exit()
+            }
+            Err(_) => {
+                eprintln!("invalid run arguments; see work run --help (delegate argv requires --)");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        Cli::parse()
+    };
     match cli.command {
         Command::Start(request) => {
             eprintln!(
@@ -64,6 +84,23 @@ pub fn run() {
                 ),
                 Err(e) => {
                     eprintln!("start refused: {e}; inspect WORK_CONFIG and held allocations; retry with the same --operation UUID");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Run(request) => {
+            eprintln!("run: {} (retain --run-id for retries)", request.run_id);
+            let result = Config::load()
+                .map_err(|_| std::io::Error::other("invalid configuration"))
+                .and_then(|config| crate::supervisor::command(&config, request));
+            match result {
+                Ok(code) => std::process::exit(code),
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    eprintln!("interactive TTY/job-control unsupported; use non-terminal protocol stdio; no delegate launched");
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    eprintln!("run held/refused; inspect lease and run journal; retry only with the same --run-id; historical bindings cannot be restored");
                     std::process::exit(1);
                 }
             }
@@ -119,17 +156,17 @@ pub fn run() {
 
 fn print_status() {
     // Read-only: a missing or present config never creates files.
-    let _config = Config::load().unwrap_or_else(|err| {
+    let config = Config::load().unwrap_or_else(|err| {
         eprintln!("{err}");
         Config::default()
     });
     let os = std::env::consts::OS;
-    let qualification = if os == "linux" {
-        "qualified"
+    let qualification = "runtime qualification not verified";
+    if config.store_dir.is_some() {
+        println!("status: lifecycle inventory not inspected (read-only placeholder)");
     } else {
-        "unqualified"
-    };
-    println!("status: not initialized");
+        println!("status: not initialized (no store configured)");
+    }
     println!("platform: {os}");
     println!("qualification: {qualification}");
     println!("schema: {}", SchemaVersion::V1);

@@ -52,6 +52,61 @@ impl LaunchPolicy {
         })
     }
 }
+/// Explicit Git attribution, never human identity fallback or arbitrary environment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "GitWire")]
+pub struct ActorGitProfile {
+    author_name: String,
+    author_email: String,
+    committer_name: String,
+    committer_email: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitWire {
+    author_name: String,
+    author_email: String,
+    committer_name: String,
+    committer_email: String,
+}
+impl TryFrom<GitWire> for ActorGitProfile {
+    type Error = &'static str;
+    fn try_from(w: GitWire) -> Result<Self> {
+        Self::new(
+            &w.author_name,
+            &w.author_email,
+            &w.committer_name,
+            &w.committer_email,
+        )
+    }
+}
+impl ActorGitProfile {
+    pub fn new(
+        author_name: &str,
+        author_email: &str,
+        committer_name: &str,
+        committer_email: &str,
+    ) -> Result<Self> {
+        if [author_name, author_email, committer_name, committer_email]
+            .iter()
+            .any(|v| v.trim().is_empty() || v.len() > 256 || v.chars().any(char::is_control))
+        {
+            return Err(HOLD);
+        }
+        Ok(Self {
+            author_name: author_name.into(),
+            author_email: author_email.into(),
+            committer_name: committer_name.into(),
+            committer_email: committer_email.into(),
+        })
+    }
+}
+/// Typed command-scoped attribution; no arbitrary environment injection.
+pub struct AttributedCommand<'a> {
+    pub cwd: &'a Path,
+    pub argv: &'a [OsString],
+    pub git: &'a ActorGitProfile,
+}
 pub struct OwnedLaunch {
     gate: GuardedLaunch,
     child: Option<Child>,
@@ -92,6 +147,45 @@ impl OwnedLaunch {
         argv: &[OsString],
         policy: LaunchPolicy,
         io: LaunchIo,
+    ) -> Result<Self> {
+        Self::spawn_inner(driver, intent, directory, cwd, argv, policy, io, None)
+    }
+    pub fn spawn_attributed(
+        driver: &Driver,
+        intent: LaunchIntent,
+        directory: &Path,
+        command: AttributedCommand<'_>,
+        policy: LaunchPolicy,
+        io: Option<LaunchIo>,
+    ) -> Result<Self> {
+        let io = match io {
+            Some(io) => io,
+            None => LaunchIo {
+                systemd_run: "/usr/bin/systemd-run".into(),
+                self_binary: std::env::current_exe().map_err(|_| HOLD)?,
+            },
+        };
+        Self::spawn_inner(
+            driver,
+            intent,
+            directory,
+            command.cwd,
+            command.argv,
+            policy,
+            io,
+            Some(command.git),
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // shared legacy unattributed gate + supervised typed entry
+    fn spawn_inner(
+        driver: &Driver,
+        intent: LaunchIntent,
+        directory: &Path,
+        cwd: &Path,
+        argv: &[OsString],
+        policy: LaunchPolicy,
+        io: LaunchIo,
+        git: Option<&ActorGitProfile>,
     ) -> Result<Self> {
         let deadline = Instant::now().checked_add(policy.preexec).ok_or(HOLD)?;
         let original = OriginalRuntime::capture();
@@ -136,6 +230,17 @@ impl OwnedLaunch {
             .stderr(Stdio::inherit());
         // Overrides only this manager command, after capturing original presence/bytes.
         driver.apply_manager_context(&mut command)?;
+        // Scope launcher/hidden child/delegate share an owned process group;
+        // never signal it as cancellation authority. CLI refuses unqualified TTY.
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+        if let Some(git) = git {
+            command
+                .env("GIT_AUTHOR_NAME", &git.author_name)
+                .env("GIT_AUTHOR_EMAIL", &git.author_email)
+                .env("GIT_COMMITTER_NAME", &git.committer_name)
+                .env("GIT_COMMITTER_EMAIL", &git.committer_email);
+        }
         let child = loop {
             if Instant::now() >= deadline || live_process(parent.pid).map_err(|_| HOLD)? != parent {
                 return Err(HOLD);

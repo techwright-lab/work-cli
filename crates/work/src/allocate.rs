@@ -136,6 +136,35 @@ pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allo
         "malformed allocation metadata; held with charge retained",
     ))
 }
+/// Fresh checkout-by-ID validation. Caller holds allocation lock only for a
+/// short preflight/transaction, never for the supervised actor lifetime.
+/// Unlike allocation reconciliation this never revives held/quarantined rows.
+pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result<Allocation> {
+    let (operation, state, ready): (String, String, bool) = sql(store.conn.query_row(
+        "SELECT operation,state,ready FROM checkouts WHERE id=?1",
+        [checkout.to_string()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ))?;
+    if state != "active" || !ready {
+        return Err(err("checkout not active and ready"));
+    }
+    let mut a = load(
+        store,
+        Uuid::parse_str(&operation).map_err(|_| err("invalid operation"))?,
+    )?
+    .filter(|a| a.checkout == checkout && a.stage == "ready")
+    .ok_or_else(|| err("checkout allocation not ready"))?;
+    source_authority(store, &mut a)?;
+    if crate::recovery::verify(&a).is_err() {
+        crate::recovery::hold(
+            store,
+            &mut a,
+            "fresh lease identity verification failed; charge retained",
+        )?;
+        return Err(err("lease identity changed; held"));
+    }
+    Ok(a)
+}
 pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
     let dir = config
         .store_dir
@@ -462,7 +491,12 @@ fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf
         [a.checkout.to_string()],
         |row| row.get(0),
     ))?;
-    let result = CheckoutIdentity::inspect(a.request.repository.as_ref().unwrap());
+    let result = a
+        .request
+        .repository
+        .as_ref()
+        .ok_or_else(|| err("missing durable source authority"))
+        .and_then(|path| CheckoutIdentity::inspect(path));
     match result {
         Ok(source) if source.common_git_dir == std::path::Path::new(&charged) => {
             Ok(source.common_git_dir)

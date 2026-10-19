@@ -12,6 +12,7 @@ pub struct Config {
     pub roots: Vec<PathBuf>,
     pub repositories: Vec<PathBuf>,
     pub allocation: Option<AllocationPolicy>,
+    pub supervisor: Option<SupervisorConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -24,7 +25,47 @@ pub struct AllocationPolicy {
     pub capture_sink: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorConfig {
+    pub runtime_directory: PathBuf,
+    pub bus_address: String,
+    pub runtime_max_seconds: u64,
+    pub preexec_ms: u64,
+    pub closure_grace_ms: u64,
+    pub cancel_grace_ms: u64,
+    pub actors: std::collections::BTreeMap<String, crate::scope_spawn::ActorGitProfile>,
+}
+impl SupervisorConfig {
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        let invalid = || Error::Config("invalid supervisor policy".into());
+        if !(1..=86_400).contains(&self.runtime_max_seconds)
+            || !(1..=30_000).contains(&self.preexec_ms)
+            || !(1..=30_000).contains(&self.closure_grace_ms)
+            || !(1..=30_000).contains(&self.cancel_grace_ms)
+            || self.actors.is_empty()
+            || self.actors.len() > 128
+            || self.actors.keys().any(|a| {
+                a.is_empty()
+                    || a.len() > 128
+                    || !a
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            })
+            || self.bus_address
+                != format!("unix:path={}", self.runtime_directory.join("bus").display())
+        {
+            return Err(invalid());
+        }
+        validate_path(&self.runtime_directory, false).map_err(|_| invalid())?;
+        Ok(())
+    }
+}
 impl Config {
+    /// Parse host configuration without filesystem initialization or diagnostic values.
+    pub fn from_text(text: &str) -> Result<Self, Error> {
+        Self::from_toml(text)
+    }
     /// Load configuration if a file already exists. Never creates files or directories.
     pub fn load() -> Result<Self, Error> {
         let Some(path) = Self::discover_path() else {
@@ -117,6 +158,17 @@ impl Config {
             trusted_registry: single("trusted_registry")?,
             roots: many("roots")?,
             repositories: many("repositories")?,
+            supervisor: value
+                .get("supervisor")
+                .map(|v| {
+                    let policy: SupervisorConfig = v
+                        .clone()
+                        .try_into()
+                        .map_err(|_| Error::Config("invalid supervisor policy".into()))?;
+                    policy.validate()?;
+                    Ok(policy)
+                })
+                .transpose()?,
             allocation: value
                 .get("allocation")
                 .map(|v| {
