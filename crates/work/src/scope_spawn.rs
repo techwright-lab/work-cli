@@ -136,10 +136,25 @@ impl OwnedLaunch {
             .stderr(Stdio::inherit());
         // Overrides only this manager command, after capturing original presence/bytes.
         driver.apply_manager_context(&mut command)?;
-        if Instant::now() >= deadline || live_process(parent.pid).map_err(|_| HOLD)? != parent {
-            return Err(HOLD);
-        }
-        let child = command.spawn().map_err(|_| HOLD)?;
+        let child = loop {
+            if Instant::now() >= deadline || live_process(parent.pid).map_err(|_| HOLD)? != parent {
+                return Err(HOLD);
+            }
+            match command.spawn() {
+                Ok(child) => break child,
+                // ETXTBSY means exec never occurred: no manager/agent started.
+                // A parallel fork can briefly retain a fresh launcher's writable
+                // descriptor until exec closes it. Reuse the same prepared context
+                // and immutable command, charging every retry to the original budget.
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error()) =>
+                {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(remaining.min(Duration::from_millis(2)));
+                }
+                Err(_) => return Err(HOLD),
+            }
+        };
         let pid = child.id();
         Ok(Self {
             gate: GuardedLaunch::adopt_prepared(intent, prepared),

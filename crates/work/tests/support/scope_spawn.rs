@@ -80,9 +80,34 @@ impl SpawnFixture {
             "manager",
             format!("exec /usr/bin/cat '{}/properties'", root.display()),
         );
-        script("systemd-run", format!("printf '%s\\0' \"$@\" > '{0}/launch-argv'\nprintf '%s\\n' \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{0}/launch-env'\npwd > '{0}/launch-cwd'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\n{1}", root.display(), match mode { "fork" => "\"$@\" & wait", "exit" => "exit 7", "timeout" => "exec /usr/bin/sleep 10", _ => "exec \"$@\"" }));
-        script("self", format!("[ \"$1\" = __scope-child ] && [ \"$2\" = --context ] && [ \"$4\" = -- ] || exit 9\nshift 4\nprintf '%s\\0' \"$@\" > '{0}/delegate-argv'\nexport OWNED_FIXTURE_ROOT='{0}'\nexec '{1}' --exact owned::owned_fixture_child --nocapture", root.display(), std::env::current_exe().unwrap().display()));
-        script("delegate", format!("printf '%s\\0' \"$@\" > '{0}/actual-argv'\nprintf '%s\\n' \"${{XDG_RUNTIME_DIR-unset}}\" \"${{DBUS_SESSION_BUS_ADDRESS-unset}}\" > '{0}/actual-env'\n/usr/bin/touch '{0}/delegate-executed'", root.display()));
+        script(
+            "systemd-run",
+            format!(
+                "printf '%s\\0' \"$@\" > '{0}/launch-argv'\nprintf '%s\\n' \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{0}/launch-env'\npwd > '{0}/launch-cwd'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\n{1}",
+                root.display(),
+                match mode {
+                    "fork" => "\"$@\" & wait",
+                    "exit" => "exit 7",
+                    "timeout" => "exec /usr/bin/sleep 10",
+                    _ => "exec \"$@\"",
+                }
+            ),
+        );
+        script(
+            "self",
+            format!(
+                "[ \"$1\" = __scope-child ] && [ \"$2\" = --context ] && [ \"$4\" = -- ] || exit 9\nshift 4\nprintf '%s\\0' \"$@\" > '{0}/delegate-argv'\nexport OWNED_FIXTURE_ROOT='{0}'\nexec '{1}' --exact owned::owned_fixture_child --nocapture",
+                root.display(),
+                std::env::current_exe().unwrap().display()
+            ),
+        );
+        script(
+            "delegate",
+            format!(
+                "printf '%s\\0' \"$@\" > '{0}/actual-argv'\nprintf '%s\\n' \"${{XDG_RUNTIME_DIR-unset}}\" \"${{DBUS_SESSION_BUS_ADDRESS-unset}}\" > '{0}/actual-env'\n/usr/bin/touch '{0}/delegate-executed'",
+                root.display()
+            ),
+        );
         let driver = Driver::with_io(
             RuntimeContext::new(
                 root.join("runtime"),
@@ -107,6 +132,10 @@ impl SpawnFixture {
         }
     }
     fn spawn(&self, timeout: Duration) -> OwnedLaunch {
+        self.try_spawn(timeout)
+            .expect("EXEC-style fixture must actually spawn")
+    }
+    fn try_spawn(&self, timeout: Duration) -> Result<OwnedLaunch, &'static str> {
         let argv = [
             self.root.join("delegate").into_os_string(),
             "$SECRET no-expand ; ' literal".into(),
@@ -128,7 +157,6 @@ impl SpawnFixture {
                 self_binary: self.root.join("self"),
             },
         )
-        .expect("EXEC-style fixture must actually spawn")
     }
     fn evidence(&self, pid: u32) {
         fs::create_dir_all(self.root.join(format!("proc/{pid}"))).unwrap();
@@ -388,6 +416,52 @@ fn out_of_order_release_is_terminal_preexec_failure() {
     assert_eq!(launch.outcome(), Outcome::RecoveryHold);
     assert!(launch.try_wait().unwrap().is_some());
     assert!(!f.root.join("gate/permit.json").exists());
+}
+#[test]
+fn text_busy_launcher_retries_until_local_writer_closes() {
+    let f = SpawnFixture::new("exec");
+    let writer = fs::OpenOptions::new()
+        .write(true)
+        .open(f.root.join("systemd-run"))
+        .unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            drop(writer);
+        });
+        let mut launch = f.spawn(Duration::from_secs(2));
+        poll_owned(&mut launch).unwrap();
+        f.evidence(launch.pid());
+        launch.bind(&f.driver).unwrap();
+        assert_eq!(launch.binding().unwrap().trusted_child().pid, launch.pid());
+        assert!(!f.root.join("delegate-executed").exists());
+        launch.release(&f.driver).unwrap();
+        assert!(launch.wait().unwrap().success());
+        assert!(f.root.join("delegate-executed").exists());
+    });
+}
+#[test]
+fn text_busy_launcher_exhausts_original_deadline_without_starting() {
+    let f = SpawnFixture::new("exec");
+    let _writer = fs::OpenOptions::new()
+        .write(true)
+        .open(f.root.join("systemd-run"))
+        .unwrap();
+    let budget = Duration::from_millis(100);
+    let started = Instant::now();
+    assert_eq!(f.try_spawn(budget).err(), Some("scope launch held"));
+    assert!(started.elapsed() >= budget);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(f.root.join("gate/context.json").exists());
+    for record in [
+        "launch-argv",
+        "gate/claimed",
+        "gate/ready.json",
+        "gate/permit.json",
+        "delegate-executed",
+    ] {
+        assert!(!f.root.join(record).exists(), "{record}");
+    }
 }
 #[test]
 fn launch_policy_rejects_unbounded_or_ambiguous_deadlines() {
