@@ -247,17 +247,9 @@ pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
     if normalize(&ddl) != normalize(SCHEMA.split(';').next().ok_or(StoreError::Invalid)?) {
         return Err(StoreError::Invalid);
     }
-    let mut stmt = conn.prepare("SELECT checkout FROM task_finishes LIMIT 4097")?;
-    let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if ids.len() > 4096 {
-        return Err(StoreError::Invalid);
-    }
-    for id in ids {
-        load(conn, Uuid::parse_str(&id).map_err(|_| StoreError::Invalid)?)?
-            .ok_or(StoreError::Invalid)?;
-    }
+    // Shape is authority-wide; receipt data is validated by load at every
+    // targeted read/retry. Historical receipt count is not lifecycle policy,
+    // and opening a store must not multiply outbox/roster scans by that count.
     Ok(())
 }
 pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<bool> {
@@ -508,6 +500,162 @@ fn prepare(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legal_finish_history_has_no_schema_quota_or_receipt_read_amplification() {
+        use super::*;
+        use crate::allocate::{Allocation, Start};
+        use crate::identity::{CheckoutIdentity, DirectoryIdentity};
+        for count in [512, 4097] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("r");
+            std::fs::create_dir(&root).unwrap();
+            let dir = temp.path().join("s");
+            let mut store = Store::open(&dir, std::slice::from_ref(&root)).unwrap();
+            let mut ids = Vec::new();
+            let tx = store.conn.transaction().unwrap();
+            for n in 0..count {
+                let checkout = Uuid::now_v7();
+                let operation = Uuid::now_v7();
+                let task = n.to_string();
+                let destination = root.join(&task);
+                let identity = CheckoutIdentity {
+                    path: destination.clone(),
+                    private_git_dir: root.join(format!("g{n}")),
+                    common_git_dir: root.clone(),
+                    directory: DirectoryIdentity {
+                        device: 1,
+                        inode: n + 1,
+                    },
+                    head: "a".repeat(40),
+                    boot_id: Uuid::now_v7().to_string(),
+                };
+                let a = Allocation {
+                    checkout,
+                    request: Start {
+                        operation: Uuid::now_v7(),
+                        repository: Some(root.clone()),
+                        root: Some(root.clone()),
+                        actor: Some("a".into()),
+                        owner: Some("a".into()),
+                        task: task.clone(),
+                        branch: Some(task.clone()),
+                        base: "main".into(),
+                        reuse_branch: false,
+                    },
+                    destination,
+                    base_commit: "a".repeat(40),
+                    stage: "ready".into(),
+                    reason: None,
+                    identity: Some(identity.clone()),
+                };
+                let mut hash = Sha256::new();
+                for field in [
+                    "work-reservation-v1",
+                    root.to_str().unwrap(),
+                    "a",
+                    "a",
+                    &task,
+                ] {
+                    hash.update((field.len() as u64).to_be_bytes());
+                    hash.update(field.as_bytes());
+                }
+                tx.execute(
+                    "INSERT INTO checkouts VALUES(?1,?2,?3,?4,'a',?5,'a','held',0)",
+                    (
+                        checkout.to_string(),
+                        a.request.operation.to_string(),
+                        hash.finalize().to_vec(),
+                        root.to_str(),
+                        &task,
+                    ),
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO allocations VALUES(?1,?2,?3)",
+                    (
+                        checkout.to_string(),
+                        json(&a.request).unwrap(),
+                        json(&a).unwrap(),
+                    ),
+                )
+                .unwrap();
+                let r = Receipt {
+                    version: 1,
+                    checkout,
+                    operation,
+                    allocation_operation: a.request.operation,
+                    allocation_digest: digest(json(&a).unwrap()),
+                    hold_reason: "retirement-disabled".into(),
+                    identity,
+                    capture_binding: digest(json(&Option::<String>::None).unwrap()),
+                    local_freeze: Freeze::NotConfigured,
+                    delivery: Some(Delivery::NotConfigured),
+                    reason: None,
+                };
+                tx.execute(
+                    "INSERT INTO task_finishes VALUES(?1,?2,?3)",
+                    (
+                        checkout.to_string(),
+                        operation.to_string(),
+                        json(&r).unwrap(),
+                    ),
+                )
+                .unwrap();
+                crate::store::emit(
+                    &tx,
+                    &crate::events::Event::TaskFinished {
+                        checkout,
+                        operation,
+                    },
+                )
+                .unwrap();
+                ids.push(checkout);
+            }
+            tx.commit().unwrap();
+            store
+                .conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+                .unwrap();
+            let bytes: u64 = ["store.sqlite", "store.sqlite-wal", "store.sqlite-shm"]
+                .iter()
+                .map(|name| std::fs::metadata(dir.join(name)).unwrap().len())
+                .sum();
+            assert!(
+                bytes <= 16 * 1024 * 1024,
+                "fixture exceeds technical file bound: {bytes}"
+            );
+            assert!(
+                load(&store.conn, ids[0]).unwrap().is_some(),
+                "fixture receipt is legal before schema check"
+            );
+            {
+                let _phase = store.sql_phase();
+                validate_schema(&store.conn).expect("schema validation must not read every historical receipt or impose a 4096 quota");
+            }
+            drop(store);
+            let store = Store::open(&dir, std::slice::from_ref(&root)).unwrap();
+            let middle = ids.len() / 2;
+            for index in [0, middle, ids.len() - 1] {
+                let _phase = store.sql_phase();
+                assert_eq!(
+                    load(&store.conn, ids[index]).unwrap().unwrap().checkout,
+                    ids[index]
+                );
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE task_finishes SET record='{}' WHERE checkout=?1",
+                    [ids[middle].to_string()],
+                )
+                .unwrap();
+            assert!(
+                load(&store.conn, ids[middle]).is_err(),
+                "targeted corrupt history must not become None/Existing"
+            );
+        }
+    }
+
     #[test]
     fn allocation_save_cannot_reopen_even_a_corrupt_finish_fence() {
         use crate::{

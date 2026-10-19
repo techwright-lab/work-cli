@@ -396,6 +396,8 @@ impl Store {
         initialization_boundary("store_dir");
         let mut reg = database(&registry, "authorities.sqlite", pending)?;
         initialization_boundary("registry_db");
+        let reg_budget = SqlBudget::install(&reg)?;
+        let reg_phase = reg_budget.enter();
         let version: i64 = reg.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !matches!(version, 0 | 1) {
             return Err(StoreError::Unsafe);
@@ -426,9 +428,14 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        drop(reg_phase);
         initialization_boundary("claims");
         let mut conn = database(&dir, "store.sqlite", pending)?;
         initialization_boundary("store_db");
+        // Bound mutable validation/migration before taking the SQLite writer
+        // lock. The same Store-owned callback remains installed on return.
+        let budget = SqlBudget::install(&conn)?;
+        let phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !matches!(version, 0..=9) {
             return Err(StoreError::Unsafe);
@@ -541,6 +548,7 @@ impl Store {
         tx.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
         tx.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
         tx.commit()?;
+        drop(phase);
         initialization_boundary("store_schema");
         // FULL SQLite commits make schema and claims durable, including their
         // WAL records. Sync directory entries before publishing initialized.
@@ -551,7 +559,6 @@ impl Store {
             persist_initialization(&registry, &record)?;
         }
         initialization_boundary("initialized");
-        let budget = SqlBudget::install(&conn)?;
         Ok(Self { conn, budget })
     }
     pub fn charged(&self, repository: &Path, owner: Option<&str>) -> Result<u64> {
@@ -1100,6 +1107,74 @@ mod tests {
         // Outside a phase even a query exceeding the instruction cap is inert.
         conn.query_row(&SCAN.replace("5000", "20000"), [], |r| r.get::<_, i64>(0))
             .unwrap();
+    }
+
+    #[test]
+    fn mutable_open_budget_exhaustion_rolls_back_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let dir = temp.path().join("private");
+        let store = super::Store::open(&dir, std::slice::from_ref(&root)).unwrap();
+        // Adversarial but relationally consistent input: schema validation must
+        // bound its orphan scan even before it can return a Store. No test-only
+        // production selector or altered budget is involved.
+        store.conn.execute_batch("DROP TABLE task_finishes; PRAGMA user_version=8;
+            INSERT INTO checkouts VALUES('checkout','allocation',x'00','repo','actor','task','owner','held',0);
+            INSERT INTO run_groups VALUES('group','checkout','supervised',1,0,1,0);
+            INSERT INTO runs VALUES('run','group','ref','{}','intent',NULL,NULL);
+            WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<6000)
+            INSERT INTO run_participants SELECT 'child'||x,'group','ref'||x,'run','{}','pending',NULL,1,NULL FROM n;").unwrap();
+        // One pre-migration scan fits; cumulative validation around the v9
+        // DDL must exhaust the allowance, rolling that DDL back as well.
+        {
+            let _phase = store.sql_phase();
+            super::validate_existing_schema(&store.conn, 8).unwrap();
+        }
+        let before: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        drop(store);
+        let result = super::Store::open(&dir, std::slice::from_ref(&root));
+        assert!(
+            matches!(result, Err(super::StoreError::Database(rusqlite::Error::SqliteFailure(e, _)))
+            if e.code == rusqlite::ErrorCode::OperationInterrupted),
+            "mutable pre-return validation must exhaust the real SQL budget"
+        );
+        let conn = rusqlite::Connection::open(dir.join("store.sqlite")).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        let after: Vec<(String, String)> = conn
+            .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM run_participants", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            6000
+        );
+        assert_eq!(
+            conn.query_row("SELECT state FROM checkouts", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "held"
+        );
+        // Removing the expensive private fixture history permits the same
+        // authority to migrate, demonstrating rollback and released locks.
+        conn.execute("DELETE FROM run_participants", []).unwrap();
+        super::Store::open(&dir, std::slice::from_ref(&root)).unwrap();
     }
 
     #[test]
