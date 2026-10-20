@@ -17,6 +17,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Terminal capture journal reconciliation only; no runtime or task authority
+    #[command(version, propagate_version = true)]
+    Capture {
+        #[command(subcommand)]
+        command: crate::capture_cli::Command,
+    },
     /// Child metadata only: no launch, writer permission or automatic handoff
     #[command(version, propagate_version = true)]
     Participant {
@@ -75,7 +81,8 @@ pub fn run() {
         std::process::exit(1);
     }
     let cli = if args.first().is_some_and(|a| {
-        a == "finish"
+        a == "capture"
+            || a == "finish"
             || a == "run"
             || a == "recover"
             || a == "status"
@@ -101,6 +108,32 @@ pub fn run() {
         Cli::parse()
     };
     match cli.command {
+        Command::Capture { command } => {
+            let result = Config::load()
+                .map_err(|_| crate::store::StoreError::Unsafe)
+                .and_then(|config| crate::capture_cli::command(&config, command));
+            match result {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("capture serialization")
+                    );
+                    if report.is_held() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(crate::store::StoreError::UpgradeRequired) => {
+                    eprintln!("capture held: authority schema upgrade required; result unknown");
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    eprintln!(
+                        "capture held: invalid_metadata_or_existing_authority; result unknown"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Participant { command } => {
             let result = Config::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)

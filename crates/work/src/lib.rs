@@ -17,6 +17,7 @@ pub mod allocate;
 mod bounded_process;
 mod capture_artifacts;
 pub mod capture_bridge;
+pub mod capture_cli;
 pub mod capture_config;
 pub mod capture_finalization;
 pub mod capture_journal;

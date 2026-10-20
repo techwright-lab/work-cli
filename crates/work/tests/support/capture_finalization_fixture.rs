@@ -20,6 +20,18 @@ impl Fixture {
         Self::with_source(closed, outcome, None)
     }
     pub fn with_source(closed: bool, outcome: Option<RootOutcome>, source: Option<Source>) -> Self {
+        Self::build(closed, outcome, source, true)
+    }
+    #[allow(dead_code)] // Shared fixture; only the operator CLI needs this preparation state.
+    pub fn unprepared() -> Self {
+        Self::build(false, None, None, false)
+    }
+    fn build(
+        closed: bool,
+        outcome: Option<RootOutcome>,
+        source: Option<Source>,
+        prepare: bool,
+    ) -> Self {
         let (dir, mut store, checkout) = fixture_support::fixture();
         let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
         let operation: String = sql
@@ -109,18 +121,20 @@ impl Fixture {
         };
         let context = dir.path().join(format!("state/{CAPTURE}.context.json"));
         let prepared = decode_begin(&serde_json::to_vec(&serde_json::json!({"capture_id":CAPTURE,"actor_ref":"actor","run_ref":root.identity().run_ref.as_str(),"state":"open","environment":{"AGENT_ATTRIBUTION_CONTEXT":context,"DEVDIARY_ATTRIBUTION_CONTEXT":context,"DEVDIARY_CAPTURE_ID":CAPTURE}})).unwrap(), &spec.begin_request(), &GitProfile::default()).unwrap();
-        store.record_capture_prepared(handle, &prepared).unwrap();
-        let binding = fixture_support::binding(&root);
-        store.record_bound(&root, &binding).unwrap();
-        store.record_permit_attempt(&root, &binding).unwrap();
-        if let Some(outcome) = outcome {
-            store.record_root_outcome(&root, outcome).unwrap();
-        }
-        if closed {
-            let os = fixture_support::ClosureOs::new(&root, &binding);
-            let snapshot = store.group_snapshot(&root.identity().run).unwrap();
-            let proof = snapshot.certify_empty(&os.driver, &binding).unwrap();
-            store.close_supervised_group(&snapshot, &proof).unwrap();
+        if prepare {
+            store.record_capture_prepared(handle, &prepared).unwrap();
+            let binding = fixture_support::binding(&root);
+            store.record_bound(&root, &binding).unwrap();
+            store.record_permit_attempt(&root, &binding).unwrap();
+            if let Some(outcome) = outcome {
+                store.record_root_outcome(&root, outcome).unwrap();
+            }
+            if closed {
+                let os = fixture_support::ClosureOs::new(&root, &binding);
+                let snapshot = store.group_snapshot(&root.identity().run).unwrap();
+                let proof = snapshot.certify_empty(&os.driver, &binding).unwrap();
+                store.close_supervised_group(&snapshot, &proof).unwrap();
+            }
         }
         let config = Config {
             store_dir: Some(dir.path().join("private")),

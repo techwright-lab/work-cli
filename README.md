@@ -20,7 +20,7 @@ production qualification/activation and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture construction (Tasks 8.1–8.4a; implementation, not acceptance)
+### Capture construction (Tasks 8.1–8.4b; implementation, not acceptance)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
@@ -288,6 +288,54 @@ mint it. This observation is not readiness authority. `RunReport::capture_delive
 distinguishes historical frozen-pending/delivered from unfrozen/not-configured.
 Standalone terminal APIs leave writer/task/charge/ready flags and the ordinary
 ANY-capture-history writer fence unchanged. An acknowledgement alone cannot restore Ready.
+
+#### Operator terminal reconciliation (Task 8.4b candidate)
+
+```text
+work capture status <run-id>
+work capture finalize <run-id>
+work capture retry <run-id>
+```
+
+These commands require a UUIDv7 root run and an existing registered current-schema
+(13) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
+They never initialize, migrate or repair an authority. Help/version are read-only;
+invalid arguments exit 2 without echoing argument values. Historical operations need
+no current supervisor, actor profile or capture selection.
+
+`status` reads the **WORK journal only**, not the receiver's external status operation.
+The allowlisted JSON reports recorded root closure/outcome, actual task-open and
+lease-charge facts, preparation, local freeze, delivery and any typed receipt.
+`runtime: "not_inspected"` is explicit: these are journal observations, not a fresh
+kernel-quiescence claim. Missing capture rows, unprepared mappings, unfrozen roots,
+unconfirmed FINISH intents and confirmed frozen roots remain distinguishable.
+No settings, source, context, environment, intent body or raw receiver errors are printed.
+
+`finalize` delegates the terminal library API above: only a known-outcome, closed,
+certain-end root with its prepared mapping can send the exact original FINISH.
+Confirmed results are passive, even if the original executable is gone. `retry`
+requires a confirmed freeze and explicitly sends only RETRY, including when already
+delivered. Both use sealed per-root process settings rather than current capture
+configuration. External I/O holds neither SQL transactions/phases nor lifecycle flock.
+Actual FINISH acknowledgements are discarded, never converted into readiness authority.
+
+Post-operation JSON reflects current per-root journal facts. Attempt `response_recorded`
+means a validated response was recorded, **not** that this attempt newly delivered.
+`receiver_error_recorded` is a boolean only: a failed refresh can retain prior Delivered
+and receipt facts. A confirmed local freeze with Pending delivery (including a receiver
+delivery error) exits 0; delivery outages are not local-freeze failures. Status and
+passive `existing_confirmation` also exit 0. Refusals and `finish_uncertain` /
+`delivery_uncertain` exit 1, retaining trustworthy passive observations when available.
+If the post-read fails, only constant phase/result-unknown metadata is emitted; no
+claim that the external operation had no effect is made.
+
+These commands do not launch/control actors, inspect runtime, finish tasks, release
+charges, restore Ready or rewrite a previously recorded task-finish receipt (even its
+old Pending delivery). Begin/lost-preparation operator reconciliation, off/adopted
+policy, broader privacy work, real private CLI/HTTP qualification and production
+activation remain later work. Tests use synthetic allocation/fake closure fixtures
+and disposable public-protocol producers, not the private product or actual kernel path.
+This increment does not complete Task 8 or constitute acceptance.
 
 #### Integrated supervised readiness and continuation (schema 13)
 
