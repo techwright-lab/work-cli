@@ -431,50 +431,15 @@ fn finalize_after_preflight(
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (root, capture, spec) = target(&tx, run)?;
-        let request = request(&capture, &root)?;
-        let body = String::from_utf8(request.encode().map_err(|_| StoreError::Invalid)?)
-            .map_err(|_| StoreError::Invalid)?;
-        let mut intent = Intent {
-            capture_id: request.capture_id.as_str().into(),
-            outcome: root.outcome.ok_or(StoreError::Invalid)?,
-            ended_at: capture
-                .group_end
-                .as_ref()
-                .ok_or(StoreError::Invalid)?
-                .observed_wall
-                .clone(),
-            intent_wall: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
-                .to_rfc3339(),
-            fingerprint: Sha256::digest(body.as_bytes()).into(),
-            context: context(&root, &capture, &spec)?,
-            body,
-        };
-        let declaration = spec.begin_request();
-        let binding = CaptureBinding::new(
-            &intent.capture_id,
-            &declaration.actor_ref,
-            &declaration.run_ref,
-        )
-        .map_err(|_| StoreError::Invalid)?;
-        if let Some(existing) = validate(&tx, &root, &capture, &spec)? {
-            if existing.confirmation.is_some() {
-                tx.commit()?;
-                drop(_phase);
-                return Ok((store, FinalizeResult::Existing(existing)));
-            }
-            intent = existing.intent;
-        } else {
-            if date(&intent.intent_wall)? < date(&intent.ended_at)? {
-                return Err(StoreError::Invalid);
-            }
-            tx.execute(
-                "INSERT INTO capture_finalizations(run,intent,revision) VALUES(?1,?2,1)",
-                (run.to_string(), json(&intent)?),
-            )?;
-            event(&tx, &root, &capture, 1, Change::Intent)?;
+        let snapshot = prepare_intent(&tx, &root, &capture, &spec)?;
+        if snapshot.confirmation.is_some() {
+            tx.commit()?;
+            drop(_phase);
+            return Ok((store, FinalizeResult::Existing(snapshot)));
         }
+        let binding = binding(&capture, &spec)?;
         tx.commit()?;
-        (spec, binding, intent)
+        (spec, binding, snapshot.intent)
     };
     before_process();
     let finish = FinishRequest {
@@ -501,6 +466,49 @@ fn finalize_after_preflight(
             },
         },
     ))
+}
+/// Pure SQL, called only with a qualified target tuple in the caller's write
+/// transaction. Shared by standalone finalization and task-finish preparation.
+pub(crate) fn prepare_intent(
+    conn: &Connection,
+    root: &RunRecord,
+    capture: &CaptureRecord,
+    spec: &CaptureSpec,
+) -> Result<Snapshot> {
+    if let Some(existing) = validate(conn, root, capture, spec)? {
+        return Ok(existing);
+    }
+    let request = request(capture, root)?;
+    let body = String::from_utf8(request.encode().map_err(|_| StoreError::Invalid)?)
+        .map_err(|_| StoreError::Invalid)?;
+    let intent = Intent {
+        capture_id: request.capture_id.as_str().into(),
+        outcome: root.outcome.ok_or(StoreError::Invalid)?,
+        ended_at: capture
+            .group_end
+            .as_ref()
+            .ok_or(StoreError::Invalid)?
+            .observed_wall
+            .clone(),
+        intent_wall: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
+            .to_rfc3339(),
+        fingerprint: Sha256::digest(body.as_bytes()).into(),
+        context: context(root, capture, spec)?,
+        body,
+    };
+    if date(&intent.intent_wall)? < date(&intent.ended_at)? {
+        return Err(StoreError::Invalid);
+    }
+    conn.execute(
+        "INSERT INTO capture_finalizations(run,intent,revision) VALUES(?1,?2,1)",
+        (root.request.identity().run.to_string(), json(&intent)?),
+    )?;
+    event(conn, root, capture, 1, Change::Intent)?;
+    Ok(Snapshot {
+        intent,
+        confirmation: None,
+        revision: 1,
+    })
 }
 fn confirm(
     store: &mut Store,

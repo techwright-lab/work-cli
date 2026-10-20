@@ -488,7 +488,7 @@ fn durable_finish_row_blocks_integrated_preflight_and_allocation_reuse_before_he
 }
 
 #[test]
-fn production_configured_capture_is_explicit_unsupported_not_off() {
+fn production_configured_capture_without_maps_is_incomplete_not_off() {
     let f = Fixture::new();
     let a = allocated(&f);
     let id = Uuid::parse_str(a["checkout"].as_str().unwrap()).unwrap();
@@ -499,7 +499,7 @@ fn production_configured_capture_is_explicit_unsupported_not_off() {
     assert_eq!(report["task_finished"], true);
     assert_eq!(report["local_freeze"], "failed");
     assert_eq!(report["delivery"], serde_json::Value::Null);
-    assert_eq!(report["reasons"][1], "capture-unsupported");
+    assert_eq!(report["reasons"][1], "capture-incomplete");
     assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
 }
 #[test]

@@ -370,7 +370,7 @@ pub(crate) fn roster(
     let rows = child_rows(
         conn,
         "WHERE group_id=?1 ORDER BY rowid LIMIT 257",
-        &root.identity().group.to_string(),
+        [root.identity().group.to_string()],
     )?;
     validate_roster(conn, root, binding, rows)
 }
@@ -383,13 +383,22 @@ impl TargetRosters {
         let rows = child_rows(
             conn,
             "WHERE group_id IN (SELECT id FROM run_groups WHERE checkout=?1) ORDER BY rowid",
-            checkout,
+            [checkout],
         )?;
+        Ok(Self::group(rows))
+    }
+    /// Authority-wide raw rosters, valid only in the caller's read snapshot.
+    /// Unlike capture-history loading this does not decode capture metadata.
+    pub(crate) fn authority(conn: &rusqlite::Connection) -> Result<Self> {
+        validate_orphans(conn)?;
+        Ok(Self::group(child_rows(conn, "ORDER BY rowid", [])?))
+    }
+    fn group(rows: Vec<ChildRow>) -> Self {
         let mut groups = std::collections::BTreeMap::<String, Vec<ChildRow>>::new();
         for row in rows {
             groups.entry(row.group.clone()).or_default().push(row);
         }
-        Ok(Self(groups))
+        Self(groups)
     }
     pub(crate) fn roster(
         &mut self,
@@ -415,10 +424,14 @@ struct ChildRow {
     depth: u8,
     host: Option<String>,
 }
-fn child_rows(conn: &rusqlite::Connection, suffix: &str, key: &str) -> Result<Vec<ChildRow>> {
+fn child_rows(
+    conn: &rusqlite::Connection,
+    suffix: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<ChildRow>> {
     let mut stmt = conn.prepare(&format!("SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth,host FROM run_participants {suffix}"))?;
     let rows = stmt
-        .query_map([key], |r| {
+        .query_map(params, |r| {
             Ok(ChildRow {
                 id: r.get(0)?,
                 group: r.get(1)?,

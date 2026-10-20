@@ -20,7 +20,7 @@ production qualification/activation and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture construction (Tasks 8.1–8.3b3b; implementation, not acceptance)
+### Capture construction (Tasks 8.1–8.4a; implementation, not acceptance)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
@@ -345,10 +345,11 @@ remain intact, and removed capture configuration cannot downgrade a permanent re
 Each related captured-history traversal uses one structural child-ledger check and batched
 target rosters in its read snapshot, retaining strict root/capture/finalization validation within unchanged
 SQL budgets. Validated history is not cached across I/O, mutations or locked transactions.
-For a new task-finish receipt, absent current capture selection plus a permanent requirement
-or any capture-history row refuses before task completion; the fence is rechecked in the
-IMMEDIATE transaction. Historical finish receipts still replay, and currently configured
-unsupported capture retains its existing honest incomplete-capture behavior.
+The generic no-sink library finish path still refuses new completion when current selection
+is absent but a permanent requirement or any capture-history row exists. Production explicit
+finish instead reconciles that obligation using original per-run settings, as described below.
+Authority-wide finish roster preflight batches raw child rows within its read snapshot and
+retains every root/child check without parsing unrelated capture JSON.
 
 Certification persists an already **committed** Ready result across CLI processes; it cannot
 recover lost/uncommitted live handles or automatically unhold a checkout. It is passive
@@ -357,8 +358,8 @@ Reports keep observed process exit/root outcome, group closure, local freeze, de
 durable readiness, task openness and retained charge separate. Reported readiness is an
 observation, not fresh physical proof or permission to launch.
 
-Captured adopted execution, explicit attribution-off, captured explicit task finish, full
-operator recovery, privacy qualification and real private-CLI/HTTP contract qualification
+Captured adopted execution, explicit attribution-off, full operator recovery,
+privacy qualification and real private-CLI/HTTP contract qualification
 remain deferred. Existing credential filtering and bounded public-JSON interoperability are
 not a claim that those later reviews are complete. No installation, host-policy changes,
 live manager/receiver test or production activation is implied by this implementation.
@@ -597,21 +598,40 @@ Task completion is separate from run completion. Historical status and finished-
 retry receipts derive task openness from the same snapshot as run/accounting metadata;
 finished retries require no original actor Git profile or runtime.
 
-No sink is a valid completion (exit 0). Configured capture for this explicit task-finish
-command remains unsupported: completion remains durable, local freeze is Failed, evidence is incomplete,
-and the sanitized held report exits nonzero. Configured capture never silently becomes
-no-sink. A trusted library-only `LocalSink` seam supports future local capture; it is
-not selected from CLI/environment/plugins and grants no receiver/network authority.
-Local freeze runs only **after** the durable completion fence, outside SQL transactions
-and the lifecycle flock. Local Frozen/Failed and delivery Pending/Delivered/Failed are
-separate: no delivery queue/session is invented. Pending/Failed retries can call an
-explicit local sink only with the original binding and Work-owned idempotency key;
-Frozen never refreezes. Changed configuration returns stored evidence, never retargets it.
-No raw sink URI, prompt or environment is persisted. A second exact-context transaction
-records the capture result without another task-completion event.
+No sink is a valid completion (exit 0) only without current selection, permanent requirement
+or captured history. Genuine historical NotConfigured receipts never upgrade or rebind.
+Production finish uses a private integrated policy; the trusted library-only `LocalSink`
+seam retains its separate binding/callback guards. No public bypass selector is introduced.
+
+Captured completion also accepts previously-Ready allocation JSON held after closed groups,
+not incomplete creation, open/adopted/orphan writers or unrelated holds. Actual source,
+marker, registration, branch, directory and HEAD-descent inspection occurs outside SQL and
+lifecycle flock. The original two-second observation lifetime and exact allocation/current
+owner/requirement/history snapshot are checked after locking and near commit. Descendant
+HEAD refresh commits with the task fence; no temporary Ready state or writer is granted.
+
+TaskFinished commits **first**. While still holding the lifecycle lock, a shared pure-SQL
+helper prepares every known per-root FINISH intent. Intent failure does not undo task truth.
+All SQL phases and lifecycle flock end before capture processes run. Confirmed roots are
+passive; unconfirmed roots use the exact original capture ID, terminal outcome/end and sealed
+settings, even after current selection/profile/registry removal. Lost responses leave local
+Pending with per-run Unconfirmed observations; retries replay FINISH, never RETRY to establish
+freeze. Unknown outcome/clock, missing maps, zero maps or family mismatch remain incomplete,
+without guessing outcomes or inventing sessions. Frozen requires at least one map and every
+root locally confirmed; delivery is Pending if any confirmed root remains pending.
+
+Frozen task receipts never refreeze or implicitly retry delivery. Historical configured
+Unsupported/Failed receipts may reconcile genuine original maps, but cannot retroactively
+begin capture. Receipt v1 fields and exact case-sensitive capture-binding hashes are unchanged;
+there is no schema migration or historical backfill. Capture-result persistence failures retain
+the already committed task fence and recorded receipt. Raw JSON, stderr, credentials, prompts
+and argv are not included in finish observations or errors.
 
 Reports distinguish task completion, unchanged run outcomes, local freeze/delivery,
 incomplete evidence, held lease, retained charge and retirement `disabled`/action `none`.
+Top-level freeze/delivery describe the recorded task receipt; each `run_outcomes[].capture`
+is a current passive per-run observation. A later explicit delivery reconciliation can
+therefore show Delivered per run while the immutable Frozen task receipt still says Pending.
 Retries return the same durable operation after lost acknowledgements. Allocation
 recovery/start and writer APIs cannot reopen the fence; finish IDs stay reserved across
 allocation, root/adopted/child and legacy-writer namespaces. Dirty/untracked no-sink

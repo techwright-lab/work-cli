@@ -1088,7 +1088,7 @@ mod tests {
             .unwrap());
     }
     #[test]
-    fn certified_ready_finish_refuses_removed_capture_selection_without_mutation() {
+    fn generic_ready_finish_refuses_removed_capture_selection_without_mutation() {
         let (_temp, mut cfg, store, a, _root, seal, ack) = closed();
         restore(&cfg, seal, ack).unwrap();
         cfg.allocation.as_mut().unwrap().capture_sink = None;
@@ -1121,7 +1121,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let before = snapshot();
-        let result = crate::finish::finish(&cfg, a.checkout);
+        let result = crate::finish::finish_with_sink_observed(&cfg, a.checkout, None, |_| {});
         assert!(
             result.is_err(),
             "durable captured finish must be refused, got {result:?}"
@@ -1133,13 +1133,15 @@ mod tests {
     fn historical_captured_finish_receipt_survives_removed_selection() {
         let (_temp, mut cfg, store, a, _root, seal, ack) = closed();
         restore(&cfg, seal, ack).unwrap();
-        let original = crate::finish::finish(&cfg, a.checkout).unwrap();
+        let original =
+            crate::finish::finish_with_sink_observed(&cfg, a.checkout, None, |_| {}).unwrap();
         assert!(original.task_finished);
         assert!(original.capture_incomplete);
         cfg.allocation.as_mut().unwrap().capture_sink = None;
         let replay = crate::finish::finish(&cfg, a.checkout).unwrap();
         assert_eq!(original.operation, replay.operation);
-        assert!(replay.capture_incomplete);
+        assert!(!replay.capture_incomplete);
+        assert_eq!(replay.local_freeze, crate::finish::Freeze::Frozen);
         assert_eq!(
             store
                 .conn
@@ -1151,6 +1153,127 @@ mod tests {
     }
     #[test]
     fn many_closed_captured_roots_with_terminal_children_fit_sql_budget() {
+        many_closed_history(|cfg, _store, a, original| {
+            let next = next_root(original);
+            let spec = cfg
+                .capture_spec(&next, a, uuid::Uuid::now_v7(), vec!["task".into()], None)
+                .unwrap();
+            let result = crate::capture_setup::begin(cfg, &next, &spec);
+            assert!(
+                result.is_ok(),
+                "large-history admission: {:?}",
+                result.as_ref().err()
+            );
+        });
+    }
+    #[test]
+    fn captured_finish_many_roots_preserves_shared_sql_budgets() {
+        many_closed_history(|cfg, _store, a, _original| {
+            Store::open_finish_authority(
+                cfg.trusted_registry.as_ref().unwrap(),
+                cfg.store_dir.as_ref().unwrap(),
+                &cfg.roots,
+            )
+            .expect("bounded finish authority preflight");
+            let report =
+                crate::finish::finish(cfg, a.checkout).expect("bounded all-root completion");
+            assert!(report.task_finished);
+            assert_eq!(report.local_freeze, crate::finish::Freeze::Frozen);
+        });
+    }
+    #[test]
+    fn captured_finish_prepares_all_intents_before_any_producer() {
+        many_closed_history(|cfg, store, a, _| {
+            store
+                .conn
+                .execute("DELETE FROM capture_finalizations", [])
+                .unwrap();
+            let producer = &cfg.capture.as_ref().unwrap().executable;
+            std::fs::write(producer, format!(r#"#!/usr/bin/python3
+import sqlite3,json,sys
+r=json.load(sys.stdin)
+c=sqlite3.connect({database:?})
+assert c.execute('SELECT count(*) FROM task_finishes').fetchone()[0]==1
+assert c.execute('SELECT count(*) FROM capture_finalizations').fetchone()[0]==c.execute('SELECT count(*) FROM capture_runs').fetchone()[0]
+p=json.loads(c.execute("SELECT prepared FROM capture_runs WHERE json_extract(prepared,'$.capture_id')=?",(r['capture_id'],)).fetchone()[0])
+json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p['run_ref'],'state':'pending'}},sys.stdout)
+"#, database=cfg.store_dir.as_ref().unwrap().join("store.sqlite"))).unwrap();
+            let report = crate::finish::finish(cfg, a.checkout).unwrap();
+            assert_eq!(report.local_freeze, crate::finish::Freeze::Frozen);
+        });
+    }
+    #[test]
+    fn missing_capture_remains_failed_even_when_another_finish_is_uncertain() {
+        many_closed_history(|cfg, store, a, original| {
+            let run: String = store
+                .conn
+                .query_row(
+                    "SELECT run FROM capture_runs WHERE run<>?1 LIMIT 1",
+                    [original.identity().run.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM capture_finalizations WHERE run=?1", [&run])
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM capture_runs WHERE run=?1", [&run])
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE capture_finalizations SET confirmation=NULL,revision=1",
+                    [],
+                )
+                .unwrap();
+            std::fs::write(
+                &cfg.capture.as_ref().unwrap().executable,
+                "#!/bin/sh\nexit 1\n",
+            )
+            .unwrap();
+            let report = crate::finish::finish(cfg, a.checkout).unwrap();
+            assert!(report.task_finished);
+            assert_eq!(report.local_freeze, crate::finish::Freeze::Failed);
+        });
+    }
+    #[test]
+    fn captured_finish_counts_closed_roots_without_maps() {
+        many_closed_history(|cfg, store, a, original| {
+            let run: String = store
+                .conn
+                .query_row(
+                    "SELECT run FROM capture_runs WHERE run<>?1 LIMIT 1",
+                    [original.identity().run.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM capture_finalizations WHERE run=?1", [&run])
+                .unwrap();
+            store
+                .conn
+                .execute("DELETE FROM capture_runs WHERE run=?1", [&run])
+                .unwrap();
+            let report = crate::finish::finish(cfg, a.checkout).unwrap();
+            assert!(report.task_finished && report.capture_incomplete);
+            assert_eq!(report.local_freeze, crate::finish::Freeze::Failed);
+            assert!(report
+                .run_outcomes
+                .iter()
+                .any(|r| r.capture == crate::finish::RunCapture::Missing));
+        });
+    }
+    fn many_closed_history(
+        mut completed: impl FnMut(
+            &crate::config::Config,
+            &Store,
+            &crate::allocate::Allocation,
+            &crate::run_journal::RootRunRequest,
+        ),
+    ) {
         use crate::capture_journal::json;
         use crate::run_participants::{ChildRequest, EnrollmentRecord, ExpectedHost, HostSnapshot};
         for count in [2, 48] {
@@ -1362,16 +1485,7 @@ mod tests {
                 let _phase = store.sql_phase();
                 guard_certified_identity(&store.conn, a.checkout).unwrap();
             }
-            let next = next_root(&original);
-            let spec = cfg
-                .capture_spec(&next, &a, uuid::Uuid::now_v7(), vec!["task".into()], None)
-                .unwrap();
-            let result = crate::capture_setup::begin(&cfg, &next, &spec);
-            assert!(
-                result.is_ok(),
-                "large-history admission: {:?}",
-                result.as_ref().err()
-            );
+            completed(&cfg, &store, &a, &original);
         }
     }
     fn git_at(a: &crate::allocate::Allocation, args: &[&str]) -> String {

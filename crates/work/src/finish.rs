@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+#[path = "capture_finish.rs"]
+mod captured;
+
 pub(crate) const SCHEMA: &str = "CREATE TABLE task_finishes(
  checkout TEXT PRIMARY KEY REFERENCES checkouts(id), operation TEXT NOT NULL UNIQUE,
  record TEXT NOT NULL); PRAGMA user_version=9;";
@@ -49,6 +52,18 @@ struct Receipt {
 pub struct RunOutcome {
     pub run: work_contract::RunId,
     pub outcome: Option<crate::run_journal::RootOutcome>,
+    /// Current passive per-run observation, not the recorded task receipt.
+    pub capture: RunCapture,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum RunCapture {
+    Missing,
+    UnknownOutcome,
+    UncertainClock,
+    Incomplete,
+    Unconfirmed,
+    Frozen { delivery: Delivery },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Report {
@@ -306,7 +321,11 @@ pub struct CaptureContext {
 }
 #[derive(Debug, Clone)]
 pub enum CaptureResult {
-    Frozen { delivery: Option<Delivery> },
+    Frozen {
+        delivery: Option<Delivery>,
+    },
+    /// Local FINISH was attempted but durable confirmation is uncertain.
+    Pending,
     Failed,
 }
 /// Boundary observer grants no policy or authority; intended for crash qualification.
@@ -314,6 +333,18 @@ pub fn finish_with_sink_observed(
     config: &Config,
     checkout: Uuid,
     sink: Option<&dyn LocalSink>,
+    boundary: impl FnMut(&str),
+) -> Result<Report> {
+    finish_internal(config, checkout, Mode::Library(sink), boundary)
+}
+enum Mode<'a> {
+    Library(Option<&'a dyn LocalSink>),
+    Integrated,
+}
+fn finish_internal(
+    config: &Config,
+    checkout: Uuid,
+    mode: Mode<'_>,
     mut boundary: impl FnMut(&str),
 ) -> Result<Report> {
     uuid7(checkout)?;
@@ -323,18 +354,53 @@ pub fn finish_with_sink_observed(
         .as_deref()
         .ok_or(StoreError::Unsafe)?;
     let mut store = Store::open_finish_authority(registry, dir, &config.roots)?;
+    let integrated = matches!(mode, Mode::Integrated);
+    let captured_new = {
+        let _phase = store.sql_phase();
+        integrated
+            && load(&store.conn, checkout)?.is_none()
+            && crate::capture_journal::unresolved_checkout(&store.conn, checkout)?
+    };
+    let proof = if captured_new {
+        Some(captured::Completion::inspect(&store, checkout)?)
+    } else {
+        None
+    };
     let lock = allocate::lifecycle_lock(dir)?;
-    let receipt = prepare(config, &mut store, checkout, &mut boundary)?;
+    let receipt = prepare(
+        config,
+        &mut store,
+        checkout,
+        &mode,
+        proof.as_ref(),
+        &mut boundary,
+    )?;
+    let compatible = receipt.capture_binding == digest(json(&Some("devdiary"))?);
+    let capture_ready = !integrated
+        || (compatible
+            && (!matches!(receipt.local_freeze, Freeze::Pending | Freeze::Failed)
+                || captured::intents(&mut store, checkout).is_ok()));
     drop(lock);
+    let adapter = CapturedFinish { config };
+    let sink: Option<&dyn LocalSink> = match mode {
+        Mode::Library(sink) => sink,
+        Mode::Integrated if capture_ready => Some(&adapter),
+        Mode::Integrated => None,
+    };
     boundary("completion_committed");
-    let configured = config
-        .allocation
-        .as_ref()
-        .and_then(|a| a.capture_sink.as_ref());
+    let configured = if integrated {
+        Some("devdiary")
+    } else {
+        config
+            .allocation
+            .as_ref()
+            .and_then(|a| a.capture_sink.as_deref())
+    };
     let receipt = if matches!(receipt.local_freeze, Freeze::Pending | Freeze::Failed)
-        && configured.is_some()
-        && receipt.capture_binding == digest(json(&configured)?)
-        && (sink.is_some() || receipt.local_freeze == Freeze::Pending)
+        && (integrated
+            || (configured.is_some()
+                && receipt.capture_binding == digest(json(&configured)?)
+                && (sink.is_some() || receipt.local_freeze == Freeze::Pending)))
     {
         boundary("before_freeze");
         let result = sink.map(|s| {
@@ -347,6 +413,11 @@ pub fn finish_with_sink_observed(
         boundary("external_frozen");
         let mut updated = receipt.clone();
         match result {
+            Some(CaptureResult::Pending) => {
+                updated.local_freeze = Freeze::Pending;
+                updated.delivery = None;
+                updated.reason = None;
+            }
             Some(CaptureResult::Frozen { delivery })
                 if delivery != Some(Delivery::NotConfigured) =>
             {
@@ -358,7 +429,7 @@ pub fn finish_with_sink_observed(
                 updated.local_freeze = Freeze::Failed;
                 updated.delivery = None;
                 updated.reason = Some(
-                    if sink.is_some() {
+                    if integrated || sink.is_some() {
                         "capture-incomplete"
                     } else {
                         "capture-unsupported"
@@ -367,7 +438,7 @@ pub fn finish_with_sink_observed(
                 );
             }
         }
-        {
+        let persisted = (|| -> Result<()> {
             let _phase = store.sql_phase();
             let tx = store
                 .conn
@@ -394,8 +465,13 @@ pub fn finish_with_sink_observed(
                 )?;
             }
             tx.commit()?;
+            Ok(())
+        })();
+        match persisted {
+            Ok(()) => boundary("outcome_committed"),
+            Err(StoreError::Database(_)) if integrated => updated = receipt.clone(),
+            Err(error) => return Err(error),
         }
-        boundary("outcome_committed");
         updated
     } else {
         receipt
@@ -411,21 +487,151 @@ pub fn finish_with_sink_observed(
     let ids = stmt
         .query_map([checkout.to_string()], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut captured =
+        crate::run_journal::with_capture_history(&store.conn, checkout, |history| {
+            Ok(history
+                .into_iter()
+                .map(|(root, (capture, _, frozen))| {
+                    let observation = if root.outcome.is_none() {
+                        RunCapture::UnknownOutcome
+                    } else if capture
+                        .group_end
+                        .as_ref()
+                        .is_some_and(|e| e.clock_uncertain)
+                    {
+                        RunCapture::UncertainClock
+                    } else {
+                        match frozen {
+                            Some(s) => match s.confirmation {
+                                Some(c) => RunCapture::Frozen {
+                                    delivery: if c.delivered {
+                                        Delivery::Delivered
+                                    } else {
+                                        Delivery::Pending
+                                    },
+                                },
+                                None => RunCapture::Unconfirmed,
+                            },
+                            None => RunCapture::Incomplete,
+                        }
+                    };
+                    (
+                        root.request.identity().run.to_string(),
+                        (root.outcome, observation),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>())
+        })?;
     let mut outcomes = Vec::new();
     for id in ids {
         let run = work_contract::RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
-        let (record, _, _) = store.run_status_record(&run)?;
+        let (outcome, capture) = if let Some(pair) = captured.remove(&id) {
+            pair
+        } else {
+            // load() already validated task truth and every root/roster in this
+            // same snapshot. Do not recursively reload that task receipt via
+            // run_status_record for each unmapped root.
+            let record = crate::run_journal::read(&store.conn, &run)?.ok_or(StoreError::Invalid)?;
+            (record.outcome, RunCapture::Missing)
+        };
         outcomes.push(RunOutcome {
             run,
-            outcome: record.outcome,
+            outcome,
+            capture,
         });
     }
     Ok(report(current, outcomes))
 }
-/// Production has no local capture implementation. Configured capture is an
-/// honest unsupported failure, never silently an attribution-off bypass.
+/// Explicit completion observes original per-run capture facts, independently
+/// of task completion and without delivery retries.
 pub fn finish(config: &Config, checkout: Uuid) -> Result<Report> {
-    finish_with_sink_observed(config, checkout, None, |_| {})
+    finish_internal(config, checkout, Mode::Integrated, |_| {})
+}
+struct CapturedFinish<'a> {
+    config: &'a Config,
+}
+impl LocalSink for CapturedFinish<'_> {
+    fn freeze(&self, context: &CaptureContext) -> CaptureResult {
+        match self.observe(context.checkout) {
+            Ok(result) => result,
+            Err(StoreError::CaptureFinishUncertain) => CaptureResult::Pending,
+            Err(_) => CaptureResult::Failed,
+        }
+    }
+}
+impl CapturedFinish<'_> {
+    fn observe(&self, checkout: Uuid) -> Result<CaptureResult> {
+        let store = Store::open_existing_registered_mut(
+            self.config
+                .trusted_registry
+                .as_deref()
+                .ok_or(StoreError::Invalid)?,
+            self.config
+                .store_dir
+                .as_deref()
+                .ok_or(StoreError::Invalid)?,
+            &self.config.roots,
+        )?;
+        let runs = {
+            let _phase = store.sql_phase();
+            crate::run_journal::with_capture_history(&store.conn, checkout, |history| {
+                Ok(history
+                    .into_iter()
+                    .filter(|(r, (c, _, f))| {
+                        r.outcome.is_some()
+                            && c.group_end.as_ref().is_some_and(|e| !e.clock_uncertain)
+                            && f.as_ref().is_some_and(|s| s.confirmation.is_none())
+                    })
+                    .map(|(r, _)| r.request.identity().run.clone())
+                    .collect::<Vec<_>>())
+            })?
+        };
+        let mut uncertain = false;
+        let mut refused = false;
+        for run in runs {
+            match crate::capture_finalization::finalize(self.config, &run) {
+                Ok(_) => {}
+                Err(StoreError::CaptureFinishUncertain) => uncertain = true,
+                Err(_) => refused = true,
+            }
+        }
+        let _phase = store.sql_phase();
+        let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
+        let total: i64 = store.conn.query_row(
+            "SELECT count(*) FROM run_groups WHERE checkout=?1",
+            [checkout.to_string()],
+            |r| r.get(0),
+        )?;
+        crate::run_journal::with_capture_history(&store.conn, checkout, |history| {
+            if refused
+                || history.is_empty()
+                || history.len() as i64 != total
+                || history.iter().any(|(r, (c, _, _))| {
+                    r.outcome.is_none() || c.group_end.as_ref().is_none_or(|e| e.clock_uncertain)
+                })
+            {
+                return Ok(CaptureResult::Failed);
+            }
+            let mut delivered = true;
+            for (_, (_, _, frozen)) in history {
+                let Some(confirmation) = frozen.and_then(|f| f.confirmation) else {
+                    return Ok(if uncertain {
+                        CaptureResult::Pending
+                    } else {
+                        CaptureResult::Failed
+                    });
+                };
+                delivered &= confirmation.delivered;
+            }
+            Ok(CaptureResult::Frozen {
+                delivery: Some(if delivered {
+                    Delivery::Delivered
+                } else {
+                    Delivery::Pending
+                }),
+            })
+        })
+    }
 }
 fn guard_unconfigured_capture(conn: &Connection, checkout: Uuid) -> Result<()> {
     if crate::capture_requirement::present(conn, checkout)?
@@ -439,15 +645,30 @@ fn prepare(
     config: &Config,
     store: &mut Store,
     checkout: Uuid,
+    mode: &Mode<'_>,
+    proof: Option<&captured::Completion>,
     boundary: &mut impl FnMut(&str),
 ) -> Result<Receipt> {
-    let configured = config
-        .allocation
-        .as_ref()
-        .and_then(|a| a.capture_sink.as_ref());
+    let configured = {
+        let _phase = store.sql_phase();
+        let current = config
+            .allocation
+            .as_ref()
+            .and_then(|a| a.capture_sink.clone());
+        if matches!(mode, Mode::Integrated)
+            && current.is_none()
+            && (crate::capture_requirement::present(&store.conn, checkout)?
+                || crate::capture_journal::unresolved_checkout(&store.conn, checkout)?)
+        {
+            Some("devdiary".to_owned())
+        } else {
+            current
+        }
+    };
     let guard_capture = |conn: &Connection| -> Result<()> {
         // Current configuration cannot erase durable attribution obligations.
-        // Captured task finish is deferred; historical receipts remain replayable.
+        // Only the integrated path derives a family from durable obligations;
+        // generic no-sink callers cannot bypass the raw presence fence.
         if configured.is_none() {
             guard_unconfigured_capture(conn, checkout)?;
         }
@@ -459,9 +680,17 @@ fn prepare(
             return Ok(r);
         }
         guard_capture(&store.conn)?;
-        eligible(&store.conn, checkout)?;
+        if let Some(proof) = proof {
+            proof.validate(&store.conn)?;
+        } else {
+            eligible(&store.conn, checkout)?;
+        }
     }
-    let a = allocate::verified_checkout(store, checkout).map_err(|_| StoreError::Invalid)?;
+    let a = if let Some(proof) = proof {
+        proof.allocation()
+    } else {
+        allocate::verified_checkout(store, checkout).map_err(|_| StoreError::Invalid)?
+    };
     let operation = Uuid::now_v7();
     let receipt = Receipt {
         version: 1,
@@ -490,7 +719,15 @@ fn prepare(
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         guard_capture(&tx)?;
-        eligible(&tx, checkout)?;
+        if let Some(proof) = proof {
+            proof.validate(&tx)?;
+            tx.execute(
+                "UPDATE allocations SET record=?2 WHERE checkout=?1",
+                (checkout.to_string(), json(&a)?),
+            )?;
+        } else {
+            eligible(&tx, checkout)?;
+        }
         crate::store::exclude_journal_identity(&tx, operation)?;
         let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)",[operation.to_string()],|r|r.get(0))?;
         if collision {
@@ -517,12 +754,429 @@ fn prepare(
             },
         )?;
         boundary("before_commit");
+        if let Some(proof) = proof {
+            proof.fresh()?;
+        }
         tx.commit()?;
     }
     Ok(receipt)
 }
 #[cfg(test)]
 mod tests {
+    fn closed_capture() -> (
+        tempfile::TempDir,
+        crate::config::Config,
+        crate::allocate::Allocation,
+        crate::run_journal::RootRunRequest,
+        crate::capture_readiness::ClosureSeal,
+    ) {
+        let (temp, cfg, a, root, seal) = closed_capture_case("known");
+        (temp, cfg, a, root, seal.unwrap())
+    }
+    fn closed_capture_case(
+        case: &str,
+    ) -> (
+        tempfile::TempDir,
+        crate::config::Config,
+        crate::allocate::Allocation,
+        crate::run_journal::RootRunRequest,
+        Option<crate::capture_readiness::ClosureSeal>,
+    ) {
+        let (temp, mut cfg, a, root, mut spec) =
+            crate::capture_preparation::tests::qualified_fixture();
+        if case == "delay" {
+            cfg.capture.as_mut().unwrap().timeout_ms = 2000;
+            spec = cfg
+                .capture_spec(&root, &a, spec.operation(), vec!["task".into()], None)
+                .unwrap();
+        }
+        let (mut store, crate::capture_preparation::PreparationResult::Live(live)) =
+            crate::capture_preparation::prepare(&cfg, &root, &spec).unwrap()
+        else {
+            panic!("live");
+        };
+        let binding = crate::test_run_fixture::binding(&root);
+        store.record_bound(&root, &binding).unwrap();
+        store.record_permit_attempt(&root, &binding).unwrap();
+        if case != "unknown" {
+            store
+                .record_root_outcome(&root, crate::run_journal::RootOutcome::Completed)
+                .unwrap();
+        }
+        if case == "clock" {
+            store.conn.execute("UPDATE capture_runs SET intent_wall='2999-01-01T00:00:00+00:00',prepared=json_set(prepared,'$.observed_wall','2999-01-01T00:00:00+00:00')", []).unwrap();
+        }
+        let os = crate::test_run_fixture::ClosureOs::new(&root, &binding);
+        let snapshot = store.group_snapshot(&root.identity().run).unwrap();
+        let proof = snapshot.certify_empty(&os.driver, &binding).unwrap();
+        let (_, seal) = store.close_live_capture(&snapshot, &proof, &live).unwrap();
+        let declaration = spec.begin_request();
+        std::fs::write(temp.path().join("response"), serde_json::to_vec(&serde_json::json!({"state":"pending","capture_id":"550e8400-e29b-41d4-a716-446655440001","actor_ref":declaration.actor_ref,"run_ref":declaration.run_ref})).unwrap()).unwrap();
+        (temp, cfg, a, root, seal)
+    }
+    #[test]
+    fn capture_delay_runs_outside_sql_and_lifecycle_lock() {
+        let (temp, cfg, a, _, _) = closed_capture_case("delay");
+        let dir = cfg.store_dir.as_ref().unwrap();
+        let signal = temp.path().join("capturing");
+        let progressed = temp.path().join("progressed");
+        std::fs::write(
+            temp.path().join("producer"),
+            format!(
+                r#"#!/usr/bin/python3
+import json,sys,time,sqlite3,fcntl,os
+json.load(sys.stdin)
+c=sqlite3.connect({database:?},timeout=0)
+c.execute('BEGIN IMMEDIATE');c.rollback()
+f=open({lock:?},'r+');fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB);f.close()
+open({signal:?},'w').close()
+time.sleep(0.65)
+end=time.monotonic()+1
+while not os.path.exists({progressed:?}) and time.monotonic()<end: time.sleep(.005)
+assert os.path.exists({progressed:?})
+json.dump(json.load(open({response:?})),sys.stdout)
+"#,
+                database = dir.join("store.sqlite"),
+                lock = dir.join("allocation.lock"),
+                response = temp.path().join("response")
+            ),
+        )
+        .unwrap();
+        let mut other_cfg = cfg.clone();
+        other_cfg.allocation.as_mut().unwrap().capture_sink = None;
+        let mut request = a.request.clone();
+        request.operation = uuid::Uuid::now_v7();
+        request.task = "independent".into();
+        request.branch = Some("independent".into());
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !signal.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(signal.exists());
+            crate::allocate::start(&other_cfg, request).unwrap();
+            std::fs::write(progressed, "ready").unwrap();
+        });
+        let report = super::finish(&cfg, a.checkout).unwrap();
+        worker.join().unwrap();
+        assert_eq!(report.local_freeze, super::Freeze::Frozen);
+        assert!(report.task_finished);
+    }
+    #[test]
+    fn late_completion_context_change_refuses_fence() {
+        use super::*;
+        for change in [
+            "owner",
+            "requirement",
+            "hold",
+            "root",
+            "expired",
+            "near_commit",
+        ] {
+            let (_temp, cfg, a, _, _) = closed_capture();
+            let mut store = Store::open_finish_authority(
+                cfg.trusted_registry.as_ref().unwrap(),
+                cfg.store_dir.as_ref().unwrap(),
+                &cfg.roots,
+            )
+            .unwrap();
+            let proof = captured::Completion::inspect(&store, a.checkout).unwrap();
+            match change {
+                "owner" => {
+                    store
+                        .conn
+                        .execute("UPDATE checkouts SET owner='changed'", [])
+                        .unwrap();
+                }
+                "requirement" => {
+                    store
+                        .conn
+                        .execute("UPDATE capture_requirements SET revision=revision+1", [])
+                        .unwrap();
+                }
+                "hold" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE allocations SET record=json_set(record,'$.reason','unrelated')",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "root" => {
+                    store
+                        .conn
+                        .execute("UPDATE runs SET outcome='\"failed\"'", [])
+                        .unwrap();
+                }
+                "expired" => std::thread::sleep(std::time::Duration::from_millis(2100)),
+                _ => {}
+            }
+            let _lock = allocate::lifecycle_lock(cfg.store_dir.as_ref().unwrap()).unwrap();
+            let result = prepare(
+                &cfg,
+                &mut store,
+                a.checkout,
+                &Mode::Integrated,
+                Some(&proof),
+                &mut |boundary| {
+                    if change == "near_commit" && boundary == "before_commit" {
+                        std::thread::sleep(std::time::Duration::from_millis(2100));
+                    }
+                },
+            );
+            assert!(result.is_err(), "{change}");
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(!store
+                .conn
+                .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
+                .unwrap());
+        }
+    }
+    #[test]
+    fn captured_finish_refuses_changed_physical_identity() {
+        for damage in ["marker", "branch", "source", "head"] {
+            let (_temp, cfg, a, _, _) = closed_capture();
+            let sql =
+                rusqlite::Connection::open(cfg.store_dir.as_ref().unwrap().join("store.sqlite"))
+                    .unwrap();
+            let stored: String = sql
+                .query_row("SELECT record FROM allocations", [], |r| r.get(0))
+                .unwrap();
+            let current: crate::allocate::Allocation = serde_json::from_str(&stored).unwrap();
+            match damage {
+                "marker" => std::fs::write(
+                    current
+                        .identity
+                        .as_ref()
+                        .unwrap()
+                        .private_git_dir
+                        .join("work-lease.json"),
+                    "{}",
+                )
+                .unwrap(),
+                "branch" => {
+                    assert!(std::process::Command::new("git")
+                        .current_dir(&a.destination)
+                        .args(["symbolic-ref", "HEAD", "refs/heads/missing"])
+                        .status()
+                        .unwrap()
+                        .success());
+                }
+                "source" => {
+                    sql.execute("UPDATE allocations SET request=json_set(request,'$.repository','/missing'),record=json_set(record,'$.request.repository','/missing')", []).unwrap();
+                }
+                "head" => {
+                    sql.execute(
+                        "UPDATE allocations SET record=json_set(record,'$.identity.head',?1)",
+                        ["a".repeat(40)],
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(super::finish(&cfg, a.checkout).is_err(), "{damage}");
+            assert_eq!(
+                sql.query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+    #[test]
+    fn binding_hashes_preserve_v1_exact_case_and_none() {
+        use super::*;
+        for (value, expected) in [
+            (
+                None,
+                "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+            ),
+            (
+                Some("devdiary"),
+                "ecb54e4a7d60dfeb3d4eeb764e8b362c822591c8586f8bf34c3dbc223cf4160a",
+            ),
+            (
+                Some("DevDiary"),
+                "98c0315c339d2c070ef569c41aba8d9592d0cb968d54aa37abb2feb6df71ded0",
+            ),
+        ] {
+            let actual = digest(json(&value).unwrap())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            assert_eq!(actual, expected);
+        }
+    }
+    #[test]
+    fn historical_frozen_never_refreezes() {
+        let (temp, mut cfg, a, root, _) = closed_capture();
+        let first = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(first.delivery, Some(super::Delivery::Pending));
+        let sql = rusqlite::Connection::open(cfg.store_dir.as_ref().unwrap().join("store.sqlite"))
+            .unwrap();
+        let before: String = sql
+            .query_row("SELECT record FROM task_finishes", [], |r| r.get(0))
+            .unwrap();
+        let mut response: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("response")).unwrap()).unwrap();
+        response["state"] = "delivered".into();
+        response["receipt"] = serde_json::json!({"actor_ref":response["actor_ref"],"run_ref":response["run_ref"],"event_id":"event:fixture","session_id":42});
+        std::fs::write(temp.path().join("response"), response.to_string()).unwrap();
+        crate::capture_finalization::retry_delivery(&cfg, &root.identity().run).unwrap();
+        std::fs::remove_file(temp.path().join("producer")).unwrap();
+        std::fs::remove_file(temp.path().join("actors.json")).unwrap();
+        cfg.capture = None;
+        cfg.supervisor = None;
+        cfg.allocation.as_mut().unwrap().capture_sink = None;
+        let replay = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(replay.operation, first.operation);
+        assert_eq!(replay.delivery, Some(super::Delivery::Pending));
+        assert_eq!(
+            replay.run_outcomes[0].capture,
+            super::RunCapture::Frozen {
+                delivery: super::Delivery::Delivered
+            }
+        );
+        assert_eq!(
+            before,
+            sql.query_row("SELECT record FROM task_finishes", [], |r| r
+                .get::<_, String>(0))
+                .unwrap()
+        );
+    }
+    #[test]
+    fn capture_outbox_fault_never_hides_committed_task_truth() {
+        for event in ["capture_finalization_changed", "finish_capture_result"] {
+            let (_temp, cfg, a, _, _) = closed_capture();
+            let sql =
+                rusqlite::Connection::open(cfg.store_dir.as_ref().unwrap().join("store.sqlite"))
+                    .unwrap();
+            sql.execute_batch(&format!("CREATE TRIGGER fail_capture BEFORE INSERT ON outbox WHEN json_extract(NEW.payload,'$.type')='{event}' BEGIN SELECT RAISE(FAIL,'injected'); END;")).unwrap();
+            let report = super::finish(&cfg, a.checkout)
+                .expect("known task completion survives capture outbox fault");
+            assert!(report.task_finished && report.charge_retained && report.capture_incomplete);
+            assert_eq!(
+                sql.query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn family_mismatch_is_incomplete_without_calling_sealed_producer() {
+        let (temp, mut cfg, a, _, _) = closed_capture();
+        cfg.allocation.as_mut().unwrap().capture_sink = Some("DevDiary".into());
+        std::fs::remove_file(temp.path().join("producer")).unwrap();
+        let report = super::finish(&cfg, a.checkout).unwrap();
+        assert!(report.task_finished);
+        assert_eq!(report.local_freeze, super::Freeze::Failed);
+        let sql = rusqlite::Connection::open(cfg.store_dir.as_ref().unwrap().join("store.sqlite"))
+            .unwrap();
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM capture_finalizations", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn unknown_outcome_or_clock_finishes_task_but_never_invents_capture() {
+        for case in ["unknown", "clock"] {
+            let (temp, cfg, a, _root, _) = closed_capture_case(case);
+            std::fs::remove_file(temp.path().join("producer")).unwrap();
+            let report = super::finish(&cfg, a.checkout).unwrap();
+            assert!(report.task_finished && report.capture_incomplete);
+            assert_eq!(report.local_freeze, super::Freeze::Failed);
+            assert_eq!(report.run_outcomes[0].outcome.is_none(), case == "unknown");
+            let wire = serde_json::to_value(report).unwrap();
+            assert_eq!(
+                wire["run_outcomes"][0]["capture"]["state"],
+                if case == "unknown" {
+                    "unknown_outcome"
+                } else {
+                    "uncertain_clock"
+                }
+            );
+        }
+    }
+    #[test]
+    fn lost_finish_reply_replays_exact_intent_without_reexecuting_actor() {
+        let (temp, mut cfg, a, root, _seal) = closed_capture();
+        std::fs::write(temp.path().join("producer"), "#!/bin/sh\nexit 1\n").unwrap();
+        let first = super::finish(&cfg, a.checkout).unwrap();
+        assert!(first.task_finished && first.charge_retained);
+        assert_eq!(first.local_freeze, super::Freeze::Pending);
+        let sql = rusqlite::Connection::open(cfg.store_dir.as_ref().unwrap().join("store.sqlite"))
+            .unwrap();
+        let intent: String = sql
+            .query_row("SELECT intent FROM capture_finalizations", [], |r| r.get(0))
+            .unwrap();
+        std::fs::write(temp.path().join("producer"), format!("#!/usr/bin/python3\nimport json,sys\nr=json.load(sys.stdin)\nassert r==json.loads({:?})\njson.dump(json.load(open({:?})),sys.stdout)\n", serde_json::from_str::<serde_json::Value>(&intent).unwrap()["body"].as_str().unwrap(), temp.path().join("response"))).unwrap();
+        cfg.allocation.as_mut().unwrap().capture_sink = None;
+        cfg.capture = None;
+        let second = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(second.operation, first.operation);
+        assert_eq!(second.local_freeze, super::Freeze::Frozen);
+        assert_eq!(second.run_outcomes[0].run, root.identity().run);
+        let after: String = sql
+            .query_row("SELECT intent FROM capture_finalizations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(intent, after);
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn removed_selection_uses_sealed_captured_obligation() {
+        let (_temp, mut cfg, a, _root, _seal) = closed_capture();
+        cfg.allocation.as_mut().unwrap().capture_sink = None;
+        cfg.capture = None;
+        cfg.supervisor = None;
+        let report = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(report.local_freeze, super::Freeze::Frozen);
+        assert_eq!(report.delivery, Some(super::Delivery::Pending));
+        let again = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(again.operation, report.operation);
+    }
+    #[test]
+    fn held_known_capture_freezes_only_after_task_fence() {
+        let (temp, cfg, a, _root, _seal) = closed_capture();
+        std::fs::write(temp.path().join("producer"), format!("#!/usr/bin/python3\nimport json,sqlite3,sys\nr=json.load(sys.stdin)\nc=sqlite3.connect({:?})\nassert c.execute('SELECT count(*) FROM task_finishes').fetchone()[0]==1\nassert c.execute('SELECT count(*) FROM capture_finalizations').fetchone()[0]==1\njson.dump(json.load(open({:?})),sys.stdout)\n", cfg.store_dir.as_ref().unwrap().join("store.sqlite"), temp.path().join("response"))).unwrap();
+        let report = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(report.local_freeze, super::Freeze::Frozen);
+        assert!(report.task_finished && report.charge_retained);
+    }
+    #[test]
+    fn ready_frozen_finish_is_passive_and_retains_charge() {
+        let (temp, cfg, a, root, seal) = closed_capture();
+        let (
+            _,
+            crate::capture_finalization::FinalizeResult::Confirmed {
+                acknowledgement, ..
+            },
+        ) = crate::capture_finalization::finalize(&cfg, &root.identity().run).unwrap()
+        else {
+            panic!("confirmed");
+        };
+        crate::capture_readiness::restore(&cfg, seal, acknowledgement).unwrap();
+        std::fs::remove_file(temp.path().join("producer")).unwrap();
+        let report = super::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(report.local_freeze, super::Freeze::Frozen);
+        assert_eq!(report.delivery, Some(super::Delivery::Pending));
+        assert!(report.task_finished && report.charge_retained && !report.capture_incomplete);
+    }
     #[test]
     fn missing_selection_fence_uses_raw_presence_including_v10_history() {
         use super::*;

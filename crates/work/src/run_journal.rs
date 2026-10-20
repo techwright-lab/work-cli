@@ -504,14 +504,15 @@ fn read_base(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
 }
 pub(crate) fn validate_enrollment_rosters(conn: &Connection) -> Result<()> {
     let _snapshot = read_transaction(conn)?;
-    crate::run_participants::validate_orphans(conn)?;
-    let mut stmt = conn.prepare("SELECT id FROM runs")?;
-    let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+    let mut rosters = crate::run_participants::TargetRosters::authority(conn)?;
+    let mut stmt = conn.prepare(SELECT)?;
+    let records = stmt
+        .query_map([], read_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in ids {
-        let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
-        let record = read_base(conn, &run)?.ok_or(StoreError::Invalid)?;
+    for record in records {
+        let mut record = record?;
+        record.children = rosters.roster(conn, &record.request, record.binding.as_ref())?;
+        validate_child_history(&record)?;
         exact_record(conn, &record.request, &record)?;
     }
     Ok(())
