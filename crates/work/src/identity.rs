@@ -35,6 +35,12 @@ fn git(path: &Path, args: &[&std::ffi::OsStr]) -> io::Result<String> {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Identity is the stored object graph, never user-supplied parents.
+            // Override legacy grafts as well as modern replacement objects.
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            // Unsupported Git versions fail closed before inspecting objects;
+            // partial clones must not fetch missing objects during authority proof.
+            .args(["--no-replace-objects", "--no-lazy-fetch"])
             .args([
                 "-c",
                 "core.hooksPath=/dev/null",

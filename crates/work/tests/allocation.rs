@@ -146,6 +146,61 @@ fn ready_descendant_commit_is_reused_but_changed_branch_is_held() {
 }
 
 #[test]
+fn synthetic_git_parents_cannot_authorize_ready_descendant_reuse() {
+    let mut accepted = Vec::new();
+    for mechanism in ["replace", "graft"] {
+        let f = Fixture::new();
+        let op = Uuid::now_v7().to_string();
+        assert!(f.start(&op, "task", "topic", &[]).status.success());
+        let checkout = f.root.join("task");
+        let prior = work_cli::identity::CheckoutIdentity::inspect(&checkout).unwrap();
+        let marker = prior.private_git_dir.join("work-lease.json");
+        let marker_bytes = std::fs::read(&marker).unwrap();
+        let tree = git(&checkout, &["rev-parse", "HEAD^{tree}"]);
+        let unrelated = git(&checkout, &["commit-tree", &tree, "-m", "unrelated"]);
+        git(&checkout, &["update-ref", "refs/heads/topic", &unrelated]);
+        match mechanism {
+            "replace" => {
+                git(&checkout, &["replace", "--graft", &unrelated, &prior.head]);
+            }
+            "graft" => {
+                std::fs::create_dir_all(prior.common_git_dir.join("info")).unwrap();
+                std::fs::write(
+                    prior.common_git_dir.join("info/grafts"),
+                    format!("{unrelated} {}\n", prior.head),
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        // Default Git is fooled, while every non-graph anchor still matches.
+        git(
+            &checkout,
+            &["merge-base", "--is-ancestor", &prior.head, &unrelated],
+        );
+        let current = work_cli::identity::CheckoutIdentity::inspect(&checkout).unwrap();
+        assert_eq!(current.path, prior.path);
+        assert_eq!(current.directory, prior.directory);
+        assert_eq!(current.private_git_dir, prior.private_git_dir);
+        assert_eq!(current.common_git_dir, prior.common_git_dir);
+        assert_eq!(std::fs::read(&marker).unwrap(), marker_bytes);
+        assert_eq!(
+            git(&checkout, &["symbolic-ref", "HEAD"]),
+            "refs/heads/topic"
+        );
+        let out = f.start(&op, "task", "topic", &[]);
+        if out.status.success() {
+            accepted.push(mechanism);
+        }
+        assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+    }
+    assert!(
+        accepted.is_empty(),
+        "synthetic ancestry authorized reuse: {accepted:?}"
+    );
+}
+
+#[test]
 fn sibling_alias_and_legacy_path_charge_share_capacity() {
     for legacy in [false, true] {
         let f = Fixture::new();
