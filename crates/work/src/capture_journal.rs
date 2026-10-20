@@ -466,10 +466,13 @@ pub struct CaptureRecord {
     pub prepared: Option<PreparationObservation>,
     pub group_end: Option<GroupEndObservation>,
 }
+pub use crate::capture_artifacts::ContextArtifactObservation;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparationObservation {
     pub capture_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_artifact: Option<ContextArtifactObservation>,
     actor_ref: String,
     run_ref: String,
     context: PathBuf,
@@ -510,6 +513,7 @@ fn observation(
     let projection_digest = digest(&(b.capture_id().as_str(), &context, &spec.expected_git))?;
     Ok(PreparationObservation {
         capture_id: b.capture_id().as_str().into(),
+        context_artifact: None,
         actor_ref: b.actor_ref().into(),
         run_ref: b.run_ref().into(),
         context,
@@ -546,6 +550,27 @@ impl Store {
             prepared,
             Some(handle.revision),
             handle.pending.as_ref(),
+            None,
+        )
+    }
+    /// Only the actual qualified library path may attach an artifact observation.
+    pub(crate) fn record_qualified_capture_prepared(
+        &mut self,
+        handle: PreparationHandle,
+        prepared: &crate::capture_bridge::Prepared,
+        context: &crate::capture_artifacts::Context,
+    ) -> Result<()> {
+        // Cached typed data only; all FD reads/revalidation precede this method.
+        let artifact = context
+            .observation(prepared.environment().context_path(), &handle.spec)
+            .map_err(|_| StoreError::Conflict)?;
+        self.commit_preparation(
+            &handle.request,
+            &handle.spec,
+            prepared,
+            Some(handle.revision),
+            handle.pending.as_ref(),
+            Some(artifact),
         )
     }
     /// A lost acknowledgement can attach matching metadata, never restore readiness.
@@ -555,7 +580,7 @@ impl Store {
         spec: &CaptureSpec,
         prepared: &crate::capture_bridge::Prepared,
     ) -> Result<()> {
-        self.commit_preparation(request, spec, prepared, None, None)
+        self.commit_preparation(request, spec, prepared, None, None, None)
     }
     fn commit_preparation(
         &mut self,
@@ -564,8 +589,10 @@ impl Store {
         prepared: &crate::capture_bridge::Prepared,
         live_revision: Option<u64>,
         pending: Option<&crate::capture_setup::PendingPreparation>,
+        artifact: Option<ContextArtifactObservation>,
     ) -> Result<()> {
-        let observation = observation(spec, prepared, live_revision.is_some())?;
+        let mut observation = observation(spec, prepared, live_revision.is_some())?;
+        observation.context_artifact = artifact;
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -913,6 +940,12 @@ pub(crate) fn read(conn: &Connection, root: &RunRecord) -> Result<Option<Capture
     if let Some(p) = &prepared {
         crate::capture_bridge::CaptureId::parse(&p.capture_id).map_err(|_| StoreError::Invalid)?;
         date(&p.observed_wall)?;
+        if p.context_artifact
+            .as_ref()
+            .is_some_and(|a| !a.validate() || !p.live_preparation)
+        {
+            return Err(StoreError::Invalid);
+        }
         if p.actor_ref != spec.declaration.actor_ref
             || p.run_ref != spec.declaration.run_ref
             || p.context != spec.sink.context_path(&p.capture_id)

@@ -19,13 +19,14 @@ Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture library construction (Tasks 8.1–8.3a only)
+### Capture library construction (Tasks 8.1–8.3b1 only)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
 `capture_journal`. Typed host configuration and capture-pending allocation
-materialization are available. Actor launch, subprocess callbacks, freeze/delivery
-and configured `work run`/adopted execution remain explicitly unsupported. Tests use
+materialization and trusted library-only capture preparation are available. Actor
+launch, credential stripping, freeze/delivery and configured `work run`/adopted
+execution remain explicitly unsupported. Tests use
 private fake executables or disposable Git repositories, not an installed
 DevDiary/Python CLI, a live scope or a receiver.
 
@@ -59,8 +60,8 @@ raw child output. Lifecycle IDs/scope remain declarations, not ownership proof.
 typed sink/declaration snapshot: literal paths, finite transport limits, optional
 key-file locator, credential environment **names**, explicit endpoint/registry
 identity labels, registry actor mapping, Git profile and begin declarations.
-Labels do not pin mutable registry bytes: the future trusted host adapter must
-verify its bounded no-follow registry digest before an external side effect.
+Labels alone do not pin mutable registry bytes: `capture_preparation` verifies
+bounded no-follow registry bytes against the declared SHA-256 before Begin.
 No key values, arbitrary returned environment, argv, prompts or output are stored.
 The begin declaration must match the durable allocation's checkout path and primary
 task, and the root's run/group/chain/parent context. Additional task refs remain
@@ -128,9 +129,8 @@ developer = "actor:example"
 ```
 
 Paths are literal absolute locators, not shell expressions. The registry identity
-snapshot is declared `sha256:<pin>` metadata: **8.3a does not read or verify registry
-bytes or key-file metadata**. Registry-byte verification and actual registry key-env
-coverage are required before Begin in 8.3b. Actor mappings and credential names are
+snapshot is declared `sha256:<pin>` metadata. The setup-only helper does not inspect
+registry bytes; `capture_preparation::prepare` performs actual verification before Begin. Actor mappings and credential names are
 bounded to 128 each; all nine projection/runtime environment names are forbidden as
 receiver credentials. Without a key-file locator, names must be explicitly nonempty.
 Endpoint labels cannot contain userinfo, query or fragment delimiters. TOML is bounded
@@ -167,9 +167,61 @@ remains held/not-ready. Exact historical Existing setup uses the sealed request/
 without current actor profiles, registry files, filesystem refresh or a new handle.
 Returned preparation metadata is not a kernel Binding or actor launch permission.
 
-Actual callbacks, projection-file validation, credential stripping, freeze and
-configured runtime activation remain 8.3b; finish/delivery reconciliation and disposable
-HTTP qualification remain 8.4. No capture process is invoked by this setup helper.
+No capture process is invoked by the setup-only helper. Trusted library callers may
+instead call `capture_preparation::prepare(config, root, spec) -> (Store, PreparationResult)`.
+It first performs that genuine setup, committing the root/capture intent and exact
+writer **before** any receiver process side effect. Setup releases its SQL phases,
+transactions and allocator flock before registry/artifact reads and ProcessSink Begin.
+`prepare_observed` offers trusted boundary observations, not a fake OS/process selector.
+Exact `Existing` returns only its historical `CaptureRecord`: no callbacks, artifact
+refresh, receiver invocation, readiness promotion or live result, even if current
+profiles, registry, executable and context files are unavailable.
+
+For Created, registry qualification uses bounded nonblocking descriptors with
+`openat2` no-symlink resolution across every component, owned regular single-link
+0400/0600 files, before/after metadata and a maximum 1 MiB read. Recursive JSON
+uniqueness and critical ingest object shapes are checked. Actual `ingest.key_env`
+(default `DEVDIARY_INGEST_KEY`) must be explicitly covered by configured receiver
+names without a key file. With a key file, its metadata alone is checked using
+O_PATH (never secret reads/hashes), and the actual receiver name is still included
+in the ephemeral removal-name union, even when the configured list is empty.
+Only explicit additional names are included; no prefix or unrelated-key inference.
+The derived union is at most 129 names; all nine reserved names remain forbidden.
+Key contents may rotate at their stable locator. Endpoint identity remains a label,
+not a claim of equality to the registry URL.
+
+State must be owned 0700 with no symlink components. After literal bounded Begin,
+registry identity/content is rechecked. The exact returned
+`state-dir/<capture-id>.context.json` must be owned, regular, single-link, read-only
+0400, bounded to 1 MiB and stable across descriptor/path/directory rechecks. Unique
+JSON binds hook schema **string `"1.0"`**, actor/run/parent/primary task, exact typed
+execution chain, canonical working directory and timezone-aware RFC3339 start time
+to the sealed spec. Object-only actor/run/principal/command positions cannot be
+replaced with positional arrays. Principal/display fields are not ownership proof.
+No raw context, registry, command, receiver environment or credential values are
+logged or journaled. Regular filesystem I/O and kernel D-state can still exceed
+hard wall-clock expectations; these checks do not claim a watchdog guarantee.
+
+Only after final artifact revalidation does a private verified-observation method
+consume the Created handle through the existing exact preparation CAS. It atomically
+promotes allocation JSON/readiness and adds an optional typed context digest/stat
+observation. Schema stays 11; older preparation JSON omits this field unchanged.
+The public `record_capture_prepared` remains a metadata observer without an artifact
+claim. Failures retain tree, charge and exact writer, record the root recovery hold
+(without inventing outcome/capture ID), and return no live result. If hold persistence
+itself fails, the sanitized error explicitly reports uncertainty; no cleanup or
+receiver relaunch is attempted. A root recovery hold does not imply physical closure
+or a change of the checkout's `active` accounting state.
+
+Only this new successful path constructs non-Clone, nonserializable, redacted
+`LiveCapture`, carrying the seven-key typed projection, receiver removal **names**
+and a retained descriptor-backed context proof. `revalidate_context()` performs
+actual FD/path/digest reobservation outside SQL for a future pre-exec boundary.
+Neither this value, a decoded `Prepared`, stored observation nor a ready flag mints
+a kernel Binding or permit. Lost acknowledgement/retry is metadata-only Existing.
+Actor launch/projection/credential stripping and whole-group freeze integration
+remain 8.3b2; finish/delivery reconciliation and disposable HTTP qualification remain
+8.4. No CLI capture execution is activated by this library increment.
 
 ## Read-only inventory
 

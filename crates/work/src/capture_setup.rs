@@ -17,7 +17,7 @@ use std::{
 const MAX_AGE: Duration = Duration::from_secs(2);
 #[cfg(test)]
 #[path = "capture_setup_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 /// Existing acknowledgements are metadata only. Never returns runtime authority.
 /// New required roots always inspect the actual registered Git checkout. No

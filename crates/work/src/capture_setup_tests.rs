@@ -24,7 +24,7 @@ fn observing(observer: impl FnMut(&Connection) + 'static) -> ObserverGuard {
 }
 #[path = "../tests/support/lifecycle_regressions.rs"]
 mod fixture;
-fn materialized() -> (
+pub(crate) fn materialized() -> (
     tempfile::TempDir,
     Config,
     Store,
