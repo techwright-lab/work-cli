@@ -11,22 +11,24 @@ channels.
 
 Early construction. Read-only `work --help`, `work status [--run <uuidv7>]` and `work doctor` are
 available, plus configured `work start` allocation. Start never launches a writer.
-Configured root-only `work run` coordination is available for construction/testing,
+Configured supervised `work run` coordination is available for construction/testing,
 not production activation. Adopted-only declarations (`work adopt begin/event/status`) are
 available without process control. Explicit `work finish <checkout-id>` records task completion;
 retirement is disabled and every finished checkout retains its tree and charge.
-Production capture integration and removal are not implemented.
+Configured supervised capture integration and certified continuation are implemented in source;
+production qualification/activation and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture library construction (Tasks 8.1–8.3b3a only)
+### Capture construction (Tasks 8.1–8.3b3b; implementation, not acceptance)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
 `capture_journal`. Typed host configuration and capture-pending allocation
 materialization, trusted library-only capture preparation and captured supervised
 execution and explicit trusted-library terminal finalization are available.
-Configured `work run`/adopted execution remain explicitly unsupported. Tests use
+Explicitly configured supervised `work run` uses the integrated capture path described
+below. Captured adopted execution remains unsupported. Tests use
 private fake executables or disposable Git repositories, not an installed
 DevDiary/Python CLI, a live scope or a receiver.
 
@@ -93,10 +95,12 @@ still requires the original fresh complete full-roster proof. Its transaction
 records an immutable whole-group wall observation before exact writer removal,
 retains unknown outcomes and flags backward-clock uncertainty. Closure alone retains
 capture-incomplete, held/not-ready checkout accounting.
-Indexed capture-row presence independently fences every **new** writer, even if
-checkout flags or mapping JSON are corrupt. Ordinary allocation retries cannot
-revive Preparing/reconciled/closed capture; live Prepared own-root ready identity
-refresh remains possible. Capture metadata never finishes a task or releases charge.
+Indexed capture-row presence independently fences every **new ordinary public** writer,
+even if checkout flags or mapping JSON are corrupt. Ordinary allocation retries cannot
+revive Preparing/reconciled/held capture. Live Prepared own-root identity refresh and
+qualified certified-history refresh remain possible; neither grants a new writer.
+Only the private certified admission path below permits a subsequent captured root.
+Capture metadata never finishes a task or releases charge.
 
 Schema 11 adds a permanent per-allocation `capture_requirements` relation and
 operation index. Its allocation-operation reference is the existing reservation
@@ -142,7 +146,8 @@ Trusted library callers construct a matching selected root snapshot using
 This selects only the root actor's registry mapping and existing supervisor Git
 profile (all four fields), not unrelated actor-map settings. No live runtime/bus
 inspection is needed for materialization. Full selected settings are sealed per root.
-`capture_setup::begin(config, root, spec)` verifies those current selected settings,
+For first-use capture-pending materialization, `capture_setup::begin(config, root, spec)`
+verifies those current selected settings,
 registered authority, charged source common directory, actual marker/registration/
 branch/path/device/inode/boot identity and pending durable context. Its private,
 non-Clone/non-Serde proof binds the exact root/spec/allocation/requirement revision,
@@ -206,7 +211,8 @@ hard wall-clock expectations; these checks do not claim a watchdog guarantee.
 Only after final artifact revalidation does a private verified-observation method
 consume the Created handle through the existing exact preparation CAS. It atomically
 promotes allocation JSON/readiness and adds an optional typed context digest/stat
-observation. Schema stays 11; older preparation JSON omits this field unchanged.
+observation. That preparation increment required no change beyond schema 11;
+older preparation JSON omits this field unchanged. Current authority requires schema 13.
 The public `record_capture_prepared` remains a metadata observer without an artifact
 claim. Failures retain tree, charge and exact writer, record the root recovery hold
 (without inventing outcome/capture ID), and return no live result. If hold persistence
@@ -220,9 +226,9 @@ and a retained descriptor-backed context proof. `revalidate_context()` performs
 actual FD/path/digest reobservation outside SQL at the captured pre-exec boundary.
 Neither this value, a decoded `Prepared`, stored observation nor a ready flag mints
 a kernel Binding or permit. Lost acknowledgement/retry is metadata-only Existing.
-No CLI capture execution is activated by this library increment.
+This preparation capability alone does not activate CLI execution.
 
-`supervisor::supervise_captured_with_io` is the library-only captured coordinator.
+`supervisor::supervise_captured_with_io` retains the deliberately unfrozen b2 library contract.
 It first observes matching open/closed captured history read-only, before current
 supervisor/profile/sink/registry dependence. Historic mapping corruption or caller
 checkout/explicit actor/chain/literal-command conflict refuses; a no-sink root
@@ -251,14 +257,13 @@ original Driver/Binding, owned PID, nonce, lease/journal/finish checks or deadli
 The captured-only `Boundary::CapturedPreflight` observer runs after proof collection
 and before the allocator lock; callbacks never run inside SQL or allocator flock.
 
-Both entrypoints share one bind/journal/permit/outcome/cancellation/full-roster
-physical-closure loop. Root exit, logical child outcomes and Stop acknowledgements
-never close a writer. Physical closure records group end before exact writer removal,
-leaves local capture **unfrozen**, and retains held/not-ready accounting and the
-permanent unresolved requirement. `RunReport::capture_unfrozen` reports this separately
-from root outcome, group closure, task openness and charge. The coordinator never
-finalizes automatically. No finish, uncharging, sequential captured root, readiness
-continuation or adopted/CLI activation is provided here.
+Ordinary, b2 captured and integrated captured entrypoints share one
+bind/journal/permit/outcome/cancellation/full-roster physical-closure loop. Root exit,
+logical child outcomes and Stop acknowledgements never close a writer. Physical closure
+records group end before exact writer removal. The b2 entry leaves capture **unfrozen**
+and accounting held/not-ready; it never automatically finalizes or restores readiness.
+`RunReport::capture_unfrozen` is separate from root outcome, group closure, durable
+`checkout_ready`, task openness and charge. Integrated continuation is described below.
 
 Schema 12 adds `capture_finalizations` without rewriting or backfilling old rows.
 Its intent, confirmation, revisions and `CaptureFinalizationChanged` outbox events
@@ -281,8 +286,75 @@ Only actual matching FINISH plus committed confirmation yields a private-constru
 non-Clone/non-Serde `FreezeAcknowledgement`. Snapshots, `Existing` and RETRY cannot
 mint it. This observation is not readiness authority. `RunReport::capture_delivery`
 distinguishes historical frozen-pending/delivered from unfrozen/not-configured.
-All writer/task/charge/ready flags and the ANY-capture-history writer fence remain
-unchanged; b3b/b4 integration remains unsupported.
+Standalone terminal APIs leave writer/task/charge/ready flags and the ordinary
+ANY-capture-history writer fence unchanged. An acknowledgement alone cannot restore Ready.
+
+#### Integrated supervised readiness and continuation (schema 13)
+
+`supervisor::supervise_captured_integrated_with_io` is the trusted library entry with
+explicit fixture IO. Explicitly configured supervised `work run` uses the same integrated
+coordinator with fixed actual manager/helper paths, never a flag/environment fake backend.
+Matching captured Existing is metadata-only before current supervisor/profile/receiver/
+artifact requirements, including CLI before Driver construction. It cannot relaunch or
+recreate a live capability. Ordinary no-sink changed-profile conflicts remain unchanged.
+Interactive TTY/job control remains unsupported.
+
+Only Changed full-roster closure with the original Created `LiveCapture` may produce a
+private non-Clone/non-Serde closure seal. Cached checks bind the original preparation
+frame/spec and authority registry, exact post-close root/capture, current durable allocation
+JSON/request, charged identity/current owner, permanent requirement and eligible held state.
+Existing closure, stored rows and DTOs cannot mint it. Unknown outcome, uncertain group-end
+clock or unrelated holds do not prevent otherwise proved physical closure, but provide no
+readiness seal or guessed FINISH claim. Added SQL work shares the original closure proof's
+two-second lifetime, with a fresh check near commit.
+
+After committed closure, actual FINISH runs outside SQL phases/transactions and allocator
+flock. Only a matching actual `FreezeAcknowledgement` can proceed; passive Existing or RETRY
+cannot replace it. New actual source/checkout/marker/branch/private/common/directory/HEAD/boot
+inspection and reinspection occur outside SQL and allocator flock. Their original two-second
+clock starts before inspection and is never renewed. After allocator and IMMEDIATE locking,
+SQL-only exact-context CAS checks and a near-commit age check gate atomic Ready/certification.
+Legitimate descendant HEAD is recorded atomically. Changed owner/requirement/allocation,
+finish, writer or other conflicting state refuses restoration. Capture/readiness failures
+preserve task/charge and known physical closure, rather than inventing root failure or
+attempting a closed-root recovery-hold transition. Frozen pending delivery permits Ready.
+
+Schema 13 adds one passive `capture_readiness` certificate per checkout without rewriting
+v12 JSON or backfilling certification. It binds the last certified closed run, checkout,
+trusted store/registry locators, stable allocation/source/requirement identity, actual
+filesystem anchors/marker/certified HEAD, and a versioned domain-separated frontier digest
+of target root/capture IDs and immutable frozen intents/context seals. Delivery receipts
+and revisions, wall-clock ordering and SQLite rowid are not frontier authority. New root
+admission changes that frontier atomically: an old certificate cannot authorize another
+root after newer frozen-but-uncertified history, even with forged Ready flags. Work-owned
+unrelated readiness revocation marks the certificate revoked in the same transaction;
+history is not deleted. Store validation is shape-only; targeted certificate readers are
+strict. Historical stale certification during an open root is not global corruption.
+
+A separate private certified continuation proof requires active/Ready state, valid targeted
+certification/frontier, all prior captured groups closed/certain/frozen, no writer/adopted/
+orphan/finish barrier, current owner/lease/requirement and new root/spec identities. It obtains
+fresh actual filesystem evidence, checks descent from the certified immutable HEAD anchor,
+and rechecks cached context after locking and original age near commit. It shares the
+existing admission kernel: root, writer, capture intent and not-ready state commit together;
+Created-only matched preparation restores readiness for that exact root without pretending
+an already-Ready allocation was capture-pending. Normal descendant HEAD, qualified boot/device
+refresh and post-certification owner transfer need not invalidate certification. No history
+count quota or per-history Git inspection is introduced. All ordinary public writer fences
+remain intact, and removed capture configuration cannot downgrade a permanent requirement.
+
+Certification persists an already **committed** Ready result across CLI processes; it cannot
+recover lost/uncommitted live handles or automatically unhold a checkout. It is passive
+metadata, not a kernel proof, HMAC or claim of resistance to full same-UID SQL forgery.
+Reports keep observed process exit/root outcome, group closure, local freeze, delivery,
+durable readiness, task openness and retained charge separate. Reported readiness is an
+observation, not fresh physical proof or permission to launch.
+
+Captured adopted execution, explicit attribution-off, captured explicit task finish, full
+operator recovery, privacy qualification and real private-CLI/HTTP contract qualification
+remain deferred. Existing credential filtering and bounded public-JSON interoperability are
+not a claim that those later reviews are complete. No installation, host-policy changes,
+live manager/receiver test or production activation is implied by this implementation.
 
 ## Read-only inventory
 
@@ -384,9 +456,10 @@ requires operator recovery outside start. Initial in-progress crash stages may r
 Incomplete creation (including create-before-marker crashes), altered metadata or
 unsupported layouts remain charged and held for operator reconciliation; nothing
 is deleted, timed out or automatically retired. Boot/device changes require durable
-identity reconciliation, not invented activity. Configured capture materializes only
-pending; execution remains unsupported. Schema-v1 migration preserves old charges with writer
-readiness false; doctor remains a no-migration existing-evidence reader for both versions.
+identity reconciliation, not invented activity. Configured capture materializes pending;
+explicit supervised execution then uses the qualified capture path above. Schema-v1
+migration preserves old charges with writer readiness false; doctor remains a no-migration
+existing-evidence reader.
 
 Controlled creation fails closed on any effective nonempty `filter.*.smudge` or
 `filter.*.process` configuration, including included configuration. LFS is not yet
@@ -403,8 +476,10 @@ and a 16-KiB byte bound. Uncertainty retains the charge and never triggers delet
 
 ## Supervised root commands (not activation)
 
-A previously allocated, active/ready checkout ID is required. No implicit allocation,
-path reuse, repository discovery or held-lease revival occurs. Extend host configuration
+A previously allocated checkout ID is required: active/ready for ordinary no-sink roots,
+or capture-pending first-use / certified active/ready continuation for explicitly configured
+captured roots. No implicit allocation, path reuse, repository discovery or generic
+held-lease revival occurs. Extend host configuration
 with explicit finite policy and named actor Git profiles (values below are examples,
 not compiled defaults):
 
@@ -452,9 +527,12 @@ separately before gate publication. Root Completed/Failed/Cancelled status is se
 from writer closure: only fresh, complete whole-scope emptiness against the exact
 scope identity and current full contained roster/revision can release that group's writer.
 Uncertain evidence or surviving descendants retain a held writer under finite policy.
-A closed group permits a sequential run without another checkout charge. Lease charges
-and task openness are never released here. Capture_sink remains unsupported and fails
-closed before any delegate; attribution capture is not configured.
+A closed no-sink group permits a sequential run without another checkout charge.
+Captured continuation additionally requires committed readiness certification and fresh
+physical admission, not closure or frozen flags alone. Lease charges and task openness
+are never released here. Explicit `allocation.capture_sink = "devdiary"` selects integrated
+supervised capture; absence of a sink is valid and reports attribution not configured.
+Neither route bypasses a permanent capture requirement or an irreversible task-finish fence.
 
 SIGINT/SIGTERM request cancellation through an atomic token. Cancellation freshly
 revalidates exact unit/invocation/boot/cgroup identity before requesting scope SIGTERM;
@@ -481,7 +559,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted schema-12 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-13 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -497,7 +575,7 @@ retries remain receipts/holds, not relaunches or automatic recovery.
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8/v9/v10/v11 store to schema 12; malformed schemas, missing tables, views, incorrect
+upgrade a valid v8/v9/v10/v11/v12 store to schema 13; malformed schemas, missing tables, views, incorrect
 claims and non-WAL authority fail closed, without repair. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
@@ -512,8 +590,8 @@ Task completion is separate from run completion. Historical status and finished-
 retry receipts derive task openness from the same snapshot as run/accounting metadata;
 finished retries require no original actor Git profile or runtime.
 
-No sink is a valid completion (exit 0). Configured production capture is explicitly
-unsupported: completion remains durable, local freeze is Failed, evidence is incomplete,
+No sink is a valid completion (exit 0). Configured capture for this explicit task-finish
+command remains unsupported: completion remains durable, local freeze is Failed, evidence is incomplete,
 and the sanitized held report exits nonzero. Configured capture never silently becomes
 no-sink. A trusted library-only `LocalSink` seam supports future local capture; it is
 not selected from CLI/environment/plugins and grants no receiver/network authority.
@@ -762,7 +840,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-schema-12-authority metadata, with
+Status is read-only existing-schema-13-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -771,7 +849,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema 12.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 13.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned
@@ -795,6 +873,11 @@ or retirement.
 ## Requirements
 
 - Rust 1.98.1
+- Git must support the fixed `--no-replace-objects` and `--no-lazy-fetch` flags.
+  Unsupported flags fail closed, never fall back or probe a remote. Authority checks
+  ignore replacement objects, neutralize legacy grafts with `GIT_GRAFT_FILE=/dev/null`,
+  and disable lazy fetching; synthetic parents cannot prove HEAD descent. The minimal
+  Git environment still disables hooks, fsmonitor and credential helpers.
 - Linux is the supported platform; live runtime qualification is not implied by Linux.
   Other operating systems are unsupported.
 
