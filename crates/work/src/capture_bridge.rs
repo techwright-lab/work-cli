@@ -121,6 +121,22 @@ pub struct BeginRequest {
     pub source: Option<Source>,
     pub lifecycle: WorkLifecycle,
 }
+/// First-seen order is the portable protocol's primary/additional task order.
+/// Validate the original count and every input, not just the deduplicated list.
+pub(crate) fn canonical_task_refs(refs: &[String]) -> Result<Vec<&String>, Refused> {
+    if refs.len() > 10000 {
+        return Err(Refused);
+    }
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for value in refs {
+        scalar(value)?;
+        if seen.insert(value) {
+            result.push(value);
+        }
+    }
+    Ok(result)
+}
 impl BeginRequest {
     pub fn encode(&self) -> Result<Vec<u8>, Refused> {
         scalar(&self.actor_ref)?;
@@ -133,17 +149,7 @@ impl BeginRequest {
         if let Some(s) = &self.parent_run_ref {
             scalar(s)?;
         }
-        if self.task_refs.len() > 10000 {
-            return Err(Refused);
-        }
-        let mut seen = HashSet::new();
-        let mut task_refs = Vec::new();
-        for s in &self.task_refs {
-            scalar(s)?;
-            if seen.insert(s) {
-                task_refs.push(s);
-            }
-        }
+        let task_refs = canonical_task_refs(&self.task_refs)?;
         #[derive(Serialize)]
         struct Work {
             schema_version: u8,

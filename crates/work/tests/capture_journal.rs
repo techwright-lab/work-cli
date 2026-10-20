@@ -107,6 +107,346 @@ fn spec(r: &RootRunRequest) -> CaptureSpec {
 }
 
 #[test]
+fn canonical_capture_snapshot_matches_transport_without_duplicate_amplification() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    let mut d = declaration(&r);
+    let extra = "x".repeat(4096);
+    d.task_refs.extend(std::iter::repeat_n(extra.clone(), 9998));
+    d.task_refs.push("last".into());
+    let wire = d.encode().unwrap();
+    let op = Uuid::now_v7();
+    let s = CaptureSpec::new(
+        op,
+        SinkSnapshot::new(settings()).unwrap(),
+        d,
+        GitProfile::default(),
+    )
+    .unwrap();
+    let bytes = serde_json::to_vec(&s).unwrap();
+    assert!(
+        bytes.len() <= 2 * 1024 * 1024,
+        "accepted snapshot amplified to {} bytes",
+        bytes.len()
+    );
+    assert_eq!(s.begin_request().task_refs, vec!["task", &extra, "last"]);
+    assert_eq!(s.begin_request().encode().unwrap(), wire);
+    let mut canonical = declaration(&r);
+    canonical.task_refs = vec!["task".into(), extra, "last".into()];
+    let canonical = CaptureSpec::new(
+        op,
+        SinkSnapshot::new(settings()).unwrap(),
+        canonical,
+        GitProfile::default(),
+    )
+    .unwrap();
+    assert_eq!(serde_json::to_vec(&canonical).unwrap(), bytes);
+    drop(store.begin_captured_run(&r, &s).unwrap());
+    let fingerprint = store
+        .capture_snapshot(&r.identity().run)
+        .unwrap()
+        .unwrap()
+        .fingerprint;
+    drop(store);
+    let mut store = reopen(&dir).unwrap();
+    let BeginCapturedRun::Existing(record) = store.begin_captured_run(&r, &canonical).unwrap()
+    else {
+        panic!("existing")
+    };
+    assert_eq!(record.fingerprint, fingerprint);
+}
+
+#[test]
+fn credential_metadata_has_a_finite_positive_bound_without_authority_mutation() {
+    let (dir, store, _checkout) = fixture();
+    let events = store.pending_events(100).unwrap();
+    for count in [128, 129] {
+        let mut s = settings();
+        s.receiver_credential_names = (0..count).map(|n| format!("TOKEN_{n}")).collect();
+        assert_eq!(
+            SinkSnapshot::new(s).is_ok(),
+            count == 128,
+            "credential count {count}"
+        );
+    }
+    drop(store);
+    let store = reopen(&dir).unwrap();
+    assert_eq!(store.pending_events(100).unwrap(), events);
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn oversized_target_capture_payloads_are_refused_even_when_json_is_valid() {
+    let mut accepted = Vec::new();
+    for column in ["spec", "prepared", "group_end"] {
+        let (dir, mut store, checkout) = fixture();
+        let r = request(checkout);
+        let s = spec(&r);
+        let BeginCapturedRun::Created(h) = store.begin_captured_run(&r, &s).unwrap() else {
+            panic!("created")
+        };
+        let p = prepared(
+            &s,
+            "/private/state/context.json",
+            "actor:registered",
+            r.identity().run_ref.as_str(),
+            &GitProfile::default(),
+        );
+        store.record_capture_prepared(h, &p).unwrap();
+        let b = binding(&r);
+        store.record_bound(&r, &b).unwrap();
+        let os = ClosureOs::new(&r, &b);
+        let snap = store.group_snapshot(&r.identity().run).unwrap();
+        let proof = snap.certify_empty(&os.driver, &b).unwrap();
+        store.close_supervised_group(&snap, &proof).unwrap();
+        let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        let body: String = sql
+            .query_row(&format!("SELECT {column} FROM capture_runs"), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let oversized = body + &" ".repeat(2 * 1024 * 1024);
+        sql.execute(
+            &format!("UPDATE capture_runs SET {column}=?1"),
+            [&oversized],
+        )
+        .unwrap();
+        let events = store.pending_events(100).unwrap();
+        if store.capture_snapshot(&r.identity().run).is_ok() {
+            accepted.push(column);
+        }
+        if store.begin_captured_run(&r, &s).is_ok() {
+            accepted.push(column);
+        }
+        assert_eq!(store.pending_events(100).unwrap(), events);
+        drop(store);
+        let store = reopen(&dir).unwrap();
+        if store.capture_snapshot(&r.identity().run).is_ok() {
+            accepted.push(column);
+        }
+        assert_eq!(
+            sql.query_row(&format!("SELECT {column} FROM capture_runs"), [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            oversized
+        );
+    }
+    assert!(
+        accepted.is_empty(),
+        "oversized valid JSON accepted: {accepted:?}"
+    );
+}
+
+#[test]
+fn leading_additional_task_cannot_replace_the_durable_primary() {
+    let (dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    let mut d = declaration(&r);
+    d.task_refs = vec!["other".into(), "task".into()];
+    let s = CaptureSpec::new(
+        Uuid::now_v7(),
+        SinkSnapshot::new(settings()).unwrap(),
+        d,
+        GitProfile::default(),
+    )
+    .unwrap();
+    let events = store.pending_events(100).unwrap();
+    assert!(
+        store.begin_captured_run(&r, &s).is_err(),
+        "nonprimary membership accepted"
+    );
+    assert_eq!(store.pending_events(100).unwrap(), events);
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let mut d = declaration(&r);
+    d.task_refs.push("other".into());
+    let s = CaptureSpec::new(
+        Uuid::now_v7(),
+        SinkSnapshot::new(settings()).unwrap(),
+        d,
+        GitProfile::default(),
+    )
+    .unwrap();
+    let wire: serde_json::Value =
+        serde_json::from_slice(&s.begin_request().encode().unwrap()).unwrap();
+    assert_eq!(wire["task_refs"], serde_json::json!(["task", "other"]));
+    drop(store.begin_captured_run(&r, &s).unwrap());
+}
+
+// Synthetic independent capture checkouts reuse a legal allocation's immutable
+// metadata; no extra Git worktrees or OS scopes are involved.
+fn unrelated_capture(
+    f: &support::Fixture,
+    store: &mut work_cli::store::Store,
+    a: &work_cli::allocate::Allocation,
+    extra: Option<String>,
+) -> RootRunRequest {
+    let sql = Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let checkout = Uuid::now_v7();
+    let operation = Uuid::now_v7();
+    sql.execute("INSERT INTO checkouts SELECT ?1,?2,digest,repository,actor,task,owner,'active',1 FROM checkouts WHERE id=?3", (checkout.to_string(), operation.to_string(), a.checkout.to_string())).unwrap();
+    sql.execute("INSERT INTO allocations SELECT ?1,json_set(request,'$.operation',?2),json_set(record,'$.checkout',?1,'$.request.operation',?2) FROM allocations WHERE checkout=?3", (checkout.to_string(), operation.to_string(), a.checkout.to_string())).unwrap();
+    let r = request(checkout);
+    let mut d = declaration(&r);
+    d.cwd = a.destination.clone();
+    if let Some(extra) = extra {
+        d.task_refs.push(extra);
+    }
+    let s = CaptureSpec::new(
+        Uuid::now_v7(),
+        SinkSnapshot::new(settings()).unwrap(),
+        d,
+        GitProfile::default(),
+    )
+    .unwrap();
+    drop(store.begin_captured_run(&r, &s).unwrap());
+    r
+}
+
+#[test]
+fn unrelated_corrupt_capture_does_not_poison_no_sink_finish() {
+    let f = support::Fixture::new();
+    let output = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+    assert!(output.status.success());
+    let a: work_cli::allocate::Allocation = serde_json::from_slice(&output.stdout).unwrap();
+    let cfg = work_cli::config::Config::from_text(
+        &std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap(),
+    )
+    .unwrap();
+    let mut store = f.store();
+    let r = unrelated_capture(&f, &mut store, &a, None);
+    let sql = Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    sql.execute("UPDATE capture_runs SET spec='{}'", [])
+        .unwrap();
+    assert!(store.capture_snapshot(&r.identity().run).is_err());
+    let result = work_cli::finish::finish(&cfg, a.checkout);
+    assert!(
+        result.is_ok(),
+        "unrelated capture poisoned finish: {result:?}"
+    );
+    assert!(store.capture_snapshot(&r.identity().run).is_err());
+}
+
+#[test]
+fn unrelated_legacy_root_writer_and_child_corruption_still_blocks_finish() {
+    for case in ["root", "writer", "child_count"] {
+        let f = support::Fixture::new();
+        let output = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+        assert!(output.status.success());
+        let a: work_cli::allocate::Allocation = serde_json::from_slice(&output.stdout).unwrap();
+        let cfg = work_cli::config::Config::from_text(
+            &std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap(),
+        )
+        .unwrap();
+        let mut store = f.store();
+        let r = unrelated_capture(&f, &mut store, &a, None);
+        let sql = Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        match case {
+            "root" => {
+                sql.execute("UPDATE runs SET request='{}'", []).unwrap();
+            }
+            "writer" => {
+                sql.execute("DELETE FROM writers", []).unwrap();
+            }
+            _ => {
+                sql.execute("UPDATE run_groups SET child_count=1", [])
+                    .unwrap();
+            }
+        }
+        assert!(
+            work_cli::finish::finish(&cfg, a.checkout).is_err(),
+            "legacy {case}"
+        );
+        assert!(store.run_snapshot(&r.identity().run).is_err() || case == "writer");
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn substantial_legal_capture_history_does_not_amplify_finish_validation() {
+    let f = support::Fixture::new();
+    let output = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+    assert!(output.status.success());
+    let a: work_cli::allocate::Allocation = serde_json::from_slice(&output.stdout).unwrap();
+    let cfg = work_cli::config::Config::from_text(
+        &std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap(),
+    )
+    .unwrap();
+    let mut store = f.store();
+    // 128 legal captures, each with twelve distinct 4096-character references.
+    for n in 0..128 {
+        let r = unrelated_capture(&f, &mut store, &a, None);
+        let sql = Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        let body: String = sql
+            .query_row(
+                "SELECT spec FROM capture_runs WHERE run=?1",
+                [r.identity().run.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let mut d = declaration(&r);
+        d.cwd = a.destination.clone();
+        d.task_refs
+            .extend((0..12).map(|i| format!("{n:03}{i:02}{}", "x".repeat(4091))));
+        let op = Uuid::parse_str(value["operation"].as_str().unwrap()).unwrap();
+        let s = CaptureSpec::new(
+            op,
+            SinkSnapshot::new(settings()).unwrap(),
+            d,
+            GitProfile::default(),
+        )
+        .unwrap();
+        value = serde_json::to_value(&s).unwrap();
+        use sha2::{Digest, Sha256};
+        let fingerprint = Sha256::digest(serde_json::to_vec(&s).unwrap());
+        sql.execute(
+            "UPDATE capture_runs SET spec=?2,fingerprint=?3 WHERE run=?1",
+            rusqlite::params![
+                r.identity().run.to_string(),
+                value.to_string(),
+                fingerprint.as_slice()
+            ],
+        )
+        .unwrap();
+        assert!(store.capture_snapshot(&r.identity().run).unwrap().is_some());
+    }
+    let sql = Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    sql.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let bytes: u64 = ["store.sqlite", "store.sqlite-wal", "store.sqlite-shm"]
+        .iter()
+        .map(|name| {
+            std::fs::metadata(f.temp.path().join("private").join(name))
+                .unwrap()
+                .len()
+        })
+        .sum();
+    assert!(bytes < 16 * 1024 * 1024, "fixture file bytes {bytes}");
+    let result = work_cli::finish::finish(&cfg, a.checkout);
+    assert!(
+        result.is_ok(),
+        "legal capture history poisoned finish: {result:?}"
+    );
+}
+
+#[test]
 fn immutable_snapshots_refuse_invalid_settings_declarations_and_git() {
     for case in [
         "relative",

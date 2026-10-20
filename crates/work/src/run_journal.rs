@@ -436,6 +436,17 @@ fn apply_interruptions(record: &mut RunRecord, ids: &[RunId]) -> Result<()> {
     Ok(())
 }
 pub(crate) fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
+    let _snapshot = read_transaction(conn)?;
+    let record = read_base(conn, run)?;
+    if let Some(r) = &record {
+        crate::capture_journal::read(conn, r)?;
+    }
+    Ok(record)
+}
+// Legacy enrollment validation must retain its authority-wide root/child
+// structural checks, without parsing unrelated capture payloads. Only targeted
+// readers layer capture validation on top; this is not a caller-selectable flag.
+fn read_base(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     // Typed domain validation is shared with admission. Historical reads must
     // not impose a smaller serialized size than previously accepted requests.
     let _snapshot = read_transaction(conn)?;
@@ -451,11 +462,11 @@ pub(crate) fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> 
     if let Some(r) = &mut record {
         r.children = crate::run_participants::roster(conn, &r.request, r.binding.as_ref())?;
         validate_child_history(r)?;
-        crate::capture_journal::read(conn, r)?;
     }
     Ok(record)
 }
 pub(crate) fn validate_enrollment_rosters(conn: &Connection) -> Result<()> {
+    let _snapshot = read_transaction(conn)?;
     crate::run_participants::validate_orphans(conn)?;
     let mut stmt = conn.prepare("SELECT id FROM runs")?;
     let ids = stmt
@@ -463,8 +474,8 @@ pub(crate) fn validate_enrollment_rosters(conn: &Connection) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for id in ids {
         let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
-        let record = read(conn, &run)?.ok_or(StoreError::Invalid)?;
-        exact(conn, &record.request)?;
+        let record = read_base(conn, &run)?.ok_or(StoreError::Invalid)?;
+        exact_record(conn, &record.request, &record)?;
     }
     Ok(())
 }
@@ -481,6 +492,10 @@ pub(crate) fn read_transaction(conn: &Connection) -> Result<Option<rusqlite::Tra
 pub(crate) fn exact(conn: &Connection, request: &RootRunRequest) -> Result<RunRecord> {
     let _snapshot = read_transaction(conn)?;
     let record = read(conn, &request.identity.run)?.ok_or(StoreError::Invalid)?;
+    exact_record(conn, request, &record)?;
+    Ok(record)
+}
+fn exact_record(conn: &Connection, request: &RootRunRequest, record: &RunRecord) -> Result<()> {
     if &record.request != request {
         return Err(StoreError::Conflict);
     }
@@ -495,7 +510,7 @@ pub(crate) fn exact(conn: &Connection, request: &RootRunRequest) -> Result<RunRe
     if writer == record.closed {
         return Err(StoreError::Invalid);
     }
-    Ok(record)
+    Ok(())
 }
 impl Store {
     /// Acquires writer, records root participant intent, and appends events in

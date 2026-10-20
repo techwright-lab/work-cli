@@ -73,8 +73,28 @@ fn uuid7(id: Uuid) -> Result<()> {
 fn id(v: &impl ToString) -> Result<Uuid> {
     Uuid::parse_str(&v.to_string()).map_err(|_| StoreError::Invalid)
 }
+// Per-record technical bound, not a history quota. Twice the 1 MiB wire
+// allowance leaves room for sink paths/labels, 128 credential names and all
+// four 4096-character Git identities, including full-width UTF-8/JSON escaping.
+const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CREDENTIAL_NAMES: usize = 128;
 fn json<T: Serialize>(v: &T) -> Result<String> {
-    serde_json::to_string(v).map_err(|_| StoreError::Invalid)
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_RECORD_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("capture record limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Bounded(Vec::new());
+    serde_json::to_writer(&mut writer, v).map_err(|_| StoreError::Invalid)?;
+    String::from_utf8(writer.0).map_err(|_| StoreError::Invalid)
 }
 fn digest(v: &impl Serialize) -> Result<[u8; 32]> {
     Ok(Sha256::digest(json(v)?).into())
@@ -115,6 +135,7 @@ impl SinkSnapshot {
         if !(1..=30000).contains(&self.timeout_ms)
             || !(1..=1048576).contains(&self.response_cap)
             || self.endpoint_identity.contains(['@', '?', '#'])
+            || self.receiver_credential_names.len() > MAX_CREDENTIAL_NAMES
         {
             return Err(StoreError::Invalid);
         }
@@ -209,12 +230,17 @@ impl CaptureSpec {
     pub fn new(
         operation: Uuid,
         sink: SinkSnapshot,
-        request: BeginRequest,
+        mut request: BeginRequest,
         git: GitProfile,
     ) -> Result<Self> {
         uuid7(operation)?;
         sink.validate()?;
         git.validate().map_err(|_| StoreError::Invalid)?;
+        request.task_refs = crate::capture_bridge::canonical_task_refs(&request.task_refs)
+            .map_err(|_| StoreError::Invalid)?
+            .into_iter()
+            .cloned()
+            .collect();
         request.encode().map_err(|_| StoreError::Invalid)?;
         if request.lifecycle.mode != ExecutionMode::Supervised
             || request.actor_ref != sink.registry_actor_ref
@@ -253,6 +279,7 @@ impl CaptureSpec {
         {
             return Err(StoreError::Invalid);
         }
+        json(&spec)?;
         Ok(spec)
     }
     pub fn operation(&self) -> Uuid {
@@ -304,8 +331,8 @@ impl CaptureSpec {
         let (task,operation,request,record):(String,String,String,String)=conn.query_row(
             "SELECT c.task,c.operation,a.request,a.record FROM checkouts c JOIN allocations a ON a.checkout=c.id WHERE c.id=?1",
             [i.checkout.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
-        let allocation: crate::allocate::Allocation = strict(&record)?;
-        let allocation_request: crate::allocate::Start = strict(&request)?;
+        let allocation: crate::allocate::Allocation = exact_json(&record)?;
+        let allocation_request: crate::allocate::Start = exact_json(&request)?;
         if allocation.checkout != id(&i.checkout)?
             || allocation.request != allocation_request
             || allocation.request.task != task
@@ -323,7 +350,7 @@ impl CaptureSpec {
             || d.run_ref != i.run_ref.as_str()
             || d.execution_chain != i.execution_chain
             || d.parent_run_ref.as_deref() != i.parent_run_ref.as_ref().map(|s| s.as_str())
-            || !d.task_refs.contains(&task)
+            || d.task_refs.first() != Some(&task)
             || self.operation == id(&i.run)?
             || self.operation == id(&i.group)?
             || self.operation == id(&i.checkout)?
@@ -337,6 +364,14 @@ impl CaptureSpec {
 // require the typed serializer's exact object/optional shape. Never let Value
 // overwrite duplicate keys or serde accept positional representations of structs.
 fn strict<T: serde::de::DeserializeOwned + Serialize>(bytes: &str) -> Result<T> {
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err(StoreError::Invalid);
+    }
+    exact_json(bytes)
+}
+// Allocation history retains its existing typed domain, not the capture-record
+// byte limit. Only the capture payload entry points use the bounded wrapper.
+fn exact_json<T: serde::de::DeserializeOwned + Serialize>(bytes: &str) -> Result<T> {
     struct Unique;
     impl<'de> Deserialize<'de> for Unique {
         fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
@@ -615,6 +650,8 @@ impl Store {
         request: &RootRunRequest,
         spec: &CaptureSpec,
     ) -> Result<BeginCapturedRun> {
+        // Bound the actual durable representation before acquiring SQL authority.
+        let body = json(spec)?;
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -642,7 +679,7 @@ impl Store {
         if crate::run_journal::begin_run_tx(&tx, request)? != BeginRun::Created {
             return Err(StoreError::Conflict);
         }
-        tx.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",rusqlite::params![request.identity().run.to_string(), request.identity().group.to_string(),request.identity().checkout.to_string(),spec.operation.to_string(),json(spec)?,digest(spec)?.as_slice(),wall()])?;
+        tx.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",rusqlite::params![request.identity().run.to_string(), request.identity().group.to_string(),request.identity().checkout.to_string(),spec.operation.to_string(),body,digest(spec)?.as_slice(),wall()])?;
         crate::run_journal::journal_event(
             &tx,
             request,
@@ -789,7 +826,15 @@ pub(crate) fn read(conn: &Connection, root: &RunRecord) -> Result<Option<Capture
         Option<String>,
         Option<String>,
     );
-    let row:Option<Row>=conn.query_row("SELECT group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision,prepared,group_end FROM capture_runs WHERE run=?1",[root.request.identity().run.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?))).optional()?;
+    let row: Option<Row> = conn.query_row("SELECT group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision,prepared,group_end FROM capture_runs WHERE run=?1", [root.request.identity().run.to_string()], |r| {
+        // Inspect SQLite's borrowed bytes before allocating Strings or cloning JSON.
+        for index in [3, 7, 8] {
+            if matches!(r.get_ref(index)?, rusqlite::types::ValueRef::Text(bytes) if bytes.len() > MAX_RECORD_BYTES) {
+                return Ok(Err(StoreError::Invalid));
+            }
+        }
+        Ok(Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))
+    }).optional()?.transpose()?;
     let Some((
         group,
         checkout,

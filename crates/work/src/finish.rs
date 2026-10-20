@@ -288,6 +288,9 @@ fn writer_free(conn: &Connection, checkout: Uuid) -> Result<()> {
         return Err(StoreError::Writer);
     }
     crate::run_journal::validate_enrollment_rosters(conn)?;
+    let target =
+        work_contract::CheckoutId::parse(&checkout.to_string()).map_err(|_| StoreError::Invalid)?;
+    crate::capture_journal::validate_related(conn, &target)?;
     Ok(())
 }
 /// Trusted library-only capture seam. Production never obtains a sink from CLI,
