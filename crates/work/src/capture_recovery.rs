@@ -64,7 +64,19 @@ fn target(conn: &Connection, run: &RunId) -> Result<Snapshot> {
         });
     }
     let checkout = root.request.identity().checkout.to_string();
-    let bad: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1) OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1) OR EXISTS(SELECT 1 FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id WHERE g.id IS NULL) OR EXISTS(SELECT 1 FROM writers WHERE checkout=?1 AND group_id!=?2)", (&checkout, root.request.identity().group.to_string()), |r| r.get(0))?;
+    // Schema foreign keys only fence runs -> groups. Fence rootless groups and
+    // competing open/held history on this checkout in both preflight and CAS.
+    let bad: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)
+         OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1)
+         OR EXISTS(SELECT 1 FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id WHERE g.id IS NULL)
+         OR EXISTS(SELECT 1 FROM writers WHERE checkout=?1 AND group_id!=?2)
+         OR EXISTS(SELECT 1 FROM run_groups g LEFT JOIN runs r ON r.group_id=g.id
+                   WHERE g.checkout=?1 AND (r.id IS NULL
+                     OR (g.id!=?2 AND (g.closed=0 OR g.recovery_hold!=0))))",
+        (&checkout, root.request.identity().group.to_string()),
+        |r| r.get(0),
+    )?;
     if bad
         || root.stage != RunStage::Intent
         || root.binding.is_some()

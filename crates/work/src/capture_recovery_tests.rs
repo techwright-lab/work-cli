@@ -56,6 +56,257 @@ fn raw(store: &Store) -> String {
         .unwrap();
     format!("{rows:?}")
 }
+// All relational facts, including events/certificates/charge/owner and injected rows.
+// File-level SQLite bookkeeping is deliberately not treated as operator metadata.
+fn relational_facts(store: &Store) -> Vec<(String, Vec<String>)> {
+    let tables = store
+        .conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|name| {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
+                .unwrap();
+            let columns = stmt.column_count();
+            let mut rows = stmt
+                .query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map(|v| format!("{v:?}"))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows.sort();
+            (name, rows)
+        })
+        .collect()
+}
+fn inject_checkout_contradiction(
+    store: &Store,
+    root: &crate::run_journal::RootRunRequest,
+    case: &str,
+) {
+    // Synthetic relational corruption, not a physical Git change. No foreign-key
+    // bypass, capture row, participant or extra writer can mask the missing fence.
+    let mut value = serde_json::to_value(root).unwrap();
+    value["identity"]["group"] = uuid::Uuid::now_v7().to_string().into();
+    value["identity"]["run"] = uuid::Uuid::now_v7().to_string().into();
+    value["identity"]["run_ref"] = format!("run:extra-{}", uuid::Uuid::now_v7()).into();
+    let extra: crate::run_journal::RootRunRequest = serde_json::from_value(value).unwrap();
+    let closed = matches!(case, "rootless_closed" | "held_closed");
+    store.conn.execute("INSERT INTO run_groups(id,checkout,mode,revision,closed,recovery_hold) VALUES(?1,?2,'supervised',1,?3,?4)",
+        rusqlite::params![extra.identity().group.to_string(), extra.identity().checkout.to_string(), closed, case == "held_closed"]).unwrap();
+    if matches!(case, "extra_open" | "held_closed") {
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs(id,group_id,run_ref,request,stage) VALUES(?1,?2,?3,?4,'intent')",
+                rusqlite::params![
+                    extra.identity().run.to_string(),
+                    extra.identity().group.to_string(),
+                    extra.identity().run_ref.as_str(),
+                    serde_json::to_string(&extra).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn begin_replay_checkout_contradictions_refuse_before_receiver() {
+    let mut violations = Vec::new();
+    for known in [false, true] {
+        for case in [
+            "rootless_open",
+            "rootless_closed",
+            "extra_open",
+            "held_closed",
+        ] {
+            let (temp, cfg, _a, root, spec) =
+                crate::capture_preparation::tests::qualified_fixture();
+            let (mut store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+            if known {
+                let crate::capture_journal::BeginCapturedRun::Created(handle) = created else {
+                    panic!("created")
+                };
+                let prepared =
+                    crate::sinks::ProcessSink::new(spec.sink().process_settings().unwrap())
+                        .begin(&spec.begin_request(), &spec.expected_git())
+                        .unwrap();
+                store.record_capture_prepared(handle, &prepared).unwrap();
+            } else {
+                drop(created);
+            }
+            let exe = &cfg.capture.as_ref().unwrap().executable;
+            let original = fs::read_to_string(exe).unwrap();
+            let calls = temp.path().join("calls");
+            fs::write(
+                exe,
+                original.replace(
+                    "#!/bin/sh",
+                    &format!("#!/bin/sh\nprintf called > '{}'", calls.display()),
+                ),
+            )
+            .unwrap();
+            inject_checkout_contradiction(&store, &root, case);
+            let before = relational_facts(&store);
+            let result = reconcile(&cfg, &root.identity().run);
+            let unchanged = relational_facts(&store) == before;
+            if result.is_ok() || calls.exists() || !unchanged {
+                violations.push(format!(
+                    "{case} known={known}: result={result:?}, receiver={}, unchanged={unchanged}",
+                    calls.exists()
+                ));
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+#[test]
+fn begin_replay_checkout_contradictions_after_begin_are_uncertain() {
+    let mut violations = Vec::new();
+    for case in [
+        "rootless_open",
+        "rootless_closed",
+        "extra_open",
+        "held_closed",
+    ] {
+        let (temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+        let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+        drop(created);
+        let exe = &cfg.capture.as_ref().unwrap().executable;
+        let original = fs::read_to_string(exe).unwrap();
+        let calls = temp.path().join("calls");
+        fs::write(
+            exe,
+            original.replace(
+                "#!/bin/sh",
+                &format!("#!/bin/sh\nprintf called > '{}'", calls.display()),
+            ),
+        )
+        .unwrap();
+        let expected = std::rc::Rc::new(RefCell::new(None));
+        let slot = expected.clone();
+        let root2 = root.clone();
+        let _guard = observing(move |stage, db| {
+            if stage == "post_process" {
+                assert!(db.conn.is_autocommit());
+                inject_checkout_contradiction(db, &root2, case);
+                *slot.borrow_mut() = Some(relational_facts(db));
+            }
+        });
+        let result = reconcile(&cfg, &root.identity().run);
+        assert!(calls.exists(), "{case}: actual BEGIN must execute");
+        let unchanged =
+            relational_facts(&store) == *expected.borrow().as_ref().expect("post-BEGIN injection");
+        if !matches!(result, Ok("begin_uncertain")) || !unchanged {
+            violations.push(format!("{case}: result={result:?}, unchanged={unchanged}"));
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+#[test]
+fn begin_replay_retains_valid_closed_history_and_closed_target_passivity() {
+    // Supplemental positive coverage added after the two behavioral REDs.
+    for known in [false, true] {
+        let (_temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+        let (mut store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+        if known {
+            let crate::capture_journal::BeginCapturedRun::Created(handle) = created else {
+                panic!("created")
+            };
+            let prepared = crate::sinks::ProcessSink::new(spec.sink().process_settings().unwrap())
+                .begin(&spec.begin_request(), &spec.expected_git())
+                .unwrap();
+            store.record_capture_prepared(handle, &prepared).unwrap();
+        } else {
+            drop(created);
+        }
+        let mut value = serde_json::to_value(&root).unwrap();
+        value["identity"]["group"] = uuid::Uuid::now_v7().to_string().into();
+        value["identity"]["run"] = uuid::Uuid::now_v7().to_string().into();
+        value["identity"]["run_ref"] = format!("run:closed-{}", uuid::Uuid::now_v7()).into();
+        let prior: crate::run_journal::RootRunRequest = serde_json::from_value(value).unwrap();
+        // Synthetic valid closed metadata, with typed structurally valid binding;
+        // no OS closure claim, capture row, extra writer or forged Ready stage.
+        let binding = crate::test_run_fixture::binding(&prior);
+        let bound = crate::run_journal::BoundSnapshot::capture(&prior, &binding).unwrap();
+        store.conn.execute("INSERT INTO run_groups(id,checkout,mode,revision,closed) VALUES(?1,?2,'supervised',4,1)",
+            (prior.identity().group.to_string(), prior.identity().checkout.to_string())).unwrap();
+        store.conn.execute("INSERT INTO runs(id,group_id,run_ref,request,stage,binding,outcome) VALUES(?1,?2,?3,?4,'permit_attempt',?5,?6)",
+            rusqlite::params![prior.identity().run.to_string(), prior.identity().group.to_string(), prior.identity().run_ref.as_str(), serde_json::to_string(&prior).unwrap(), serde_json::to_string(&bound).unwrap(), serde_json::to_string(&crate::run_journal::RootOutcome::Completed).unwrap()]).unwrap();
+        let history = run_journal::exact(&store.conn, &prior).unwrap();
+        assert!(history.closed);
+        assert!(!history.recovery_hold);
+        assert_eq!(
+            reconcile(&cfg, &root.identity().run).unwrap(),
+            "metadata_reconciled"
+        );
+        assert_eq!(run_journal::exact(&store.conn, &prior).unwrap(), history);
+    }
+    // A genuinely closed known target still acknowledges passively before the
+    // checkout-local fence, even with a synthetic rootless row added afterward.
+    let (_temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+    let (mut store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+    let crate::capture_journal::BeginCapturedRun::Created(handle) = created else {
+        panic!("created")
+    };
+    let prepared = crate::sinks::ProcessSink::new(spec.sink().process_settings().unwrap())
+        .begin(&spec.begin_request(), &spec.expected_git())
+        .unwrap();
+    store.record_capture_prepared(handle, &prepared).unwrap();
+    let binding = crate::test_run_fixture::binding(&root);
+    store.record_bound(&root, &binding).unwrap();
+    store.record_permit_attempt(&root, &binding).unwrap();
+    store
+        .record_root_outcome(&root, crate::run_journal::RootOutcome::Completed)
+        .unwrap();
+    let os = crate::test_run_fixture::ClosureOs::new(&root, &binding);
+    let snapshot = store.group_snapshot(&root.identity().run).unwrap();
+    let proof = snapshot.certify_empty(&os.driver, &binding).unwrap();
+    store.close_supervised_group(&snapshot, &proof).unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)",
+            (
+                uuid::Uuid::now_v7().to_string(),
+                root.identity().checkout.to_string(),
+            ),
+        )
+        .unwrap();
+    let before = relational_facts(&store);
+    assert_eq!(
+        reconcile(&cfg, &root.identity().run).unwrap(),
+        "existing_preparation"
+    );
+    assert_eq!(relational_facts(&store), before);
+}
 #[test]
 fn begin_replay_missing_requirement_is_only_valid_for_legacy_ready_history() {
     let (temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
