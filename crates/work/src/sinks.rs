@@ -70,9 +70,28 @@ impl ProcessSink {
         }
         Ok(output.stdout)
     }
-    pub fn begin(&self, request: &BeginRequest) -> Result<Prepared, Refused> {
+    /// The host must supply its trusted profile, not one inferred from the response.
+    /// An explicitly empty profile requires all Git fields to be absent:
+    /// ```no_run
+    /// use work_cli::{capture_bridge::*, sinks::ProcessSink};
+    /// fn prepare_without_git(sink: &ProcessSink, request: &BeginRequest) -> Result<Prepared, Refused> {
+    ///     sink.begin(request, &GitProfile::default())
+    /// }
+    /// ```
+    /// ```compile_fail
+    /// use work_cli::{capture_bridge::BeginRequest, sinks::ProcessSink};
+    /// fn unchecked(sink: &ProcessSink, request: &BeginRequest) {
+    ///     let _ = sink.begin(request); // trusted profile is mandatory
+    /// }
+    /// ```
+    pub fn begin(
+        &self,
+        request: &BeginRequest,
+        expected_git: &GitProfile,
+    ) -> Result<Prepared, Refused> {
+        expected_git.validate()?;
         let input = request.encode()?;
-        decode_begin(&self.invoke("begin", &input)?, request)
+        decode_begin(&self.invoke("begin", &input)?, request, expected_git)
     }
     pub fn finish(
         &self,

@@ -42,6 +42,119 @@ fn terminal(state: &str, extra: &str) -> String {
     )
 }
 #[test]
+fn valid_positional_response_objects_are_rejected_at_every_boundary() {
+    use serde_json::json;
+    let env = serde_json::from_str::<serde_json::Value>(&open()).unwrap()["environment"].clone();
+    let mut nested_env: serde_json::Value = serde_json::from_str(&open()).unwrap();
+    nested_env["environment"] = json!([
+        "/private/context",
+        "/private/context",
+        CAPTURE,
+        "Author",
+        "author@example.test",
+        "Committer",
+        "committer@example.test"
+    ]);
+    let cases = [
+        ("begin", json!([CAPTURE, "urn:test:actor:a", "urn:test:run:r", "open", env]).to_string(), true),
+        ("environment", nested_env.to_string(), true),
+        ("terminal", json!([CAPTURE, "urn:test:actor:a", "urn:test:run:r", "pending", "2026-10-18T09:00:00Z", "2026-10-18T10:00:00Z", {}, "2026-10-18T10:00:01Z", "delivery_failed", {"actor_ref":"urn:test:actor:a","run_ref":"urn:test:run:r","event_id":"event","session_id":1}]).to_string(), false),
+        ("source", terminal("pending", r#", "source":["local","company","agent","run"]"#), false),
+        ("receipt", terminal("delivered", r#", "receipt":["urn:test:actor:a","urn:test:run:r","event",1]"#), false),
+    ];
+    let mut accepted = Vec::new();
+    for (name, frame, begin) in cases {
+        let refused = if begin {
+            decode_begin(
+                frame.as_bytes(),
+                &request(),
+                &if name == "environment" {
+                    expected_profile()
+                } else {
+                    GitProfile::default()
+                },
+            )
+            .is_err()
+        } else {
+            decode_terminal(frame.as_bytes(), &binding()).is_err()
+        };
+        if !refused {
+            accepted.push(name);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted positional objects: {accepted:?}"
+    );
+}
+
+fn expected_profile() -> GitProfile {
+    GitProfile {
+        author_name: Some("Author".into()),
+        author_email: Some("author@example.test".into()),
+        committer_name: Some("Committer".into()),
+        committer_email: Some("committer@example.test".into()),
+    }
+}
+fn profiled_open() -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_str(&open()).unwrap();
+    for (key, text) in [
+        ("GIT_AUTHOR_NAME", "Author"),
+        ("GIT_AUTHOR_EMAIL", "author@example.test"),
+        ("GIT_COMMITTER_NAME", "Committer"),
+        ("GIT_COMMITTER_EMAIL", "committer@example.test"),
+    ] {
+        value["environment"][key] = text.into();
+    }
+    value
+}
+#[test]
+fn accepting_begin_requires_exact_trusted_git_values_and_presence() {
+    let expected = expected_profile();
+    let good = profiled_open();
+    let mut accepted = Vec::new();
+    for key in [
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+    ] {
+        for absent in [false, true] {
+            let mut value = good.clone();
+            if absent {
+                value["environment"].as_object_mut().unwrap().remove(key);
+            } else {
+                value["environment"][key] = "wrong-identity".into();
+            }
+            // Acceptance itself must enforce the trusted profile.
+            if decode_begin(value.to_string().as_bytes(), &request(), &expected).is_ok() {
+                accepted.push(format!("{key} absent={absent}"));
+            }
+        }
+    }
+    assert!(
+        decode_begin(good.to_string().as_bytes(), &request(), &expected)
+            .unwrap()
+            .environment()
+            .matches_git_profile(&expected)
+    );
+    // Explicit expected absence must reject unexpected presence too.
+    if decode_begin(
+        good.to_string().as_bytes(),
+        &request(),
+        &GitProfile::default(),
+    )
+    .is_ok()
+    {
+        accepted.push("expected absence".into());
+    }
+    assert!(
+        accepted.is_empty(),
+        "prepared mismatched profiles: {accepted:?}"
+    );
+}
+
+#[test]
 fn begin_encodes_only_declared_checkout_scope_and_literal_values() {
     let r = request();
     let wire = r.encode().unwrap();
@@ -59,7 +172,7 @@ fn begin_encodes_only_declared_checkout_scope_and_literal_values() {
 }
 #[test]
 fn begin_response_is_identity_bound_and_projection_is_redacted() {
-    let prepared = decode_begin(open().as_bytes(), &request()).unwrap();
+    let prepared = decode_begin(open().as_bytes(), &request(), &GitProfile::default()).unwrap();
     assert_eq!(prepared.binding().capture_id().as_str(), CAPTURE);
     assert_eq!(
         prepared.environment().context_path(),
@@ -130,7 +243,7 @@ fn begin_strict_rejection_matrix() {
     ];
     for (i, case) in cases.iter().enumerate() {
         assert!(
-            decode_begin(case.as_bytes(), &request()).is_err(),
+            decode_begin(case.as_bytes(), &request(), &GitProfile::default()).is_err(),
             "row {i}"
         );
     }

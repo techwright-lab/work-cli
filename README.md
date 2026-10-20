@@ -38,7 +38,15 @@ pre-exec retry and owned-group kill/reap. Exact response-cap exhaustion is refus
 without an EOF lookahead. Kernel D-state can still delay reap.
 
 Begin projections require exact actor/run/capture binding and the seven-key
-allowlist; the integration caller must compare against its trusted Git profile.
+allowlist. Both `ProcessSink::begin(&request, &expected_git)` and
+`capture_bridge::decode_begin(bytes, &request, &expected_git)` require the
+caller's trusted `GitProfile`; all four values and their presence must match
+before `Prepared` can be returned. `GitProfile::default()` explicitly expects
+all four fields absent; it never means accept any response. Expected strings
+are bounded/control-free, and the process sink validates them before spawn.
+Do not derive the expected profile from the receiver's response. Response
+objects must use JSON objects at every nesting level, never positional arrays;
+request execution-chain/task-reference arrays remain supported.
 Projections are redacted and not serializable. Terminal exit zero with `pending`
 is only a local-frozen/delivery-pending observation, never delivery or lifecycle
 authority. Delivered requires a matching receipt (`event_id` per the portable

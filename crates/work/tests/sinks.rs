@@ -88,7 +88,7 @@ fn literal_executable_argv_and_exact_stdin_json_reach_eof() {
     fake.respond(&open());
     let sink = fake.sink(Duration::from_secs(2), 4096);
     let r = request();
-    let prepared = sink.begin(&r).unwrap();
+    let prepared = sink.begin(&r, &GitProfile::default()).unwrap();
     assert_eq!(
         fs::read(fake.temp.path().join("input")).unwrap(),
         r.encode().unwrap()
@@ -130,6 +130,92 @@ fn literal_executable_argv_and_exact_stdin_json_reach_eof() {
         .contains("\nretry\n"));
 }
 #[test]
+fn process_begin_refuses_git_identity_substitutions_before_prepared() {
+    let fake = Fake::new(RECORDER);
+    let sink = fake.sink(Duration::from_secs(2), 4096);
+    let mut good: serde_json::Value = serde_json::from_str(&open()).unwrap();
+    let fields = [
+        ("GIT_AUTHOR_NAME", "Author"),
+        ("GIT_AUTHOR_EMAIL", "author@example.test"),
+        ("GIT_COMMITTER_NAME", "Committer"),
+        ("GIT_COMMITTER_EMAIL", "committer@example.test"),
+    ];
+    let expected = GitProfile {
+        author_name: Some("Author".into()),
+        author_email: Some("author@example.test".into()),
+        committer_name: Some("Committer".into()),
+        committer_email: Some("committer@example.test".into()),
+    };
+    for (key, value) in fields {
+        good["environment"][key] = value.into();
+    }
+    fake.respond(&good.to_string());
+    assert!(sink
+        .begin(&request(), &expected)
+        .unwrap()
+        .environment()
+        .matches_git_profile(&expected));
+    let mut accepted = Vec::new();
+    for (key, _) in fields {
+        for absent in [false, true] {
+            let mut value = good.clone();
+            if absent {
+                value["environment"].as_object_mut().unwrap().remove(key);
+            } else {
+                value["environment"][key] = "wrong-identity".into();
+            }
+            fake.respond(&value.to_string());
+            if sink.begin(&request(), &expected).is_ok() {
+                accepted.push(format!("{key} absent={absent}"));
+            }
+        }
+    }
+    fake.respond(&good.to_string());
+    if sink.begin(&request(), &GitProfile::default()).is_ok() {
+        accepted.push("expected absence".into());
+    }
+    assert!(
+        accepted.is_empty(),
+        "prepared mismatched process profiles: {accepted:?}"
+    );
+}
+
+#[test]
+fn invalid_trusted_git_scalars_refuse_before_process_spawn() {
+    let fake = Fake::new("touch called; /usr/bin/cat > input; /usr/bin/cat response");
+    fake.respond(&open());
+    let sink = fake.sink(Duration::from_secs(2), 4096);
+    let mut spawned = Vec::new();
+    for field in 0..4 {
+        for (kind, invalid) in [
+            ("blank", " ".into()),
+            ("control", "secret\n".into()),
+            ("overbound", "x".repeat(4097)),
+        ] {
+            let mut expected = GitProfile::default();
+            let fields = [
+                &mut expected.author_name,
+                &mut expected.author_email,
+                &mut expected.committer_name,
+                &mut expected.committer_email,
+            ];
+            *fields.into_iter().nth(field).unwrap() = Some(invalid);
+            assert!(decode_begin(open().as_bytes(), &request(), &expected).is_err());
+            assert!(sink.begin(&request(), &expected).is_err());
+            let marker = fake.temp.path().join("called");
+            if marker.exists() {
+                spawned.push(format!("field={field} {kind}"));
+                fs::remove_file(marker).unwrap();
+            }
+        }
+    }
+    assert!(
+        spawned.is_empty(),
+        "invalid expected profiles spawned: {spawned:?}"
+    );
+}
+
+#[test]
 fn settings_reject_relative_paths_and_out_of_budget_limits() {
     for (exe, registry, state, timeout, cap) in [
         ("relative", "/r", "/s", Duration::from_secs(1), 1),
@@ -160,7 +246,7 @@ fn malformed_nonzero_oversized_timeout_missing_are_sanitized_refusals() {
         fake.respond(&open());
         let sink = fake.sink(Duration::from_millis(100), 4096);
         let now = Instant::now();
-        let error = sink.begin(&request()).unwrap_err();
+        let error = sink.begin(&request(), &GitProfile::default()).unwrap_err();
         assert!(now.elapsed() < Duration::from_secs(2));
         assert_eq!(error.to_string(), "capture transport refused");
         assert!(!format!("{error:?} {sink:?}").contains("secret-sentinel"));
@@ -169,7 +255,7 @@ fn malformed_nonzero_oversized_timeout_missing_are_sanitized_refusals() {
     fs::remove_file(&fake.executable).unwrap();
     assert!(fake
         .sink(Duration::from_secs(1), 4096)
-        .begin(&request())
+        .begin(&request(), &GitProfile::default())
         .is_err());
 }
 #[test]
@@ -178,7 +264,7 @@ fn invalid_request_and_conflicting_capture_never_spawn() {
     let sink = fake.sink(Duration::from_secs(1), 4096);
     let mut r = request();
     r.actor_ref = "secret\n".into();
-    assert!(sink.begin(&r).is_err());
+    assert!(sink.begin(&r, &GitProfile::default()).is_err());
     assert!(!fake.temp.path().join("called").exists());
     let binding = CaptureBinding::new(CAPTURE, "actor ; literal", "run ; literal").unwrap();
     let finish = FinishRequest {

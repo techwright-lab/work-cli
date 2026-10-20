@@ -1,7 +1,7 @@
 //! Portable capture declarations and observations, never writer/retirement authority.
 //! Nothing here persists mappings, launches writers, or selects host configuration.
 use serde::{
-    de::{self, DeserializeOwned, MapAccess, SeqAccess, Visitor},
+    de::{self, DeserializeOwned, MapAccess, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 use std::{
@@ -248,12 +248,30 @@ impl CaptureBinding {
         &self.run_ref
     }
 }
+/// Expected optional Git identities supplied by the trusted caller.
+/// `Default` means all four fields must be absent, not wildcard acceptance.
 #[derive(Default, PartialEq, Eq)]
 pub struct GitProfile {
     pub author_name: Option<String>,
     pub author_email: Option<String>,
     pub committer_name: Option<String>,
     pub committer_email: Option<String>,
+}
+impl GitProfile {
+    pub(crate) fn validate(&self) -> Result<(), Refused> {
+        for s in [
+            &self.author_name,
+            &self.author_email,
+            &self.committer_name,
+            &self.committer_email,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            scalar(s)?;
+        }
+        Ok(())
+    }
 }
 /// Ephemeral allowlisted metadata. Not serializable and not execution authority.
 ///
@@ -277,7 +295,7 @@ impl EnvironmentProjection {
     pub fn git_profile(&self) -> &GitProfile {
         &self.git
     }
-    /// Integration must supply its trusted expected profile, never guess it from a response.
+    /// Recheck metadata against a trusted profile; begin acceptance already requires this match.
     pub fn matches_git_profile(&self, expected: &GitProfile) -> bool {
         &self.git == expected
     }
@@ -342,7 +360,21 @@ struct EnvWire {
     #[serde(rename = "GIT_COMMITTER_EMAIL", default, deserialize_with = "present")]
     committer_email: Option<String>,
 }
-pub fn decode_begin(bytes: &[u8], request: &BeginRequest) -> Result<Prepared, Refused> {
+/// Accept only against the caller's trusted Git profile, including explicit absence.
+/// Never construct the expected profile from receiver-provided values.
+///
+/// ```compile_fail
+/// use work_cli::capture_bridge::{decode_begin, BeginRequest};
+/// fn unchecked(bytes: &[u8], request: &BeginRequest) {
+///     let _ = decode_begin(bytes, request); // trusted profile is mandatory
+/// }
+/// ```
+pub fn decode_begin(
+    bytes: &[u8],
+    request: &BeginRequest,
+    expected_git: &GitProfile,
+) -> Result<Prepared, Refused> {
+    expected_git.validate()?;
     let wire: BeginWire = decode(bytes)?;
     if wire.state != "open"
         || wire.actor_ref != request.actor_ref
@@ -362,16 +394,9 @@ pub fn decode_begin(bytes: &[u8], request: &BeginRequest) -> Result<Prepared, Re
         committer_name: env.committer_name,
         committer_email: env.committer_email,
     };
-    for s in [
-        &git.author_name,
-        &git.author_email,
-        &git.committer_name,
-        &git.committer_email,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        scalar(s)?;
+    git.validate()?;
+    if &git != expected_git {
+        return Err(Refused);
     }
     let environment = EnvironmentProjection {
         context: env.agent.into(),
@@ -518,6 +543,9 @@ redacted_debug!(
 // Validate every object before typed deserialization, including unknown objects.
 // No serde_json::Value/map overwrite can erase a duplicate key. Depth is also
 // bounded by serde_json's default recursion limit and input by MAX_WIRE_BYTES.
+// Responses have no array-valued fields: omitting visit_seq rejects positional
+// struct representations at every nesting level before typed deserialization.
+// Request encoding (execution_chain/task_refs arrays) is a separate path.
 struct Unique;
 impl<'de> Deserialize<'de> for Unique {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -535,10 +563,6 @@ impl<'de> Deserialize<'de> for Unique {
                     }
                     map.next_value::<Unique>()?;
                 }
-                Ok(Unique)
-            }
-            fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<Unique, S::Error> {
-                while seq.next_element::<Unique>()?.is_some() {}
                 Ok(Unique)
             }
             fn visit_bool<E: de::Error>(self, _: bool) -> Result<Unique, E> {
