@@ -145,6 +145,116 @@ fn delivered(f: &Fixture, event: &str) {
     f.respond("delivered", serde_json::json!({"receipt":{"actor_ref":"actor","run_ref":f.root.identity().run_ref.as_str(),"event_id":event,"session_id":12}}), false);
 }
 #[test]
+fn capture_begin_reconciliation_holds_known_prebind_metadata_without_receiver() {
+    // Synthetic known metadata only: deliberately nonexistent checkout and registry.
+    let mut f = Fixture::prepared_only();
+    let prepared: String = f
+        .sql()
+        .query_row("SELECT prepared FROM capture_runs", [], |r| r.get(0))
+        .unwrap();
+    let r = report(&cli(&f, "reconcile-begin"));
+    assert_eq!(r["attempt"], "metadata_reconciled");
+    assert_eq!(r["runtime"], "not_inspected");
+    assert!(calls(&f).is_empty());
+    assert_eq!(
+        f.sql()
+            .query_row("SELECT prepared FROM capture_runs", [], |r| r
+                .get::<_, String>(0))
+            .unwrap(),
+        prepared
+    );
+    let root = f
+        .store
+        .run_snapshot(&f.root.identity().run)
+        .unwrap()
+        .unwrap();
+    assert!(root.recovery_hold);
+    assert!(f
+        .store
+        .record_bound(&f.root, &fixture_support::binding(&f.root))
+        .is_err());
+    let before = truth(&f);
+    let r = report(&cli(&f, "reconcile-begin"));
+    assert_eq!(r["attempt"], "existing_preparation");
+    assert_eq!(truth(&f), before);
+    assert!(calls(&f).is_empty());
+}
+#[test]
+fn capture_begin_reconciliation_closed_history_is_passive_and_preserves_new_writer() {
+    // Synthetic durable history, NOT admission or closure qualification.
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    recorded_task_finish(&f);
+    let before = truth(&f);
+    assert_eq!(
+        report(&cli(&f, "reconcile-begin"))["attempt"],
+        "existing_preparation"
+    );
+    assert_eq!(truth(&f), before);
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    let newer = uuid::Uuid::now_v7();
+    f.sql()
+        .execute("UPDATE checkouts SET state='active',ready=1", [])
+        .unwrap();
+    f.sql()
+        .execute(
+            "INSERT INTO writers(checkout,group_id) VALUES(?1,?2)",
+            (f.root.identity().checkout.to_string(), newer.to_string()),
+        )
+        .unwrap();
+    let before = truth(&f);
+    assert_eq!(
+        report(&cli(&f, "reconcile-begin"))["attempt"],
+        "existing_preparation"
+    );
+    assert_eq!(truth(&f), before);
+    assert!(calls(&f).is_empty());
+}
+#[test]
+fn capture_begin_reconciliation_refuses_in_use_or_finished_open_intent() {
+    for case in ["bound", "permit", "task", "writer", "mismatch", "held-task"] {
+        let mut f = if case == "permit" {
+            Fixture::new(false, None)
+        } else {
+            Fixture::prepared_only()
+        };
+        match case {
+            "bound" => {
+                f.store
+                    .record_bound(&f.root, &fixture_support::binding(&f.root))
+                    .unwrap();
+            }
+            "task" => {
+                recorded_task_finish(&f);
+            }
+            "held-task" => {
+                f.store.record_recovery_hold(&f.root).unwrap();
+                recorded_task_finish(&f);
+            }
+            "writer" => {
+                f.sql()
+                    .execute(
+                        "UPDATE writers SET group_id=?1",
+                        [uuid::Uuid::now_v7().to_string()],
+                    )
+                    .unwrap();
+            }
+            "mismatch" => {
+                f.sql()
+                    .execute(
+                        "UPDATE capture_runs SET prepared=json_set(prepared,'$.actor_ref','wrong')",
+                        [],
+                    )
+                    .unwrap();
+            }
+            _ => (),
+        }
+        let before = truth(&f);
+        assert_eq!(cli(&f, "reconcile-begin").status.code(), Some(1), "{case}");
+        assert_eq!(truth(&f), before, "{case}");
+        assert!(calls(&f).is_empty());
+    }
+}
+#[test]
 fn capture_finalize_replays_exact_intent_without_runtime_authority() {
     let f = Fixture::new(true, Some(RootOutcome::Failed));
     let before = truth(&f);

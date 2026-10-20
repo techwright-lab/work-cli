@@ -335,11 +335,54 @@ claim that the external operation had no effect is made.
 
 These commands do not launch/control actors, inspect runtime, finish tasks, release
 charges, restore Ready or rewrite a previously recorded task-finish receipt (even its
-old Pending delivery). Begin/lost-preparation operator reconciliation, off/adopted
-policy, broader privacy work, real private CLI/HTTP qualification and production
+old Pending delivery). Off/adopted policy, broader privacy work,
+real private CLI/HTTP qualification and production
 activation remain later work. Tests use synthetic allocation/fake closure fixtures
 and disposable public-protocol producers, not the private product or actual kernel path.
 This increment does not complete Task 8 or constitute acceptance.
+
+#### Explicit BEGIN metadata recovery (Task 8.4c candidate)
+
+```text
+work capture reconcile-begin <UUIDv7-run>
+```
+
+This command uses the same existing registered current-schema authority and bounded
+metadata-only report as the terminal commands. It **invalidates pre-bind authority**;
+it is not a controller-death assertion or proof that an OS process has stopped.
+Bound, permitted, adopted, task-fenced or contradictory open roots are refused.
+It never creates a new root, launches/relaunches an actor, invokes a Driver, signals,
+hands off a writer, grants Ready, finishes a task, releases quota or retires a tree.
+
+For an already prepared pre-bind Intent, it checks and holds the existing metadata
+without consulting checkout files, registry or receiver. Preparation bytes (including
+live/artifact observations) remain unchanged. Closed known history is passive, even
+with a finished task or a newer current writer. An already held open Intent is passive
+only after validating its raw task fence and pre-bind eligibility.
+
+For an existing Intent with missing preparation, it inspects the actual allocation,
+charged source authority, checkout identity and Git/marker state outside SQL and locks.
+Only eligible capture-pending or ready allocation history can replay the **exact sealed
+BEGIN and process settings**, not a current profile or caller-provided environment.
+The durable intent precedes receiver I/O. First receiver creation is possible here only
+because an unprepared Intent could never have released a WORK actor. This does not
+attribute any past actor. After a matching response, a fresh physical observation must
+match the pre-call observation; the full original durable context must still match under
+lifecycle lock and an immediate transaction. Both physical observations retain their
+original two-second deadlines, including a near-commit check. No artifact qualification
+or live capability is reconstructed: new preparation is recorded with
+`live_preparation=false`, checkout not-ready/held and root recovery hold.
+
+`metadata_reconciled` and passive `existing_preparation` exit 0, even though the lease
+remains charged and held. Pre-call refusal exits 1 without dispatching BEGIN. Any
+transport, codec, physical, lock or commit failure after dispatch reports
+`begin_uncertain` (exit 1); a receiver effect may have occurred. Exact replay can be
+retried. Concurrent original-creator progress is never overwritten. Untrustworthy
+post-read state produces only constant unknown-result metadata.
+
+Tests use disposable real Git worktrees and public-protocol fake producers for the
+missing-preparation path, synthetic durable fixtures for known metadata, and private
+clock seams for expiry. These are not kernel/private-product or production qualification.
 
 #### Integrated supervised readiness and continuation (schema 13)
 

@@ -23,6 +23,7 @@ pub mod capture_finalization;
 pub mod capture_journal;
 pub mod capture_preparation;
 mod capture_readiness;
+mod capture_recovery;
 mod capture_requirement;
 pub mod capture_setup;
 pub mod cli;

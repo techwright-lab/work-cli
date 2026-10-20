@@ -8,6 +8,11 @@ use work_contract::RunId;
 
 #[derive(Debug, clap::Subcommand)]
 pub enum Command {
+    /// Recover BEGIN metadata only; invalidates pre-bind authority, never launches an actor
+    ReconcileBegin {
+        #[arg(value_parser = parse_run)]
+        run: RunId,
+    },
     /// Read WORK journal metadata only; never queries the capture receiver
     Status {
         #[arg(value_parser = parse_run)]
@@ -62,7 +67,7 @@ impl Report {
             Self::Unknown { .. } => true,
             Self::Journal(r) => matches!(
                 r.attempt,
-                "refused" | "finish_uncertain" | "delivery_uncertain"
+                "refused" | "finish_uncertain" | "delivery_uncertain" | "begin_uncertain"
             ),
         }
     }
@@ -157,11 +162,14 @@ pub fn command(config: &Config, command: Command) -> Result<Report> {
         }
         Command::Finalize { run } => (run, "finalize"),
         Command::Retry { run } => (run, "retry"),
+        Command::ReconcileBegin { run } => (run, "reconcile-begin"),
     };
     // Registered current-schema read-only target validation MUST precede mutable open.
     // No snapshot or SQL phase survives across the delegated process operation.
     observe(config, &run)?;
-    let operation = if action == "retry" {
+    let operation = if action == "reconcile-begin" {
+        crate::capture_recovery::reconcile(config, &run)
+    } else if action == "retry" {
         crate::capture_finalization::retry_delivery(config, &run).map(|_| "response_recorded")
     } else {
         crate::capture_finalization::finalize(config, &run).map(|(_store, result)| match result {

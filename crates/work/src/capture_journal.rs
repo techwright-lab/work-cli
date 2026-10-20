@@ -494,7 +494,7 @@ fn wall() -> String {
 fn date(s: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
     chrono::DateTime::parse_from_rfc3339(s).map_err(|_| StoreError::Invalid)
 }
-fn observation(
+pub(crate) fn observation(
     spec: &CaptureSpec,
     p: &crate::capture_bridge::Prepared,
     live: bool,
@@ -523,6 +523,28 @@ fn observation(
         observed_wall: wall(),
         live_preparation: live,
     })
+}
+/// Shared metadata transition only; callers own all eligibility and CAS decisions.
+pub(crate) fn reconcile_hold(conn: &Connection, root: &RunRecord) -> Result<()> {
+    let request = &root.request;
+    let revision = root
+        .revision
+        .checked_add(1)
+        .filter(|n| *n <= i64::MAX as u64)
+        .ok_or(StoreError::Invalid)?;
+    conn.execute("UPDATE checkouts SET ready=0,state=CASE WHEN state='active' THEN 'held' ELSE state END WHERE id=?1", [request.identity().checkout.to_string()])?;
+    if !root.closed {
+        conn.execute(
+            "UPDATE run_groups SET revision=?2,recovery_hold=1 WHERE id=?1",
+            (request.identity().group.to_string(), revision as i64),
+        )?;
+    }
+    crate::run_journal::journal_event(
+        conn,
+        request,
+        revision,
+        crate::run_journal::JournalChange::CaptureReconciled,
+    )
 }
 pub enum BeginCapturedRun {
     Created(PreparationHandle),
@@ -662,7 +684,9 @@ impl Store {
                 [request.identity().checkout.to_string()],
             )?;
         } else {
-            tx.execute("UPDATE checkouts SET ready=0,state=CASE WHEN state='active' THEN 'held' ELSE state END WHERE id=?1",[request.identity().checkout.to_string()])?;
+            reconcile_hold(&tx, &root)?;
+            tx.commit()?;
+            return Ok(());
         }
         if !root.closed {
             tx.execute("UPDATE run_groups SET revision=?2,recovery_hold=CASE WHEN ?3 THEN recovery_hold ELSE 1 END WHERE id=?1",(request.identity().group.to_string(),revision as i64,live_revision.is_some()))?;
