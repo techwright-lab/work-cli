@@ -330,17 +330,23 @@ impl CaptureSpec {
         conn: &Connection,
         r: &RootRunRequest,
     ) -> Result<crate::allocate::Allocation> {
+        let row = AgreementRow::read(conn, &r.identity().checkout)?;
+        self.agrees_with(&row, r)?;
+        Ok(row.allocation)
+    }
+    fn agrees_with(&self, row: &AgreementRow, r: &RootRunRequest) -> Result<()> {
         let d = &self.declaration;
         let i = r.identity();
-        let (task,operation,request,record):(String,String,String,String)=conn.query_row(
-            "SELECT c.task,c.operation,a.request,a.record FROM checkouts c JOIN allocations a ON a.checkout=c.id WHERE c.id=?1",
-            [i.checkout.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
-        let allocation: crate::allocate::Allocation = exact_json(&record)?;
-        let allocation_request: crate::allocate::Start = exact_json(&request)?;
+        let AgreementRow {
+            task,
+            operation,
+            allocation,
+            allocation_request,
+        } = row;
         if allocation.checkout != id(&i.checkout)?
-            || allocation.request != allocation_request
-            || allocation.request.task != task
-            || allocation.request.operation.to_string() != operation
+            || &allocation.request != allocation_request
+            || &allocation.request.task != task
+            || allocation.request.operation.to_string() != *operation
             || allocation.destination != d.cwd
             || allocation
                 .identity
@@ -354,14 +360,35 @@ impl CaptureSpec {
             || d.run_ref != i.run_ref.as_str()
             || d.execution_chain != i.execution_chain
             || d.parent_run_ref.as_deref() != i.parent_run_ref.as_ref().map(|s| s.as_str())
-            || d.task_refs.first() != Some(&task)
+            || d.task_refs.first() != Some(task)
             || self.operation == id(&i.run)?
             || self.operation == id(&i.group)?
             || self.operation == id(&i.checkout)?
         {
             return Err(StoreError::Conflict);
         }
-        Ok(allocation)
+        Ok(())
+    }
+}
+struct AgreementRow {
+    task: String,
+    operation: String,
+    allocation: crate::allocate::Allocation,
+    allocation_request: crate::allocate::Start,
+}
+impl AgreementRow {
+    fn read(conn: &Connection, checkout: &CheckoutId) -> Result<Self> {
+        let (task,operation,request,record):(String,String,String,String)=conn.query_row(
+            "SELECT c.task,c.operation,a.request,a.record FROM checkouts c JOIN allocations a ON a.checkout=c.id WHERE c.id=?1",
+            [checkout.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        let allocation = exact_json(&record)?;
+        let allocation_request = exact_json(&request)?;
+        Ok(Self {
+            task,
+            operation,
+            allocation,
+            allocation_request,
+        })
     }
 }
 // Parse unique keys first (including objects in legitimate request arrays), then
@@ -432,7 +459,7 @@ fn exact_json<T: serde::de::DeserializeOwned + Serialize>(bytes: &str) -> Result
     }
     serde_json::from_str::<Unique>(bytes).map_err(|_| StoreError::Invalid)?;
     let value: serde_json::Value = serde_json::from_str(bytes).map_err(|_| StoreError::Invalid)?;
-    let typed: T = serde_json::from_value(value.clone()).map_err(|_| StoreError::Invalid)?;
+    let typed: T = T::deserialize(&value).map_err(|_| StoreError::Invalid)?;
     if serde_json::to_value(&typed).map_err(|_| StoreError::Invalid)? != value {
         return Err(StoreError::Invalid);
     }
@@ -754,7 +781,18 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let allocation = spec.agrees(&tx, request)?;
-        validate_related(&tx, &request.identity().checkout)?;
+        // Construct only for an actual private admission proof, at the old
+        // validate_related position. No frontier check precedes Existing.
+        let related = if proof.is_some() {
+            Some(crate::capture_setup::Related::qualify(
+                &tx,
+                id(&request.identity().checkout)?,
+            )?)
+        } else {
+            validate_related(&tx, &request.identity().checkout)?;
+            None
+        };
+        let admission = proof.zip(related.as_ref());
         exclude_operation(&tx, &request.identity().run)?;
         exclude_operation(&tx, &request.identity().group)?;
         if let Some(existing) = crate::run_journal::read(&tx, &request.identity().run)? {
@@ -765,8 +803,8 @@ impl Store {
             }
             return Ok(BeginCapturedRun::Existing(record));
         }
-        if let Some(proof) = proof {
-            proof.validate_capture(&tx, request, spec)?;
+        if let Some((proof, related)) = admission {
+            proof.validate_capture(&tx, request, spec, related)?;
         } else if allocation.stage != "ready" {
             return Err(StoreError::Invalid);
         }
@@ -775,9 +813,12 @@ impl Store {
         if collision {
             return Err(StoreError::Conflict);
         }
-        if crate::run_journal::begin_run_context(&tx, request, proof)? != BeginRun::Created {
+        if crate::run_journal::begin_run_context(&tx, request, admission)? != BeginRun::Created {
             return Err(StoreError::Conflict);
         }
+        // The last consumer was validate_writer, before INSERT INTO writers.
+        // No qualified SQL fact is consulted after that mutation.
+        drop(related);
         tx.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",rusqlite::params![request.identity().run.to_string(), request.identity().group.to_string(),request.identity().checkout.to_string(),spec.operation.to_string(),body,digest(spec)?.as_slice(),wall()])?;
         crate::run_journal::journal_event(
             &tx,
@@ -933,6 +974,54 @@ pub(crate) fn qualified_terminal(
     conn: &Connection,
     root: &RunRecord,
 ) -> Result<Option<QualifiedTerminal>> {
+    qualify_terminal(conn, root, |spec| {
+        spec.agrees(conn, &root.request).map(|_| ())
+    })
+}
+// The batch can only be constructed inside its own nested read snapshot. Its
+// connection and checkout cannot be selected by a qualification consumer.
+pub(crate) struct QualificationBatch<'a> {
+    conn: &'a Connection,
+    checkout: Uuid,
+    agreement: Option<AgreementRow>,
+}
+pub(crate) fn with_qualification_batch<T>(
+    conn: &Connection,
+    checkout: Uuid,
+    use_batch: impl FnOnce(&mut QualificationBatch<'_>) -> Result<T>,
+) -> Result<T> {
+    let _snapshot = crate::run_journal::read_transaction(conn)?;
+    use_batch(&mut QualificationBatch {
+        conn,
+        checkout,
+        agreement: None,
+    })
+}
+impl QualificationBatch<'_> {
+    pub(crate) fn terminal(&mut self, root: &RunRecord) -> Result<Option<QualifiedTerminal>> {
+        if root.request.identity().checkout.to_string() != self.checkout.to_string() {
+            return Err(StoreError::Invalid);
+        }
+        qualify_terminal(self.conn, root, |spec| {
+            // Lazy at the original agrees point, AFTER this root's spec decode.
+            if self.agreement.is_none() {
+                self.agreement = Some(AgreementRow::read(
+                    self.conn,
+                    &root.request.identity().checkout,
+                )?);
+            }
+            spec.agrees_with(
+                self.agreement.as_ref().ok_or(StoreError::Invalid)?,
+                &root.request,
+            )
+        })
+    }
+}
+fn qualify_terminal(
+    conn: &Connection,
+    root: &RunRecord,
+    agree: impl FnOnce(&CaptureSpec) -> Result<()>,
+) -> Result<Option<QualifiedTerminal>> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 10 {
         return Ok(None);
@@ -972,16 +1061,20 @@ pub(crate) fn qualified_terminal(
         return Ok(None);
     };
     let spec = CaptureSpec::decode(&body)?;
-    spec.agrees(conn, &root.request)?;
+    agree(&spec)?;
     let collision:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1) OR EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1) OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1) OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1) OR EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)",[spec.operation.to_string()],|r|r.get(0))?;
     if collision {
         return Err(StoreError::Invalid);
     }
+    // Preserve the original short-circuit order before computing the digest.
     if group != root.request.identity().group.to_string()
         || checkout != root.request.identity().checkout.to_string()
         || operation != spec.operation.to_string()
-        || fingerprint != digest(&spec)?
     {
+        return Err(StoreError::Invalid);
+    }
+    let spec_digest = digest(&spec)?;
+    if fingerprint != spec_digest {
         return Err(StoreError::Invalid);
     }
     date(&intent_wall)?;
@@ -1031,7 +1124,7 @@ pub(crate) fn qualified_terminal(
     }
     let record = CaptureRecord {
         operation: spec.operation,
-        fingerprint: digest(&spec)?,
+        fingerprint: spec_digest,
         intent_wall,
         prepared,
         group_end,

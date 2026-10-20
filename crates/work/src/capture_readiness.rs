@@ -153,35 +153,54 @@ fn frontier_except(
     checkout: uuid::Uuid,
     current: &str,
 ) -> Result<[u8; 32]> {
-    use crate::store::StoreError;
-    use sha2::Digest;
     let _snapshot = crate::run_journal::read_transaction(conn)?;
+    frontier_prequery(conn, checkout, current)?;
+    crate::run_journal::with_capture_history(conn, checkout, |history| {
+        frontier_fold(checkout, current, &history)
+    })
+}
+pub(crate) fn frontier_prequery(
+    conn: &rusqlite::Connection,
+    checkout: uuid::Uuid,
+    current: &str,
+) -> Result<()> {
+    use crate::store::StoreError;
     let invalid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_groups g WHERE checkout=?1 AND g.id NOT IN (SELECT group_id FROM capture_runs WHERE run=?2) AND (closed=0 OR recovery_hold<>0 OR NOT EXISTS(SELECT 1 FROM capture_runs c WHERE c.group_id=g.id))) OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1) OR EXISTS(SELECT 1 FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id WHERE g.id IS NULL)", (checkout.to_string(),current), |r| r.get(0))?;
     if invalid {
         return Err(StoreError::Invalid);
     }
+    Ok(())
+}
+pub(crate) fn frontier_fold(
+    checkout: uuid::Uuid,
+    current: &str,
+    history: &[(
+        crate::run_journal::RunRecord,
+        crate::capture_journal::QualifiedTerminal,
+    )],
+) -> Result<[u8; 32]> {
+    use crate::store::StoreError;
+    use sha2::Digest;
     let mut digest = sha2::Sha256::new();
     digest.update(b"work.capture-readiness.frontier.v1\0");
     digest.update(checkout.as_bytes());
-    crate::run_journal::with_capture_history(conn, checkout, |history| {
-        let mut any = false;
-        for (root, (capture, _spec, frozen)) in history {
-            let id = &root.request.identity().run;
-            if id.to_string() == current {
-                continue;
-            }
-            let frozen = frozen.ok_or(StoreError::Invalid)?;
-            if frozen.confirmation.is_none() {
-                return Err(StoreError::Invalid);
-            }
-            digest.update(hash(&(id, capture.operation, frozen.intent))?);
-            any = true;
+    let mut any = false;
+    for (root, (capture, _spec, frozen)) in history {
+        let id = &root.request.identity().run;
+        if id.to_string() == current {
+            continue;
         }
-        if !any {
+        let frozen = frozen.as_ref().ok_or(StoreError::Invalid)?;
+        if frozen.confirmation.is_none() {
             return Err(StoreError::Invalid);
         }
-        Ok(digest.finalize().into())
-    })
+        digest.update(hash(&(id, capture.operation, &frozen.intent))?);
+        any = true;
+    }
+    if !any {
+        return Err(StoreError::Invalid);
+    }
+    Ok(digest.finalize().into())
 }
 impl ClosureSeal {
     fn validate(
@@ -518,8 +537,13 @@ impl ContinuationProof {
         }
         self.fresh()
     }
-    fn validate(&self, conn: &rusqlite::Connection) -> Result<()> {
+    fn validate(
+        &self,
+        conn: &rusqlite::Connection,
+        related: &crate::capture_setup::Related<'_, '_>,
+    ) -> Result<()> {
         use crate::store::StoreError;
+        related.check(conn, self.anchor.checkout)?;
         self.fresh()?;
         ready(conn, self.anchor.checkout)?;
         if crate::capture_setup::PendingPreparation::read(conn, self.anchor.checkout)?
@@ -529,7 +553,7 @@ impl ContinuationProof {
         }
         let cert = certificate(conn, self.anchor.checkout)?;
         if hash(&cert)? != self.certificate
-            || frontier(conn, self.anchor.checkout)? != cert.frontier
+            || related.frontier(conn, self.anchor.checkout)? != cert.frontier
         {
             return Err(StoreError::Conflict);
         }
@@ -540,24 +564,26 @@ impl ContinuationProof {
         conn: &rusqlite::Connection,
         root: &crate::run_journal::RootRunRequest,
         spec: &crate::capture_journal::CaptureSpec,
+        related: &crate::capture_setup::Related<'_, '_>,
     ) -> Result<()> {
         if root != &self.root || hash(spec)? != self.spec {
             return Err(crate::store::StoreError::Conflict);
         }
-        self.validate(conn)
+        self.validate(conn, related)
     }
     pub(crate) fn validate_writer(
         &self,
         conn: &rusqlite::Connection,
         checkout: uuid::Uuid,
         group: uuid::Uuid,
+        related: &crate::capture_setup::Related<'_, '_>,
     ) -> Result<()> {
         if checkout != self.anchor.checkout
             || group.to_string() != self.root.identity().group.to_string()
         {
             return Err(crate::store::StoreError::Conflict);
         }
-        self.validate(conn)
+        self.validate(conn, related)
     }
     pub(crate) fn fresh(&self) -> Result<()> {
         fresh(self.observed)
@@ -570,7 +596,7 @@ impl ContinuationProof {
 #[cfg(test)]
 use crate::test_run_fixture as fixture;
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     type Observer = Box<dyn FnMut(&str, &rusqlite::Connection, std::time::Instant)>;
     thread_local! { static OBSERVER: std::cell::RefCell<Option<Observer>> = std::cell::RefCell::new(None); }
@@ -1023,6 +1049,352 @@ mod tests {
         }
     }
     #[test]
+    fn strict_json_preserves_typed_roundtrip_and_rejects_noncanonical_shapes() {
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Nested {
+            text: String,
+        }
+        #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
+        struct Shape {
+            nested: Nested,
+            #[serde(default)]
+            count: u64,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            optional: Option<String>,
+        }
+        for text in [
+            "é".to_owned(),
+            "é".repeat((crate::capture_journal::MAX_RECORD_BYTES - 80) / 2),
+        ] {
+            let bytes = serde_json::to_string(&Shape {
+                nested: Nested { text },
+                count: 0,
+                optional: None,
+            })
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&bytes).unwrap();
+            let reference: Shape = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&reference).unwrap(), value);
+            assert_eq!(
+                crate::capture_journal::strict::<Shape>(&bytes).unwrap(),
+                reference
+            );
+        }
+        for bytes in [
+            r#"{"nested":{"text":"a","unknown":1},"count":0}"#,
+            r#"{"nested":{"text":"a","text":"b"},"count":0}"#,
+            r#"{"nested":{"text":"a"},"count":0,"count":0}"#,
+            r#"{"nested":["a"],"count":0}"#,
+            r#"[{"text":"a"},0,null]"#,
+            r#"{"nested":{"text":"a"}}"#,
+            r#"{"nested":{"text":"a"},"count":0,"optional":null}"#,
+            r#"{"nested":{"text":"a"},"count":"0"}"#,
+        ] {
+            assert!(
+                matches!(
+                    crate::capture_journal::strict::<Shape>(bytes),
+                    Err(crate::store::StoreError::Invalid)
+                ),
+                "{bytes}"
+            );
+        }
+        let oversized = serde_json::to_string(&Shape {
+            nested: Nested {
+                text: "é".repeat(crate::capture_journal::MAX_RECORD_BYTES / 2),
+            },
+            count: 0,
+            optional: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            crate::capture_journal::strict::<Shape>(&oversized),
+            Err(crate::store::StoreError::Invalid)
+        ));
+    }
+    #[test]
+    fn related_witness_is_connection_bound_and_frontier_bytes_match_reference() {
+        many_closed_history(|cfg, store, a, original| {
+            use sha2::Digest;
+            let other =
+                rusqlite::Connection::open(cfg.store_dir.as_ref().unwrap().join("store.sqlite"))
+                    .unwrap();
+            let tx = rusqlite::Transaction::new_unchecked(
+                &store.conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .unwrap();
+            let related = crate::capture_setup::Related::qualify(&tx, a.checkout).unwrap();
+            assert!(related.check(&tx, a.checkout).is_ok());
+            assert!(matches!(
+                related.check(&other, a.checkout),
+                Err(crate::store::StoreError::Conflict)
+            ));
+            assert!(matches!(
+                related.frontier(&other, a.checkout),
+                Err(crate::store::StoreError::Conflict)
+            ));
+            assert!(matches!(
+                related.check(&tx, uuid::Uuid::now_v7()),
+                Err(crate::store::StoreError::Conflict)
+            ));
+            let reference = crate::run_journal::with_capture_history(&tx, a.checkout, |history| {
+                let mut digest = sha2::Sha256::new();
+                digest.update(b"work.capture-readiness.frontier.v1\0");
+                digest.update(a.checkout.as_bytes());
+                let mut ids = Vec::new();
+                for (root, (capture, spec, frozen)) in &history {
+                    let id = &root.request.identity().run;
+                    ids.push(id.to_string());
+                    let frozen = frozen.as_ref().unwrap();
+                    assert!(frozen.confirmation.is_some());
+                    assert!(
+                        frozen.intent.context
+                            == crate::capture_finalization::context(root, capture, spec)?
+                    );
+                    // The fresh standalone reader retains every validator, and
+                    // must produce identical durable DTO bytes to batch reads.
+                    let fresh = crate::capture_journal::qualified_terminal(&tx, root)?.unwrap();
+                    assert_eq!(
+                        crate::capture_journal::json(&(capture, spec, &frozen.intent))?,
+                        crate::capture_journal::json(&(
+                            &fresh.0,
+                            &fresh.1,
+                            &fresh.2.unwrap().intent
+                        ))?
+                    );
+                    digest.update(hash(&(id, capture.operation, frozen.intent.clone()))?);
+                }
+                assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+                // Exercise the original skip rule independently of the empty
+                // current-run admission fold.
+                let current = original.identity().run.to_string();
+                let mut skipped = sha2::Sha256::new();
+                skipped.update(b"work.capture-readiness.frontier.v1\0");
+                skipped.update(a.checkout.as_bytes());
+                for (root, (capture, _, frozen)) in &history {
+                    let id = &root.request.identity().run;
+                    if id.to_string() != current {
+                        skipped.update(hash(&(
+                            id,
+                            capture.operation,
+                            frozen.as_ref().unwrap().intent.clone(),
+                        ))?);
+                    }
+                }
+                assert_eq!(
+                    frontier_fold(a.checkout, &current, &history)?,
+                    <[u8; 32]>::from(skipped.finalize())
+                );
+                Ok(<[u8; 32]>::from(digest.finalize()))
+            })
+            .unwrap();
+            assert_eq!(related.frontier(&tx, a.checkout).unwrap(), reference);
+            assert_eq!(certificate(&tx, a.checkout).unwrap().frontier, reference);
+            drop(related);
+            tx.rollback().unwrap();
+        });
+    }
+    #[test]
+    fn certified_existing_precedes_unconfirmed_frontier_and_proof_subject() {
+        let (_temp, cfg, mut store, a, root, seal, ack) = closed();
+        restore(&cfg, seal, ack).unwrap();
+        let next = next_root(&root);
+        let spec = cfg
+            .capture_spec(&next, &a, uuid::Uuid::now_v7(), vec!["task".into()], None)
+            .unwrap();
+        let proof = ContinuationProof::inspect(&store, &cfg, &next, &spec).unwrap();
+        let record = crate::run_journal::read(&store.conn, &root.identity().run)
+            .unwrap()
+            .unwrap();
+        let (_, original_spec) = crate::capture_journal::qualified(&store.conn, &record)
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE capture_finalizations SET confirmation=NULL,revision=1",
+                [],
+            )
+            .unwrap();
+        let before = durable_rows(&store.conn);
+        assert!(matches!(
+            store.begin_certified_capture(&root, &original_spec, &proof),
+            Ok(crate::capture_journal::BeginCapturedRun::Existing(_))
+        ));
+        assert_eq!(before, durable_rows(&store.conn));
+    }
+    fn durable_rows(conn: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+        let tables = conn
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut stmt = conn
+                    .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))
+                    .unwrap();
+                let columns = stmt.column_count();
+                stmt.query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            })
+            .collect()
+    }
+    #[test]
+    fn certified_admission_rechecks_current_transaction_without_mutation() {
+        use crate::store::StoreError;
+        for change in [
+            "writer",
+            "finish",
+            "owner",
+            "requirement",
+            "allocation",
+            "revoked",
+            "open",
+            "rootless",
+            "orphan",
+            "missing_capture",
+            "confirmation",
+            "namespace",
+        ] {
+            let (_temp, cfg, mut store, a, root, seal, ack) = closed();
+            restore(&cfg, seal, ack).unwrap();
+            let next = next_root(&root);
+            let spec = cfg
+                .capture_spec(&next, &a, uuid::Uuid::now_v7(), vec!["task".into()], None)
+                .unwrap();
+            let proof = ContinuationProof::inspect(&store, &cfg, &next, &spec).unwrap();
+            store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            match change {
+                "writer" => {
+                    store
+                        .conn
+                        .execute(
+                            "INSERT INTO writers VALUES(?1,?2)",
+                            (a.checkout.to_string(), uuid::Uuid::now_v7().to_string()),
+                        )
+                        .unwrap();
+                }
+                "finish" => {
+                    store
+                        .conn
+                        .execute(
+                            "INSERT INTO task_finishes VALUES(?1,?2,'{}')",
+                            (a.checkout.to_string(), uuid::Uuid::now_v7().to_string()),
+                        )
+                        .unwrap();
+                }
+                "owner" => {
+                    store
+                        .conn
+                        .execute("UPDATE checkouts SET owner='changed'", [])
+                        .unwrap();
+                }
+                "requirement" => {
+                    store
+                        .conn
+                        .execute("UPDATE capture_requirements SET revision=revision+1", [])
+                        .unwrap();
+                }
+                "allocation" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE allocations SET record=json_set(record,'$.reason','changed')",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "revoked" => {
+                    store
+                        .conn
+                        .execute("UPDATE capture_readiness SET revoked=1", [])
+                        .unwrap();
+                }
+                "open" => {
+                    store
+                        .conn
+                        .execute("UPDATE run_groups SET closed=0", [])
+                        .unwrap();
+                }
+                "rootless" => {
+                    store.conn.execute("INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)", (uuid::Uuid::now_v7().to_string(), a.checkout.to_string())).unwrap();
+                }
+                "orphan" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE runs SET group_id=?1",
+                            [uuid::Uuid::now_v7().to_string()],
+                        )
+                        .unwrap();
+                }
+                "missing_capture" => {
+                    store.conn.execute("DELETE FROM capture_runs", []).unwrap();
+                }
+                "confirmation" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE capture_finalizations SET confirmation=NULL,revision=1",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "namespace" => {
+                    store
+                        .conn
+                        .execute(
+                            "INSERT INTO task_finishes VALUES(?1,?2,'{}')",
+                            (
+                                uuid::Uuid::now_v7().to_string(),
+                                spec.operation().to_string(),
+                            ),
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = durable_rows(&store.conn);
+            let result = store.begin_certified_capture(&next, &spec, &proof);
+            let expected_conflict =
+                matches!(change, "owner" | "requirement" | "allocation" | "namespace");
+            assert!(
+                if change == "revoked" {
+                    matches!(
+                        result,
+                        Err(StoreError::Database(rusqlite::Error::QueryReturnedNoRows))
+                    )
+                } else if change == "orphan" {
+                    matches!(
+                        result,
+                        Err(StoreError::Database(rusqlite::Error::InvalidColumnType(
+                            4,
+                            _,
+                            rusqlite::types::Type::Null
+                        )))
+                    )
+                } else if expected_conflict {
+                    matches!(result, Err(StoreError::Conflict))
+                } else {
+                    matches!(result, Err(StoreError::Invalid))
+                },
+                "{change}: {:?}",
+                result.err()
+            );
+            assert_eq!(before, durable_rows(&store.conn), "{change}");
+        }
+    }
+    #[test]
     fn certified_ready_admits_one_distinct_next_capture_without_new_charge() {
         let (_temp, cfg, mut store, a, root, seal, ack) = closed();
         restore(&cfg, seal, ack).unwrap();
@@ -1423,7 +1795,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 .any(|r| r.capture == crate::finish::RunCapture::Missing));
         });
     }
-    fn many_closed_history(
+    pub(crate) fn many_closed_history(
         mut completed: impl FnMut(
             &crate::config::Config,
             &Store,

@@ -1045,13 +1045,16 @@ pub(crate) fn acquire_writer_context(
     checkout: Uuid,
     group: Uuid,
     allow_existing: bool,
-    materialized: Option<&crate::capture_setup::AdmissionProof<'_>>,
+    materialized: Option<(
+        &crate::capture_setup::AdmissionProof<'_>,
+        &crate::capture_setup::Related<'_, '_>,
+    )>,
 ) -> Result<()> {
     // New managed groups acquire before inserting their journal. Existing
     // managed requests retry through their journal API, never as bare writers.
     exclude_journal_identity(conn, group)?;
-    if let Some(proof) = materialized {
-        proof.validate_writer(conn, checkout, group)?;
+    if let Some((proof, related)) = materialized {
+        proof.validate_writer(conn, checkout, group, related)?;
     } else {
         if crate::capture_requirement::present(conn, checkout)?
             || crate::capture_journal::unresolved_checkout(conn, checkout)?

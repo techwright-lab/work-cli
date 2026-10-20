@@ -449,27 +449,29 @@ pub(crate) fn with_capture_history<T>(
         return use_history(history);
     }
     let mut rosters = crate::run_participants::TargetRosters::read(conn, &checkout.to_string())?;
-    for id in ids {
-        let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
-        let mut root = conn
-            .query_row(
-                &format!("{SELECT} WHERE r.id=?1"),
-                [run.to_string()],
-                read_row,
-            )
-            .optional()?
-            .transpose()?
-            .ok_or(StoreError::Invalid)?;
-        if root.request.identity().checkout.to_string() != checkout.to_string() {
-            return Err(StoreError::Invalid);
+    crate::capture_journal::with_qualification_batch(conn, checkout, |batch| {
+        for id in ids {
+            let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
+            let mut root = conn
+                .query_row(
+                    &format!("{SELECT} WHERE r.id=?1"),
+                    [run.to_string()],
+                    read_row,
+                )
+                .optional()?
+                .transpose()?
+                .ok_or(StoreError::Invalid)?;
+            if root.request.identity().checkout.to_string() != checkout.to_string() {
+                return Err(StoreError::Invalid);
+            }
+            root.children = rosters.roster(conn, &root.request, root.binding.as_ref())?;
+            validate_child_history(&root)?;
+            exact_record(conn, &root.request, &root)?;
+            let tuple = batch.terminal(&root)?.ok_or(StoreError::Invalid)?;
+            history.push((root, tuple));
         }
-        root.children = rosters.roster(conn, &root.request, root.binding.as_ref())?;
-        validate_child_history(&root)?;
-        exact_record(conn, &root.request, &root)?;
-        let tuple =
-            crate::capture_journal::qualified_terminal(conn, &root)?.ok_or(StoreError::Invalid)?;
-        history.push((root, tuple));
-    }
+        Ok(())
+    })?;
     use_history(history)
 }
 pub(crate) fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
@@ -582,9 +584,16 @@ pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<
 pub(crate) fn begin_run_context(
     tx: &Connection,
     request: &RootRunRequest,
-    materialized: Option<&crate::capture_setup::AdmissionProof<'_>>,
+    materialized: Option<(
+        &crate::capture_setup::AdmissionProof<'_>,
+        &crate::capture_setup::Related<'_, '_>,
+    )>,
 ) -> Result<BeginRun> {
-    crate::capture_journal::validate_related(tx, &request.identity.checkout)?;
+    if let Some((_, related)) = materialized {
+        related.check(tx, uuid(&request.identity.checkout)?)?;
+    } else {
+        crate::capture_journal::validate_related(tx, &request.identity.checkout)?;
+    }
     crate::capture_journal::exclude_operation(tx, &request.identity.run)?;
     crate::capture_journal::exclude_operation(tx, &request.identity.group)?;
     if read(tx, &request.identity.run)?.is_some() {

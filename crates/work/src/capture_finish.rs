@@ -12,11 +12,12 @@ struct Context {
     history: [u8; 32],
 }
 fn context(conn: &Connection, checkout: Uuid) -> Result<Context> {
+    let _snapshot = crate::run_journal::read_transaction(conn)?;
     let (a, state, ready) = allocation(conn, checkout)?;
     if a.reason.is_some() || !((state == "active" && ready) || (state == "held" && !ready)) {
         return Err(StoreError::Invalid);
     }
-    writer_free(conn, checkout)?;
+    writer_fence(conn, checkout)?;
     let charge: (String, String, String, String, String, Vec<u8>) = conn.query_row(
         "SELECT owner,repository,actor,task,operation,digest FROM checkouts WHERE id=?1",
         [checkout.to_string()],
@@ -41,7 +42,14 @@ fn context(conn: &Connection, checkout: Uuid) -> Result<Context> {
         }
         let contexts = history
             .iter()
-            .map(|(r, (c, s, _))| crate::capture_finalization::context(r, c, s))
+            .map(|(r, (c, s, frozen))| {
+                // qualified_terminal already checked exact context equality
+                // for this tuple, on this connection in this read snapshot.
+                match frozen {
+                    Some(frozen) => Ok(frozen.intent.context.clone()),
+                    None => crate::capture_finalization::context(r, c, s),
+                }
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(digest(json(&contexts)?))
     })?;

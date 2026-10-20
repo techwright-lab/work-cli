@@ -149,6 +149,48 @@ impl PendingPreparation {
     }
 }
 
+/// SQL-only, transaction-borrowed related history. No physical proof or Live
+/// authority is manufactured here. The admission path uses every consumer
+/// before its FIRST writer insert; the borrow fences commit, not SQL writes.
+pub(crate) struct Related<'tx, 'conn> {
+    tx: &'tx rusqlite::Transaction<'conn>,
+    checkout: uuid::Uuid,
+    history: Vec<(
+        crate::run_journal::RunRecord,
+        crate::capture_journal::QualifiedTerminal,
+    )>,
+}
+impl<'tx, 'conn> Related<'tx, 'conn> {
+    pub(crate) fn qualify(
+        tx: &'tx rusqlite::Transaction<'conn>,
+        checkout: uuid::Uuid,
+    ) -> Result<Self> {
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let history = if version < 10 {
+            Vec::new()
+        } else {
+            crate::run_journal::with_capture_history(tx, checkout, Ok)?
+        };
+        Ok(Self {
+            tx,
+            checkout,
+            history,
+        })
+    }
+    pub(crate) fn check(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
+        if !std::ptr::eq(conn, &**self.tx) || checkout != self.checkout {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+    pub(crate) fn frontier(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<[u8; 32]> {
+        self.check(conn, checkout)?;
+        // Deliberately deferred until the original certificate-validation point:
+        // Existing and namespace errors must precede frontier eligibility.
+        crate::capture_readiness::frontier_prequery(conn, checkout, "")?;
+        crate::capture_readiness::frontier_fold(checkout, "", &self.history)
+    }
+}
 pub(crate) enum AdmissionProof<'a> {
     Pending(&'a MaterializationProof),
     Certified(&'a crate::capture_readiness::ContinuationProof),
@@ -159,10 +201,16 @@ impl AdmissionProof<'_> {
         conn: &Connection,
         root: &RootRunRequest,
         spec: &CaptureSpec,
+        related: &Related<'_, '_>,
     ) -> Result<()> {
+        related.check(
+            conn,
+            uuid::Uuid::parse_str(&root.identity().checkout.to_string())
+                .map_err(|_| StoreError::Invalid)?,
+        )?;
         match self {
             Self::Pending(p) => p.validate_capture(conn, root, spec),
-            Self::Certified(p) => p.validate_capture(conn, root, spec),
+            Self::Certified(p) => p.validate_capture(conn, root, spec, related),
         }
     }
     pub(crate) fn validate_writer(
@@ -170,10 +218,12 @@ impl AdmissionProof<'_> {
         conn: &Connection,
         checkout: uuid::Uuid,
         group: uuid::Uuid,
+        related: &Related<'_, '_>,
     ) -> Result<()> {
+        related.check(conn, checkout)?;
         match self {
             Self::Pending(p) => p.validate_writer(conn, checkout, group),
-            Self::Certified(p) => p.validate_writer(conn, checkout, group),
+            Self::Certified(p) => p.validate_writer(conn, checkout, group, related),
         }
     }
     pub(crate) fn fresh(&self) -> Result<()> {

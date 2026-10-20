@@ -175,6 +175,13 @@ fn allocation(conn: &Connection, checkout: Uuid) -> Result<(allocate::Allocation
     Ok((a, state, ready))
 }
 fn load(conn: &Connection, checkout: Uuid) -> Result<Option<Receipt>> {
+    let receipt = receipt_only(conn, checkout)?;
+    if receipt.is_some() {
+        writer_free(conn, checkout)?;
+    }
+    Ok(receipt)
+}
+fn receipt_only(conn: &Connection, checkout: Uuid) -> Result<Option<Receipt>> {
     let value: Option<(String, String)> = conn
         .query_row(
             "SELECT operation,record FROM task_finishes WHERE checkout=?1",
@@ -237,7 +244,6 @@ fn load(conn: &Connection, checkout: Uuid) -> Result<Option<Receipt>> {
     {
         return Err(StoreError::Invalid);
     }
-    writer_free(conn, checkout)?;
     Ok(Some(r))
 }
 pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
@@ -293,6 +299,12 @@ fn eligible(conn: &Connection, checkout: Uuid) -> Result<()> {
     writer_free(conn, checkout)
 }
 fn writer_free(conn: &Connection, checkout: Uuid) -> Result<()> {
+    writer_fence(conn, checkout)?;
+    let target =
+        work_contract::CheckoutId::parse(&checkout.to_string()).map_err(|_| StoreError::Invalid)?;
+    crate::capture_journal::validate_related(conn, &target)
+}
+fn writer_fence(conn: &Connection, checkout: Uuid) -> Result<()> {
     let blocked: bool = conn.query_row("SELECT
         EXISTS(SELECT 1 FROM writers WHERE checkout=?1)
         OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1)
@@ -302,11 +314,7 @@ fn writer_free(conn: &Connection, checkout: Uuid) -> Result<()> {
     if blocked {
         return Err(StoreError::Writer);
     }
-    crate::run_journal::validate_enrollment_rosters(conn)?;
-    let target =
-        work_contract::CheckoutId::parse(&checkout.to_string()).map_err(|_| StoreError::Invalid)?;
-    crate::capture_journal::validate_related(conn, &target)?;
-    Ok(())
+    crate::run_journal::validate_enrollment_rosters(conn)
 }
 /// Trusted library-only capture seam. Production never obtains a sink from CLI,
 /// environment or a dynamic plugin. Implementations must deduplicate by operation.
@@ -492,13 +500,14 @@ fn finish_internal(
     boundary("before_ack");
     let _phase = store.sql_phase();
     let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
-    let current = load(&store.conn, checkout)?.ok_or(StoreError::Invalid)?;
+    let current = receipt_only(&store.conn, checkout)?.ok_or(StoreError::Invalid)?;
+    writer_fence(&store.conn, checkout)?;
     if current.operation != receipt.operation {
         return Err(StoreError::Conflict);
     }
-    // load() validated every base root, roster and exact writer plus the target
-    // capture history in this same read transaction. Project only reporting
-    // facts here; rereading each missing map would repeat global orphan scans.
+    // The complete writer fence validated every base root, roster and exact
+    // writer. The projection below qualifies target capture history once in
+    // this same snapshot; receipt-only validation never escapes this path.
     let mut stmt=store.conn.prepare("SELECT r.id,r.outcome FROM runs r JOIN run_groups g ON r.group_id=g.id WHERE g.checkout=?1 ORDER BY r.id")?;
     let roots = stmt
         .query_map([checkout.to_string()], |r| {
@@ -887,6 +896,12 @@ json.dump(json.load(open({response:?})),sys.stdout)
             "requirement",
             "hold",
             "root",
+            "writer",
+            "adopted",
+            "open",
+            "rootless",
+            "orphan",
+            "namespace",
             "expired",
             "near_commit",
         ] {
@@ -899,6 +914,43 @@ json.dump(json.load(open({response:?})),sys.stdout)
             .unwrap();
             let proof = captured::Completion::inspect(&store, a.checkout).unwrap();
             match change {
+                "writer" => {
+                    store
+                        .conn
+                        .execute(
+                            "INSERT INTO writers VALUES(?1,?2)",
+                            (a.checkout.to_string(), Uuid::now_v7().to_string()),
+                        )
+                        .unwrap();
+                }
+                "adopted" => {
+                    store.conn.execute("INSERT INTO adopted_groups(id,checkout,run_id,run_ref,operation,request,revision) VALUES(?1,?2,?3,'adopted:race',?4,'{}',1)", rusqlite::params![Uuid::now_v7().to_string(), a.checkout.to_string(), Uuid::now_v7().to_string(), Uuid::now_v7().to_string()]).unwrap();
+                }
+                "open" => {
+                    store
+                        .conn
+                        .execute("UPDATE run_groups SET closed=0", [])
+                        .unwrap();
+                }
+                "rootless" => {
+                    store.conn.execute("INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)", (Uuid::now_v7().to_string(), a.checkout.to_string())).unwrap();
+                }
+                "orphan" => {
+                    store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+                    store
+                        .conn
+                        .execute("UPDATE runs SET group_id=?1", [Uuid::now_v7().to_string()])
+                        .unwrap();
+                }
+                "namespace" => {
+                    store
+                        .conn
+                        .execute(
+                            "UPDATE capture_runs SET operation=(SELECT operation FROM checkouts)",
+                            [],
+                        )
+                        .unwrap();
+                }
                 "owner" => {
                     store
                         .conn
@@ -956,6 +1008,77 @@ json.dump(json.load(open({response:?})),sys.stdout)
                 .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
                 .unwrap());
         }
+    }
+    #[test]
+    fn completion_rechecks_rosters_and_frozen_context_before_task_fence() {
+        use super::*;
+        crate::capture_readiness::tests::many_closed_history(|cfg, _, a, _| {
+            let mut store = Store::open_finish_authority(
+                cfg.trusted_registry.as_ref().unwrap(),
+                cfg.store_dir.as_ref().unwrap(),
+                &cfg.roots,
+            )
+            .unwrap();
+            for (table, column, replacement) in [
+                ("run_participants", "host", "'{}'"),
+                ("run_participants", "depth", "2"),
+                (
+                    "run_participants",
+                    "id",
+                    "(SELECT operation FROM capture_runs LIMIT 1)",
+                ),
+                (
+                    "capture_finalizations",
+                    "intent",
+                    "json_set(intent,'$.context.operation','019b86f0-0000-7000-8000-000000000001')",
+                ),
+            ] {
+                let proof = captured::Completion::inspect(&store, a.checkout).unwrap();
+                let (rowid, original): (i64, rusqlite::types::Value) = store
+                    .conn
+                    .query_row(
+                        &format!("SELECT rowid,{column} FROM {table} LIMIT 1"),
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                store
+                    .conn
+                    .execute(
+                        &format!("UPDATE {table} SET {column}={replacement} WHERE rowid=?1"),
+                        [rowid],
+                    )
+                    .unwrap();
+                let _lock = allocate::lifecycle_lock(cfg.store_dir.as_ref().unwrap()).unwrap();
+                let result = prepare(
+                    cfg,
+                    &mut store,
+                    a.checkout,
+                    &Mode::Integrated,
+                    Some(&proof),
+                    &mut |_| {},
+                );
+                assert!(
+                    matches!(result, Err(StoreError::Invalid)),
+                    "{table}.{column}: {result:?}"
+                );
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                store
+                    .conn
+                    .execute(
+                        &format!("UPDATE {table} SET {column}=?1 WHERE rowid=?2"),
+                        rusqlite::params![original, rowid],
+                    )
+                    .unwrap();
+            }
+        });
     }
     #[test]
     fn captured_finish_refuses_changed_physical_identity() {
