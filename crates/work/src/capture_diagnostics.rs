@@ -35,6 +35,12 @@ pub(crate) enum Event {
         total_elapsed_us: u128,
         max_elapsed_us: u128,
     },
+    /// Inclusive outer seam: current thread only, not receiver/child CPU.
+    CpuWall {
+        frame: FrameName,
+        wall_us: u128,
+        thread_cpu_us: Option<u128>,
+    },
     FinishRefused,
     FinishCodec {
         accepted: bool,
@@ -179,6 +185,64 @@ impl Drop for Span {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameName {
+    FixtureFrontier,
+    FixtureHistory,
+    FixtureCertifiedIdentity,
+    WholeAdmission,
+    WholeFinish,
+}
+
+// Only construct at known outer test seams, BEFORE phase/snapshot/lock locals.
+// Explicitly drop AFTER them; reverse declaration order also protects unwind.
+// Never use inside a product frame or a caller-owned SQL snapshot.
+pub(crate) struct CpuWallSpan {
+    frame: FrameName,
+    started: Option<(std::time::Instant, Option<std::time::Duration>)>,
+    // A thread CPU sample must end on its originating thread.
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+pub(crate) fn outside_sql_span(frame: FrameName) -> CpuWallSpan {
+    CpuWallSpan {
+        frame,
+        started: enabled().then(|| (std::time::Instant::now(), thread_cpu_now())),
+        _thread: std::marker::PhantomData,
+    }
+}
+fn cpu_duration(value: rustix::time::Timespec) -> Option<std::time::Duration> {
+    let seconds = value.tv_sec.try_into().ok()?;
+    let nanos: u32 = value.tv_nsec.try_into().ok()?;
+    (nanos < 1_000_000_000).then(|| std::time::Duration::new(seconds, nanos))
+}
+fn cpu_delta(start: Option<std::time::Duration>, end: Option<std::time::Duration>) -> Option<u128> {
+    start
+        .zip(end)
+        .and_then(|(start, end)| end.checked_sub(start))
+        .map(|elapsed| elapsed.as_micros())
+}
+fn thread_cpu_now() -> Option<std::time::Duration> {
+    cpu_duration(rustix::time::clock_gettime(
+        rustix::time::ClockId::ThreadCPUTime,
+    ))
+}
+impl Drop for CpuWallSpan {
+    fn drop(&mut self) {
+        let Some((wall, cpu)) = self.started else {
+            return;
+        };
+        if !enabled() {
+            return;
+        }
+        let end = thread_cpu_now();
+        record(Event::CpuWall {
+            frame: self.frame,
+            wall_us: wall.elapsed().as_micros(),
+            thread_cpu_us: cpu_delta(cpu, end),
+        });
+    }
+}
+
 struct Collector {
     events: [Option<Event>; 256],
     count: usize,
@@ -300,6 +364,120 @@ impl Drop for Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cpu_wall_outer_seams_emit_on_error_and_unwind_only_when_enabled() {
+        fn attempt() -> Result<(), ()> {
+            let _cpu = outside_sql_span(FrameName::WholeAdmission);
+            let sum = (0_u64..100).fold(0_u64, u64::wrapping_add);
+            std::hint::black_box(sum);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Err(())
+        }
+        fn assert_sample(event: Event, expected: FrameName) {
+            let Event::CpuWall {
+                frame,
+                wall_us: _,
+                thread_cpu_us,
+            } = event
+            else {
+                panic!("missing scoped CPU/wall event: {event:?}");
+            };
+            assert_eq!(frame, expected);
+            // Zero is a valid measured value; None must not masquerade as zero.
+            assert!(thread_cpu_us.is_some());
+        }
+        assert!(!enabled());
+        let disabled = outside_sql_span(FrameName::WholeFinish);
+        assert!(disabled.started.is_none());
+        drop(disabled);
+        assert_eq!(attempt(), Err(()));
+        let guard = Guard::new();
+        assert!(guard.events().is_empty());
+        assert_eq!(attempt(), Err(()));
+        assert_eq!(
+            guard.events().len(),
+            1,
+            "missing scoped CPU/wall event on Err"
+        );
+        assert_sample(guard.events()[0], FrameName::WholeAdmission);
+        {
+            let inner = Guard::new();
+            assert_eq!(attempt(), Err(()));
+            assert_eq!(inner.events().len(), 1);
+            assert_sample(inner.events()[0], FrameName::WholeAdmission);
+        }
+        assert_eq!(
+            guard.events().len(),
+            1,
+            "nested collector must restore outer"
+        );
+        struct InnerFrame;
+        impl Drop for InnerFrame {
+            fn drop(&mut self) {
+                record(Event::Workload { roots: 1 });
+            }
+        }
+        assert!(std::panic::catch_unwind(|| {
+            let _cpu = outside_sql_span(FrameName::WholeFinish);
+            let _inner = InnerFrame;
+            panic!("standalone outer-seam unwind");
+        })
+        .is_err());
+        let events = guard.events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1], Event::Workload { roots: 1 });
+        assert_sample(events[2], FrameName::WholeFinish);
+        drop(guard);
+        assert_eq!(attempt(), Err(()));
+        assert!(!enabled());
+    }
+
+    // Supplemental arithmetic safety after the scoped-emission RED/GREEN.
+    #[test]
+    fn cpu_wall_checked_timespec_conversion_preserves_unknown_and_valid_zero() {
+        use rustix::time::Timespec;
+        use std::time::Duration;
+        for (seconds, nanos) in [(-1, 0), (0, -1), (0, 1_000_000_000)] {
+            assert_eq!(
+                cpu_duration(Timespec {
+                    tv_sec: seconds,
+                    tv_nsec: nanos
+                }),
+                None
+            );
+        }
+        assert_eq!(
+            cpu_duration(Timespec {
+                tv_sec: 0,
+                tv_nsec: 0
+            }),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            cpu_duration(Timespec {
+                tv_sec: 1,
+                tv_nsec: 999_999_999
+            }),
+            Some(Duration::new(1, 999_999_999))
+        );
+        let large = cpu_duration(Timespec {
+            tv_sec: i64::MAX,
+            tv_nsec: 999_999_999,
+        });
+        assert!(large.is_some());
+        assert_eq!(cpu_delta(large, large), Some(0));
+        assert_eq!(
+            cpu_delta(Some(Duration::ZERO), Some(Duration::ZERO)),
+            Some(0)
+        );
+        assert_eq!(
+            cpu_delta(Some(Duration::from_secs(1)), Some(Duration::ZERO)),
+            None
+        );
+        assert_eq!(cpu_delta(None, large), None);
+        assert_eq!(cpu_delta(large, None), None);
+    }
+
     #[test]
     fn subphase_profiles_aggregate_scoped_wall_spans_on_early_return() {
         fn attempt() -> Result<(), ()> {

@@ -598,6 +598,18 @@ use crate::test_run_fixture as fixture;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::capture_diagnostics::{outside_sql_span, FrameName};
+
+    // Only existing top-level test calls use this wrapper. Product frames (and
+    // their SQL/TX/flock locals) return or unwind before the CPU guard drops;
+    // the caller's original unwrap/expect/assert remains outside the sample.
+    fn measured_finish(
+        cfg: &crate::config::Config,
+        checkout: uuid::Uuid,
+    ) -> crate::store::Result<crate::finish::Report> {
+        let _cpu = outside_sql_span(FrameName::WholeFinish);
+        crate::finish::finish(cfg, checkout)
+    }
     type Observer = Box<dyn FnMut(&str, &rusqlite::Connection, std::time::Instant)>;
     thread_local! { static OBSERVER: std::cell::RefCell<Option<Observer>> = std::cell::RefCell::new(None); }
     pub(super) fn observe(stage: &str, conn: &rusqlite::Connection, at: std::time::Instant) {
@@ -1510,7 +1522,7 @@ pub(crate) mod tests {
         assert!(original.task_finished);
         assert!(original.capture_incomplete);
         cfg.allocation.as_mut().unwrap().capture_sink = None;
-        let replay = crate::finish::finish(&cfg, a.checkout).unwrap();
+        let replay = measured_finish(&cfg, a.checkout).unwrap();
         assert_eq!(original.operation, replay.operation);
         assert!(!replay.capture_incomplete);
         assert_eq!(replay.local_freeze, crate::finish::Freeze::Frozen);
@@ -1531,7 +1543,10 @@ pub(crate) mod tests {
             let spec = cfg
                 .capture_spec(&next, a, uuid::Uuid::now_v7(), vec!["task".into()], None)
                 .unwrap();
-            let result = crate::capture_setup::begin(cfg, &next, &spec);
+            let result = {
+                let _cpu = outside_sql_span(FrameName::WholeAdmission);
+                crate::capture_setup::begin(cfg, &next, &spec)
+            };
             assert!(
                 result.is_ok(),
                 "large-history admission: {:?}",
@@ -1549,8 +1564,7 @@ pub(crate) mod tests {
                 &cfg.roots,
             )
             .expect("bounded finish authority preflight");
-            let report =
-                crate::finish::finish(cfg, a.checkout).expect("bounded all-root completion");
+            let report = measured_finish(cfg, a.checkout).expect("bounded all-root completion");
             assert!(report.task_finished);
             assert_eq!(report.local_freeze, crate::finish::Freeze::Frozen);
         });
@@ -1627,7 +1641,7 @@ pub(crate) mod tests {
             let mut passive_cfg = cfg.clone();
             passive_cfg.supervisor = None;
             let frozen = rows("capture_finalizations");
-            let report = crate::finish::finish(&passive_cfg, a.checkout)
+            let report = measured_finish(&passive_cfg, a.checkout)
                 .expect("bounded many-unmapped completion must expose committed task truth");
             assert!(
                 report.task_finished
@@ -1671,7 +1685,7 @@ pub(crate) mod tests {
                 }
             );
             let receipt = rows("task_finishes");
-            let retry = crate::finish::finish(&passive_cfg, a.checkout).unwrap();
+            let retry = measured_finish(&passive_cfg, a.checkout).unwrap();
             assert_eq!(retry, report);
             assert_eq!(rows("task_finishes"), receipt);
             assert_eq!(rows("capture_finalizations"), frozen);
@@ -1725,7 +1739,7 @@ assert c.execute('SELECT count(*) FROM capture_finalizations').fetchone()[0]==c.
 p=json.loads(c.execute("SELECT prepared FROM capture_runs WHERE json_extract(prepared,'$.capture_id')=?",(r['capture_id'],)).fetchone()[0])
 json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p['run_ref'],'state':'pending'}},sys.stdout)
 "#, database=cfg.store_dir.as_ref().unwrap().join("store.sqlite"))).unwrap();
-            let report = crate::finish::finish(cfg, a.checkout).unwrap();
+            let report = measured_finish(cfg, a.checkout).unwrap();
             assert_eq!(report.local_freeze, crate::finish::Freeze::Frozen);
         });
     }
@@ -1761,7 +1775,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 "#!/bin/sh\nexit 1\n",
             )
             .unwrap();
-            let report = crate::finish::finish(cfg, a.checkout).unwrap();
+            let report = measured_finish(cfg, a.checkout).unwrap();
             assert!(report.task_finished);
             assert_eq!(report.local_freeze, crate::finish::Freeze::Failed);
         });
@@ -1786,7 +1800,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 .conn
                 .execute("DELETE FROM capture_runs WHERE run=?1", [&run])
                 .unwrap();
-            let report = crate::finish::finish(cfg, a.checkout).unwrap();
+            let report = measured_finish(cfg, a.checkout).unwrap();
             assert!(report.task_finished && report.capture_incomplete);
             assert_eq!(report.local_freeze, crate::finish::Freeze::Failed);
             assert!(report
@@ -1967,6 +1981,9 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
                 .sum::<u64>();
             assert!(bytes < 16 * 1024 * 1024, "authority size {bytes}");
+            // CPU reads enclose both guards, including on assertion unwind.
+            // This inclusive sample retains the existing stderr work below.
+            let cpu = outside_sql_span(FrameName::FixtureFrontier);
             let _phase = store.sql_phase();
             let _snapshot = crate::run_journal::read_transaction(&store.conn).unwrap();
             let started = std::time::Instant::now();
@@ -1979,7 +1996,9 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             );
             drop(_snapshot);
             drop(_phase);
+            drop(cpu);
             {
+                let _cpu = outside_sql_span(FrameName::FixtureHistory);
                 let _phase = store.sql_phase();
                 crate::run_journal::with_capture_history(&store.conn, a.checkout, |history| {
                     assert_eq!(history.len(), count);
@@ -2014,6 +2033,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 )
                 .unwrap();
             {
+                let _cpu = outside_sql_span(FrameName::FixtureCertifiedIdentity);
                 let _phase = store.sql_phase();
                 guard_certified_identity(&store.conn, a.checkout).unwrap();
             }
