@@ -277,10 +277,7 @@ impl GroupSnapshot {
     }
 }
 
-use crate::{
-    events::Event,
-    store::{acquire_writer_tx, emit},
-};
+use crate::{events::Event, store::emit};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 fn json<T: Serialize>(value: &T) -> Result<String> {
@@ -539,6 +536,13 @@ impl Store {
     }
 }
 pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<BeginRun> {
+    begin_run_context(tx, request, None)
+}
+pub(crate) fn begin_run_context(
+    tx: &Connection,
+    request: &RootRunRequest,
+    materialized: Option<&crate::capture_setup::MaterializationProof>,
+) -> Result<BeginRun> {
     crate::capture_journal::validate_related(tx, &request.identity.checkout)?;
     crate::capture_journal::exclude_operation(tx, &request.identity.run)?;
     crate::capture_journal::exclude_operation(tx, &request.identity.group)?;
@@ -559,7 +563,13 @@ pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<
     if conflict {
         return Err(StoreError::Conflict);
     }
-    acquire_writer_tx(tx, uuid(&i.checkout)?, uuid(&i.group)?, false)?;
+    crate::store::acquire_writer_context(
+        tx,
+        uuid(&i.checkout)?,
+        uuid(&i.group)?,
+        false,
+        materialized,
+    )?;
     tx.execute(
         "INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)",
         (i.group.to_string(), i.checkout.to_string()),

@@ -84,6 +84,13 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
         return Err(err("explicit finish fence forbids allocation mutation"));
     }
     if a.stage == "ready" {
+        if db(crate::capture_requirement::present(&tx, a.checkout))?
+            && !db(crate::capture_journal::unresolved_checkout(&tx, a.checkout))?
+        {
+            return Err(err(
+                "capture requirement forbids generic readiness promotion",
+            ));
+        }
         db(crate::capture_journal::guard_allocation_identity(
             &tx, a.checkout,
         ))?;
@@ -391,7 +398,9 @@ pub fn start_observed(
                 "later lifecycle state requires explicit recovery; start cannot reverse it",
             ));
         }
-        if config.allocation.as_ref().unwrap().capture_sink.is_some() {
+        if !db(crate::capture_requirement::present(&store.conn, a.checkout))?
+            && config.allocation.as_ref().unwrap().capture_sink.is_some()
+        {
             crate::recovery::hold(
                 &mut store,
                 &mut a,
@@ -406,7 +415,7 @@ pub fn start_observed(
         }
         source_authority(&mut store, &mut a)?;
         crate::recovery::reconcile(&mut store, &mut a)?;
-        return if a.stage == "ready" {
+        return if matches!(a.stage.as_str(), "ready" | "capture_pending") {
             Ok(a)
         } else {
             Err(err(a.reason.as_deref().unwrap_or("allocation held")))
@@ -513,29 +522,31 @@ pub fn start_observed(
             Uuid::parse_str(&operation).map_err(|_| err("invalid stored operation"))?,
         )?
         .ok_or_else(|| err("matching charge lacks intent; hold"))?;
-        if state != "active" || a.stage != "ready" {
+        let required = db(crate::capture_requirement::read(&store.conn, a.checkout))?.is_some();
+        if !((state == "active" && a.stage == "ready")
+            || (required && state == "partial" && a.stage == "capture_pending"))
+        {
             return Err(err(
                 "matching allocation incomplete or held; explicit recovery required",
             ));
         }
-        if config.allocation.as_ref().unwrap().capture_sink.is_some() {
+        if !required && config.allocation.as_ref().unwrap().capture_sink.is_some() {
             crate::recovery::hold(&mut store, &mut a, "configured capture unsupported")?;
             return Err(err("configured capture unsupported"));
         }
         source_authority(&mut store, &mut a)?;
         crate::recovery::reconcile(&mut store, &mut a)?;
-        return if a.stage == "ready" {
+        return if matches!(a.stage.as_str(), "ready" | "capture_pending") {
             Ok(a)
         } else {
             Err(err("matching allocation held"))
         };
     }
     let policy = config.allocation.as_ref().unwrap();
-    if policy.capture_sink.is_some() {
-        return Err(err(
-            "configured capture sink unsupported; no capture prepared, no writer eligible",
-        ));
-    }
+    let capture_required = config
+        .selected_capture()
+        .map_err(|_| err("configured capture missing or unsupported; no reservation"))?
+        .is_some();
     if repo.join(".gitmodules").exists() || source.common_git_dir.join("modules").exists() {
         return Err(err("unsupported submodule layout; hold"));
     }
@@ -592,10 +603,12 @@ pub fn start_observed(
         },
         |checkout| {
             a.checkout = checkout;
-            Ok(Some((
-                serde_json::to_string(&a.request).map_err(|_| crate::store::StoreError::Invalid)?,
-                serde_json::to_string(&a).map_err(|_| crate::store::StoreError::Invalid)?,
-            )))
+            Ok(Some(crate::admission::AllocationIntent {
+                request: serde_json::to_string(&a.request)
+                    .map_err(|_| crate::store::StoreError::Invalid)?,
+                record: serde_json::to_string(&a).map_err(|_| crate::store::StoreError::Invalid)?,
+                capture_required,
+            }))
         },
     ))?;
     boundary("charged");
@@ -603,8 +616,11 @@ pub fn start_observed(
     create(config, &mut store, a, &mut boundary)
 }
 // The charged row, not a second fresh Git query, is repository authority.
-fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf> {
-    let charged: String = sql(store.conn.query_row(
+pub(crate) fn source_authority_evidence(
+    conn: &rusqlite::Connection,
+    a: &Allocation,
+) -> io::Result<PathBuf> {
+    let charged: String = sql(conn.query_row(
         "SELECT repository FROM checkouts WHERE id=?1",
         [a.checkout.to_string()],
         |row| row.get(0),
@@ -619,7 +635,13 @@ fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf
         Ok(source) if source.common_git_dir == std::path::Path::new(&charged) => {
             Ok(source.common_git_dir)
         }
-        _ => {
+        _ => Err(err("source repository authority mismatch")),
+    }
+}
+fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf> {
+    match source_authority_evidence(&store.conn, a) {
+        Ok(common) => Ok(common),
+        Err(_) => {
             crate::recovery::hold(
                 store,
                 a,
@@ -631,16 +653,11 @@ fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf
 }
 
 fn create(
-    config: &Config,
+    _config: &Config,
     store: &mut Store,
     mut a: Allocation,
     boundary: &mut impl FnMut(&str),
 ) -> io::Result<Allocation> {
-    if config.allocation.as_ref().unwrap().capture_sink.is_some() {
-        return Err(err(
-            "configured capture unsupported; allocation remains charged",
-        ));
-    }
     crate::config::validate_path(a.destination.parent().unwrap(), true)
         .map_err(|_| err("destination ancestor changed"))?;
     if fs::symlink_metadata(&a.destination).is_ok() {
@@ -739,9 +756,9 @@ fn create(
     fs::File::open(a.destination.parent().unwrap())?.sync_all()?;
     boundary("marker");
     crate::recovery::reconcile(store, &mut a)?;
-    if a.stage != "ready" {
+    if !matches!(a.stage.as_str(), "ready" | "capture_pending") {
         return Err(err("identity changed before readiness; allocation held"));
     }
-    boundary("ready");
+    boundary(&a.stage);
     Ok(a)
 }

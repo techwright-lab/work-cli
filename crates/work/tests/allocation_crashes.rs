@@ -333,7 +333,7 @@ fn version_one_migration_preserves_charge_without_inventing_ready() {
     drop(s);
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
     conn.execute_batch(
-        "DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
+        "DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
     )
     .unwrap();
     drop(conn);
@@ -351,6 +351,7 @@ fn readiness_rechecks_marker_after_external_side_effects() {
             roots: vec![f.root.clone()],
             repositories: vec![f.repo.clone()],
             supervisor: None,
+            capture: None,
             allocation: Some(work_cli::config::AllocationPolicy {
                 repository_limit: 10,
                 owner_limit: 10,
@@ -513,6 +514,7 @@ fn moved_reuse_branch_boundary_is_persistently_held() {
         roots: vec![f.root.clone()],
         repositories: vec![f.repo.clone()],
         supervisor: None,
+        capture: None,
         allocation: Some(work_cli::config::AllocationPolicy {
             repository_limit: 10,
             owner_limit: 10,

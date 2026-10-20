@@ -27,6 +27,11 @@ pub struct Limits {
     pub floor_bytes: u64,
     pub warn_bytes: u64,
 }
+pub(crate) struct AllocationIntent {
+    pub(crate) request: String,
+    pub(crate) record: String,
+    pub(crate) capture_required: bool,
+}
 impl Store {
     pub fn reserve(&mut self, request: &Reservation, limits: Limits) -> Result<Uuid> {
         self.reserve_recorded(request, limits, |_| Ok(None))
@@ -36,7 +41,7 @@ impl Store {
         &mut self,
         request: &Reservation,
         limits: Limits,
-        record: impl FnOnce(Uuid) -> Result<Option<(String, String)>>,
+        record: impl FnOnce(Uuid) -> Result<Option<AllocationIntent>>,
     ) -> Result<Uuid> {
         if request.operation.get_version_num() != 7
             || request.operation.get_variant() != uuid::Variant::RFC4122
@@ -129,11 +134,14 @@ impl Store {
                     .is_some_and(|b| b < limits.warn_bytes),
             },
         )?;
-        if let Some((request_json, record_json)) = record(checkout)? {
+        if let Some(intent) = record(checkout)? {
             tx.execute(
                 "INSERT INTO allocations VALUES(?1,?2,?3)",
-                rusqlite::params![checkout.to_string(), request_json, record_json],
+                rusqlite::params![checkout.to_string(), intent.request, intent.record],
             )?;
+            if intent.capture_required {
+                crate::capture_requirement::insert(&tx, checkout, request.operation)?;
+            }
         }
         tx.commit()?;
         Ok(checkout)

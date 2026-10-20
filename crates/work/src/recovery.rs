@@ -41,6 +41,18 @@ pub(crate) fn hold(store: &mut Store, a: &mut Allocation, reason: &str) -> io::R
     allocate::save(store, a)
 }
 pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()> {
+    let required =
+        allocate::db(crate::capture_requirement::read(&store.conn, a.checkout))?.is_some();
+    if required
+        && !matches!(
+            a.stage.as_str(),
+            "reserved" | "creating" | "created" | "capture_pending" | "ready"
+        )
+    {
+        return Err(allocate::err(
+            "capture requirement has an unknown or later allocation stage",
+        ));
+    }
     let result = verify(a);
     match result {
         Ok(current) => {
@@ -59,7 +71,13 @@ pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()>
                     allocate::sql(tx.commit())?;
                 }
             }
-            a.identity = Some(current); a.stage = "ready".into(); a.reason = None;
+            a.identity = Some(current);
+            if required && a.stage != "ready" {
+                a.stage = "capture_pending".into();
+                a.reason = Some("capture required; root preparation pending".into());
+            } else {
+                a.stage = "ready".into(); a.reason = None;
+            }
             allocate::save(store, a)
         }
         Err(_) => hold(store, a, "identity/marker/registration incomplete or changed; operator reconciliation required (slot retained)"),

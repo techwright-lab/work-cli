@@ -19,14 +19,15 @@ Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture library construction (Tasks 8.1–8.2 only)
+### Capture library construction (Tasks 8.1–8.3a only)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
-`capture_journal`. These are **not** wired into host configuration, allocation
-materialization, actor launch, finish callbacks or a CLI command.
-Every configured-capture unsupported gate remains in place. Tests invoke only
-private fake executables, not an installed DevDiary/Python CLI or a receiver.
+`capture_journal`. Typed host configuration and capture-pending allocation
+materialization are available. Actor launch, subprocess callbacks, freeze/delivery
+and configured `work run`/adopted execution remain explicitly unsupported. Tests use
+private fake executables or disposable Git repositories, not an installed
+DevDiary/Python CLI, a live scope or a receiver.
 
 Settings require absolute executable/registry/state paths, a 1..30000 ms runtime
 budget and a 1..1048576-byte aggregate stdout+stderr budget. Input encoding stops
@@ -95,10 +96,70 @@ checkout flags or mapping JSON are corrupt. Ordinary allocation retries cannot
 revive Preparing/reconciled/closed capture; live Prepared own-root ready identity
 refresh remains possible. Capture metadata never finishes a task or releases charge.
 
-Fresh capture-pending allocation proof, host configuration, subprocess callbacks,
-launch projection/credential stripping and freezing belong to 8.3. Finish/delivery
-reconciliation and disposable HTTP qualification belong to 8.4. All configured-sink
-unsupported gates remain unchanged; nothing here activates capture or retirement.
+Schema 11 adds a permanent per-allocation `capture_requirements` relation and
+operation index. Its allocation-operation reference is the existing reservation
+operation, not a second reserved ID. Requirement, charge, allocation intent and
+reservation event share one transaction before Git. Migration adds no requirements
+to historical allocations and rewrites no allocation/root/finish/capture/outbox bytes.
+Requirement presence independently fences all ordinary public writer/root/adopted/
+captured-root **new** admission, regardless of forged readiness or allocation JSON.
+
+Explicit `allocation.capture_sink = "devdiary"` plus a valid `[capture]` definition
+allows `start` to materialize `capture_pending` (authoritative `partial`, `ready=0`).
+A definition alone is dormant. Missing/unknown selected sinks refuse before charging.
+Same-operation and matching-task pending receipts retain their original path/charge;
+removing current config cannot erase a durable requirement or turn it into no-sink Ready.
+No run, execution chain or capture session is invented by `start`.
+
+```toml
+[capture]
+executable = "/absolute/bin/capture"
+registry = "/absolute/private/actors.json"
+state_dir = "/absolute/private/capture-state"
+timeout_ms = 5000
+response_cap = 1048576
+# Replace with the explicit canonical lowercase SHA-256 pin for your registry.
+registry_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+endpoint_identity = "receiver:example"
+receiver_credential_names = ["RECEIVER_TOKEN"]
+# key_file = "/absolute/private/key" # locator only, never a key value
+[capture.actor_refs]
+developer = "actor:example"
+```
+
+Paths are literal absolute locators, not shell expressions. The registry identity
+snapshot is declared `sha256:<pin>` metadata: **8.3a does not read or verify registry
+bytes or key-file metadata**. Registry-byte verification and actual registry key-env
+coverage are required before Begin in 8.3b. Actor mappings and credential names are
+bounded to 128 each; all nine projection/runtime environment names are forbidden as
+receiver credentials. Without a key-file locator, names must be explicitly nonempty.
+Endpoint labels cannot contain userinfo, query or fragment delimiters. TOML is bounded
+to 1 MiB and configuration diagnostics never echo supplied values.
+
+Trusted library callers construct a matching selected root snapshot using
+`Config::capture_spec(root, allocation, capture_operation, task_refs, source)`.
+This selects only the root actor's registry mapping and existing supervisor Git
+profile (all four fields), not unrelated actor-map settings. No live runtime/bus
+inspection is needed for materialization. Full selected settings are sealed per root.
+`capture_setup::begin(config, root, spec)` verifies those current selected settings,
+registered authority, charged source common directory, actual marker/registration/
+branch/path/device/inode/boot identity and pending durable context. Its private,
+non-Clone/non-Serde proof binds the exact root/spec/allocation/requirement revision,
+expires after two seconds, and is rechecked after IMMEDIATE locking and before
+handoff. Only the shared internal admission kernel consumes it; no public flag/DTO
+can bypass ordinary Ready admission. Refusal retains the charge and grants no root.
+
+A fresh Created-only handle admits preparation at active/not-ready; matched
+`record_capture_prepared` atomically promotes both allocation JSON (`ready`, no reason)
+and authoritative readiness. Changed allocation/requirement/writer/root revision,
+holds, outcomes and finish fences refuse late promotion. Lost-result reconciliation
+remains held/not-ready. Exact historical Existing setup uses the sealed request/spec
+without current actor profiles, registry files, filesystem refresh or a new handle.
+Returned preparation metadata is not a kernel Binding or actor launch permission.
+
+Actual callbacks, projection-file validation, credential stripping, freeze and
+configured runtime activation remain 8.3b; finish/delivery reconciliation and disposable
+HTTP qualification remain 8.4. No capture process is invoked by this setup helper.
 
 ## Read-only inventory
 
@@ -174,7 +235,7 @@ owner_limit = 2
 floor_bytes = 1073741824
 warn_bytes = 2147483648
 # No capture_sink: allocation may become ready without attribution capture.
-# Any configured capture_sink currently fails closed; capture is NOT prepared.
+# capture_sink = "devdiary" # only with valid [capture]; start stays capture_pending.
 ```
 
 ```sh
@@ -200,8 +261,8 @@ requires operator recovery outside start. Initial in-progress crash stages may r
 Incomplete creation (including create-before-marker crashes), altered metadata or
 unsupported layouts remain charged and held for operator reconciliation; nothing
 is deleted, timed out or automatically retired. Boot/device changes require durable
-identity reconciliation, not invented activity. Capture-enabled configurations are
-unsupported and fail closed. Schema-v1 migration preserves old charges with writer
+identity reconciliation, not invented activity. Configured capture materializes only
+pending; execution remains unsupported. Schema-v1 migration preserves old charges with writer
 readiness false; doctor remains a no-migration existing-evidence reader for both versions.
 
 Controlled creation fails closed on any effective nonempty `filter.*.smudge` or
@@ -297,7 +358,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted schema-10 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-11 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -313,7 +374,7 @@ retries remain receipts/holds, not relaunches or automatic recovery.
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8/v9 store to schema 10; malformed schemas, missing tables, views, incorrect
+upgrade a valid v8/v9/v10 store to schema 11; malformed schemas, missing tables, views, incorrect
 claims and non-WAL authority fail closed, without repair. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
@@ -578,7 +639,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-schema-10-authority metadata, with
+Status is read-only existing-schema-11-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -587,7 +648,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema 10.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 11.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned

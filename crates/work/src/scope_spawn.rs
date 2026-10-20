@@ -81,6 +81,14 @@ impl TryFrom<GitWire> for ActorGitProfile {
     }
 }
 impl ActorGitProfile {
+    pub(crate) fn capture_profile(&self) -> crate::capture_bridge::GitProfile {
+        crate::capture_bridge::GitProfile {
+            author_name: Some(self.author_name.clone()),
+            author_email: Some(self.author_email.clone()),
+            committer_name: Some(self.committer_name.clone()),
+            committer_email: Some(self.committer_email.clone()),
+        }
+    }
     pub fn new(
         author_name: &str,
         author_email: &str,

@@ -325,7 +325,11 @@ impl CaptureSpec {
             candidate.expected_git(),
         )
     }
-    fn agrees(&self, conn: &Connection, r: &RootRunRequest) -> Result<crate::allocate::Allocation> {
+    pub(crate) fn agrees(
+        &self,
+        conn: &Connection,
+        r: &RootRunRequest,
+    ) -> Result<crate::allocate::Allocation> {
         let d = &self.declaration;
         let i = r.identity();
         let (task,operation,request,record):(String,String,String,String)=conn.query_row(
@@ -452,6 +456,7 @@ pub struct PreparationHandle {
     request: RootRunRequest,
     spec: Box<CaptureSpec>,
     revision: u64,
+    pending: Option<crate::capture_setup::PendingPreparation>,
 }
 #[derive(Clone, Serialize)]
 pub struct CaptureRecord {
@@ -540,6 +545,7 @@ impl Store {
             &handle.spec,
             prepared,
             Some(handle.revision),
+            handle.pending.as_ref(),
         )
     }
     /// A lost acknowledgement can attach matching metadata, never restore readiness.
@@ -549,7 +555,7 @@ impl Store {
         spec: &CaptureSpec,
         prepared: &crate::capture_bridge::Prepared,
     ) -> Result<()> {
-        self.commit_preparation(request, spec, prepared, None)
+        self.commit_preparation(request, spec, prepared, None, None)
     }
     fn commit_preparation(
         &mut self,
@@ -557,6 +563,7 @@ impl Store {
         spec: &CaptureSpec,
         prepared: &crate::capture_bridge::Prepared,
         live_revision: Option<u64>,
+        pending: Option<&crate::capture_setup::PendingPreparation>,
     ) -> Result<()> {
         let observation = observation(spec, prepared, live_revision.is_some())?;
         let _phase = self.sql_phase();
@@ -620,6 +627,9 @@ impl Store {
             )?;
         }
         if live_revision.is_some() {
+            if let Some(pending) = pending {
+                pending.promote(&tx, id(&request.identity().checkout)?)?;
+            }
             tx.execute(
                 "UPDATE checkouts SET ready=1 WHERE id=?1",
                 [request.identity().checkout.to_string()],
@@ -643,12 +653,29 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    /// Normal active/ready allocation only. No capture-pending eligibility bypass.
+    /// Normal active/ready allocation without a capture requirement only.
+    /// No capture-pending eligibility bypass; exact Existing remains metadata.
     /// Only a freshly committed Created result yields a preparation handle.
     pub fn begin_captured_run(
         &mut self,
         request: &RootRunRequest,
         spec: &CaptureSpec,
+    ) -> Result<BeginCapturedRun> {
+        self.begin_capture_context(request, spec, None)
+    }
+    pub(crate) fn begin_materialized_capture(
+        &mut self,
+        request: &RootRunRequest,
+        spec: &CaptureSpec,
+        proof: &crate::capture_setup::MaterializationProof,
+    ) -> Result<BeginCapturedRun> {
+        self.begin_capture_context(request, spec, Some(proof))
+    }
+    fn begin_capture_context(
+        &mut self,
+        request: &RootRunRequest,
+        spec: &CaptureSpec,
+        proof: Option<&crate::capture_setup::MaterializationProof>,
     ) -> Result<BeginCapturedRun> {
         // Bound the actual durable representation before acquiring SQL authority.
         let body = json(spec)?;
@@ -668,7 +695,9 @@ impl Store {
             }
             return Ok(BeginCapturedRun::Existing(record));
         }
-        if allocation.stage != "ready" {
+        if let Some(proof) = proof {
+            proof.validate_capture(&tx, request, spec)?;
+        } else if allocation.stage != "ready" {
             return Err(StoreError::Invalid);
         }
         crate::store::exclude_journal_identity(&tx, spec.operation)?;
@@ -676,7 +705,7 @@ impl Store {
         if collision {
             return Err(StoreError::Conflict);
         }
-        if crate::run_journal::begin_run_tx(&tx, request)? != BeginRun::Created {
+        if crate::run_journal::begin_run_context(&tx, request, proof)? != BeginRun::Created {
             return Err(StoreError::Conflict);
         }
         tx.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",rusqlite::params![request.identity().run.to_string(), request.identity().group.to_string(),request.identity().checkout.to_string(),spec.operation.to_string(),body,digest(spec)?.as_slice(),wall()])?;
@@ -687,14 +716,18 @@ impl Store {
             crate::run_journal::JournalChange::CaptureIntent,
         )?;
         tx.execute(
-            "UPDATE checkouts SET ready=0 WHERE id=?1",
+            "UPDATE checkouts SET ready=0,state='active' WHERE id=?1",
             [request.identity().checkout.to_string()],
         )?;
+        if let Some(proof) = proof {
+            proof.fresh()?;
+        }
         tx.commit()?;
         Ok(BeginCapturedRun::Created(PreparationHandle {
             request: request.clone(),
             spec: Box::new(spec.clone()),
             revision: 1,
+            pending: proof.map(|p| p.preparation()),
         }))
     }
 }
@@ -721,6 +754,12 @@ pub(crate) fn validate_related(conn: &Connection, checkout: &CheckoutId) -> Resu
 /// This cannot promote Preparing, reconciled, closed, held or malformed history.
 pub(crate) fn guard_allocation_identity(conn: &Connection, checkout: Uuid) -> Result<()> {
     if !unresolved_checkout(conn, checkout)? {
+        if crate::capture_requirement::present(conn, checkout)? {
+            let ready:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND (state='active' OR ready=1))",[checkout.to_string()],|r|r.get(0))?;
+            if ready {
+                return Err(StoreError::Invalid);
+            }
+        }
         return Ok(());
     }
     let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1) AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",[checkout.to_string()],|r|r.get(0))?;

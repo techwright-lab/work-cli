@@ -1136,8 +1136,10 @@ fn v9_upgrade_preserves_receipt_bytes_and_missing_v10_shapes_fail_closed() {
         .query_row("SELECT request FROM runs", [], |r| r.get(0))
         .unwrap();
     let events = store.pending_events(100).unwrap();
-    sql.execute_batch("DROP TABLE capture_runs; PRAGMA user_version=9")
-        .unwrap();
+    sql.execute_batch(
+        "DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9",
+    )
+    .unwrap();
     drop(store);
     let store = reopen(&dir).unwrap();
     assert_eq!(store.pending_events(100).unwrap(), events);
@@ -1187,7 +1189,7 @@ fn v9_capture_migration_failure_rolls_back_version_and_all_existing_rows() {
     let r = request(checkout);
     store.begin_run(&r).unwrap();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE capture_runs; PRAGMA user_version=9; CREATE VIEW capture_runs AS SELECT 1 AS obstruction").unwrap();
+    sql.execute_batch("DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9; CREATE VIEW capture_runs AS SELECT 1 AS obstruction").unwrap();
     let body: String = sql
         .query_row("SELECT request FROM runs", [], |r| r.get(0))
         .unwrap();
@@ -1763,7 +1765,7 @@ fn schema_ten_adds_empty_capture_journal_without_rewriting_no_sink_history() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     assert_eq!(
         sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r

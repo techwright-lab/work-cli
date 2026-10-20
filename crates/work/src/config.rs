@@ -13,6 +13,7 @@ pub struct Config {
     pub repositories: Vec<PathBuf>,
     pub allocation: Option<AllocationPolicy>,
     pub supervisor: Option<SupervisorConfig>,
+    pub capture: Option<crate::capture_config::HostCaptureConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -115,6 +116,9 @@ impl Config {
     }
 
     fn from_toml(text: &str) -> Result<Self, Error> {
+        if text.len() > 1024 * 1024 {
+            return Err(Error::Config("configuration exceeds size limit".into()));
+        }
         let value: toml::Value = toml::from_str(text).map_err(|err: toml::de::Error| {
             // Parser diagnostics include source text and values; expose only location.
             let mut diagnostic = "invalid TOML".to_owned();
@@ -167,6 +171,17 @@ impl Config {
                         .map_err(|_| Error::Config("invalid supervisor policy".into()))?;
                     policy.validate()?;
                     Ok(policy)
+                })
+                .transpose()?,
+            capture: value
+                .get("capture")
+                .map(|v| {
+                    let host: crate::capture_config::HostCaptureConfig = v
+                        .clone()
+                        .try_into()
+                        .map_err(|_| Error::Config("invalid capture policy".into()))?;
+                    host.validate()?;
+                    Ok(host)
                 })
                 .transpose()?,
             allocation: value
