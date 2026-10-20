@@ -172,6 +172,7 @@ fn load(conn: &Connection, checkout: Uuid) -> Result<Option<Receipt>> {
     };
     let r: Receipt = parse(&body)?;
     uuid7(r.operation)?;
+    crate::capture_journal::exclude_operation(conn, &r.operation)?;
     uuid7(r.checkout)?;
     let (a, state, ready) = allocation(conn, checkout)?;
     let events:i64 = conn.query_row("SELECT count(*) FROM outbox WHERE json_extract(payload,'$.type')='task_finished' AND json_extract(payload,'$.checkout')=?1 AND json_extract(payload,'$.operation')=?2",(checkout.to_string(),r.operation.to_string()),|row|row.get(0))?;

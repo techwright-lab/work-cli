@@ -130,6 +130,10 @@ pub enum JournalChange {
     ChildHold,
     ChildEnrolled,
     ChildrenInterrupted,
+    CaptureIntent,
+    CapturePrepared,
+    CaptureReconciled,
+    CaptureGroupEnd,
 }
 
 use crate::{
@@ -151,6 +155,7 @@ pub struct GroupEmptyProof {
     record: RunRecord,
     interrupted_children: Vec<RunId>,
     collected_at: Instant,
+    observed_wall: std::time::SystemTime,
 }
 /// A non-executing candidate made only from a Store-validated group snapshot.
 /// Not serializable; cannot authorize launch, cancellation, or delegation.
@@ -215,6 +220,7 @@ impl GroupSnapshot {
                 .map(|child| child.request.run.clone())
                 .collect(),
             collected_at,
+            observed_wall: std::time::SystemTime::now(),
         }
     }
     /// Reinspect historical full-roster metadata without restoring a Binding.
@@ -429,7 +435,7 @@ fn apply_interruptions(record: &mut RunRecord, ids: &[RunId]) -> Result<()> {
     }
     Ok(())
 }
-fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
+pub(crate) fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     // Typed domain validation is shared with admission. Historical reads must
     // not impose a smaller serialized size than previously accepted requests.
     let _snapshot = read_transaction(conn)?;
@@ -445,6 +451,7 @@ fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     if let Some(r) = &mut record {
         r.children = crate::run_participants::roster(conn, &r.request, r.binding.as_ref())?;
         validate_child_history(r)?;
+        crate::capture_journal::read(conn, r)?;
     }
     Ok(record)
 }
@@ -499,40 +506,9 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if read(&tx, &request.identity.run)?.is_some() {
-            exact(&tx, request)?;
-            return Ok(BeginRun::Existing);
-        }
-        let i = &request.identity;
-        let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE run_ref=?1 OR id=?2 OR group_id=?2 OR group_id=?3)
-            OR EXISTS(SELECT 1 FROM run_groups WHERE id=?2 OR id=?3)
-            OR EXISTS(SELECT 1 FROM checkouts WHERE id IN (?2,?3) OR operation IN (?2,?3))
-            OR EXISTS(SELECT 1 FROM adopted_groups WHERE run_ref=?1 OR id IN (?2,?3) OR run_id IN (?2,?3) OR operation IN (?2,?3))
-            OR EXISTS(SELECT 1 FROM writers WHERE group_id IN (?2,?3))
-            OR EXISTS(SELECT 1 FROM run_participants WHERE run_ref=?1 OR id IN (?2,?3))
-            OR EXISTS(SELECT 1 FROM task_finishes WHERE operation IN (?2,?3))
-            ",
-            (i.run_ref.as_str(), i.group.to_string(), i.run.to_string()), |r| r.get(0))?;
-        if conflict {
-            return Err(StoreError::Conflict);
-        }
-        acquire_writer_tx(&tx, uuid(&i.checkout)?, uuid(&i.group)?, false)?;
-        tx.execute(
-            "INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)",
-            (i.group.to_string(), i.checkout.to_string()),
-        )?;
-        tx.execute(
-            "INSERT INTO runs(id,group_id,run_ref,request,stage) VALUES(?1,?2,?3,?4,'intent')",
-            (
-                i.run.to_string(),
-                i.group.to_string(),
-                i.run_ref.as_str(),
-                json(request)?,
-            ),
-        )?;
-        journal_event(&tx, request, 1, JournalChange::Intent)?;
+        let result = begin_run_tx(&tx, request)?;
         tx.commit()?;
-        Ok(BeginRun::Created)
+        Ok(result)
     }
     /// Historical snapshot from opaque observed Binding, never reconstructed
     /// from serialized metadata. Must commit before any permit attempt.
@@ -546,6 +522,46 @@ impl Store {
             Change::Bound(BoundSnapshot::capture(request, binding)?),
         )
     }
+}
+pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<BeginRun> {
+    crate::capture_journal::validate_related(tx, &request.identity.checkout)?;
+    crate::capture_journal::exclude_operation(tx, &request.identity.run)?;
+    crate::capture_journal::exclude_operation(tx, &request.identity.group)?;
+    if read(tx, &request.identity.run)?.is_some() {
+        exact(tx, request)?;
+        return Ok(BeginRun::Existing);
+    }
+    let i = &request.identity;
+    let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE run_ref=?1 OR id=?2 OR group_id=?2 OR group_id=?3)
+            OR EXISTS(SELECT 1 FROM run_groups WHERE id=?2 OR id=?3)
+            OR EXISTS(SELECT 1 FROM checkouts WHERE id IN (?2,?3) OR operation IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM adopted_groups WHERE run_ref=?1 OR id IN (?2,?3) OR run_id IN (?2,?3) OR operation IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM writers WHERE group_id IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM run_participants WHERE run_ref=?1 OR id IN (?2,?3))
+            OR EXISTS(SELECT 1 FROM task_finishes WHERE operation IN (?2,?3))
+            ",
+            (i.run_ref.as_str(), i.group.to_string(), i.run.to_string()), |r| r.get(0))?;
+    if conflict {
+        return Err(StoreError::Conflict);
+    }
+    acquire_writer_tx(tx, uuid(&i.checkout)?, uuid(&i.group)?, false)?;
+    tx.execute(
+        "INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)",
+        (i.group.to_string(), i.checkout.to_string()),
+    )?;
+    tx.execute(
+        "INSERT INTO runs(id,group_id,run_ref,request,stage) VALUES(?1,?2,?3,?4,'intent')",
+        (
+            i.run.to_string(),
+            i.group.to_string(),
+            i.run_ref.as_str(),
+            json(request)?,
+        ),
+    )?;
+    journal_event(tx, request, 1, JournalChange::Intent)?;
+    Ok(BeginRun::Created)
+}
+impl Store {
     /// Commit BEFORE publishing a gate. This records a potentially launched run,
     /// NOT proof of exec. A failed/uncertain fsync may still leave launch possible.
     /// Callers must separately revalidate the runtime binding at publication.
@@ -572,12 +588,21 @@ impl Store {
     }
     pub fn run_snapshot(&self, run: &RunId) -> Result<Option<RunRecord>> {
         let _phase = self.sql_phase();
-        read(&self.conn, run)
+        let _snapshot = read_transaction(&self.conn)?;
+        let record = read(&self.conn, run)?;
+        if let Some(record) = &record {
+            crate::capture_journal::validate_related(
+                &self.conn,
+                &record.request.identity.checkout,
+            )?;
+        }
+        Ok(record)
     }
     pub(crate) fn run_status_record(&self, run: &RunId) -> Result<(RunRecord, bool, bool)> {
         let _phase = self.sql_phase();
         let _snapshot = read_transaction(&self.conn)?;
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
+        crate::capture_journal::validate_related(&self.conn, &record.request.identity.checkout)?;
         let record = exact(&self.conn, &record.request)?;
         let state: String = self.conn.query_row(
             "SELECT CASE WHEN length(state)<=32 THEN state ELSE '' END FROM checkouts WHERE id=?1",
@@ -631,6 +656,7 @@ impl Store {
         let _phase = self.sql_phase();
         let _snapshot = read_transaction(&self.conn)?;
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
+        crate::capture_journal::validate_related(&self.conn, &record.request.identity.checkout)?;
         let record = exact(&self.conn, &record.request)?;
         if record.closed || record.binding.is_none() {
             return Err(StoreError::Invalid);
@@ -654,6 +680,7 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let expected = &snapshot.record;
+        crate::capture_journal::validate_related(&tx, &expected.request.identity.checkout)?;
         let current = exact(&tx, &expected.request)?;
         let revision = expected
             .revision
@@ -700,6 +727,7 @@ impl Store {
                 JournalChange::ChildrenInterrupted,
             )?;
         }
+        crate::capture_journal::observe_group_end(&tx, &current, proof.observed_wall)?;
         // Child updates/outbox work consume the original evidence window too.
         if Instant::now()
             .checked_duration_since(proof.collected_at)
@@ -731,6 +759,18 @@ impl Store {
         let record = exact(&tx, request)?;
         if record.closed {
             return Err(StoreError::Invalid);
+        }
+        if matches!(change, Change::Bound(_) | Change::Permit(_)) {
+            if let Some(capture) = crate::capture_journal::read(&tx, &record)? {
+                let eligible: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1) AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",[request.identity.checkout.to_string()],|r|r.get(0))?;
+                if !eligible
+                    || record.recovery_hold
+                    || record.outcome.is_some()
+                    || !capture.prepared.is_some_and(|p| p.live_preparation)
+                {
+                    return Err(StoreError::Invalid);
+                }
+            }
         }
         let run = request.identity.run.to_string();
         let group = request.identity.group.to_string();

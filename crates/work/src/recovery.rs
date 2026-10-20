@@ -50,7 +50,9 @@ pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()>
                 if prior.head != current.head {
                     // Commit evidence before refreshing the snapshot. A crash between
                     // commits only repeats the ancestry observation; it grants no writer.
+                    let _phase=store.sql_phase();
                     let tx = allocate::sql(store.conn.transaction())?;
+                    allocate::db(crate::capture_journal::guard_allocation_identity(&tx,a.checkout))?;
                     allocate::db(crate::store::emit(&tx, &crate::events::Event::HeadAdvanced {
                         checkout: a.checkout, old: prior.head.clone(), new: current.head.clone(),
                     }))?;

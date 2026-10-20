@@ -221,6 +221,13 @@ impl Store {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let i = &request.identity;
+        for value in [
+            i.run.to_string(),
+            i.group.to_string(),
+            request.operation.to_string(),
+        ] {
+            crate::capture_journal::exclude_operation(&tx, &value)?;
+        }
         if let Some((existing, _, _)) = read(&tx, &i.run)? {
             if &existing != request {
                 return Err(StoreError::Conflict);

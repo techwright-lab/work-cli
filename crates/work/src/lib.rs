@@ -10,6 +10,7 @@ pub mod adopted;
 pub mod allocate;
 mod bounded_process;
 pub mod capture_bridge;
+pub mod capture_journal;
 pub mod cli;
 pub mod config;
 pub mod doctor;

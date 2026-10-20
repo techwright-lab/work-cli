@@ -19,11 +19,12 @@ Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture transport construction (Task 8.1 only)
+### Capture library construction (Tasks 8.1–8.2 only)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
-`sinks::ProcessSink` for a trusted host adapter. It is **not** wired into host
-configuration, allocation, launch, finish, reconciliation or a CLI command.
+`sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
+`capture_journal`. These are **not** wired into host configuration, allocation
+materialization, actor launch, finish callbacks or a CLI command.
 Every configured-capture unsupported gate remains in place. Tests invoke only
 private fake executables, not an installed DevDiary/Python CLI or a receiver.
 
@@ -53,9 +54,51 @@ authority. Delivered requires a matching receipt (`event_id` per the portable
 protocol, positive integer `session_id`, exact actor/run). Errors never expose
 raw child output. Lifecycle IDs/scope remain declarations, not ownership proof.
 
-Durable mapping/readiness (8.2), launch projection/credential stripping and
-finalization (8.3), and real disposable capture/HTTP contract qualification (8.4)
-remain gated on Task 7 acceptance. Nothing here enables capture or retirement.
+`CaptureSpec::new(operation, snapshot, begin_request, expected_git)` seals a full
+typed sink/declaration snapshot: literal paths, finite transport limits, optional
+key-file locator, credential environment **names**, explicit endpoint/registry
+identity labels, registry actor mapping, Git profile and begin declarations.
+Labels do not pin mutable registry bytes: the future trusted host adapter must
+verify its bounded no-follow registry digest before an external side effect.
+No key values, arbitrary returned environment, argv, prompts or output are stored.
+The begin declaration must match the durable allocation's checkout path and primary
+task, and the root's run/group/chain/parent context. Additional task refs remain
+sealed declarations. Root actor mapping is independent of quota ownership.
+
+Schema 10 adds per-root capture intents/mappings and an indexed checkout barrier;
+v9 no-sink run and finish JSON/outbox receipts are not rewritten or backfilled.
+Schema checks are shape-only; targeted reads/retries validate related capture/root
+history under the existing cumulative 500 ms/200000-instruction SQL budget.
+`Store::begin_captured_run` shares the ordinary active/ready writer transaction:
+root, writer, capture intent, events and not-ready state commit atomically.
+Only `BeginCapturedRun::Created` yields a private, nonserializable, non-Clone
+`PreparationHandle`. Existing results are metadata only and never reacquire writers.
+An existing no-sink root cannot acquire capture retroactively.
+
+`record_capture_prepared(handle, prepared)` accepts only unchanged, unbound,
+unpermitted live context with the exact writer and no hold/outcome/finish fence.
+The response must match the sealed actor/run/profile and the public context path
+`state-dir/<capture-id>.context.json`. It records typed nonsecret observation data
+and readiness, not a runtime Binding or permit. Lost-response
+`reconcile_capture_prepared` may attach the same validated binding as held/not-ready
+metadata; it cannot mint a handle or restore launch permission. Local intent,
+preparation and whole-group observation times are not receiver start times.
+
+Capture operations reserve Work UUIDv7 namespaces; external capture IDs do not.
+Captured roots cannot bind/permit before live preparation. Physical writer closure
+still requires the original fresh complete full-roster proof. Its transaction
+records an immutable whole-group wall observation before exact writer removal,
+retains unknown outcomes and flags backward-clock uncertainty. No local-freeze API
+exists in 8.2: closure retains capture-incomplete, held/not-ready checkout accounting.
+Indexed capture-row presence independently fences every **new** writer, even if
+checkout flags or mapping JSON are corrupt. Ordinary allocation retries cannot
+revive Preparing/reconciled/closed capture; live Prepared own-root ready identity
+refresh remains possible. Capture metadata never finishes a task or releases charge.
+
+Fresh capture-pending allocation proof, host configuration, subprocess callbacks,
+launch projection/credential stripping and freezing belong to 8.3. Finish/delivery
+reconciliation and disposable HTTP qualification belong to 8.4. All configured-sink
+unsupported gates remain unchanged; nothing here activates capture or retirement.
 
 ## Read-only inventory
 
@@ -254,7 +297,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted v9 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-10 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -270,7 +313,7 @@ retries remain receipts/holds, not relaunches or automatic recovery.
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8 store to v9; malformed schemas, missing tables, views, incorrect
+upgrade a valid v8/v9 store to schema 10; malformed schemas, missing tables, views, incorrect
 claims and non-WAL authority fail closed, without repair. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
@@ -535,7 +578,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-v9-authority metadata, with
+Status is read-only existing-schema-10-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -544,7 +587,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema v9.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 10.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned

@@ -71,6 +71,7 @@ fn component(s: &str) -> bool {
 pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
     let record = serde_json::to_string(a)?;
     let request = serde_json::to_string(&a.request)?;
+    let _phase = store.sql_phase();
     let tx = sql(store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
@@ -81,6 +82,11 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
     ))?;
     if finished {
         return Err(err("explicit finish fence forbids allocation mutation"));
+    }
+    if a.stage == "ready" {
+        db(crate::capture_journal::guard_allocation_identity(
+            &tx, a.checkout,
+        ))?;
     }
     sql(tx.execute("INSERT INTO allocations VALUES(?1,?2,?3) ON CONFLICT(checkout) DO UPDATE SET record=excluded.record", rusqlite::params![a.checkout.to_string(), request, record]))?;
     sql(tx.execute(
@@ -109,10 +115,20 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
     sql(tx.commit())
 }
 pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allocation>> {
+    let _phase = store.sql_phase();
+    db(crate::capture_journal::exclude_operation(
+        &store.conn,
+        &operation,
+    ))?;
     let value: Option<(String, Option<String>, Option<String>)> = sql(store.conn.query_row("SELECT c.id,a.request,a.record FROM checkouts c LEFT JOIN allocations a ON c.id=a.checkout WHERE c.operation=?1", [operation.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional())?;
     let Some((id, request, record)) = value else {
         return Ok(None);
     };
+    let checkout = Uuid::parse_str(&id).map_err(|_| err("invalid checkout key"))?;
+    db(crate::capture_journal::guard_allocation_identity(
+        &store.conn,
+        checkout,
+    ))?;
     let parsed = record
         .as_deref()
         .and_then(|v| serde_json::from_str::<Allocation>(v).ok())
@@ -169,6 +185,13 @@ fn refuse_finished(store: &Store, checkout: Uuid) -> io::Result<()> {
 /// Unlike allocation reconciliation this never revives held/quarantined rows.
 pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result<Allocation> {
     refuse_finished(store, checkout)?;
+    {
+        let _phase = store.sql_phase();
+        db(crate::capture_journal::guard_allocation_identity(
+            &store.conn,
+            checkout,
+        ))?;
+    }
     let (operation, state, ready): (String, String, bool) = sql(store.conn.query_row(
         "SELECT operation,state,ready FROM checkouts WHERE id=?1",
         [checkout.to_string()],
@@ -205,9 +228,13 @@ fn refresh_ready_identity(
     a: &mut Allocation,
     current: CheckoutIdentity,
 ) -> io::Result<()> {
+    let _phase = store.sql_phase();
     let tx = sql(store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+    db(crate::capture_journal::guard_allocation_identity(
+        &tx, a.checkout,
+    ))?;
     let stored: Option<(String, String)> = sql(tx
         .query_row(
             "SELECT a.request,a.record FROM allocations a JOIN checkouts c ON c.id=a.checkout
