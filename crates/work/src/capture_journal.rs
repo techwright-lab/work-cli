@@ -944,15 +944,15 @@ pub(crate) fn unresolved_checkout(conn: &Connection, checkout: Uuid) -> Result<b
     )?)
 }
 pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<bool> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let version: i64 = conn
+        .prepare_cached("PRAGMA user_version")?
+        .query_row([], |r| r.get(0))?;
     if version < 10 {
         return Ok(false);
     }
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM capture_runs WHERE operation=?1)",
-        [operation],
-        |r| r.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM capture_runs WHERE operation=?1)")?
+        .query_row([operation], |r| r.get(0))?)
 }
 pub(crate) fn exclude_operation(conn: &Connection, value: &impl ToString) -> Result<()> {
     if operation_reserved(conn, &value.to_string())? {
@@ -1114,7 +1114,7 @@ fn qualify_terminal(
     drop(agrees_profile);
     #[cfg(test)]
     let namespace_profile = span(Subphase::TerminalNamespaceHeaderDigest);
-    let collision:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1) OR EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1) OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1) OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1) OR EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)",[spec.operation.to_string()],|r|r.get(0))?;
+    let collision:bool=conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1) OR EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1) OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1) OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1) OR EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)")?.query_row([spec.operation.to_string()],|r|r.get(0))?;
     if collision {
         return Err(StoreError::Invalid);
     }

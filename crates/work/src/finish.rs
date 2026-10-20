@@ -275,15 +275,15 @@ pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<bool> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let version: i64 = conn
+        .prepare_cached("PRAGMA user_version")?
+        .query_row([], |r| r.get(0))?;
     if version < 9 {
         return Ok(false);
     }
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)",
-        [operation],
-        |r| r.get(0),
-    )?)
+    Ok(conn
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)")?
+        .query_row([operation], |r| r.get(0))?)
 }
 pub(crate) fn task_open(conn: &Connection, checkout: Uuid) -> Result<bool> {
     Ok(load(conn, checkout)?.is_none())

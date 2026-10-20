@@ -352,13 +352,13 @@ fn namespace_conflict(conn: &rusqlite::Connection, request: &ChildRequest) -> Re
     {
         return Ok(true);
     }
-    conn.query_row("SELECT
+    conn.prepare_cached("SELECT
         EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1 OR run_ref=?2)
         OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1)
         OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1 OR run_ref=?2)
         OR EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1)
         OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)
-        OR EXISTS(SELECT 1 FROM run_participants WHERE id!=?1 AND run_ref=?2)",
+        OR EXISTS(SELECT 1 FROM run_participants WHERE id!=?1 AND run_ref=?2)")?.query_row(
         (request.run.to_string(), request.run_ref.as_str()), |r| r.get(0)).map_err(StoreError::from)
 }
 pub(crate) fn roster(
@@ -453,11 +453,9 @@ fn validate_roster(
     binding: Option<&crate::run_journal::BoundSnapshot>,
     rows: Vec<ChildRow>,
 ) -> Result<Vec<ChildRecord>> {
-    let count: i64 = conn.query_row(
-        "SELECT child_count FROM run_groups WHERE id=?1",
-        [root.identity().group.to_string()],
-        |r| r.get(0),
-    )?;
+    let count: i64 = conn
+        .prepare_cached("SELECT child_count FROM run_groups WHERE id=?1")?
+        .query_row([root.identity().group.to_string()], |r| r.get(0))?;
     let mut records = Vec::new();
     for row in rows {
         let body = row.body;
