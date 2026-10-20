@@ -19,14 +19,14 @@ Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture library construction (Tasks 8.1–8.3b2 only)
+### Capture library construction (Tasks 8.1–8.3b3a only)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
 `capture_journal`. Typed host configuration and capture-pending allocation
 materialization, trusted library-only capture preparation and captured supervised
-execution are available. Freeze/delivery and configured `work run`/adopted execution
-remain explicitly unsupported. Tests use
+execution and explicit trusted-library terminal finalization are available.
+Configured `work run`/adopted execution remain explicitly unsupported. Tests use
 private fake executables or disposable Git repositories, not an installed
 DevDiary/Python CLI, a live scope or a receiver.
 
@@ -91,8 +91,8 @@ Capture operations reserve Work UUIDv7 namespaces; external capture IDs do not.
 Captured roots cannot bind/permit before live preparation. Physical writer closure
 still requires the original fresh complete full-roster proof. Its transaction
 records an immutable whole-group wall observation before exact writer removal,
-retains unknown outcomes and flags backward-clock uncertainty. No local-freeze API
-exists in 8.2: closure retains capture-incomplete, held/not-ready checkout accounting.
+retains unknown outcomes and flags backward-clock uncertainty. Closure alone retains
+capture-incomplete, held/not-ready checkout accounting.
 Indexed capture-row presence independently fences every **new** writer, even if
 checkout flags or mapping JSON are corrupt. Ordinary allocation retries cannot
 revive Preparing/reconciled/closed capture; live Prepared own-root ready identity
@@ -256,10 +256,33 @@ physical-closure loop. Root exit, logical child outcomes and Stop acknowledgemen
 never close a writer. Physical closure records group end before exact writer removal,
 leaves local capture **unfrozen**, and retains held/not-ready accounting and the
 permanent unresolved requirement. `RunReport::capture_unfrozen` reports this separately
-from root outcome, group closure, task openness and charge. No freeze, delivery,
-finish, uncharging, sequential captured root, readiness continuation or adopted/CLI
-activation is provided here. Terminal capture journaling and subsequent lifecycle
-integration remain later increments.
+from root outcome, group closure, task openness and charge. The coordinator never
+finalizes automatically. No finish, uncharging, sequential captured root, readiness
+continuation or adopted/CLI activation is provided here.
+
+Schema 12 adds `capture_finalizations` without rewriting or backfilling old rows.
+Its intent, confirmation, revisions and `CaptureFinalizationChanged` outbox events
+are separate from the closed root/group revision and its original closure receipt.
+`capture_finalization::finalize(config, &run)` requires an established current-schema
+store, physically closed group, known root outcome and certain whole-group end.
+It commits the exact FINISH intent before invoking the original sealed process
+settings. Unconfirmed intent replays FINISH byte-for-byte; confirmed finalize returns
+passive `Existing` without a process. `retry_delivery` requires confirmation and only
+invokes RETRY. No current actor registry, key or context reread is needed.
+`finalize_observed` exposes a callback after intent commit, outside SQL and locks.
+
+Typed snapshots retain receiver-reported start/end/source/attempt/error/receipt facts.
+Optional end echoes must match the instant or explicitly qualify as the same
+microsecond (receiver truncation); the original nanosecond request is preserved.
+Delivered facts and known event identity cannot be downgraded; later session receipts
+may refresh. Transport or persistence failures retain the unconfirmed intent (or
+previous confirmed evidence). No raw child JSON/stderr is retained.
+Only actual matching FINISH plus committed confirmation yields a private-constructor,
+non-Clone/non-Serde `FreezeAcknowledgement`. Snapshots, `Existing` and RETRY cannot
+mint it. This observation is not readiness authority. `RunReport::capture_delivery`
+distinguishes historical frozen-pending/delivered from unfrozen/not-configured.
+All writer/task/charge/ready flags and the ANY-capture-history writer fence remain
+unchanged; b3b/b4 integration remains unsupported.
 
 ## Read-only inventory
 

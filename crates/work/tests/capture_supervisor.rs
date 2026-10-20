@@ -183,6 +183,43 @@ json.dump({{'capture_id':'{CAPTURE}','state':'open','actor_ref':r['actor_ref'],'
     }
 }
 #[test]
+fn terminal_finalization_changes_only_observational_report() {
+    let mut h = Harness::new();
+    h.launcher();
+    let report = h
+        .observed(|b, r| {
+            if b == Boundary::RootTerminal {
+                h.empty(r)
+            }
+        })
+        .unwrap();
+    let response = serde_json::json!({"capture_id":CAPTURE,"actor_ref":"actor:alice","run_ref":report.record.request.identity().run_ref.as_str(),"state":"pending"});
+    file(
+        &h.f.temp.path().join("response"),
+        response.to_string(),
+        0o600,
+    );
+    file(
+        &h.f.temp.path().join("producer"),
+        format!(
+            "#!/bin/sh\n/usr/bin/cat >/dev/null\nexec /usr/bin/cat '{}'\n",
+            h.f.temp.path().join("response").display()
+        ),
+        0o700,
+    );
+    work_cli::capture_finalization::finalize(&h.cfg, &report.record.request.identity().run)
+        .unwrap();
+    let after = h.execute().unwrap();
+    assert!(
+        !after.capture_unfrozen,
+        "confirmed frozen still reported unfrozen"
+    );
+    assert!(!after.attribution_not_configured);
+    assert!(after.task_open && after.lease_charged && after.existing);
+    assert_eq!(after.record, report.record);
+}
+
+#[test]
 fn qualified_capture_runs_attributed_actor_and_closes_group_but_retains_capture_hold() {
     let mut h = Harness::new();
     h.launcher();

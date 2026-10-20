@@ -86,6 +86,8 @@ pub struct RunReport {
     pub attribution_not_configured: bool,
     /// Capture is locally unfrozen; physical group closure is not freeze/delivery.
     pub capture_unfrozen: bool,
+    /// Historical delivery observation, never readiness or a fresh live acknowledgement.
+    pub capture_delivery: Option<crate::capture_bridge::DeliveryObservation>,
 }
 impl RunReport {
     pub fn process_exit_code(&self) -> i32 {
@@ -209,8 +211,17 @@ fn report(
     let _phase = store.sql_phase();
     let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
     let (record, lease_charged, task_open) = db(store.run_status_record(run))?;
-    let capture_unfrozen = db(store.capture_snapshot(run))?.is_some();
-    let attribution_not_configured = !capture_unfrozen
+    let mapped = db(store.capture_snapshot(run))?.is_some();
+    let confirmation = db(store.capture_finalization_snapshot(run))?.and_then(|s| s.confirmation);
+    let capture_unfrozen = mapped && confirmation.is_none();
+    let capture_delivery = confirmation.map(|c| {
+        if c.delivered {
+            crate::capture_bridge::DeliveryObservation::Delivered
+        } else {
+            crate::capture_bridge::DeliveryObservation::Pending
+        }
+    });
+    let attribution_not_configured = !mapped
         && db(crate::finish::capture_not_configured(
             &store.conn,
             Uuid::parse_str(&record.request.identity().checkout.to_string())
@@ -224,6 +235,7 @@ fn report(
         task_open,
         attribution_not_configured,
         capture_unfrozen,
+        capture_delivery,
     })
 }
 /// Historical finished-task receipt, without restoring actor/runtime authority.

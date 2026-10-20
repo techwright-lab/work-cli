@@ -71,7 +71,7 @@ pub struct WorkLifecycle {
     pub group_id: Option<GroupId>,
     pub operation_id: Option<AllocationOperationId>,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     #[serde(
@@ -318,7 +318,8 @@ impl Prepared {
         &self.environment
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryObservation {
     Pending,
     Delivered,
@@ -327,8 +328,32 @@ pub enum DeliveryObservation {
 pub struct LocalFrozen {
     binding: CaptureBinding,
     delivery: DeliveryObservation,
+    ended_at: Option<String>,
+    started_at: Option<String>,
+    last_attempt_at: Option<String>,
+    source: Option<Source>,
+    error_code: Option<String>,
+    receipt: Option<Receipt>,
 }
 impl LocalFrozen {
+    pub fn ended_at(&self) -> Option<&str> {
+        self.ended_at.as_deref()
+    }
+    pub fn started_at(&self) -> Option<&str> {
+        self.started_at.as_deref()
+    }
+    pub fn last_attempt_at(&self) -> Option<&str> {
+        self.last_attempt_at.as_deref()
+    }
+    pub fn source(&self) -> Option<&Source> {
+        self.source.as_ref()
+    }
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+    pub fn receipt(&self) -> Option<&Receipt> {
+        self.receipt.as_ref()
+    }
     pub fn delivery(&self) -> DeliveryObservation {
         self.delivery
     }
@@ -434,13 +459,27 @@ struct TerminalWire {
     #[serde(default, deserialize_with = "present")]
     receipt: Option<Receipt>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Receipt {
+pub struct Receipt {
     actor_ref: String,
     run_ref: String,
     event_id: String,
     session_id: u64,
+}
+impl Receipt {
+    pub fn actor_ref(&self) -> &str {
+        &self.actor_ref
+    }
+    pub fn run_ref(&self) -> &str {
+        &self.run_ref
+    }
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+    pub fn session_id(&self) -> u64 {
+        self.session_id
+    }
 }
 pub fn decode_terminal(bytes: &[u8], binding: &CaptureBinding) -> Result<LocalFrozen, Refused> {
     let wire: TerminalWire = decode(bytes)?;
@@ -482,6 +521,12 @@ pub fn decode_terminal(bytes: &[u8], binding: &CaptureBinding) -> Result<LocalFr
     Ok(LocalFrozen {
         binding: binding.clone(),
         delivery,
+        ended_at: wire.ended_at,
+        started_at: wire.started_at,
+        last_attempt_at: wire.last_attempt_at,
+        source: wire.source,
+        error_code: wire.error_code,
+        receipt: wire.receipt,
     })
 }
 #[derive(Clone, Copy, Serialize)]
@@ -541,6 +586,7 @@ redacted_debug!(
     EnvironmentProjection,
     Prepared,
     LocalFrozen,
+    Receipt,
     EndedAt,
     FinishRequest,
     RetryRequest

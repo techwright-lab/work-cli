@@ -367,7 +367,7 @@ impl CaptureSpec {
 // Parse unique keys first (including objects in legitimate request arrays), then
 // require the typed serializer's exact object/optional shape. Never let Value
 // overwrite duplicate keys or serde accept positional representations of structs.
-fn strict<T: serde::de::DeserializeOwned + Serialize>(bytes: &str) -> Result<T> {
+pub(crate) fn strict<T: serde::de::DeserializeOwned + Serialize>(bytes: &str) -> Result<T> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(StoreError::Invalid);
     }
@@ -880,6 +880,12 @@ pub(crate) fn observe_group_end(
     )
 }
 pub(crate) fn read(conn: &Connection, root: &RunRecord) -> Result<Option<CaptureRecord>> {
+    Ok(qualified(conn, root)?.map(|(record, _)| record))
+}
+pub(crate) fn qualified(
+    conn: &Connection,
+    root: &RunRecord,
+) -> Result<Option<(CaptureRecord, CaptureSpec)>> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 10 {
         return Ok(None);
@@ -976,13 +982,15 @@ pub(crate) fn read(conn: &Connection, root: &RunRecord) -> Result<Option<Capture
             return Err(StoreError::Invalid);
         }
     }
-    Ok(Some(CaptureRecord {
+    let record = CaptureRecord {
         operation: spec.operation,
         fingerprint: digest(&spec)?,
         intent_wall,
         prepared,
         group_end,
-    }))
+    };
+    crate::capture_finalization::validate(conn, root, &record, &spec)?;
+    Ok(Some((record, spec)))
 }
 
 pub(crate) const SCHEMA: &str = "CREATE TABLE capture_runs(
