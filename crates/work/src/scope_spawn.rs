@@ -122,6 +122,7 @@ pub struct OwnedLaunch {
     deadline: Instant,
     /// Set BEFORE publication: an fsync failure may still have exposed a permit.
     permit_attempted: bool,
+    capture_guard: Option<crate::capture_preparation::CapturedGuard>,
 }
 impl OwnedLaunch {
     /// Fixed production tools and real controller birth/boot identity. Inherited
@@ -156,7 +157,7 @@ impl OwnedLaunch {
         policy: LaunchPolicy,
         io: LaunchIo,
     ) -> Result<Self> {
-        Self::spawn_inner(driver, intent, directory, cwd, argv, policy, io, None)
+        Self::spawn_inner(driver, intent, directory, cwd, argv, policy, io, None, None)
     }
     pub fn spawn_attributed(
         driver: &Driver,
@@ -182,6 +183,43 @@ impl OwnedLaunch {
             policy,
             io,
             Some(command.git),
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_captured(
+        driver: &Driver,
+        intent: LaunchIntent,
+        directory: &Path,
+        root: &crate::run_journal::RootRunRequest,
+        command: AttributedCommand<'_>,
+        policy: LaunchPolicy,
+        io: Option<LaunchIo>,
+        live: &crate::capture_preparation::LiveCapture,
+    ) -> Result<Self> {
+        live.validate_launch(root, &command).map_err(|_| HOLD)?;
+        let expected =
+            LaunchIntent::new(root.identity().run.clone(), &root.input().boot).map_err(|_| HOLD)?;
+        if intent.unit_name() != expected.unit_name() || intent.boot_id() != expected.boot_id() {
+            return Err(HOLD);
+        }
+        let io = match io {
+            Some(io) => io,
+            None => LaunchIo {
+                systemd_run: "/usr/bin/systemd-run".into(),
+                self_binary: std::env::current_exe().map_err(|_| HOLD)?,
+            },
+        };
+        Self::spawn_inner(
+            driver,
+            intent,
+            directory,
+            command.cwd,
+            command.argv,
+            policy,
+            io,
+            Some(command.git),
+            Some(live),
         )
     }
     #[allow(clippy::too_many_arguments)] // shared legacy unattributed gate + supervised typed entry
@@ -194,6 +232,7 @@ impl OwnedLaunch {
         policy: LaunchPolicy,
         io: LaunchIo,
         git: Option<&ActorGitProfile>,
+        capture: Option<&crate::capture_preparation::LiveCapture>,
     ) -> Result<Self> {
         let deadline = Instant::now().checked_add(policy.preexec).ok_or(HOLD)?;
         let original = OriginalRuntime::capture();
@@ -249,6 +288,9 @@ impl OwnedLaunch {
                 .env("GIT_COMMITTER_NAME", &git.committer_name)
                 .env("GIT_COMMITTER_EMAIL", &git.committer_email);
         }
+        if let Some(live) = capture {
+            live.apply_environment(&mut command);
+        }
         let child = loop {
             if Instant::now() >= deadline || live_process(parent.pid).map_err(|_| HOLD)? != parent {
                 return Err(HOLD);
@@ -275,6 +317,7 @@ impl OwnedLaunch {
             pid,
             deadline,
             permit_attempted: false,
+            capture_guard: capture.map(|live| live.guard()),
         })
     }
     pub fn pid(&self) -> u32 {
@@ -311,6 +354,30 @@ impl OwnedLaunch {
         self.check_owned()
     }
     pub fn release(&mut self, driver: &Driver) -> Result<()> {
+        if self.capture_guard.is_some() {
+            return self.preexec_result(Err(HOLD));
+        }
+        self.release_inner(driver, None)
+    }
+    pub(crate) fn release_captured(
+        &mut self,
+        driver: &Driver,
+        proof: crate::capture_preparation::CapturedReleaseProof,
+    ) -> Result<()> {
+        let checked = self
+            .capture_guard
+            .as_ref()
+            .ok_or(HOLD)
+            .and_then(|guard| proof.validate(guard))
+            .and_then(|()| proof.fresh());
+        self.preexec_result(checked)?;
+        self.release_inner(driver, Some(&proof))
+    }
+    fn release_inner(
+        &mut self,
+        driver: &Driver,
+        proof: Option<&crate::capture_preparation::CapturedReleaseProof>,
+    ) -> Result<()> {
         if self.permit_attempted {
             return Err(HOLD);
         }
@@ -321,6 +388,15 @@ impl OwnedLaunch {
         let result = self.gate.validate_release(driver);
         self.preexec_result(result)?;
         self.check_owned()?;
+        if let Some(proof) = proof {
+            let checked = self
+                .capture_guard
+                .as_ref()
+                .ok_or(HOLD)
+                .and_then(|guard| proof.validate(guard))
+                .and_then(|()| proof.fresh());
+            self.preexec_result(checked)?;
+        }
         self.permit_attempted = true;
         self.gate.publish_release()
     }

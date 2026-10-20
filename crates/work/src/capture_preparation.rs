@@ -34,8 +34,95 @@ pub struct LiveCapture {
     prepared: Prepared,
     removal_names: Vec<String>,
     context: crate::capture_artifacts::Context,
+    root: Box<RootRunRequest>,
+    cwd: std::path::PathBuf,
+    launch_token: uuid::Uuid,
+}
+/// Private ephemeral binding metadata, not kernel authority.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CapturedGuard {
+    root: RootRunRequest,
+    token: uuid::Uuid,
+}
+/// Actual FD reobservation only. No Clone/Serde or cached-observation constructor.
+pub(crate) struct CapturedReleaseProof {
+    guard: CapturedGuard,
+    observed: std::time::Instant,
+}
+impl CapturedReleaseProof {
+    pub(crate) fn fresh(&self) -> Result<(), &'static str> {
+        if self.observed.elapsed() > std::time::Duration::from_secs(2) {
+            return Err("captured release held");
+        }
+        Ok(())
+    }
+    pub(crate) fn validate(&self, guard: &CapturedGuard) -> Result<(), &'static str> {
+        if &self.guard != guard {
+            return Err("captured release held");
+        }
+        Ok(())
+    }
 }
 impl LiveCapture {
+    pub(crate) fn guard(&self) -> CapturedGuard {
+        CapturedGuard {
+            root: self.root.as_ref().clone(),
+            token: self.launch_token,
+        }
+    }
+    pub(crate) fn release_proof(
+        &self,
+    ) -> Result<CapturedReleaseProof, crate::capture_bridge::Refused> {
+        let observed = std::time::Instant::now();
+        self.revalidate_context()?;
+        let proof = CapturedReleaseProof {
+            guard: self.guard(),
+            observed,
+        };
+        proof.fresh().map_err(|_| crate::capture_bridge::Refused)?;
+        Ok(proof)
+    }
+    pub(crate) fn validate_launch(
+        &self,
+        root: &RootRunRequest,
+        command: &crate::scope_spawn::AttributedCommand<'_>,
+    ) -> Result<(), crate::capture_bridge::Refused> {
+        let digest = crate::supervisor::command_digest(command.argv)
+            .map_err(|_| crate::capture_bridge::Refused)?;
+        if self.root.as_ref() != root
+            || self.root.input().command_digest != digest
+            || self.cwd != command.cwd
+            || !self
+                .environment()
+                .matches_git_profile(&command.git.capture_profile())
+        {
+            return Err(crate::capture_bridge::Refused);
+        }
+        self.revalidate_context()
+    }
+    pub(crate) fn apply_environment(&self, command: &mut std::process::Command) {
+        for name in &self.removal_names {
+            command.env_remove(name);
+        }
+        let env = self.environment();
+        command
+            .env("AGENT_ATTRIBUTION_CONTEXT", env.context_path())
+            .env("DEVDIARY_ATTRIBUTION_CONTEXT", env.context_path())
+            .env("DEVDIARY_CAPTURE_ID", env.capture_id().as_str());
+        let git = env.git_profile();
+        for (name, value) in [
+            ("GIT_AUTHOR_NAME", &git.author_name),
+            ("GIT_AUTHOR_EMAIL", &git.author_email),
+            ("GIT_COMMITTER_NAME", &git.committer_name),
+            ("GIT_COMMITTER_EMAIL", &git.committer_email),
+        ] {
+            if let Some(value) = value {
+                command.env(name, value);
+            } else {
+                command.env_remove(name);
+            }
+        }
+    }
     pub fn environment(&self) -> &EnvironmentProjection {
         self.prepared.environment()
     }
@@ -132,6 +219,9 @@ pub fn prepare_observed(
             prepared,
             removal_names,
             context,
+            root: Box::new(root.clone()),
+            cwd: spec.begin_request().cwd,
+            launch_token: uuid::Uuid::now_v7(),
         })
     })();
     match attempt {

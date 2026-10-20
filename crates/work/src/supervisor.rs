@@ -2,7 +2,8 @@
 //! -> permit-attempt journal -> release -> root status -> fresh whole-scope proof.
 //! A root exit is never writer release. Holds retain charges and task openness.
 //! Historical bindings cannot be restored; retry receipts never grant execution.
-//! No external/adopted participants, bridge capture, finish or retirement support.
+//! Captured execution is library-only; no configured CLI/adopted execution,
+//! capture freeze/delivery, finish or retirement support.
 //!
 //! Polling policy is finite, but kernel D-state can delay pre-exec kill/reaping
 //! indefinitely. Released roots retain an owned reaper on drop (see scope_spawn).
@@ -70,6 +71,8 @@ pub enum Boundary {
     Intent,
     Bound,
     PermitAttempt,
+    /// Captured-only: fresh FD proof collected, before allocator lock/lease/kernel gate.
+    CapturedPreflight,
     RootTerminal,
     Closed,
 }
@@ -81,6 +84,8 @@ pub struct RunReport {
     pub lease_charged: bool,
     pub task_open: bool,
     pub attribution_not_configured: bool,
+    /// Capture is locally unfrozen; physical group closure is not freeze/delivery.
+    pub capture_unfrozen: bool,
 }
 impl RunReport {
     pub fn process_exit_code(&self) -> i32 {
@@ -121,7 +126,7 @@ fn digest_fields(fields: impl IntoIterator<Item = impl AsRef<[u8]>>) -> [u8; 32]
     }
     hash.finalize().into()
 }
-fn command_digest(argv: &[OsString]) -> io::Result<[u8; 32]> {
+pub(crate) fn command_digest(argv: &[OsString]) -> io::Result<[u8; 32]> {
     if argv.is_empty() || argv[0].is_empty() || argv.iter().any(|v| v.as_bytes().contains(&0)) {
         return Err(err("invalid command"));
     }
@@ -204,11 +209,13 @@ fn report(
     let _phase = store.sql_phase();
     let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
     let (record, lease_charged, task_open) = db(store.run_status_record(run))?;
-    let attribution_not_configured = db(crate::finish::capture_not_configured(
-        &store.conn,
-        Uuid::parse_str(&record.request.identity().checkout.to_string())
-            .map_err(|_| err("invalid checkout"))?,
-    ))?;
+    let capture_unfrozen = db(store.capture_snapshot(run))?.is_some();
+    let attribution_not_configured = !capture_unfrozen
+        && db(crate::finish::capture_not_configured(
+            &store.conn,
+            Uuid::parse_str(&record.request.identity().checkout.to_string())
+                .map_err(|_| err("invalid checkout"))?,
+        ))?;
     Ok(RunReport {
         record,
         existing,
@@ -216,6 +223,7 @@ fn report(
         lease_charged,
         task_open,
         attribution_not_configured,
+        capture_unfrozen,
     })
 }
 /// Historical finished-task receipt, without restoring actor/runtime authority.
@@ -266,13 +274,117 @@ pub fn supervise_with_io(
 ) -> io::Result<RunReport> {
     supervise(config, command, driver, Some(io), cancel, observer)
 }
+fn captured_existing_report(
+    config: &Config,
+    command: &RootCommand,
+) -> io::Result<Option<RunReport>> {
+    let (Some(registry), Some(dir)) = (
+        config.trusted_registry.as_deref(),
+        config.store_dir.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let store = db(Store::open_existing_registered_readonly(
+        registry,
+        dir,
+        &config.roots,
+    ))?;
+    let _phase = store.sql_phase();
+    let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
+    let run = RunId::parse(&command.run_id.to_string()).map_err(|_| err("invalid run"))?;
+    let Some(record) = db(store.run_snapshot(&run))? else {
+        return Ok(None);
+    };
+    if db(store.capture_snapshot(&run))?.is_none() {
+        return Err(err("ordinary root cannot acquire capture"));
+    }
+    if record.request.identity().checkout.to_string() != command.checkout.to_string()
+        || command
+            .actor
+            .as_ref()
+            .is_some_and(|a| a != record.request.identity().actor.as_str())
+        || record.request.identity().execution_chain != command.execution_chain
+        || record.request.input().command_digest != command_digest(&command.argv)?
+    {
+        return Err(err("historical captured request conflicts"));
+    }
+    report(&store, &run, true, None).map(Some)
+}
+/// Library-only captured supervisor. Production CLI capture remains unsupported.
+pub fn supervise_captured_with_io(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: LaunchIo,
+    cancel: &CancelToken,
+    observer: impl FnMut(Boundary, &RunRecord),
+) -> io::Result<RunReport> {
+    if let Some(report) = captured_existing_report(config, &command)? {
+        return Ok(report);
+    }
+    let settings = config
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| err("supervisor not configured"))?;
+    settings.policy()?;
+    let (store, lock) = allocate::locked(config)?;
+    let allocation: allocate::Allocation = {
+        let _phase = store.sql_phase();
+        let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
+        let text: String = allocate::sql(store.conn.query_row(
+            "SELECT record FROM allocations WHERE checkout=?1",
+            [command.checkout.to_string()],
+            |r| r.get(0),
+        ))?;
+        serde_json::from_str(&text).map_err(|_| err("invalid allocation"))?
+    };
+    drop(lock);
+    drop(store);
+    let actor = command
+        .actor
+        .as_deref()
+        .or(allocation.request.actor.as_deref())
+        .ok_or_else(|| err("explicit actor required"))?;
+    let profile = settings
+        .actors
+        .get(actor)
+        .ok_or_else(|| err("actor Git profile not registered"))?;
+    let root = request(&command, &allocation, actor, profile, None)?;
+    let spec = db(config.capture_spec(
+        &root,
+        &allocation,
+        Uuid::now_v7(),
+        vec![allocation.request.task.clone()],
+        None,
+    ))?;
+    let (store, prepared) = crate::capture_preparation::prepare(config, &root, &spec)?;
+    let crate::capture_preparation::PreparationResult::Live(live) = prepared else {
+        return report(&store, &root.identity().run, true, None);
+    };
+    execute(
+        config,
+        command,
+        driver,
+        Some(io),
+        cancel,
+        observer,
+        store,
+        allocation,
+        root,
+        profile,
+        Some(live),
+    )
+}
 fn supervise(
     config: &Config,
     command: RootCommand,
     driver: &Driver,
     io: Option<LaunchIo>,
     cancel: &CancelToken,
-    mut observer: impl FnMut(Boundary, &RunRecord),
+    observer: impl FnMut(Boundary, &RunRecord),
 ) -> io::Result<RunReport> {
     // Optional read-only finished receipt. Otherwise retain the ordinary run
     // preflight, which independently validates authority and cannot revive a
@@ -284,7 +396,7 @@ fn supervise(
         .supervisor
         .as_ref()
         .ok_or_else(|| err("configure supervisor and actor Git profiles"))?;
-    let policy = settings.policy()?;
+    settings.policy()?;
     if config
         .allocation
         .as_ref()
@@ -316,6 +428,32 @@ fn supervise(
         }
         return report(&store, &request.identity().run, true, None);
     }
+    execute(
+        config, command, driver, io, cancel, observer, store, allocation, request, profile, None,
+    )
+}
+#[allow(clippy::too_many_arguments)] // one execution/physical-closure loop for both admission paths
+fn execute(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: Option<LaunchIo>,
+    cancel: &CancelToken,
+    mut observer: impl FnMut(Boundary, &RunRecord),
+    mut store: Store,
+    allocation: allocate::Allocation,
+    request: RootRunRequest,
+    profile: &ActorGitProfile,
+    live: Option<crate::capture_preparation::LiveCapture>,
+) -> io::Result<RunReport> {
+    let settings = config
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| err("supervisor not configured"))?;
+    let policy = settings.policy()?;
+    let run = request.identity().run.clone();
+    let captured_driver = live.as_ref().map(|live| driver.for_capture(live));
+    let driver = captured_driver.as_ref().unwrap_or(driver);
     observer(Boundary::Intent, &record(&store, &request)?);
     // All failures after intent retain writer and charge; never invent an outcome.
     let result = (|| {
@@ -342,18 +480,19 @@ fn supervise(
         fs::File::open(&runs)?.sync_all()?;
         let intent = LaunchIntent::new(run, &request.input().boot)
             .map_err(|_| err("invalid launch intent"))?;
-        let mut launch = OwnedLaunch::spawn_attributed(
-            driver,
-            intent,
-            &directory,
-            AttributedCommand {
-                cwd: &allocation.destination,
-                argv: &command.argv,
-                git: profile,
-            },
-            policy,
-            io,
-        )
+        let attributed = AttributedCommand {
+            cwd: &allocation.destination,
+            argv: &command.argv,
+            git: profile,
+        };
+        let mut launch = match &live {
+            Some(live) => OwnedLaunch::spawn_captured(
+                driver, intent, &directory, &request, attributed, policy, io, live,
+            ),
+            None => {
+                OwnedLaunch::spawn_attributed(driver, intent, &directory, attributed, policy, io)
+            }
+        }
         .map_err(err)?;
         while !launch.poll_blocked().map_err(err)? {
             std::thread::sleep(Duration::from_millis(5));
@@ -382,9 +521,23 @@ fn supervise(
                 launch.binding().ok_or_else(|| err("missing binding"))?,
             ))?;
             observer(Boundary::PermitAttempt, &record(&store, &request)?);
+            // Actual descriptor reads precede allocator flock and SQL. The
+            // original timestamp covers contention, lease verification and kernel gate.
+            let capture_proof = live
+                .as_ref()
+                .map(|live| live.release_proof())
+                .transpose()
+                .map_err(|_| err("capture context changed"))?;
+            if capture_proof.is_some() {
+                observer(Boundary::CapturedPreflight, &record(&store, &request)?);
+            }
             // Do not reconcile/revive holds at the irreversible boundary. Other
             // checkouts remain allocatable for the entire running actor lifetime.
             let (mut fresh_store, lock) = allocate::locked(config)?;
+            if let (Some(live), Some(proof)) = (&live, &capture_proof) {
+                proof.validate(&live.guard()).map_err(err)?;
+                proof.fresh().map_err(err)?;
+            }
             let fresh = verified_checkout(&mut fresh_store, command.checkout)?;
             let current = record(&fresh_store, &request)?;
             if fresh.destination != allocation.destination
@@ -395,7 +548,11 @@ fn supervise(
             {
                 return Err(err("release held"));
             }
-            launch.release(driver).map_err(err)?;
+            match capture_proof {
+                Some(proof) => launch.release_captured(driver, proof),
+                None => launch.release(driver),
+            }
+            .map_err(err)?;
             drop(lock);
             drop(fresh_store);
             None
@@ -451,7 +608,10 @@ fn supervise(
         }
     })();
     if result.is_err() {
-        let _ = store.record_recovery_hold(&request);
+        let held = store.record_recovery_hold(&request).is_ok();
+        if live.is_some() && !held {
+            return Err(err("captured supervision refused; recovery hold uncertain"));
+        }
     }
     result
 }

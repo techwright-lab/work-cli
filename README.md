@@ -19,14 +19,14 @@ Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
-### Capture library construction (Tasks 8.1–8.3b1 only)
+### Capture library construction (Tasks 8.1–8.3b2 only)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
 `sinks::ProcessSink` for a trusted host adapter, plus a durable library-only
 `capture_journal`. Typed host configuration and capture-pending allocation
-materialization and trusted library-only capture preparation are available. Actor
-launch, credential stripping, freeze/delivery and configured `work run`/adopted
-execution remain explicitly unsupported. Tests use
+materialization, trusted library-only capture preparation and captured supervised
+execution are available. Freeze/delivery and configured `work run`/adopted execution
+remain explicitly unsupported. Tests use
 private fake executables or disposable Git repositories, not an installed
 DevDiary/Python CLI, a live scope or a receiver.
 
@@ -35,7 +35,8 @@ budget and a 1..1048576-byte aggregate stdout+stderr budget. Input encoding stop
 at 1 MiB before spawn. Literal argv contains only registry/state locators and the
 operation; all capture data (including an optional key-file locator, never a key
 value) travels as operation-specific JSON on stdin. The receiver process inherits
-operator environment; writer credential stripping is still an integration gate.
+operator environment; captured supervised execution strips qualified receiver
+credential names from launcher, manager inspection/cancellation, helper and delegate.
 Nonblocking stdin/stdout/stderr share one original deadline, with ETXTBSY-only
 pre-exec retry and owned-group kill/reap. Exact response-cap exhaustion is refused
 without an EOF lookahead. Kernel D-state can still delay reap.
@@ -216,12 +217,49 @@ or a change of the checkout's `active` accounting state.
 Only this new successful path constructs non-Clone, nonserializable, redacted
 `LiveCapture`, carrying the seven-key typed projection, receiver removal **names**
 and a retained descriptor-backed context proof. `revalidate_context()` performs
-actual FD/path/digest reobservation outside SQL for a future pre-exec boundary.
+actual FD/path/digest reobservation outside SQL at the captured pre-exec boundary.
 Neither this value, a decoded `Prepared`, stored observation nor a ready flag mints
 a kernel Binding or permit. Lost acknowledgement/retry is metadata-only Existing.
-Actor launch/projection/credential stripping and whole-group freeze integration
-remain 8.3b2; finish/delivery reconciliation and disposable HTTP qualification remain
-8.4. No CLI capture execution is activated by this library increment.
+No CLI capture execution is activated by this library increment.
+
+`supervisor::supervise_captured_with_io` is the library-only captured coordinator.
+It first observes matching open/closed captured history read-only, before current
+supervisor/profile/sink/registry dependence. Historic mapping corruption or caller
+checkout/explicit actor/chain/literal-command conflict refuses; a no-sink root
+cannot acquire capture. Historical receipts never recreate a live capability,
+readiness, writer or process. New calls select the explicit root actor or allocation
+actor (never quota owner), its trusted Git profile, the allocation's primary task
+and the caller's typed chain/literal argv. Pending allocation metadata is read in a
+short owned SQL snapshot, without presenting it as ordinary Ready.
+
+Only successful actual preparation supplies `LiveCapture` to private captured
+spawn. It binds exact root/input/command/cwd/Git attribution and projects exactly
+seven allowlisted keys, clearing absent values. Only configured and actual-registry
+receiver credential names are removed; unrelated names and prefix lookalikes remain.
+The receiver still inherits its intended credential. Literal OsString argv, cwd,
+inherited protocol stdio and original raw-byte runtime-variable presence survive.
+No process-global environment mutation or production fake-backend selector exists.
+
+Actual descriptor context checks run outside SQL and allocator flock before blocked
+spawn and just before release preflight. Only that actual live reobservation mints a
+private non-Clone/non-Serde `CapturedReleaseProof`, timed **before** inspection and
+bound to the same live instance/root. Its original two-second age is checked after
+allocator lock acquisition and again after owned-root and actual kernel validation,
+immediately before permit publication. Generic `OwnedLaunch::release` refuses a
+captured launch. Neither the proof nor cached/prepared metadata substitutes for the
+original Driver/Binding, owned PID, nonce, lease/journal/finish checks or deadlines.
+The captured-only `Boundary::CapturedPreflight` observer runs after proof collection
+and before the allocator lock; callbacks never run inside SQL or allocator flock.
+
+Both entrypoints share one bind/journal/permit/outcome/cancellation/full-roster
+physical-closure loop. Root exit, logical child outcomes and Stop acknowledgements
+never close a writer. Physical closure records group end before exact writer removal,
+leaves local capture **unfrozen**, and retains held/not-ready accounting and the
+permanent unresolved requirement. `RunReport::capture_unfrozen` reports this separately
+from root outcome, group closure, task openness and charge. No freeze, delivery,
+finish, uncharging, sequential captured root, readiness continuation or adopted/CLI
+activation is provided here. Terminal capture journaling and subsequent lifecycle
+integration remain later increments.
 
 ## Read-only inventory
 

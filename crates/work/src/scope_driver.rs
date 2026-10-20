@@ -15,6 +15,7 @@ type Result<T> = std::result::Result<T, &'static str>;
 const HOLD: &str = "scope inspection incomplete";
 
 /// Explicit supervisor context; never inferred from the CLI's environment.
+#[derive(Clone)]
 pub struct RuntimeContext {
     directory: PathBuf,
     address: String,
@@ -58,6 +59,7 @@ pub struct LibraryIo {
     /// Controlled snapshot transition for library fixtures; production uses None.
     pub between_censuses: Option<Box<dyn Fn()>>,
 }
+#[derive(Clone)]
 pub struct Limits {
     pub duration: Duration,
     pub total_bytes: usize,
@@ -84,8 +86,9 @@ pub struct Participant {
 }
 pub struct Driver {
     context: RuntimeContext,
-    io: LibraryIo,
+    io: std::rc::Rc<LibraryIo>,
     limits: Limits,
+    removal_names: Vec<String>,
 }
 impl Driver {
     pub fn new(context: RuntimeContext) -> Result<Self> {
@@ -117,9 +120,25 @@ impl Driver {
         }
         Ok(Self {
             context,
-            io,
+            io: std::rc::Rc::new(io),
             limits,
+            removal_names: Vec::new(),
         })
+    }
+    /// Command-local filtering from the actual live preparation only; same IO,
+    /// budgets and kernel authority, no mutation of the caller's driver/environment.
+    pub(crate) fn for_capture(&self, live: &crate::capture_preparation::LiveCapture) -> Self {
+        Self {
+            context: self.context.clone(),
+            io: self.io.clone(),
+            limits: self.limits.clone(),
+            removal_names: live.receiver_removal_names().to_vec(),
+        }
+    }
+    fn remove_receiver_credentials(&self, command: &mut Command) {
+        for name in &self.removal_names {
+            command.env_remove(name);
+        }
     }
     /// Bounded identity inspection only; grants no process or scope authority.
     pub fn identify(&self, pid: u32) -> Result<ChildIdentity> {
@@ -204,6 +223,7 @@ impl Driver {
     /// Freshly validate the private manager context. Never mutates process environment.
     pub(crate) fn apply_manager_context(&self, command: &mut Command) -> Result<()> {
         self.context.validate()?;
+        self.remove_receiver_credentials(command);
         command
             .env("XDG_RUNTIME_DIR", &self.context.directory)
             .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
@@ -230,6 +250,7 @@ impl Driver {
             ])
             .env("XDG_RUNTIME_DIR", &self.context.directory)
             .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
+        self.remove_receiver_credentials(&mut command);
         let output = bounded_process::output(&mut command, self.limits.duration, 16_384)
             .map_err(|_| HOLD)?;
         if !output.status.success() {
@@ -252,6 +273,7 @@ impl Driver {
             ])
             .env("XDG_RUNTIME_DIR", &self.context.directory)
             .env("DBUS_SESSION_BUS_ADDRESS", &self.context.address);
+        self.remove_receiver_credentials(&mut command);
         let output = bounded_process::output_aggregate(
             &mut command,
             budget.remaining()?,
