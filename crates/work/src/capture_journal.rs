@@ -669,6 +669,9 @@ impl Store {
         spec: &CaptureSpec,
         proof: &crate::capture_setup::MaterializationProof,
     ) -> Result<BeginCapturedRun> {
+        // Physical reinspection is outside every SQL phase/transaction. Only
+        // sealed context and original-age checks run after IMMEDIATE locking.
+        proof.reinspect(self)?;
         self.begin_capture_context(request, spec, Some(proof))
     }
     fn begin_capture_context(

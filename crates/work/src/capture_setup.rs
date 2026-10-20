@@ -35,7 +35,11 @@ pub fn begin(
         drop(lock);
         return Ok((store, result));
     }
-    let allocation = crate::allocate::db(spec.agrees(&store.conn, request))?;
+    let allocation = {
+        let _phase = store.sql_phase();
+        let _snapshot = crate::allocate::db(crate::run_journal::read_transaction(&store.conn))?;
+        crate::allocate::db(spec.agrees(&store.conn, request))?
+    };
     let d = spec.begin_request();
     let selected = crate::allocate::db(config.capture_spec(
         request,
@@ -63,6 +67,7 @@ pub(crate) struct PendingPreparation {
     request: String,
     requirement: Requirement,
     charged: [u8; 32],
+    source_common: std::path::PathBuf,
 }
 impl PendingPreparation {
     fn read(conn: &Connection, checkout: uuid::Uuid) -> Result<Self> {
@@ -71,6 +76,7 @@ impl PendingPreparation {
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
         let requirement =
             crate::capture_requirement::read(conn, checkout)?.ok_or(StoreError::Invalid)?;
+        let source_common = std::path::PathBuf::from(&repository);
         let charged = Sha256::digest(
             serde_json::to_vec(&(operation, digest, repository, actor, task, owner))
                 .map_err(|_| StoreError::Invalid)?,
@@ -81,6 +87,7 @@ impl PendingPreparation {
             request,
             requirement,
             charged,
+            source_common,
         })
     }
     pub(crate) fn promote(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
@@ -129,10 +136,10 @@ struct Physical {
     directories: Vec<(u64, u64)>,
     marker: Vec<u8>,
 }
-fn physical(conn: &Connection, a: &Allocation) -> Result<Physical> {
+fn physical(a: &Allocation, charged_common: &std::path::Path) -> Result<Physical> {
     let source = a.request.repository.as_ref().ok_or(StoreError::Invalid)?;
     crate::config::validate_path(source, true).map_err(|_| StoreError::Unsafe)?;
-    let charged_common = crate::allocate::source_authority_evidence(conn, a)?;
+    let charged_common = crate::allocate::verify_source_authority(a, charged_common)?;
     let checkout = crate::recovery::verify(a)?;
     if checkout.common_git_dir != charged_common
         || checkout.private_git_dir == checkout.common_git_dir
@@ -161,13 +168,42 @@ fn physical(conn: &Connection, a: &Allocation) -> Result<Physical> {
         marker,
     })
 }
+fn eligible(conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
+    let eligible: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='partial' AND ready=0)
+        AND NOT EXISTS(SELECT 1 FROM writers WHERE checkout=?1)
+        AND NOT EXISTS(SELECT 1 FROM run_groups WHERE checkout=?1)
+        AND NOT EXISTS(SELECT 1 FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id WHERE g.id IS NULL)
+        AND NOT EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1)
+        AND NOT EXISTS(SELECT 1 FROM capture_runs WHERE checkout=?1)
+        AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",
+        [checkout.to_string()], |r| r.get(0),
+    )?;
+    if eligible {
+        Ok(())
+    } else {
+        Err(StoreError::Invalid)
+    }
+}
 impl MaterializationProof {
     fn inspect(store: &Store, root: &RootRunRequest, spec: &CaptureSpec) -> Result<Self> {
-        let _phase = store.sql_phase();
-        let a = spec.agrees(&store.conn, root)?;
-        let pending = PendingPreparation::read(&store.conn, a.checkout)?;
+        if !store.conn.is_autocommit() {
+            return Err(StoreError::Invalid);
+        }
+        let (a, pending) = {
+            let _phase = store.sql_phase();
+            let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
+            let a = spec.agrees(&store.conn, root)?;
+            let pending = PendingPreparation::read(&store.conn, a.checkout)?;
+            eligible(&store.conn, a.checkout)?;
+            (a, pending)
+        };
+        // Both the read transaction and SQL phase have ended. The original
+        // observation time bounds all inspection/reinspection and admission.
         let observed = Instant::now();
-        let physical = physical(&store.conn, &a)?;
+        #[cfg(test)]
+        tests::observe_physical(&store.conn);
+        let physical = physical(&a, &pending.source_common)?;
         let spec_digest =
             Sha256::digest(serde_json::to_vec(spec).map_err(|_| StoreError::Invalid)?).into();
         let proof = Self {
@@ -178,36 +214,44 @@ impl MaterializationProof {
             observed,
             spec_digest,
         };
-        proof.validate(&store.conn, root)?;
+        proof.validate_declaration(root)?;
+        proof.fresh()?;
         Ok(proof)
     }
-    pub(crate) fn validate(&self, conn: &Connection, root: &RootRunRequest) -> Result<()> {
+    /// Reobserve physical evidence immediately before entering the SQL-only
+    /// admission transaction. Never renews the original proof's timestamp.
+    pub(crate) fn reinspect(&self, store: &Store) -> Result<()> {
+        if !store.conn.is_autocommit() {
+            return Err(StoreError::Invalid);
+        }
+        self.fresh()?;
+        #[cfg(test)]
+        tests::observe_physical(&store.conn);
+        if physical(&self.allocation, &self.pending.source_common)? != self.physical {
+            return Err(StoreError::Conflict);
+        }
+        self.fresh()
+    }
+    fn validate_declaration(&self, root: &RootRunRequest) -> Result<()> {
         if &self.root != root
             || self.allocation.stage != "capture_pending"
             || self.allocation.reason.as_deref()
                 != Some("capture required; root preparation pending")
             || root.input().boot != self.physical.checkout.boot_id
-            || PendingPreparation::read(conn, self.allocation.checkout)? != self.pending
         {
             return Err(StoreError::Conflict);
         }
-        let eligible: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='partial' AND ready=0)
-            AND NOT EXISTS(SELECT 1 FROM writers WHERE checkout=?1)
-            AND NOT EXISTS(SELECT 1 FROM run_groups WHERE checkout=?1 AND closed=0)
-            AND NOT EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1)
-            AND NOT EXISTS(SELECT 1 FROM capture_runs WHERE checkout=?1)
-            AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",
-            [self.allocation.checkout.to_string()],
-            |r| r.get(0),
-        )?;
-        if !eligible {
-            return Err(StoreError::Invalid);
-        }
+        Ok(())
+    }
+    /// SQL-only exact-context CAS. Called after IMMEDIATE locking by both shared
+    /// admission layers; it performs no Git, filesystem or other physical I/O.
+    pub(crate) fn validate(&self, conn: &Connection, root: &RootRunRequest) -> Result<()> {
         self.fresh()?;
-        if physical(conn, &self.allocation)? != self.physical {
+        self.validate_declaration(root)?;
+        if PendingPreparation::read(conn, self.allocation.checkout)? != self.pending {
             return Err(StoreError::Conflict);
         }
+        eligible(conn, self.allocation.checkout)?;
         self.fresh()
     }
     pub(crate) fn validate_capture(

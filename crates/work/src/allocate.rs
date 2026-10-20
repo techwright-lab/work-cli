@@ -616,15 +616,20 @@ pub fn start_observed(
     create(config, &mut store, a, &mut boundary)
 }
 // The charged row, not a second fresh Git query, is repository authority.
-pub(crate) fn source_authority_evidence(
-    conn: &rusqlite::Connection,
-    a: &Allocation,
-) -> io::Result<PathBuf> {
+fn source_authority_evidence(conn: &rusqlite::Connection, a: &Allocation) -> io::Result<PathBuf> {
     let charged: String = sql(conn.query_row(
         "SELECT repository FROM checkouts WHERE id=?1",
         [a.checkout.to_string()],
         |row| row.get(0),
     ))?;
+    verify_source_authority(a, std::path::Path::new(&charged))
+}
+/// Physical source inspection against an already-owned charged common directory.
+/// Performs no SQL; capture setup must collect the expected authority beforehand.
+pub(crate) fn verify_source_authority(
+    a: &Allocation,
+    charged_common: &std::path::Path,
+) -> io::Result<PathBuf> {
     let result = a
         .request
         .repository
@@ -632,9 +637,7 @@ pub(crate) fn source_authority_evidence(
         .ok_or_else(|| err("missing durable source authority"))
         .and_then(|path| CheckoutIdentity::inspect(path));
     match result {
-        Ok(source) if source.common_git_dir == std::path::Path::new(&charged) => {
-            Ok(source.common_git_dir)
-        }
+        Ok(source) if source.common_git_dir == charged_common => Ok(source.common_git_dir),
         _ => Err(err("source repository authority mismatch")),
     }
 }

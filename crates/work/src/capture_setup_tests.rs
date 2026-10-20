@@ -1,5 +1,27 @@
 use super::*;
+use std::{cell::RefCell, rc::Rc};
 use uuid::Uuid;
+type PhysicalObserver = Box<dyn FnMut(&Connection)>;
+thread_local! {
+    static PHYSICAL_OBSERVER: RefCell<Option<PhysicalObserver>> = RefCell::new(None);
+}
+pub(super) fn observe_physical(conn: &Connection) {
+    PHYSICAL_OBSERVER.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().as_mut() {
+            observer(conn);
+        }
+    });
+}
+struct ObserverGuard;
+impl Drop for ObserverGuard {
+    fn drop(&mut self) {
+        PHYSICAL_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+    }
+}
+fn observing(observer: impl FnMut(&Connection) + 'static) -> ObserverGuard {
+    PHYSICAL_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+    ObserverGuard
+}
 #[path = "../tests/support/lifecycle_regressions.rs"]
 mod fixture;
 fn materialized() -> (
@@ -39,6 +61,137 @@ fn materialized() -> (
     (temp, config, store, a, root, spec)
 }
 #[test]
+fn actual_physical_inspection_never_holds_sql_transaction_or_writer_lock() {
+    let (temp, cfg, _store, _a, r, s) = materialized();
+    let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
+    sql.busy_timeout(Duration::ZERO).unwrap();
+    let observations = Rc::new(RefCell::new(Vec::new()));
+    let seen = observations.clone();
+    let _observer = observing(move |conn| {
+        let writer = sql.execute_batch("BEGIN IMMEDIATE").is_ok();
+        if writer {
+            sql.execute_batch("ROLLBACK").unwrap();
+        }
+        seen.borrow_mut().push((conn.is_autocommit(), writer));
+    });
+    let (_store, result) = begin(&cfg, &r, &s).unwrap();
+    assert!(matches!(result, BeginCapturedRun::Created(_)));
+    let seen = observations.borrow();
+    assert!(
+        seen.len() >= 2,
+        "initial inspection and pre-admission reinspection must both run"
+    );
+    assert!(
+        seen.iter()
+            .all(|&(autocommit, writer)| autocommit && writer),
+        "physical boundary held SQL authority: {seen:?}"
+    );
+}
+#[test]
+fn genuine_physical_delay_does_not_consume_sql_phase_budget_or_poison_later_operations() {
+    let (_temp, cfg, _store, _a, r, s) = materialized();
+    let mut first = true;
+    let _observer = observing(move |conn| {
+        if first {
+            first = false;
+            std::thread::sleep(Duration::from_millis(650));
+            let scan=conn.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n",[],|r|r.get::<_,i64>(0));
+            assert!(
+                scan.is_ok(),
+                "external physical delay was charged to SQL: {scan:?}"
+            );
+        }
+    });
+    let (store, result) = begin(&cfg, &r, &s).unwrap();
+    assert!(matches!(result, BeginCapturedRun::Created(_)));
+    // Later ordinary SQL must have its own unchanged bounded phase.
+    assert_eq!(
+        store
+            .pending_events(100)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, crate::events::Event::WriterAcquired { .. }))
+            .count(),
+        1
+    );
+}
+#[test]
+fn new_pending_setup_refuses_closed_or_orphan_supervised_journal_without_repair() {
+    let mut admitted = Vec::new();
+    for case in ["closed_rootless", "orphan_run", "closed_history"] {
+        let (temp, cfg, store, a, r, s) = materialized();
+        let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
+        sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+        let mut value = serde_json::to_value(&r).unwrap();
+        let group = Uuid::now_v7();
+        let run = Uuid::now_v7();
+        value["identity"]["group"] = group.to_string().into();
+        value["identity"]["run"] = run.to_string().into();
+        value["identity"]["run_ref"] = "run:disconnected-history".into();
+        let old: RootRunRequest = serde_json::from_value(value).unwrap();
+        if case != "orphan_run" {
+            sql.execute("INSERT INTO run_groups(id,checkout,mode,revision,closed) VALUES(?1,?2,'supervised',1,1)",(group.to_string(),a.checkout.to_string())).unwrap();
+        }
+        if case != "closed_rootless" {
+            sql.execute(
+                "INSERT INTO runs(id,group_id,run_ref,request,stage) VALUES(?1,?2,?3,?4,'intent')",
+                (
+                    run.to_string(),
+                    group.to_string(),
+                    old.identity().run_ref.as_str(),
+                    serde_json::to_string(&old).unwrap(),
+                ),
+            )
+            .unwrap();
+        }
+        let events = store.pending_events(100).unwrap();
+        let before = fixture::files(temp.path());
+        if begin(&cfg, &r, &s).is_ok() {
+            admitted.push(case);
+            continue;
+        }
+        assert_eq!(
+            fixture::files(temp.path()),
+            before,
+            "{case}: authority was repaired or mutated"
+        );
+        assert_eq!(store.pending_events(100).unwrap(), events, "{case}");
+        assert_eq!(
+            store
+                .charged(a.request.repository.as_ref().unwrap(), None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sql.query_row(
+                "SELECT count(*) FROM runs WHERE id=?1",
+                [r.identity().run.to_string()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(!sql
+            .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+    }
+    assert!(
+        admitted.is_empty(),
+        "orphan/closed journal admitted fresh roots: {admitted:?}"
+    );
+}
+#[test]
 fn genuine_materialization_proofs_refuse_changed_physical_or_durable_context() {
     for case in [
         "marker",
@@ -53,6 +206,8 @@ fn genuine_materialization_proofs_refuse_changed_physical_or_durable_context() {
         "requirement",
         "allocation",
         "writer",
+        "closed_rootless",
+        "orphan_run",
         "ready",
     ] {
         let (temp, _cfg, mut store, a, r, s) = materialized();
@@ -108,6 +263,15 @@ fn genuine_materialization_proofs_refuse_changed_physical_or_durable_context() {
                     )
                     .unwrap();
             }
+            "closed_rootless" => {
+                let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
+                sql.execute("INSERT INTO run_groups(id,checkout,mode,revision,closed) VALUES(?1,?2,'supervised',1,1)",(Uuid::now_v7().to_string(),a.checkout.to_string())).unwrap();
+            }
+            "orphan_run" => {
+                let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
+                sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+                sql.execute("INSERT INTO runs(id,group_id,run_ref,request,stage) VALUES(?1,?2,'orphan:metadata','{}','intent')",(Uuid::now_v7().to_string(),Uuid::now_v7().to_string())).unwrap();
+            }
             "writer" => {
                 store
                     .conn
@@ -137,7 +301,7 @@ fn genuine_materialization_proofs_refuse_changed_physical_or_durable_context() {
                 .conn
                 .query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            0,
+            if case == "orphan_run" { 1 } else { 0 },
             "{case}"
         );
     }
@@ -171,15 +335,69 @@ fn physical_proof_expiration_is_checked_after_immediate_lock_and_before_handoff(
         let (temp, _cfg, mut store, _a, r, s) = materialized();
         let mut proof = MaterializationProof::inspect(&store, &r, &s).unwrap();
         // Age only a genuinely inspected private proof; no fake inspection backend.
-        proof.observed = Instant::now() - Duration::from_millis(if wait { 1900 } else { 2100 });
+        proof.observed = Instant::now() - Duration::from_millis(if wait { 1800 } else { 2100 });
         let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
         let events = store.pending_events(100).unwrap();
         let result = if wait {
+            use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+            let (begin_send, begin_recv) = std::sync::mpsc::channel();
+            let (locked_send, locked_recv) = std::sync::mpsc::channel();
+            let mut begun = false;
+            let mut locked = false;
+            store
+                .conn
+                .authorizer(Some(move |ctx: AuthContext<'_>| {
+                    if matches!(
+                        ctx.action,
+                        AuthAction::Transaction {
+                            operation: TransactionOperation::Begin
+                        }
+                    ) {
+                        begun = true;
+                        begin_send.send(Instant::now()).unwrap();
+                    }
+                    if begun
+                        && !locked
+                        && matches!(
+                            ctx.action,
+                            AuthAction::Read {
+                                table_name: "allocations",
+                                ..
+                            }
+                        )
+                    {
+                        locked = true;
+                        locked_send.send(Instant::now()).unwrap();
+                    }
+                    Authorization::Allow
+                }))
+                .unwrap();
+            let expires = proof.observed + MAX_AGE;
             sql.execute_batch("BEGIN IMMEDIATE").unwrap();
             let thread =
                 std::thread::spawn(move || store.begin_materialized_capture(&r, &s, &proof));
-            std::thread::sleep(Duration::from_millis(250));
+            let began = begin_recv
+                .recv_timeout(Duration::from_secs(2))
+                .expect("must reach BEGIN after genuine pre-TX reinspection");
+            assert!(
+                began < expires,
+                "proof was already expired before the writer-lock wait"
+            );
+            let until_expired =
+                (expires + Duration::from_millis(25)).saturating_duration_since(Instant::now());
+            assert!(
+                until_expired < Duration::from_millis(300),
+                "fixture must remain within the unchanged SQLite busy/phase budgets"
+            );
+            std::thread::sleep(until_expired);
             sql.execute_batch("COMMIT").unwrap();
+            let acquired = locked_recv
+                .recv_timeout(Duration::from_secs(2))
+                .expect("admission must read its context after acquiring IMMEDIATE");
+            assert!(
+                acquired >= expires,
+                "test must expire the original observation during actual lock contention"
+            );
             thread.join().unwrap()
         } else {
             store.begin_materialized_capture(&r, &s, &proof)

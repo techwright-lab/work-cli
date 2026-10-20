@@ -145,9 +145,19 @@ inspection is needed for materialization. Full selected settings are sealed per 
 registered authority, charged source common directory, actual marker/registration/
 branch/path/device/inode/boot identity and pending durable context. Its private,
 non-Clone/non-Serde proof binds the exact root/spec/allocation/requirement revision,
-expires after two seconds, and is rechecked after IMMEDIATE locking and before
-handoff. Only the shared internal admission kernel consumes it; no public flag/DTO
-can bypass ordinary Ready admission. Refusal retains the charge and grants no root.
+expires after two seconds, and never renews its timestamp during reinspection.
+Setup first captures owned allocation/charge/source-common/requirement context in a
+short bounded SQL read snapshot, then drops both the transaction and SQL phase.
+Real bounded Git/filesystem inspection and pre-admission reinspection occur outside
+all SQL phases/transactions, under the allocator flock. The IMMEDIATE admission
+transaction performs only exact stored-context CAS, eligibility/namespace checks
+and original-proof age checks after locking and near handoff; it performs no Git
+or filesystem inspection. Only the shared internal admission kernel consumes the
+proof; no public flag/DTO can bypass ordinary Ready admission. A new pending root
+refuses any prior supervised group on its checkout (including closed/rootless
+rows) and disconnected runs with missing groups. These are bounded relational
+checks, not a global capture-payload scan or history quota. Refusal retains the
+charge and grants no root.
 
 A fresh Created-only handle admits preparation at active/not-ready; matched
 `record_capture_prepared` atomically promotes both allocation JSON (`ready`, no reason)
