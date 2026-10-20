@@ -141,7 +141,7 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=12))
+        || (name == "store.sqlite" && matches!(version, 2..=13))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -277,7 +277,7 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 12 {
+        if version != 13 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
@@ -293,7 +293,7 @@ impl Store {
         let (conn, budget, _) = existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 12 {
+        if version != 13 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
@@ -318,7 +318,7 @@ impl Store {
                 }
             }
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if !matches!(version, 8..=12) {
+            if !matches!(version, 8..=13) {
                 return Err(StoreError::UpgradeRequired);
             }
             validate_existing_schema(&conn, version)?;
@@ -443,7 +443,7 @@ impl Store {
         let budget = SqlBudget::install(&conn)?;
         let phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=12) {
+        if !matches!(version, 0..=13) {
             return Err(StoreError::Unsafe);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -551,7 +551,11 @@ impl Store {
             validate_existing_schema(&tx, 11)?;
             tx.execute_batch(crate::capture_finalization::SCHEMA)?;
         }
-        validate_existing_schema(&tx, 12)?;
+        if version < 13 {
+            validate_existing_schema(&tx, 12)?;
+            tx.execute_batch(crate::capture_readiness::SCHEMA)?;
+        }
+        validate_existing_schema(&tx, 13)?;
         if version < 8 {
             crate::run_journal::validate_enrollment_rosters(&tx)?;
         }
@@ -711,7 +715,7 @@ fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> 
     conn.execute_batch("PRAGMA query_only=ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=12))) || integrity != "ok"
+    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=13))) || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
@@ -830,7 +834,7 @@ fn existing_authority(
     let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if writable && version != 12 {
+    if writable && version != 13 {
         return Err(StoreError::UpgradeRequired);
     }
     validate_existing_schema(&conn, version)?;
@@ -855,6 +859,9 @@ fn existing_authority(
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
+    if version >= 13 {
+        crate::capture_readiness::validate_schema(conn)?;
+    }
     if version >= 12 {
         crate::capture_finalization::validate_schema(conn)?;
     }
@@ -1007,7 +1014,7 @@ pub(crate) fn acquire_writer_context(
     checkout: Uuid,
     group: Uuid,
     allow_existing: bool,
-    materialized: Option<&crate::capture_setup::MaterializationProof>,
+    materialized: Option<&crate::capture_setup::AdmissionProof<'_>>,
 ) -> Result<()> {
     // New managed groups acquire before inserting their journal. Existing
     // managed requests retry through their journal API, never as bare writers.
@@ -1170,7 +1177,7 @@ mod tests {
             // production selector or altered budget is involved.
             store
                 .conn
-                .execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements;")
+                .execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements;")
                 .unwrap();
             if version < 10 {
                 store
@@ -1332,7 +1339,7 @@ mod tests {
                 )
                 .unwrap();
             let events = store.pending_events(100).unwrap();
-            store.conn.execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
+            store.conn.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
             drop(store);
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "store::tests::initialization_worker"])
@@ -1395,7 +1402,7 @@ mod tests {
         let events = store.pending_events(100).unwrap();
         store
             .conn
-            .execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
+            .execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
             .unwrap();
         drop(store);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1438,7 +1445,7 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8",
+                "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8",
             )
             .unwrap();
         drop(store);
@@ -1469,7 +1476,7 @@ mod tests {
         assert_eq!(
             sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            12
+            13
         );
     }
     #[test]

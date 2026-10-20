@@ -486,6 +486,7 @@ fn prepare(
             "INSERT INTO task_finishes VALUES(?1,?2,?3)",
             (checkout.to_string(), operation.to_string(), json(&receipt)?),
         )?;
+        crate::capture_readiness::invalidate(&tx, checkout)?;
         tx.execute(
             "UPDATE checkouts SET state='held',ready=0 WHERE id=?1",
             [checkout.to_string()],

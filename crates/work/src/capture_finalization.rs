@@ -84,7 +84,11 @@ fn binding_digest(binding: &CaptureBinding) -> Result<[u8; 32]> {
         binding.run_ref(),
     ))
 }
-fn context(root: &RunRecord, capture: &CaptureRecord, spec: &CaptureSpec) -> Result<ContextSeal> {
+pub(crate) fn context(
+    root: &RunRecord,
+    capture: &CaptureRecord,
+    spec: &CaptureSpec,
+) -> Result<ContextSeal> {
     Ok(ContextSeal {
         root_digest: digest(root)?,
         capture_digest: digest(capture)?,

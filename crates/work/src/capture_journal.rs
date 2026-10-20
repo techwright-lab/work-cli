@@ -456,7 +456,7 @@ pub struct PreparationHandle {
     request: RootRunRequest,
     spec: Box<CaptureSpec>,
     revision: u64,
-    pending: Option<crate::capture_setup::PendingPreparation>,
+    pending: Option<crate::capture_setup::PreparationContext>,
 }
 #[derive(Clone, Serialize)]
 pub struct CaptureRecord {
@@ -588,7 +588,7 @@ impl Store {
         spec: &CaptureSpec,
         prepared: &crate::capture_bridge::Prepared,
         live_revision: Option<u64>,
-        pending: Option<&crate::capture_setup::PendingPreparation>,
+        pending: Option<&crate::capture_setup::PreparationContext>,
         artifact: Option<ContextArtifactObservation>,
     ) -> Result<()> {
         let mut observation = observation(spec, prepared, live_revision.is_some())?;
@@ -699,13 +699,29 @@ impl Store {
         // Physical reinspection is outside every SQL phase/transaction. Only
         // sealed context and original-age checks run after IMMEDIATE locking.
         proof.reinspect(self)?;
-        self.begin_capture_context(request, spec, Some(proof))
+        self.begin_capture_context(
+            request,
+            spec,
+            Some(&crate::capture_setup::AdmissionProof::Pending(proof)),
+        )
+    }
+    pub(crate) fn begin_certified_capture(
+        &mut self,
+        request: &RootRunRequest,
+        spec: &CaptureSpec,
+        proof: &crate::capture_readiness::ContinuationProof,
+    ) -> Result<BeginCapturedRun> {
+        self.begin_capture_context(
+            request,
+            spec,
+            Some(&crate::capture_setup::AdmissionProof::Certified(proof)),
+        )
     }
     fn begin_capture_context(
         &mut self,
         request: &RootRunRequest,
         spec: &CaptureSpec,
-        proof: Option<&crate::capture_setup::MaterializationProof>,
+        proof: Option<&crate::capture_setup::AdmissionProof<'_>>,
     ) -> Result<BeginCapturedRun> {
         // Bound the actual durable representation before acquiring SQL authority.
         let body = json(spec)?;
@@ -795,6 +811,14 @@ pub(crate) fn guard_allocation_identity(conn: &Connection, checkout: Uuid) -> Re
     let eligible:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 AND state='active' AND ready=1) AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",[checkout.to_string()],|r|r.get(0))?;
     if !eligible {
         return Err(StoreError::Invalid);
+    }
+    let certified: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM capture_readiness WHERE checkout=?1)",
+        [checkout.to_string()],
+        |r| r.get(0),
+    )?;
+    if certified {
+        return crate::capture_readiness::guard_certified_identity(conn, checkout);
     }
     let checkout = CheckoutId::parse(&checkout.to_string()).map_err(|_| StoreError::Invalid)?;
     validate_related(conn, &checkout)?;

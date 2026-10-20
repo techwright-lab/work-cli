@@ -95,6 +95,9 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
             &tx, a.checkout,
         ))?;
     }
+    if a.stage != "ready" {
+        db(crate::capture_readiness::invalidate(&tx, a.checkout))?;
+    }
     sql(tx.execute("INSERT INTO allocations VALUES(?1,?2,?3) ON CONFLICT(checkout) DO UPDATE SET record=excluded.record", rusqlite::params![a.checkout.to_string(), request, record]))?;
     sql(tx.execute(
         "UPDATE checkouts SET state=?2,ready=?3 WHERE id=?1",
@@ -132,10 +135,6 @@ pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allo
         return Ok(None);
     };
     let checkout = Uuid::parse_str(&id).map_err(|_| err("invalid checkout key"))?;
-    db(crate::capture_journal::guard_allocation_identity(
-        &store.conn,
-        checkout,
-    ))?;
     let parsed = record
         .as_deref()
         .and_then(|v| serde_json::from_str::<Allocation>(v).ok())
@@ -149,11 +148,16 @@ pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allo
                     == Some(&a.request)
         });
     if let Some(a) = parsed {
+        db(crate::capture_journal::guard_allocation_identity(
+            &store.conn,
+            checkout,
+        ))?;
         return Ok(Some(a));
     }
     // Keep corrupt evidence untouched, but revoke eligibility using the trusted row
     // key, never an ID supplied by malformed JSON.
     let tx = sql(store.conn.transaction())?;
+    db(crate::capture_readiness::invalidate(&tx, checkout))?;
     sql(tx.execute(
         "UPDATE checkouts SET state='held',ready=0 WHERE id=?1",
         [&id],
@@ -486,6 +490,7 @@ pub fn start_observed(
         if matches.len() != 1 {
             let tx = sql(store.conn.transaction())?;
             for id in matches {
+                db(crate::capture_readiness::invalidate(&tx, id))?;
                 sql(tx.execute("UPDATE checkouts SET ready=0,state=CASE WHEN state IN ('reserved','partial','active') THEN 'held' ELSE state END WHERE id=?1", [id.to_string()]))?;
                 let operation: String = sql(tx.query_row(
                     "SELECT operation FROM checkouts WHERE id=?1",

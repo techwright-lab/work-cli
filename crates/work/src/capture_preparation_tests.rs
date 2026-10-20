@@ -2,7 +2,7 @@ use super::*;
 use crate as collector_target;
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
-fn qualified_fixture() -> (
+pub(crate) fn qualified_fixture() -> (
     tempfile::TempDir,
     Config,
     crate::allocate::Allocation,

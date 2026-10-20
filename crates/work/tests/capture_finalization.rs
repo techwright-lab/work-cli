@@ -672,8 +672,10 @@ fn schema_twelve_migration_preserves_old_bytes_and_requires_explicit_upgrade() {
         )
         .unwrap();
     let events = f.store.pending_events(100).unwrap();
-    sql.execute_batch("DROP TABLE capture_finalizations; PRAGMA user_version=11")
-        .unwrap();
+    sql.execute_batch(
+        "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; PRAGMA user_version=11",
+    )
+    .unwrap();
     assert!(matches!(
         finalize(&f.config, &f.root.identity().run),
         Err(work_cli::store::StoreError::UpgradeRequired)
@@ -700,7 +702,7 @@ fn schema_twelve_migration_preserves_old_bytes_and_requires_explicit_upgrade() {
         .unwrap()
         .is_none());
     sql.execute_batch(
-        "DROP TABLE capture_finalizations; CREATE VIEW capture_finalizations AS SELECT 1 AS run",
+        "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; CREATE VIEW capture_finalizations AS SELECT 1 AS run",
     )
     .unwrap();
     assert!(fixture_support::reopen(&f.dir).is_err());
@@ -881,7 +883,7 @@ fn current_schema_has_separate_terminal_journal() {
     let version: i64 = sql
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(sql
         .prepare("SELECT run,intent,confirmation,revision FROM capture_finalizations")
         .is_ok());

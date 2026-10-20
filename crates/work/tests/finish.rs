@@ -594,13 +594,13 @@ fn established_v8_migrates_but_unsafe_or_incomplete_authority_is_not_repaired() 
         drop(store);
         let sql = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
         match case {
-            "v8" => sql.execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8").unwrap(),
+            "v8" => sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8").unwrap(),
             "missing" => sql.execute_batch("DROP TABLE task_finishes").unwrap(),
             "view" => sql.execute_batch("ALTER TABLE task_finishes RENAME TO old_finishes; CREATE VIEW task_finishes AS SELECT * FROM old_finishes").unwrap(),
             "constraints" => sql.execute_batch("ALTER TABLE task_finishes RENAME TO old_finishes; CREATE TABLE task_finishes AS SELECT * FROM old_finishes").unwrap(),
             "delete_mode" => {sql.execute_batch("PRAGMA journal_mode=DELETE").unwrap();},
             "unknown_schema" => sql.execute_batch("PRAGMA user_version=999").unwrap(),
-            "rollback" => sql.execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8; CREATE TRIGGER block_completion BEFORE UPDATE ON checkouts BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap(),
+            "rollback" => sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8; CREATE TRIGGER block_completion BEFORE UPDATE ON checkouts BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap(),
             _=>unreachable!()
         }
         let before: i64 = sql
@@ -857,7 +857,7 @@ fn closed_child_v8_history_upgrades_and_stays_readable_after_finish() {
     store.close_supervised_group(&snap, &proof).unwrap();
     let prior = store.run_snapshot(&r.identity().run).unwrap();
     let sql = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8")
+    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8")
         .unwrap();
     assert!(matches!(
         work_cli::store::Store::open_existing_registered_readonly(

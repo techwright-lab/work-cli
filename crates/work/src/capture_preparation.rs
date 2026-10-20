@@ -9,7 +9,7 @@ use crate::{
 
 #[cfg(test)]
 #[path = "capture_preparation_tests.rs"]
-mod tests;
+pub(crate) mod tests;
 
 pub enum PreparationResult {
     Existing(CaptureRecord),
@@ -37,6 +37,7 @@ pub struct LiveCapture {
     root: Box<RootRunRequest>,
     cwd: std::path::PathBuf,
     launch_token: uuid::Uuid,
+    authority_registry: std::path::PathBuf,
 }
 /// Private ephemeral binding metadata, not kernel authority.
 #[derive(Clone, PartialEq, Eq)]
@@ -64,6 +65,28 @@ impl CapturedReleaseProof {
     }
 }
 impl LiveCapture {
+    pub(crate) fn authority_registry(&self) -> &std::path::Path {
+        &self.authority_registry
+    }
+    pub(crate) fn closure_matches(
+        &self,
+        root: &RootRunRequest,
+        capture: &crate::capture_journal::CaptureRecord,
+        spec: &crate::capture_journal::CaptureSpec,
+    ) -> bool {
+        // Cached metadata only: this runs inside the physical closure transaction.
+        // The original context observation binds the exact preparation frame/spec.
+        self.root.as_ref() == root
+            && capture.prepared.as_ref().is_some_and(|p| {
+                p.live_preparation
+                    && p.capture_id == self.environment().capture_id().as_str()
+                    && self
+                        .context
+                        .observation(self.environment().context_path(), spec)
+                        .is_ok_and(|artifact| p.context_artifact.as_ref() == Some(&artifact))
+            })
+            && self.cwd == spec.begin_request().cwd
+    }
     pub(crate) fn guard(&self) -> CapturedGuard {
         CapturedGuard {
             root: self.root.as_ref().clone(),
@@ -222,6 +245,10 @@ pub fn prepare_observed(
             root: Box::new(root.clone()),
             cwd: spec.begin_request().cwd,
             launch_token: uuid::Uuid::now_v7(),
+            authority_registry: config
+                .trusted_registry
+                .clone()
+                .ok_or("missing authority registry")?,
         })
     })();
     match attempt {

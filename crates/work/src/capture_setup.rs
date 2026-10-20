@@ -53,6 +53,22 @@ pub fn begin(
             "capture does not match selected host settings",
         ));
     }
+    if allocation.stage == "ready" {
+        drop(lock);
+        let proof = crate::allocate::db(crate::capture_readiness::ContinuationProof::inspect(
+            &store, config, request, spec,
+        ))?;
+        crate::allocate::db(proof.reinspect(&store))?;
+        let lock = crate::allocate::lifecycle_lock(
+            config
+                .store_dir
+                .as_ref()
+                .ok_or_else(|| crate::allocate::err("missing store"))?,
+        )?;
+        let result = crate::allocate::db(store.begin_certified_capture(request, spec, &proof))?;
+        drop(lock);
+        return Ok((store, result));
+    }
     let proof = crate::allocate::db(MaterializationProof::inspect(&store, request, spec))?;
     let result = crate::allocate::db(store.begin_materialized_capture(request, spec, &proof))?;
     drop(lock);
@@ -70,7 +86,7 @@ pub(crate) struct PendingPreparation {
     source_common: std::path::PathBuf,
 }
 impl PendingPreparation {
-    fn read(conn: &Connection, checkout: uuid::Uuid) -> Result<Self> {
+    pub(crate) fn read(conn: &Connection, checkout: uuid::Uuid) -> Result<Self> {
         let (record, request, operation, digest, repository, actor, task, owner): (String,String,String,Vec<u8>,String,String,String,String) = conn.query_row(
             "SELECT a.record,a.request,c.operation,c.digest,c.repository,c.actor,c.task,c.owner FROM checkouts c JOIN allocations a ON a.checkout=c.id WHERE c.id=?1", [checkout.to_string()],
             |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
@@ -89,6 +105,19 @@ impl PendingPreparation {
             charged,
             source_common,
         })
+    }
+    pub(crate) fn allocation(&self) -> Result<Allocation> {
+        let allocation: Allocation =
+            serde_json::from_str(&self.record).map_err(|_| StoreError::Invalid)?;
+        if serde_json::to_string(&allocation.request).map_err(|_| StoreError::Invalid)?
+            != self.request
+        {
+            return Err(StoreError::Invalid);
+        }
+        Ok(allocation)
+    }
+    pub(crate) fn source_common(&self) -> &std::path::Path {
+        &self.source_common
     }
     pub(crate) fn promote(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
         if Self::read(conn, checkout)? != *self {
@@ -120,6 +149,65 @@ impl PendingPreparation {
     }
 }
 
+pub(crate) enum AdmissionProof<'a> {
+    Pending(&'a MaterializationProof),
+    Certified(&'a crate::capture_readiness::ContinuationProof),
+}
+impl AdmissionProof<'_> {
+    pub(crate) fn validate_capture(
+        &self,
+        conn: &Connection,
+        root: &RootRunRequest,
+        spec: &CaptureSpec,
+    ) -> Result<()> {
+        match self {
+            Self::Pending(p) => p.validate_capture(conn, root, spec),
+            Self::Certified(p) => p.validate_capture(conn, root, spec),
+        }
+    }
+    pub(crate) fn validate_writer(
+        &self,
+        conn: &Connection,
+        checkout: uuid::Uuid,
+        group: uuid::Uuid,
+    ) -> Result<()> {
+        match self {
+            Self::Pending(p) => p.validate_writer(conn, checkout, group),
+            Self::Certified(p) => p.validate_writer(conn, checkout, group),
+        }
+    }
+    pub(crate) fn fresh(&self) -> Result<()> {
+        match self {
+            Self::Pending(p) => p.fresh(),
+            Self::Certified(p) => p.fresh(),
+        }
+    }
+    pub(crate) fn preparation(&self) -> PreparationContext {
+        match self {
+            Self::Pending(p) => PreparationContext::Pending(p.preparation()),
+            Self::Certified(p) => PreparationContext::Certified(p.preparation()),
+        }
+    }
+}
+pub(crate) enum PreparationContext {
+    Pending(PendingPreparation),
+    Certified(PendingPreparation),
+}
+impl PreparationContext {
+    pub(crate) fn promote(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
+        match self {
+            Self::Pending(p) => p.promote(conn, checkout),
+            Self::Certified(p) => {
+                if PendingPreparation::read(conn, checkout)? != *p
+                    || p.allocation()?.stage != "ready"
+                {
+                    return Err(StoreError::Conflict);
+                }
+                Ok(())
+            }
+        }
+    }
+}
 // No Clone/Serde, private fields and a single real-inspection constructor. A
 // stored flag, root declaration or preparation response cannot mint this proof.
 pub(crate) struct MaterializationProof {
@@ -130,20 +218,30 @@ pub(crate) struct MaterializationProof {
     observed: Instant,
     spec_digest: [u8; 32],
 }
-#[derive(PartialEq, Eq)]
-struct Physical {
-    checkout: CheckoutIdentity,
-    directories: Vec<(u64, u64)>,
-    marker: Vec<u8>,
+#[derive(PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Physical {
+    pub(crate) checkout: CheckoutIdentity,
+    pub(crate) directories: Vec<(u64, u64)>,
+    pub(crate) marker: Vec<u8>,
 }
 fn physical(a: &Allocation, charged_common: &std::path::Path) -> Result<Physical> {
+    let observed = inspect_physical(a, charged_common)?;
+    if a.identity.as_ref() != Some(&observed.checkout) {
+        return Err(StoreError::Conflict);
+    }
+    Ok(observed)
+}
+pub(crate) fn inspect_physical(
+    a: &Allocation,
+    charged_common: &std::path::Path,
+) -> Result<Physical> {
     let source = a.request.repository.as_ref().ok_or(StoreError::Invalid)?;
     crate::config::validate_path(source, true).map_err(|_| StoreError::Unsafe)?;
     let charged_common = crate::allocate::verify_source_authority(a, charged_common)?;
     let checkout = crate::recovery::verify(a)?;
     if checkout.common_git_dir != charged_common
         || checkout.private_git_dir == checkout.common_git_dir
-        || a.identity.as_ref() != Some(&checkout)
     {
         return Err(StoreError::Conflict);
     }

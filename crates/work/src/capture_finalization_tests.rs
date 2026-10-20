@@ -1,7 +1,6 @@
 #[path = "../tests/support/capture_finalization_fixture.rs"]
 mod capture_fixture;
-#[path = "../tests/support/run_fixture.rs"]
-mod fixture_support;
+use crate::test_run_fixture as fixture_support;
 
 #[test]
 fn competitor_confirmation_before_dispatch_is_passive() {

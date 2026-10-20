@@ -319,7 +319,7 @@ fn session_only_root_metadata_parses_stores_and_remains_absent() {
         assert_eq!(
             sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            12
+            13
         );
     }
 }

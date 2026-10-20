@@ -234,7 +234,7 @@ pub(super) fn credential_name(name: &str) -> Result<()> {
     Ok(())
 }
 /// Passive nonsecret audit data. Never a live file/capture capability.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextArtifactObservation {
     device: u64,

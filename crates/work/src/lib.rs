@@ -7,6 +7,9 @@
 
 #[cfg(test)]
 extern crate self as work_cli;
+#[cfg(test)]
+#[path = "../tests/support/run_fixture.rs"]
+pub(crate) mod test_run_fixture;
 
 pub mod admission;
 pub mod adopted;
@@ -18,6 +21,7 @@ pub mod capture_config;
 pub mod capture_finalization;
 pub mod capture_journal;
 pub mod capture_preparation;
+mod capture_readiness;
 mod capture_requirement;
 pub mod capture_setup;
 pub mod cli;

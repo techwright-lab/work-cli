@@ -183,6 +183,297 @@ json.dump({{'capture_id':'{CAPTURE}','state':'open','actor_ref':r['actor_ref'],'
     }
 }
 #[test]
+fn integrated_two_distinct_captures_restore_ready_without_recharging() {
+    let mut h = Harness::new();
+    h.launcher();
+    let producer = fs::read_to_string(h.f.temp.path().join("producer")).unwrap();
+    let delegate = fs::read_to_string(h.f.temp.path().join("delegate")).unwrap();
+    file(&h.f.temp.path().join("delegate"), format!("{delegate}\n/usr/bin/git commit --allow-empty -m \"$1\" >/dev/null\nprintf 'run\\n' >> '{}'\n",h.f.temp.path().join("actor-runs").display()),0o700);
+    for capture in [CAPTURE.to_owned(), Uuid::now_v7().to_string()] {
+        h.command.run_id = Uuid::now_v7();
+        h.command.argv.truncate(1);
+        h.command.argv.push(capture.clone().into());
+        file(
+            &h.f.temp.path().join("producer"),
+            producer.replace(CAPTURE, &capture),
+            0o700,
+        );
+        let report=supervise_captured_integrated_with_io(&h.cfg,h.command.clone(),&h.driver(),work_cli::scope_spawn::LaunchIo { systemd_run:h.f.temp.path().join("launcher"),self_binary:h.f.temp.path().join("self") },&CancelToken::default(), |boundary,r| {
+            if boundary==Boundary::RootTerminal { h.empty(r); }
+            if boundary==Boundary::Closed {
+                file(&h.f.temp.path().join("response"),serde_json::json!({"capture_id":capture,"actor_ref":"actor:alice","run_ref":r.request.identity().run_ref.as_str(),"state":"pending"}).to_string(),0o600);
+                file(&h.f.temp.path().join("producer"),format!("#!/bin/sh\n/usr/bin/cat >/dev/null\n/usr/bin/sleep 0.65\nexec /usr/bin/cat '{}'\n",h.f.temp.path().join("response").display()),0o700);
+            }
+        }).unwrap_or_else(|e| panic!("integrated capture {capture} must succeed: {e}"));
+        assert!(report.record.closed && report.task_open && report.lease_charged);
+        assert!(
+            !report.capture_unfrozen,
+            "integrated closure must actually FINISH capture"
+        );
+        assert!(
+            report.checkout_ready,
+            "integrated report omitted durable Ready despite successful certification"
+        );
+        assert_eq!(
+            report.record.outcome,
+            Some(work_cli::run_journal::RootOutcome::Completed)
+        );
+        let keeper = h.f.store();
+        let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+        assert_eq!(
+            sql.query_row("SELECT state,ready FROM checkouts", [], |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, bool>(1)?
+            )))
+            .unwrap(),
+            ("active".into(), true)
+        );
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM capture_readiness", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let body: String = sql
+            .query_row("SELECT certificate FROM capture_readiness", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let certificate: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let actual = work_cli::identity::CheckoutIdentity::inspect(&h.f.root.join("task")).unwrap();
+        assert_eq!(certificate["physical"]["checkout"]["head"], actual.head);
+        assert_eq!(keeper.charged(&h.f.repo, None).unwrap(), 1);
+    }
+    assert_eq!(
+        fs::read_to_string(h.f.temp.path().join("actor-runs")).unwrap(),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn newer_frozen_but_uncertified_root_invalidates_old_certificate_despite_ready_flags() {
+    let mut h = Harness::new();
+    h.launcher();
+    let producer = fs::read_to_string(h.f.temp.path().join("producer")).unwrap();
+    for certify in [true, false] {
+        let capture = Uuid::now_v7().to_string();
+        h.command.run_id = Uuid::now_v7();
+        file(
+            &h.f.temp.path().join("producer"),
+            producer.replace(CAPTURE, &capture),
+            0o700,
+        );
+        let observer = |boundary: Boundary, r: &work_cli::run_journal::RunRecord| {
+            if boundary == Boundary::RootTerminal {
+                h.empty(r);
+            }
+            if boundary == Boundary::Closed {
+                file(&h.f.temp.path().join("response"),serde_json::json!({"state":"pending","capture_id":capture,"actor_ref":"actor:alice","run_ref":r.request.identity().run_ref.as_str()}).to_string(),0o600);
+                file(
+                    &h.f.temp.path().join("producer"),
+                    format!(
+                        "#!/bin/sh\n/usr/bin/cat >/dev/null\nexec /usr/bin/cat '{}'\n",
+                        h.f.temp.path().join("response").display()
+                    ),
+                    0o700,
+                );
+            }
+        };
+        let report = if certify {
+            supervise_captured_integrated_with_io(
+                &h.cfg,
+                h.command.clone(),
+                &h.driver(),
+                work_cli::scope_spawn::LaunchIo {
+                    systemd_run: h.f.temp.path().join("launcher"),
+                    self_binary: h.f.temp.path().join("self"),
+                },
+                &CancelToken::default(),
+                observer,
+            )
+            .unwrap()
+        } else {
+            h.observed(observer).unwrap()
+        };
+        assert!(report.record.closed);
+        if !certify {
+            work_cli::capture_finalization::finalize(&h.cfg, &report.record.request.identity().run)
+                .unwrap();
+        }
+    }
+    let keeper = h.f.store();
+    let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    assert!(!sql
+        .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
+        .unwrap());
+    assert_eq!(
+        sql.query_row(
+            "SELECT count(*) FROM capture_finalizations WHERE confirmation IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    sql.execute("UPDATE checkouts SET state='active',ready=1", [])
+        .unwrap();
+    let before = keeper.pending_events(100).unwrap();
+    h.command.run_id = Uuid::now_v7();
+    assert!(
+        h.execute().is_err(),
+        "old certificate authorized a newer frozen but uncertified frontier"
+    );
+    assert_eq!(keeper.pending_events(100).unwrap(), before);
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn passive_finish_existing_never_restores_ready_from_a_live_closure() {
+    let mut h = Harness::new();
+    h.launcher();
+    let report=supervise_captured_integrated_with_io(&h.cfg,h.command.clone(),&h.driver(),work_cli::scope_spawn::LaunchIo {systemd_run:h.f.temp.path().join("launcher"),self_binary:h.f.temp.path().join("self")},&CancelToken::default(),|boundary,r| {
+        if boundary==Boundary::RootTerminal {h.empty(r);}
+        if boundary==Boundary::Closed {
+            file(&h.f.temp.path().join("response"),serde_json::json!({"state":"pending","capture_id":CAPTURE,"actor_ref":"actor:alice","run_ref":r.request.identity().run_ref.as_str()}).to_string(),0o600);
+            file(&h.f.temp.path().join("producer"),format!("#!/bin/sh\n/usr/bin/cat >/dev/null\nexec /usr/bin/cat '{}'\n",h.f.temp.path().join("response").display()),0o700);
+            let (_,result)=work_cli::capture_finalization::finalize(&h.cfg,&r.request.identity().run).unwrap();
+            assert!(matches!(result,work_cli::capture_finalization::FinalizeResult::Confirmed {..}));
+            // Drop the actual acknowledgement. The coordinator's subsequent
+            // passive Existing lookup cannot reconstruct the lost authority.
+        }
+    }).unwrap();
+    assert!(
+        report.record.closed
+            && !report.capture_unfrozen
+            && report.lease_charged
+            && report.task_open
+    );
+    let _keeper = h.f.store();
+    let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    assert!(!sql
+        .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
+        .unwrap());
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM capture_readiness", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn post_close_capture_failure_never_claims_an_unrecorded_kernel_hold() {
+    let mut h = Harness::new();
+    h.launcher();
+    let result = supervise_captured_integrated_with_io(
+        &h.cfg,
+        h.command.clone(),
+        &h.driver(),
+        work_cli::scope_spawn::LaunchIo {
+            systemd_run: h.f.temp.path().join("launcher"),
+            self_binary: h.f.temp.path().join("self"),
+        },
+        &CancelToken::default(),
+        |boundary, r| {
+            if boundary == Boundary::RootTerminal {
+                h.empty(r);
+            }
+            if boundary == Boundary::Closed {
+                let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite"))
+                    .unwrap();
+                sql.execute("UPDATE capture_runs SET spec='{}'", [])
+                    .unwrap();
+            }
+        },
+    );
+    let error = result
+        .expect_err("corrupt capture must refuse finalization")
+        .to_string();
+    assert!(
+        !error.contains("recovery hold uncertain"),
+        "known committed closure was masked: {error}"
+    );
+    let keeper = h.f.store();
+    let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    assert_eq!(
+        sql.query_row("SELECT closed FROM run_groups", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(!sql
+        .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
+        .unwrap());
+    assert_eq!(keeper.charged(&h.f.repo, None).unwrap(), 1);
+}
+
+#[test]
+fn cli_captured_existing_precedes_runtime_profile_receiver_and_artifacts() {
+    let mut h = Harness::new();
+    h.launcher();
+    let report = h
+        .observed(|b, r| {
+            if b == Boundary::RootTerminal {
+                h.empty(r)
+            }
+        })
+        .unwrap();
+    h.cfg.supervisor = None;
+    h.cfg.capture = None;
+    h.cfg.allocation.as_mut().unwrap().capture_sink = None;
+    fs::remove_file(h.f.temp.path().join("producer")).unwrap();
+    fs::remove_dir_all(h.f.temp.path().join("capture-state")).unwrap();
+    let chain = h.f.temp.path().join("chain.json");
+    fs::write(
+        &chain,
+        serde_json::to_vec(&h.command.execution_chain).unwrap(),
+    )
+    .unwrap();
+    let before = h.f.store().pending_events(100).unwrap();
+    let result = work_cli::supervisor::command(
+        &h.cfg,
+        Run {
+            checkout: h.command.checkout,
+            actor: None,
+            run_id: h.command.run_id,
+            execution_chain: chain,
+            argv: h.command.argv.clone(),
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "captured CLI receipt must not require current runtime: {result:?}"
+    );
+    assert_eq!(h.f.store().pending_events(100).unwrap(), before);
+    assert_eq!(
+        h.f.store()
+            .run_snapshot(&report.record.request.identity().run)
+            .unwrap()
+            .unwrap(),
+        report.record
+    );
+}
+
+#[test]
 fn terminal_finalization_changes_only_observational_report() {
     let mut h = Harness::new();
     h.launcher();

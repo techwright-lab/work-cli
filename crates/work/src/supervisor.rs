@@ -2,8 +2,8 @@
 //! -> permit-attempt journal -> release -> root status -> fresh whole-scope proof.
 //! A root exit is never writer release. Holds retain charges and task openness.
 //! Historical bindings cannot be restored; retry receipts never grant execution.
-//! Captured execution is library-only; no configured CLI/adopted execution,
-//! capture freeze/delivery, finish or retirement support.
+//! Configured captured roots use live closure, actual FINISH and fresh physical
+//! certification. Adopted capture, explicit capture finish and retirement remain unsupported.
 //!
 //! Polling policy is finite, but kernel D-state can delay pre-exec kill/reaping
 //! indefinitely. Released roots retain an owned reaper on drop (see scope_spawn).
@@ -83,6 +83,8 @@ pub struct RunReport {
     pub exit_code: Option<i32>,
     pub lease_charged: bool,
     pub task_open: bool,
+    /// Durable readiness observation, not physical proof or execution permission.
+    pub checkout_ready: bool,
     pub attribution_not_configured: bool,
     /// Capture is locally unfrozen; physical group closure is not freeze/delivery.
     pub capture_unfrozen: bool,
@@ -211,6 +213,11 @@ fn report(
     let _phase = store.sql_phase();
     let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
     let (record, lease_charged, task_open) = db(store.run_status_record(run))?;
+    let checkout_ready = allocate::sql(store.conn.query_row(
+        "SELECT state='active' AND ready=1 FROM checkouts WHERE id=?1",
+        [record.request.identity().checkout.to_string()],
+        |r| r.get(0),
+    ))?;
     let mapped = db(store.capture_snapshot(run))?.is_some();
     let confirmation = db(store.capture_finalization_snapshot(run))?.and_then(|s| s.confirmation);
     let capture_unfrozen = mapped && confirmation.is_none();
@@ -233,6 +240,7 @@ fn report(
         exit_code,
         lease_charged,
         task_open,
+        checkout_ready,
         attribution_not_configured,
         capture_unfrozen,
         capture_delivery,
@@ -289,6 +297,7 @@ pub fn supervise_with_io(
 fn captured_existing_report(
     config: &Config,
     command: &RootCommand,
+    captured_only: bool,
 ) -> io::Result<Option<RunReport>> {
     let (Some(registry), Some(dir)) = (
         config.trusted_registry.as_deref(),
@@ -311,7 +320,10 @@ fn captured_existing_report(
         return Ok(None);
     };
     if db(store.capture_snapshot(&run))?.is_none() {
-        return Err(err("ordinary root cannot acquire capture"));
+        if captured_only {
+            return Err(err("ordinary root cannot acquire capture"));
+        }
+        return Ok(None);
     }
     if record.request.identity().checkout.to_string() != command.checkout.to_string()
         || command
@@ -325,7 +337,34 @@ fn captured_existing_report(
     }
     report(&store, &run, true, None).map(Some)
 }
-/// Library-only captured supervisor. Production CLI capture remains unsupported.
+/// Trusted integrated captured execution with explicit library-only IO fixtures.
+/// Changed live closure, actual FINISH acknowledgement and new physical evidence
+/// are all required for readiness. Pending delivery is not a workflow failure.
+/// Production uses the same coordinator with fixed actual IO, never selectors.
+pub fn supervise_captured_integrated_with_io(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: LaunchIo,
+    cancel: &CancelToken,
+    observer: impl FnMut(Boundary, &RunRecord),
+) -> io::Result<RunReport> {
+    supervise_captured(
+        config,
+        command,
+        driver,
+        Some(io),
+        cancel,
+        observer,
+        CaptureCompletion::Certify,
+    )
+}
+#[derive(Clone, Copy)]
+enum CaptureCompletion {
+    Unfrozen,
+    Certify,
+}
+/// Library-only captured supervisor retaining the deliberately unfrozen b2 contract.
 pub fn supervise_captured_with_io(
     config: &Config,
     command: RootCommand,
@@ -334,7 +373,26 @@ pub fn supervise_captured_with_io(
     cancel: &CancelToken,
     observer: impl FnMut(Boundary, &RunRecord),
 ) -> io::Result<RunReport> {
-    if let Some(report) = captured_existing_report(config, &command)? {
+    supervise_captured(
+        config,
+        command,
+        driver,
+        Some(io),
+        cancel,
+        observer,
+        CaptureCompletion::Unfrozen,
+    )
+}
+fn supervise_captured(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: Option<LaunchIo>,
+    cancel: &CancelToken,
+    observer: impl FnMut(Boundary, &RunRecord),
+    completion: CaptureCompletion,
+) -> io::Result<RunReport> {
+    if let Some(report) = captured_existing_report(config, &command, true)? {
         return Ok(report);
     }
     let settings = config
@@ -380,7 +438,7 @@ pub fn supervise_captured_with_io(
         config,
         command,
         driver,
-        Some(io),
+        io,
         cancel,
         observer,
         store,
@@ -388,6 +446,7 @@ pub fn supervise_captured_with_io(
         root,
         profile,
         Some(live),
+        completion,
     )
 }
 fn supervise(
@@ -441,7 +500,18 @@ fn supervise(
         return report(&store, &request.identity().run, true, None);
     }
     execute(
-        config, command, driver, io, cancel, observer, store, allocation, request, profile, None,
+        config,
+        command,
+        driver,
+        io,
+        cancel,
+        observer,
+        store,
+        allocation,
+        request,
+        profile,
+        None,
+        CaptureCompletion::Unfrozen,
     )
 }
 #[allow(clippy::too_many_arguments)] // one execution/physical-closure loop for both admission paths
@@ -457,6 +527,7 @@ fn execute(
     request: RootRunRequest,
     profile: &ActorGitProfile,
     live: Option<crate::capture_preparation::LiveCapture>,
+    completion: CaptureCompletion,
 ) -> io::Result<RunReport> {
     let settings = config
         .supervisor
@@ -467,7 +538,9 @@ fn execute(
     let captured_driver = live.as_ref().map(|live| driver.for_capture(live));
     let driver = captured_driver.as_ref().unwrap_or(driver);
     observer(Boundary::Intent, &record(&store, &request)?);
-    // All failures after intent retain writer and charge; never invent an outcome.
+    // Before physical closure, failures retain writer and charge. Once closure
+    // commits, subsequent capture/readiness errors must never rewrite that fact.
+    let mut physically_closed = false;
     let result = (|| {
         let runs = config
             .store_dir
@@ -603,8 +676,36 @@ fn execute(
                     driver,
                     launch.binding().ok_or_else(|| err("missing binding"))?,
                 ) {
-                    db(store.close_supervised_group(&snapshot, &proof))?;
+                    let seal = match (&live, completion) {
+                        (Some(live), CaptureCompletion::Certify) => {
+                            db(store.close_live_capture(&snapshot, &proof, live))?.1
+                        }
+                        _ => {
+                            db(store.close_supervised_group(&snapshot, &proof))?;
+                            None
+                        }
+                    };
+                    physically_closed = true;
                     observer(Boundary::Closed, &record(&store, &request)?);
+                    if let Some(seal) = seal {
+                        // Physical closure is already committed. Neither FINISH
+                        // nor fresh filesystem inspection spans SQL or flock.
+                        let (_, finalization) = db(crate::capture_finalization::finalize(
+                            config,
+                            &request.identity().run,
+                        ))?;
+                        if let crate::capture_finalization::FinalizeResult::Confirmed {
+                            acknowledgement,
+                            ..
+                        } = finalization
+                        {
+                            db(crate::capture_readiness::restore(
+                                config,
+                                seal,
+                                acknowledgement,
+                            ))?;
+                        }
+                    }
                     return report(&store, &request.identity().run, false, root_code);
                 }
             }
@@ -619,7 +720,7 @@ fn execute(
             std::thread::sleep(Duration::from_millis(5));
         }
     })();
-    if result.is_err() {
+    if result.is_err() && !physically_closed {
         let held = store.record_recovery_hold(&request).is_ok();
         if live.is_some() && !held {
             return Err(err("captured supervision refused; recovery hold uncertain"));
@@ -646,6 +747,9 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
         execution_chain,
         argv: request.argv,
     };
+    if let Some(report) = captured_existing_report(config, &command, false)? {
+        return Ok(print_report(&report));
+    }
     if let Ok(Some(report)) = existing_report(config, &command) {
         return Ok(print_report(&report));
     }
@@ -673,7 +777,23 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
             }
         }
     }
-    let result = supervise(config, command, &driver, None, &cancel, |_, _| {});
+    let result = if config
+        .allocation
+        .as_ref()
+        .is_some_and(|a| a.capture_sink.is_some())
+    {
+        supervise_captured(
+            config,
+            command,
+            &driver,
+            None,
+            &cancel,
+            |_, _| {},
+            CaptureCompletion::Certify,
+        )
+    } else {
+        supervise(config, command, &driver, None, &cancel, |_, _| {})
+    };
     for id in handlers {
         signal_hook::low_level::unregister(id);
     }
@@ -682,7 +802,7 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
 }
 fn print_report(report: &RunReport) -> i32 {
     eprintln!(
-        "run {}: root={:?}; writer_group={}; lease=charged; task={}; attribution={}; receipt={}",
+        "run {}: root={:?}; writer_group={}; lease={}; task={}; readiness={}; capture={}; delivery={:?}; attribution={}; receipt={}; observed_exit={:?}",
         report.record.request.identity().run,
         report.record.outcome,
         if report.record.closed {
@@ -690,13 +810,18 @@ fn print_report(report: &RunReport) -> i32 {
         } else {
             "held; inspect durable journal; historical binding restoration unsupported"
         },
+        if report.lease_charged { "charged" } else { "uncharged" },
         if report.task_open { "open" } else { "finished" },
+        if report.checkout_ready { "ready" } else { "not_ready" },
+        if report.capture_unfrozen { "unfrozen" } else if report.capture_delivery.is_some() { "frozen" } else { "not_configured" },
+        report.capture_delivery,
         if report.attribution_not_configured {
             "not_configured"
         } else {
-            "see finish receipt"
+            "configured"
         },
-        report.existing
+        report.existing,
+        report.exit_code
     );
     report.process_exit_code()
 }

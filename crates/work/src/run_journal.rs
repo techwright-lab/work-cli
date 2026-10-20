@@ -541,7 +541,7 @@ pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<
 pub(crate) fn begin_run_context(
     tx: &Connection,
     request: &RootRunRequest,
-    materialized: Option<&crate::capture_setup::MaterializationProof>,
+    materialized: Option<&crate::capture_setup::AdmissionProof<'_>>,
 ) -> Result<BeginRun> {
     crate::capture_journal::validate_related(tx, &request.identity.checkout)?;
     crate::capture_journal::exclude_operation(tx, &request.identity.run)?;
@@ -697,6 +697,15 @@ impl Store {
         snapshot: &GroupSnapshot,
         proof: &GroupEmptyProof,
     ) -> Result<Transition> {
+        self.close_supervised_group_context(snapshot, proof, None)
+            .map(|(transition, _)| transition)
+    }
+    pub(crate) fn close_supervised_group_context(
+        &mut self,
+        snapshot: &GroupSnapshot,
+        proof: &GroupEmptyProof,
+        live: Option<&crate::capture_preparation::LiveCapture>,
+    ) -> Result<(Transition, Option<crate::capture_readiness::ClosureSeal>)> {
         let _phase = self.sql_phase();
         if snapshot.record != proof.record {
             return Err(StoreError::Conflict);
@@ -719,7 +728,7 @@ impl Store {
             receipt.revision = revision;
             apply_interruptions(&mut receipt, &proof.interrupted_children)?;
             return if current == receipt {
-                Ok(Transition::Existing)
+                Ok((Transition::Existing, None))
             } else {
                 Err(StoreError::Conflict)
             };
@@ -733,6 +742,8 @@ impl Store {
         {
             return Err(StoreError::Conflict);
         }
+        let seal_eligible = live.is_some()
+            && crate::capture_readiness::before_close(&tx, &current).unwrap_or(false);
         let mut receipt = expected.clone();
         apply_interruptions(&mut receipt, &proof.interrupted_children)?;
         for run in &proof.interrupted_children {
@@ -773,8 +784,23 @@ impl Store {
             (i.group.to_string(), revision as i64),
         )?;
         journal_event(&tx, &expected.request, revision, JournalChange::GroupClosed)?;
+        // Capture eligibility never vetoes proven physical closure. Only this
+        // Changed transaction can seal its exact post-close context.
+        let seal = if seal_eligible {
+            live.and_then(|live| {
+                crate::capture_readiness::closed(&tx, &expected.request, live).ok()
+            })
+        } else {
+            None
+        };
+        if Instant::now()
+            .checked_duration_since(proof.collected_at)
+            .is_none_or(|age| age > EMPTY_MAX_AGE)
+        {
+            return Err(StoreError::Conflict);
+        }
         tx.commit()?;
-        Ok(Transition::Changed)
+        Ok((Transition::Changed, seal))
     }
     fn transition(&mut self, request: &RootRunRequest, change: Change) -> Result<Transition> {
         let _phase = self.sql_phase();

@@ -778,7 +778,7 @@ fn v6_migration_preserves_closed_and_active_roots_adopted_legacy_aliases_and_out
     let active_before = store.run_snapshot(&active.identity().run).unwrap().unwrap();
     let adopted_before =
         serde_json::to_value(store.adopted_status(&adopted.identity.run).unwrap()).unwrap();
-    sql.execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
+    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
     drop(store);
     let migrated = reopen(&dir).unwrap();
     assert_eq!(
@@ -829,9 +829,9 @@ fn v8_child_ledger_is_additive_and_versioned_tables_fail_closed() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        12
+        13
     );
-    sql.execute_batch("DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
+    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
     drop(store);
     let store = reopen(&dir).unwrap();
     assert_eq!(store.pending_events(100).unwrap(), events);
