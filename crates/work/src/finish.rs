@@ -483,9 +483,14 @@ fn finish_internal(
     if current.operation != receipt.operation {
         return Err(StoreError::Conflict);
     }
-    let mut stmt=store.conn.prepare("SELECT r.id FROM runs r JOIN run_groups g ON r.group_id=g.id WHERE g.checkout=?1 ORDER BY r.id")?;
-    let ids = stmt
-        .query_map([checkout.to_string()], |r| r.get::<_, String>(0))?
+    // load() validated every base root, roster and exact writer plus the target
+    // capture history in this same read transaction. Project only reporting
+    // facts here; rereading each missing map would repeat global orphan scans.
+    let mut stmt=store.conn.prepare("SELECT r.id,r.outcome FROM runs r JOIN run_groups g ON r.group_id=g.id WHERE g.checkout=?1 ORDER BY r.id")?;
+    let roots = stmt
+        .query_map([checkout.to_string()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut captured =
         crate::run_journal::with_capture_history(&store.conn, checkout, |history| {
@@ -523,16 +528,15 @@ fn finish_internal(
                 .collect::<std::collections::BTreeMap<_, _>>())
         })?;
     let mut outcomes = Vec::new();
-    for id in ids {
+    for (id, outcome) in roots {
         let run = work_contract::RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
         let (outcome, capture) = if let Some(pair) = captured.remove(&id) {
             pair
         } else {
-            // load() already validated task truth and every root/roster in this
-            // same snapshot. Do not recursively reload that task receipt via
-            // run_status_record for each unmapped root.
-            let record = crate::run_journal::read(&store.conn, &run)?.ok_or(StoreError::Invalid)?;
-            (record.outcome, RunCapture::Missing)
+            (
+                outcome.as_deref().map(parse).transpose()?,
+                RunCapture::Missing,
+            )
         };
         outcomes.push(RunOutcome {
             run,

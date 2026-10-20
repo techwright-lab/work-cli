@@ -1182,6 +1182,158 @@ mod tests {
         });
     }
     #[test]
+    fn captured_finish_many_unmapped_roots_preserves_shared_sql_budgets() {
+        many_closed_history(|cfg, store, a, original| {
+            let rows = |table: &str| {
+                let mut stmt = store
+                    .conn
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = stmt.column_count();
+                stmt.query_map([], |r| {
+                    (0..columns)
+                        .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            let before = ["runs", "run_groups", "run_participants", "allocations"].map(rows);
+            let expected = store
+                .conn
+                .prepare("SELECT id FROM runs ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let bytes = || {
+                ["store.sqlite", "store.sqlite-wal", "store.sqlite-shm"]
+                    .iter()
+                    .map(|name| {
+                        std::fs::metadata(cfg.store_dir.as_ref().unwrap().join(name))
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                    })
+                    .sum::<u64>()
+            };
+            let pre = bytes();
+            // Missing evidence only: retain every root, child, outcome and physical identity.
+            for table in ["capture_finalizations", "capture_runs"] {
+                assert_eq!(
+                    store
+                        .conn
+                        .execute(
+                            &format!("DELETE FROM {table} WHERE run<>?1"),
+                            [original.identity().run.to_string()]
+                        )
+                        .unwrap(),
+                    expected.len() - 1
+                );
+            }
+            eprintln!("many_unmapped roots={} children={} pre_deletion_bytes={pre} post_deletion_bytes={}", expected.len(), before[2].len(), bytes());
+            assert_eq!(
+                ["runs", "run_groups", "run_participants", "allocations"].map(rows),
+                before
+            );
+            assert_eq!(before[2].len(), (expected.len() - 1) * 4);
+            let calls = cfg
+                .store_dir
+                .as_ref()
+                .unwrap()
+                .join("unexpected-producer-call");
+            std::fs::write(
+                &cfg.capture.as_ref().unwrap().executable,
+                format!(
+                    "#!/usr/bin/python3\nimport sys\nopen({calls:?},'w').close()\nsys.exit(1)\n"
+                ),
+            )
+            .unwrap();
+            let mut passive_cfg = cfg.clone();
+            passive_cfg.supervisor = None;
+            let frozen = rows("capture_finalizations");
+            let report = crate::finish::finish(&passive_cfg, a.checkout)
+                .expect("bounded many-unmapped completion must expose committed task truth");
+            assert!(
+                report.task_finished
+                    && report.capture_incomplete
+                    && report.lease_held
+                    && report.charge_retained
+            );
+            assert_eq!(report.local_freeze, crate::finish::Freeze::Failed);
+            assert_eq!(report.delivery, None);
+            assert_eq!(report.retirement, "disabled");
+            assert_eq!(report.action, "none");
+            assert_eq!(
+                report
+                    .run_outcomes
+                    .iter()
+                    .map(|r| r.run.to_string())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(report
+                .run_outcomes
+                .iter()
+                .all(|r| r.outcome == Some(crate::run_journal::RootOutcome::Completed)));
+            assert_eq!(
+                report
+                    .run_outcomes
+                    .iter()
+                    .filter(|r| r.capture == crate::finish::RunCapture::Missing)
+                    .count(),
+                expected.len() - 1
+            );
+            assert_eq!(
+                report
+                    .run_outcomes
+                    .iter()
+                    .find(|r| r.run == original.identity().run)
+                    .unwrap()
+                    .capture,
+                crate::finish::RunCapture::Frozen {
+                    delivery: crate::finish::Delivery::Pending
+                }
+            );
+            let receipt = rows("task_finishes");
+            let retry = crate::finish::finish(&passive_cfg, a.checkout).unwrap();
+            assert_eq!(retry, report);
+            assert_eq!(rows("task_finishes"), receipt);
+            assert_eq!(rows("capture_finalizations"), frozen);
+            assert!(!calls.exists());
+            assert_eq!(rows("writers").len(), 0);
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT state,ready FROM checkouts", [], |r| Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, bool>(1)?
+                    )))
+                    .unwrap(),
+                ("held".into(), false)
+            );
+            assert!(store
+                .conn
+                .query_row("SELECT revoked FROM capture_readiness", [], |r| r
+                    .get::<_, bool>(0))
+                .unwrap());
+            assert_eq!(store.conn.query_row("SELECT count(*) FROM outbox WHERE json_extract(payload,'$.type')='task_finished'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+            assert_eq!(
+                store
+                    .charged(a.request.repository.as_ref().unwrap(), None)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                ["runs", "run_groups", "run_participants", "allocations"].map(rows),
+                before
+            );
+            assert_eq!(rows("capture_runs").len(), 1);
+            assert_eq!(rows("capture_finalizations").len(), 1);
+        });
+    }
+    #[test]
     fn captured_finish_prepares_all_intents_before_any_producer() {
         many_closed_history(|cfg, store, a, _| {
             store
