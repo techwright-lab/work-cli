@@ -1,6 +1,7 @@
-//! Bounded Git capture with owned process-group cleanup (not malicious setsid containment).
+//! Bounded process I/O with owned process-group cleanup (not malicious setsid containment).
+//! Kernel uninterruptible I/O can delay kill/reap; deadlines are not a hard D-state bound.
 use std::{
-    io::{self, Read},
+    io::{self, Read, Write},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -10,7 +11,16 @@ pub(crate) fn output_aggregate(
     timeout: Duration,
     limit: usize,
 ) -> Result<Output, &'static str> {
-    output_mode(command, timeout, limit, true)
+    output_mode(command, timeout, limit, true, None)
+}
+
+pub(crate) fn output_with_input_aggregate(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    input: &[u8],
+) -> Result<Output, &'static str> {
+    output_mode(command, timeout, limit, true, Some(input))
 }
 
 // Aggregate capture cannot probe EOF at an exhausted boundary: even a one-byte
@@ -28,7 +38,7 @@ pub(crate) fn output(
     timeout: Duration,
     limit: usize,
 ) -> Result<Output, &'static str> {
-    output_mode(command, timeout, limit, false)
+    output_mode(command, timeout, limit, false, None)
 }
 
 fn output_mode(
@@ -36,13 +46,18 @@ fn output_mode(
     timeout: Duration,
     limit: usize,
     aggregate: bool,
+    input: Option<&[u8]>,
 ) -> Result<Output, &'static str> {
     use std::os::unix::process::CommandExt;
     const IO_ERROR: &str = "Git process I/O unavailable; inventory incomplete";
     let start = Instant::now();
     command
         .process_group(0)
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = loop {
@@ -73,6 +88,15 @@ fn output_mode(
             &stderr as &dyn std::os::fd::AsFd,
         ] {
             rustix::fs::fcntl_setfl(fd, rustix::fs::OFlags::NONBLOCK).map_err(|_| IO_ERROR)?;
+        }
+        let mut stdin = child.stdin.take();
+        if let Some(pipe) = &stdin {
+            rustix::fs::fcntl_setfl(pipe, rustix::fs::OFlags::NONBLOCK).map_err(|_| IO_ERROR)?;
+        }
+        let input = input.unwrap_or_default();
+        let mut written: usize = 0;
+        if input.is_empty() {
+            drop(stdin.take());
         }
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -125,6 +149,25 @@ fn output_mode(
                     Err(_) => return Err(IO_ERROR),
                 }
             }
+            if let Some(pipe) = &mut stdin {
+                let end = input.len().min(written.saturating_add(8192));
+                match pipe.write(&input[written..end]) {
+                    Ok(0) => return Err(IO_ERROR),
+                    Ok(n) => {
+                        written += n;
+                        progressed = true;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => return Err(IO_ERROR),
+                }
+                if written == input.len() {
+                    drop(stdin.take());
+                }
+            }
             // Observe exit without reaping: keep the leader PID/group owned until
             // cleanup, avoiding a recycled process-group ID after try_wait/reap.
             use rustix::process::{waitid, WaitId, WaitIdOptions};
@@ -136,6 +179,9 @@ fn output_mode(
                 .map_err(|_| IO_ERROR)?
                 .is_some()
             {
+                if written != input.len() {
+                    return Err(IO_ERROR);
+                }
                 return Ok((out, err));
             }
             if !progressed {
@@ -174,6 +220,129 @@ mod tests {
         let mut command = Command::new(path);
         command.arg(temp.path().join("called"));
         (command, writer)
+    }
+
+    #[test]
+    fn input_interleaves_with_large_output_and_closes_at_eof() {
+        let input = vec![b'x'; 256 * 1024];
+        let result = output_with_input_aggregate(
+            Command::new("/bin/sh").args(["-c", "head -c 131072 /dev/zero; wc -c"]),
+            Duration::from_secs(2),
+            200000,
+            &input,
+        )
+        .unwrap();
+        assert!(result.status.success());
+        assert_eq!(&result.stdout[131072..], b"262144\n");
+        let empty = output_with_input_aggregate(
+            Command::new("/bin/sh").args(["-c", "wc -c"]),
+            Duration::from_secs(2),
+            32,
+            b"",
+        )
+        .unwrap();
+        assert_eq!(empty.stdout, b"0\n");
+    }
+
+    #[test]
+    fn incomplete_input_is_refused_and_blocked_input_is_bounded() {
+        let input = vec![b'x'; 1024 * 1024];
+        for body in ["exit 0", "exec sleep 30"] {
+            let start = Instant::now();
+            assert!(output_with_input_aggregate(
+                Command::new("/bin/sh").args(["-c", body]),
+                Duration::from_millis(50),
+                32,
+                &input,
+            )
+            .is_err());
+            assert!(start.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn input_busy_exec_retry_delivers_once_and_shares_the_original_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, writer) =
+            writable_script(&temp, "printf 'called\\n' >> \"$1\"; /usr/bin/cat; exit 9");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(writer);
+        });
+        let output = output_with_input_aggregate(
+            &mut command,
+            Duration::from_secs(2),
+            100,
+            b"literal input",
+        )
+        .unwrap();
+        release.join().unwrap();
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(output.stdout, b"literal input");
+        assert_eq!(
+            std::fs::read(temp.path().join("called")).unwrap(),
+            b"called\n"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, writer) = writable_script(
+            &temp,
+            "printf called > \"$1\"; /usr/bin/sleep 0.2; /usr/bin/cat",
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            drop(writer);
+        });
+        assert!(output_with_input_aggregate(
+            &mut command,
+            Duration::from_millis(350),
+            100,
+            b"literal"
+        )
+        .is_err());
+        release.join().unwrap();
+        assert!(temp.path().join("called").exists());
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, _writer) = writable_script(&temp, "printf called > \"$1\"");
+        assert!(output_with_input_aggregate(
+            &mut command,
+            Duration::from_millis(40),
+            100,
+            b"literal"
+        )
+        .is_err());
+        assert!(!temp.path().join("called").exists());
+    }
+
+    #[test]
+    fn blocked_input_cleanup_reaps_leader_and_aggregate_exhaustion_is_shared() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid = temp.path().join("pid");
+        let body = format!("printf '%s' $$ > '{}'; exec sleep 30", pid.display());
+        assert!(output_with_input_aggregate(
+            Command::new("/bin/sh").args(["-c", &body]),
+            Duration::from_millis(100),
+            100,
+            &vec![b'x'; 1024 * 1024],
+        )
+        .is_err());
+        let leader = std::fs::read_to_string(pid).unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{leader}")).exists());
+        let body = format!(
+            "printf '{}'; printf '{}' >&2; /usr/bin/cat",
+            "o".repeat(80),
+            "e".repeat(80)
+        );
+        assert_eq!(
+            output_with_input_aggregate(
+                Command::new("/bin/sh").args(["-c", &body]),
+                Duration::from_secs(2),
+                160,
+                b"input"
+            )
+            .unwrap_err(),
+            "Git capture limit reached; inventory incomplete"
+        );
     }
 
     #[test]

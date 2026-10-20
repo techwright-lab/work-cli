@@ -19,6 +19,36 @@ Production capture integration and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
+### Capture transport construction (Task 8.1 only)
+
+The library exposes `capture_bridge` typed begin/finish/retry requests and
+`sinks::ProcessSink` for a trusted host adapter. It is **not** wired into host
+configuration, allocation, launch, finish, reconciliation or a CLI command.
+Every configured-capture unsupported gate remains in place. Tests invoke only
+private fake executables, not an installed DevDiary/Python CLI or a receiver.
+
+Settings require absolute executable/registry/state paths, a 1..30000 ms runtime
+budget and a 1..1048576-byte aggregate stdout+stderr budget. Input encoding stops
+at 1 MiB before spawn. Literal argv contains only registry/state locators and the
+operation; all capture data (including an optional key-file locator, never a key
+value) travels as operation-specific JSON on stdin. The receiver process inherits
+operator environment; writer credential stripping is still an integration gate.
+Nonblocking stdin/stdout/stderr share one original deadline, with ETXTBSY-only
+pre-exec retry and owned-group kill/reap. Exact response-cap exhaustion is refused
+without an EOF lookahead. Kernel D-state can still delay reap.
+
+Begin projections require exact actor/run/capture binding and the seven-key
+allowlist; the integration caller must compare against its trusted Git profile.
+Projections are redacted and not serializable. Terminal exit zero with `pending`
+is only a local-frozen/delivery-pending observation, never delivery or lifecycle
+authority. Delivered requires a matching receipt (`event_id` per the portable
+protocol, positive integer `session_id`, exact actor/run). Errors never expose
+raw child output. Lifecycle IDs/scope remain declarations, not ownership proof.
+
+Durable mapping/readiness (8.2), launch projection/credential stripping and
+finalization (8.3), and real disposable capture/HTTP contract qualification (8.4)
+remain gated on Task 7 acceptance. Nothing here enables capture or retirement.
+
 ## Read-only inventory
 
 ```sh
