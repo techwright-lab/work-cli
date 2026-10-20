@@ -371,6 +371,14 @@ pub(crate) fn guard_certified_identity(
         }
         current = Some(run.to_string());
     }
+    let writers: i64 = conn.query_row(
+        "SELECT count(*) FROM writers WHERE checkout=?1",
+        [checkout.to_string()],
+        |r| r.get(0),
+    )?;
+    if writers != i64::from(current.is_some()) {
+        return Err(StoreError::Invalid);
+    }
     if frontier_except(conn, checkout, current.as_deref().unwrap_or(""))? != cert.frontier {
         return Err(StoreError::Conflict);
     }
@@ -382,7 +390,7 @@ fn certificate(conn: &rusqlite::Connection, checkout: uuid::Uuid) -> Result<Cert
         if matches!(r.get_ref(1)?, rusqlite::types::ValueRef::Text(b) if b.len() > crate::capture_journal::MAX_RECORD_BYTES) { return Err(rusqlite::Error::InvalidQuery); }
         Ok((r.get(0)?, r.get(1)?))
     })?;
-    let cert: Certificate = serde_json::from_str(&body).map_err(|_| StoreError::Invalid)?;
+    let cert: Certificate = crate::capture_journal::strict(&body)?;
     if !matches!(cert.physical.checkout.head.len(), 40 | 64)
         || !cert
             .physical
@@ -452,11 +460,21 @@ impl ContinuationProof {
             let pending = crate::capture_setup::PendingPreparation::read(&store.conn, a.checkout)?;
             (a, pending, cert)
         };
-        // The certified HEAD is the immutable ancestry anchor. The actual durable
-        // stage remains Ready; no synthetic stage override is used.
-        anchor.identity = Some(cert.physical.checkout.clone());
+        // Preserve current durable ancestry first; the older certificate cannot
+        // erase a HEAD advance already observed by normal identity refresh.
         let observed = std::time::Instant::now();
         let physical = crate::capture_setup::inspect_physical(&anchor, pending.source_common())?;
+        if cert.physical.checkout.head != physical.checkout.head {
+            crate::identity::query(
+                &physical.checkout.path,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &cert.physical.checkout.head,
+                    &physical.checkout.head,
+                ],
+            )?;
+        }
         if physical.marker != cert.physical.marker
             || physical.directories.len() != cert.physical.directories.len()
             || physical
@@ -473,8 +491,8 @@ impl ContinuationProof {
             return Err(StoreError::Conflict);
         }
         // Reinspection must match this actual observation. Successful descent
-        // needs one graph check against the certificate, not one per history row
-        // or another repeated check during unchanged physical reinspection.
+        // uses at most one additional certificate graph check, never one per
+        // history row or a repeated check during unchanged physical reinspection.
         anchor.identity = Some(physical.checkout.clone());
         let proof = Self {
             root: root.clone(),
@@ -1069,6 +1087,142 @@ mod tests {
             .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
             .unwrap());
     }
+    fn git_at(a: &crate::allocate::Allocation, args: &[&str]) -> String {
+        let out = std::process::Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .current_dir(&a.destination)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "Git fixture failed: {:?}", out.stderr);
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    fn next_root(root: &crate::run_journal::RootRunRequest) -> crate::run_journal::RootRunRequest {
+        let mut value = serde_json::to_value(root).unwrap();
+        value["identity"]["run"] = uuid::Uuid::now_v7().to_string().into();
+        value["identity"]["group"] = uuid::Uuid::now_v7().to_string().into();
+        value["identity"]["run_ref"] = "run:regression-next".into();
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn continuation_accepts_current_durable_head_or_its_descendant_with_older_certificate() {
+        for advance_again in [false, true] {
+            let (_temp, cfg, mut store, a, root, seal, ack) = closed();
+            restore(&cfg, seal, ack).unwrap();
+            let certified = certificate(&store.conn, a.checkout)
+                .unwrap()
+                .physical
+                .checkout
+                .head;
+            git_at(&a, &["commit", "--allow-empty", "-m", "descendant B"]);
+            let refreshed = crate::allocate::verified_checkout(&mut store, a.checkout).unwrap();
+            assert_ne!(refreshed.identity.as_ref().unwrap().head, certified);
+            assert_eq!(
+                certificate(&store.conn, a.checkout)
+                    .unwrap()
+                    .physical
+                    .checkout
+                    .head,
+                certified
+            );
+            if advance_again {
+                git_at(&a, &["commit", "--allow-empty", "-m", "descendant C"]);
+            }
+            let next = next_root(&root);
+            let spec = cfg
+                .capture_spec(
+                    &next,
+                    &refreshed,
+                    uuid::Uuid::now_v7(),
+                    vec!["task".into()],
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                crate::capture_setup::begin(&cfg, &next, &spec).unwrap().1,
+                crate::capture_journal::BeginCapturedRun::Created(_)
+            ));
+        }
+    }
+    #[test]
+    fn continuation_refuses_reset_behind_normally_refreshed_durable_head_before_prepare() {
+        let (temp, cfg, mut store, a, root, seal, ack) = closed();
+        restore(&cfg, seal, ack).unwrap();
+        let certified = certificate(&store.conn, a.checkout)
+            .unwrap()
+            .physical
+            .checkout
+            .head;
+        git_at(&a, &["commit", "--allow-empty", "-m", "descendant B"]);
+        let b = git_at(&a, &["rev-parse", "HEAD"]);
+        let refreshed = crate::allocate::verified_checkout(&mut store, a.checkout).unwrap();
+        assert_eq!(refreshed.identity.as_ref().unwrap().head, b);
+        assert_eq!(
+            crate::capture_setup::PendingPreparation::read(&store.conn, a.checkout)
+                .unwrap()
+                .allocation()
+                .unwrap()
+                .identity
+                .unwrap()
+                .head,
+            b
+        );
+        assert_eq!(
+            certificate(&store.conn, a.checkout)
+                .unwrap()
+                .physical
+                .checkout
+                .head,
+            certified
+        );
+        git_at(&a, &["reset", "--hard", &certified]);
+        let next = next_root(&root);
+        let spec = cfg
+            .capture_spec(
+                &next,
+                &refreshed,
+                uuid::Uuid::now_v7(),
+                vec!["task".into()],
+                None,
+            )
+            .unwrap();
+        let calls = temp.path().join("receiver-calls");
+        std::fs::write(
+            &cfg.capture.as_ref().unwrap().executable,
+            format!(
+                "#!/bin/sh\nprintf called >> '{}'\nexit 1\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let events = store.pending_events(100).unwrap();
+        let counts = || {
+            ["runs", "run_groups", "writers", "capture_runs"].map(|table| {
+                store
+                    .conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                        r.get::<_, i64>(0)
+                    })
+                    .unwrap()
+            })
+        };
+        let before = counts();
+        assert!(
+            crate::capture_setup::begin(&cfg, &next, &spec).is_err(),
+            "reset behind durable B admitted a new captured root"
+        );
+        assert!(crate::capture_preparation::prepare(&cfg, &next, &spec).is_err());
+        assert!(!calls.exists(), "rejected continuation invoked receiver");
+        assert_eq!(counts(), before);
+        assert_eq!(store.pending_events(100).unwrap(), events);
+    }
     #[test]
     fn certificate_head_must_be_an_immutable_object_id_not_a_mutable_ref() {
         let (_temp, cfg, store, a, root, seal, ack) = closed();
@@ -1119,6 +1273,95 @@ mod tests {
         assert!(
             crate::capture_setup::begin(&cfg, &next, &spec).is_err(),
             "mutable certificate HEAD authorized an unrelated raw commit"
+        );
+    }
+    #[test]
+    fn target_certificate_rejects_unknown_nested_fields_and_positional_structs() {
+        let mut accepted = Vec::new();
+        for shape in [
+            "checkout-extra",
+            "directory-extra",
+            "certificate-array",
+            "physical-array",
+            "checkout-array",
+            "directory-array",
+        ] {
+            let (_temp, cfg, store, a, root, seal, ack) = closed();
+            restore(&cfg, seal, ack).unwrap();
+            let original = certificate(&store.conn, a.checkout).unwrap();
+            let mut value = serde_json::to_value(&original).unwrap();
+            let (pointer, fields): (&str, &[&str]) = match shape {
+                "certificate-array" => (
+                    "",
+                    &[
+                        "version", "checkout", "run", "stable", "physical", "frontier", "registry",
+                        "store",
+                    ],
+                ),
+                "physical-array" => ("/physical", &["checkout", "directories", "marker"]),
+                "checkout-array" => (
+                    "/physical/checkout",
+                    &[
+                        "path",
+                        "private_git_dir",
+                        "common_git_dir",
+                        "directory",
+                        "head",
+                        "boot_id",
+                    ],
+                ),
+                "directory-array" => ("/physical/checkout/directory", &["device", "inode"]),
+                "checkout-extra" => ("/physical/checkout", &[]),
+                "directory-extra" => ("/physical/checkout/directory", &[]),
+                _ => unreachable!(),
+            };
+            let target = value.pointer_mut(pointer).unwrap();
+            if fields.is_empty() {
+                target["unknown"] = true.into();
+            } else {
+                *target =
+                    serde_json::Value::Array(fields.iter().map(|f| target[*f].clone()).collect());
+            }
+            // These are valid serde representations of the SAME typed certificate,
+            // not broken fixtures that already fail ordinary deserialization.
+            let decoded: Certificate = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(hash(&decoded).unwrap(), hash(&original).unwrap());
+            store
+                .conn
+                .execute(
+                    "UPDATE capture_readiness SET certificate=?1",
+                    [value.to_string()],
+                )
+                .unwrap();
+            drop(
+                Store::open_registered(
+                    cfg.trusted_registry.as_ref().unwrap(),
+                    cfg.store_dir.as_ref().unwrap(),
+                    &cfg.roots,
+                )
+                .unwrap(),
+            );
+            let next = next_root(&root);
+            let spec = cfg
+                .capture_spec(&next, &a, uuid::Uuid::now_v7(), vec!["task".into()], None)
+                .unwrap();
+            let events = store.pending_events(100).unwrap();
+            if crate::capture_setup::begin(&cfg, &next, &spec).is_ok() {
+                accepted.push(shape);
+            } else {
+                assert_eq!(store.pending_events(100).unwrap(), events);
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "noncanonical certificates admitted: {accepted:?}"
         );
     }
     #[test]
@@ -1185,6 +1428,42 @@ mod tests {
                 0
             );
         }
+    }
+    #[test]
+    fn certified_identity_refresh_refuses_bare_writer_without_mutation() {
+        let (_temp, cfg, mut store, a, _root, seal, ack) = closed();
+        restore(&cfg, seal, ack).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO writers VALUES(?1,?2)",
+                (a.checkout.to_string(), uuid::Uuid::now_v7().to_string()),
+            )
+            .unwrap();
+        git_at(
+            &a,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "advance with orphan writer",
+            ],
+        );
+        let before = crate::capture_setup::PendingPreparation::read(&store.conn, a.checkout)
+            .unwrap()
+            .allocation()
+            .unwrap();
+        let events = store.pending_events(100).unwrap();
+        assert!(
+            crate::allocate::verified_checkout(&mut store, a.checkout).is_err(),
+            "bare orphan writer allowed identity refresh"
+        );
+        let after = crate::capture_setup::PendingPreparation::read(&store.conn, a.checkout)
+            .unwrap()
+            .allocation()
+            .unwrap();
+        assert_eq!(before.identity, after.identity);
+        assert_eq!(store.pending_events(100).unwrap(), events);
     }
     #[test]
     fn certified_identity_refresh_refuses_orphan_supervised_history() {
