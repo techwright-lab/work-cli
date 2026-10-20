@@ -782,19 +782,7 @@ pub(crate) fn validate_related(conn: &Connection, checkout: &CheckoutId) -> Resu
     if version < 10 {
         return Ok(());
     }
-    let mut stmt = conn.prepare("SELECT run FROM capture_runs WHERE checkout=?1")?;
-    let ids = stmt
-        .query_map([checkout.to_string()], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for run in ids {
-        let run = RunId::parse(&run).map_err(|_| StoreError::Invalid)?;
-        let root = crate::run_journal::read(conn, &run)?.ok_or(StoreError::Invalid)?;
-        crate::run_journal::exact(conn, &root.request)?;
-        if root.request.identity().checkout != *checkout {
-            return Err(StoreError::Invalid);
-        }
-    }
-    Ok(())
+    crate::run_journal::with_capture_history(conn, id(checkout)?, |_| Ok(()))
 }
 /// Only the already-ready, live-prepared exact root may refresh allocation identity.
 /// This cannot promote Preparing, reconciled, closed, held or malformed history.
@@ -910,6 +898,17 @@ pub(crate) fn qualified(
     conn: &Connection,
     root: &RunRecord,
 ) -> Result<Option<(CaptureRecord, CaptureSpec)>> {
+    Ok(qualified_terminal(conn, root)?.map(|(capture, spec, _)| (capture, spec)))
+}
+pub(crate) type QualifiedTerminal = (
+    CaptureRecord,
+    CaptureSpec,
+    Option<crate::capture_finalization::Snapshot>,
+);
+pub(crate) fn qualified_terminal(
+    conn: &Connection,
+    root: &RunRecord,
+) -> Result<Option<QualifiedTerminal>> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 10 {
         return Ok(None);
@@ -1013,8 +1012,8 @@ pub(crate) fn qualified(
         prepared,
         group_end,
     };
-    crate::capture_finalization::validate(conn, root, &record, &spec)?;
-    Ok(Some((record, spec)))
+    let terminal = crate::capture_finalization::validate(conn, root, &record, &spec)?;
+    Ok(Some((record, spec, terminal)))
 }
 
 pub(crate) const SCHEMA: &str = "CREATE TABLE capture_runs(

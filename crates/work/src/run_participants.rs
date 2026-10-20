@@ -367,26 +367,97 @@ pub(crate) fn roster(
     binding: Option<&crate::run_journal::BoundSnapshot>,
 ) -> Result<Vec<ChildRecord>> {
     validate_orphans(conn)?;
+    let rows = child_rows(
+        conn,
+        "WHERE group_id=?1 ORDER BY rowid LIMIT 257",
+        &root.identity().group.to_string(),
+    )?;
+    validate_roster(conn, root, binding, rows)
+}
+// Snapshot-local batch data. Construction performs global structural checks once;
+// payload and namespace checks remain targeted and mandatory on every roster.
+pub(crate) struct TargetRosters(std::collections::BTreeMap<String, Vec<ChildRow>>);
+impl TargetRosters {
+    pub(crate) fn read(conn: &rusqlite::Connection, checkout: &str) -> Result<Self> {
+        validate_orphans(conn)?;
+        let rows = child_rows(
+            conn,
+            "WHERE group_id IN (SELECT id FROM run_groups WHERE checkout=?1) ORDER BY rowid",
+            checkout,
+        )?;
+        let mut groups = std::collections::BTreeMap::<String, Vec<ChildRow>>::new();
+        for row in rows {
+            groups.entry(row.group.clone()).or_default().push(row);
+        }
+        Ok(Self(groups))
+    }
+    pub(crate) fn roster(
+        &mut self,
+        conn: &rusqlite::Connection,
+        root: &RootRunRequest,
+        binding: Option<&crate::run_journal::BoundSnapshot>,
+    ) -> Result<Vec<ChildRecord>> {
+        let rows = self
+            .0
+            .remove(&root.identity().group.to_string())
+            .unwrap_or_default();
+        validate_roster(conn, root, binding, rows)
+    }
+}
+struct ChildRow {
+    id: String,
+    group: String,
+    run_ref: String,
+    parent: String,
+    body: String,
+    enrollment: String,
+    outcome: Option<String>,
+    depth: u8,
+    host: Option<String>,
+}
+fn child_rows(conn: &rusqlite::Connection, suffix: &str, key: &str) -> Result<Vec<ChildRow>> {
+    let mut stmt = conn.prepare(&format!("SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth,host FROM run_participants {suffix}"))?;
+    let rows = stmt
+        .query_map([key], |r| {
+            Ok(ChildRow {
+                id: r.get(0)?,
+                group: r.get(1)?,
+                run_ref: r.get(2)?,
+                parent: r.get(3)?,
+                body: r.get(4)?,
+                enrollment: r.get(5)?,
+                outcome: r.get(6)?,
+                depth: r.get(7)?,
+                host: r.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+fn validate_roster(
+    conn: &rusqlite::Connection,
+    root: &RootRunRequest,
+    binding: Option<&crate::run_journal::BoundSnapshot>,
+    rows: Vec<ChildRow>,
+) -> Result<Vec<ChildRecord>> {
     let count: i64 = conn.query_row(
         "SELECT child_count FROM run_groups WHERE id=?1",
         [root.identity().group.to_string()],
         |r| r.get(0),
     )?;
-    let mut stmt = conn.prepare("SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth,host FROM run_participants WHERE group_id=?1 ORDER BY rowid LIMIT 257")?;
-    let mut rows = stmt.query([root.identity().group.to_string()])?;
     let mut records = Vec::new();
-    while let Some(row) = rows.next()? {
-        let body: String = row.get(4)?;
+    for row in rows {
+        let body = row.body;
         let request: ChildRequest = serde_json::from_str(&body).map_err(|_| StoreError::Invalid)?;
         request.validate()?;
-        let state: String = row.get(5)?;
+        let state = row.enrollment;
         let enrollment = match state.as_str() {
             "pending" => Enrollment::Pending,
             "contained" => Enrollment::Contained,
             "unverified" => Enrollment::Unverified,
             _ => return Err(StoreError::Invalid),
         };
-        let host: Option<String> = row.get(8)?;
+        let host = row.host;
         let host: Option<EnrollmentRecord> = host
             .map(|s| serde_json::from_str(&s).map_err(|_| StoreError::Invalid))
             .transpose()?;
@@ -398,14 +469,14 @@ pub(crate) fn roster(
         if let Some(host) = &host {
             validate_host(root, binding, &request, host)?;
         }
-        let outcome: Option<String> = row.get(6)?;
+        let outcome = row.outcome;
         let outcome = outcome
             .map(|s| serde_json::from_str(&s).map_err(|_| StoreError::Invalid))
             .transpose()?;
-        if request.run.to_string() != row.get::<_, String>(0)?
-            || request.group.to_string() != row.get::<_, String>(1)?
-            || request.run_ref.as_str() != row.get::<_, String>(2)?
-            || request.parent_run.to_string() != row.get::<_, String>(3)?
+        if request.run.to_string() != row.id
+            || request.group.to_string() != row.group
+            || request.run_ref.as_str() != row.run_ref
+            || request.parent_run.to_string() != row.parent
             || request.checkout != root.identity().checkout
             || request.group != root.identity().group
             || (request.expected_host.is_none() && enrollment != Enrollment::Unverified)
@@ -417,7 +488,7 @@ pub(crate) fn roster(
             request,
             enrollment,
             outcome,
-            depth: row.get(7)?,
+            depth: row.depth,
             host,
         });
     }

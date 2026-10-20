@@ -342,6 +342,13 @@ an already-Ready allocation was capture-pending. Normal descendant HEAD, qualifi
 refresh and post-certification owner transfer need not invalidate certification. No history
 count quota or per-history Git inspection is introduced. All ordinary public writer fences
 remain intact, and removed capture configuration cannot downgrade a permanent requirement.
+Each related captured-history traversal uses one structural child-ledger check and batched
+target rosters in its read snapshot, retaining strict root/capture/finalization validation within unchanged
+SQL budgets. Validated history is not cached across I/O, mutations or locked transactions.
+For a new task-finish receipt, absent current capture selection plus a permanent requirement
+or any capture-history row refuses before task completion; the fence is rechecked in the
+IMMEDIATE transaction. Historical finish receipts still replay, and currently configured
+unsupported capture retains its existing honest incomplete-capture behavior.
 
 Certification persists an already **committed** Ready result across CLI processes; it cannot
 recover lost/uncommitted live handles or automatically unhold a checkout. It is passive

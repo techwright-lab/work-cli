@@ -155,6 +155,7 @@ fn frontier_except(
 ) -> Result<[u8; 32]> {
     use crate::store::StoreError;
     use sha2::Digest;
+    let _snapshot = crate::run_journal::read_transaction(conn)?;
     let invalid: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM run_groups g WHERE checkout=?1 AND g.id NOT IN (SELECT group_id FROM capture_runs WHERE run=?2) AND (closed=0 OR recovery_hold<>0 OR NOT EXISTS(SELECT 1 FROM capture_runs c WHERE c.group_id=g.id))) OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1) OR EXISTS(SELECT 1 FROM runs r LEFT JOIN run_groups g ON g.id=r.group_id WHERE g.id IS NULL)", (checkout.to_string(),current), |r| r.get(0))?;
     if invalid {
         return Err(StoreError::Invalid);
@@ -162,27 +163,25 @@ fn frontier_except(
     let mut digest = sha2::Sha256::new();
     digest.update(b"work.capture-readiness.frontier.v1\0");
     digest.update(checkout.as_bytes());
-    let mut query =
-        conn.prepare("SELECT run FROM capture_runs WHERE checkout=?1 AND run<>?2 ORDER BY run")?;
-    let rows = query.query_map((checkout.to_string(), current), |r| r.get::<_, String>(0))?;
-    let mut any = false;
-    for row in rows {
-        let id = work_contract::RunId::parse(&row?).map_err(|_| StoreError::Invalid)?;
-        let root = crate::run_journal::read(conn, &id)?.ok_or(StoreError::Invalid)?;
-        let (capture, spec) =
-            crate::capture_journal::qualified(conn, &root)?.ok_or(StoreError::Invalid)?;
-        let frozen = crate::capture_finalization::validate(conn, &root, &capture, &spec)?
-            .ok_or(StoreError::Invalid)?;
-        if frozen.confirmation.is_none() {
+    crate::run_journal::with_capture_history(conn, checkout, |history| {
+        let mut any = false;
+        for (root, (capture, _spec, frozen)) in history {
+            let id = &root.request.identity().run;
+            if id.to_string() == current {
+                continue;
+            }
+            let frozen = frozen.ok_or(StoreError::Invalid)?;
+            if frozen.confirmation.is_none() {
+                return Err(StoreError::Invalid);
+            }
+            digest.update(hash(&(id, capture.operation, frozen.intent))?);
+            any = true;
+        }
+        if !any {
             return Err(StoreError::Invalid);
         }
-        digest.update(hash(&(id, capture.operation, frozen.intent))?);
-        any = true;
-    }
-    if !any {
-        return Err(StoreError::Invalid);
-    }
-    Ok(digest.finalize().into())
+        Ok(digest.finalize().into())
+    })
 }
 impl ClosureSeal {
     fn validate(
@@ -339,6 +338,7 @@ pub(crate) fn guard_certified_identity(
     checkout: uuid::Uuid,
 ) -> Result<()> {
     use crate::store::StoreError;
+    let _snapshot = crate::run_journal::read_transaction(conn)?;
     let cert = certificate(conn, checkout)?;
     let a = crate::capture_setup::PendingPreparation::read(conn, checkout)?.allocation()?;
     if stable(conn, &a)? != cert.stable || a.stage != "ready" || a.reason.is_some() {
@@ -1086,6 +1086,293 @@ mod tests {
             .conn
             .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
             .unwrap());
+    }
+    #[test]
+    fn certified_ready_finish_refuses_removed_capture_selection_without_mutation() {
+        let (_temp, mut cfg, store, a, _root, seal, ack) = closed();
+        restore(&cfg, seal, ack).unwrap();
+        cfg.allocation.as_mut().unwrap().capture_sink = None;
+        let snapshot = || {
+            let tables = store
+                .conn
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            tables
+                .into_iter()
+                .map(|table| {
+                    let mut stmt = store
+                        .conn
+                        .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY rowid"))
+                        .unwrap();
+                    let columns = stmt.column_count();
+                    stmt.query_map([], |r| {
+                        (0..columns)
+                            .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let result = crate::finish::finish(&cfg, a.checkout);
+        assert!(
+            result.is_err(),
+            "durable captured finish must be refused, got {result:?}"
+        );
+        let after = snapshot();
+        assert_eq!(before, after, "refusal must not mutate durable authority");
+    }
+    #[test]
+    fn historical_captured_finish_receipt_survives_removed_selection() {
+        let (_temp, mut cfg, store, a, _root, seal, ack) = closed();
+        restore(&cfg, seal, ack).unwrap();
+        let original = crate::finish::finish(&cfg, a.checkout).unwrap();
+        assert!(original.task_finished);
+        assert!(original.capture_incomplete);
+        cfg.allocation.as_mut().unwrap().capture_sink = None;
+        let replay = crate::finish::finish(&cfg, a.checkout).unwrap();
+        assert_eq!(original.operation, replay.operation);
+        assert!(replay.capture_incomplete);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn many_closed_captured_roots_with_terminal_children_fit_sql_budget() {
+        use crate::capture_journal::json;
+        use crate::run_participants::{ChildRequest, EnrollmentRecord, ExpectedHost, HostSnapshot};
+        for count in [2, 48] {
+            let (_temp, cfg, store, a, original, seal, ack) = closed();
+            restore(&cfg, seal, ack).unwrap();
+            let template = crate::run_journal::read(&store.conn, &original.identity().run)
+                .unwrap()
+                .unwrap();
+            let (capture, _) = crate::capture_journal::qualified(&store.conn, &template)
+                .unwrap()
+                .unwrap();
+            let frozen = store
+                .capture_finalization_snapshot(&original.identity().run)
+                .unwrap()
+                .unwrap();
+            for n in 1..count {
+                // Synthetic durable history, not a claim of N physical executions.
+                let mut root = next_root(&original);
+                let mut value = serde_json::to_value(&root).unwrap();
+                value["identity"]["run_ref"] = format!("run:history:{n}").into();
+                root = serde_json::from_value(value).unwrap();
+                let run = root.identity().run.to_string();
+                let group = root.identity().group.to_string();
+                let binding = fixture::binding(&root);
+                let mut record = template.clone();
+                record.request = root.clone();
+                let b = binding.identity();
+                // Reuse the shape from the accepted bound root, replacing its run-scoped paths.
+                let old = json(&record.binding).unwrap();
+                record.binding = serde_json::from_str(
+                    &old.replace(&template.binding.as_ref().unwrap().unit, &b.unit)
+                        .replace(&template.binding.as_ref().unwrap().cgroup, &b.cgroup),
+                )
+                .unwrap();
+                store.conn.execute("INSERT INTO run_groups(id,checkout,mode,revision,recovery_hold,closed,child_count) VALUES(?1,?2,'supervised',?3,0,1,4)", rusqlite::params![group,a.checkout.to_string(),record.revision as i64]).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO runs VALUES(?1,?2,?3,?4,'permit_attempt',?5,?6)",
+                        rusqlite::params![
+                            run,
+                            group,
+                            root.identity().run_ref.as_str(),
+                            json(&root).unwrap(),
+                            json(&record.binding).unwrap(),
+                            json(&record.outcome).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                for _ in 0..4 {
+                    let b = record.binding.as_ref().unwrap();
+                    let child = ChildRequest {
+                        checkout: root.identity().checkout.clone(),
+                        group: root.identity().group.clone(),
+                        run: work_contract::RunId::generate(),
+                        run_ref: work_contract::RunRef::parse(&format!(
+                            "child:{}",
+                            uuid::Uuid::now_v7()
+                        ))
+                        .unwrap(),
+                        parent_run: root.identity().run.clone(),
+                        parent_run_ref: root.identity().run_ref.clone(),
+                        execution_chain: root.identity().execution_chain.clone(),
+                        source: None,
+                        session: None,
+                        agent: None,
+                        actor: None,
+                        expected_host: Some(ExpectedHost {
+                            boot: b.boot.clone(),
+                            pid: b.root_pid,
+                            start_ticks: b.root_start_ticks,
+                        }),
+                    };
+                    let host = EnrollmentRecord {
+                        root: b.clone(),
+                        host: HostSnapshot {
+                            pid: b.root_pid,
+                            start_ticks: b.root_start_ticks,
+                            boot: b.boot.clone(),
+                            cgroup: b.root_cgroup.clone(),
+                        },
+                    };
+                    store.conn.execute("INSERT INTO run_participants VALUES(?1,?2,?3,?4,?5,'contained',?6,1,?7)", rusqlite::params![child.run.to_string(),group,child.run_ref.as_str(),run,json(&child).unwrap(),"\"completed\"",json(&host).unwrap()]).unwrap();
+                }
+                let spec = cfg
+                    .capture_spec(&root, &a, uuid::Uuid::now_v7(), vec!["task".into()], None)
+                    .unwrap();
+                let mut prepared =
+                    serde_json::to_value(capture.prepared.as_ref().unwrap()).unwrap();
+                prepared["run_ref"] = root.identity().run_ref.as_str().into();
+                let capture_id = uuid::Uuid::now_v7().to_string();
+                let context = std::path::PathBuf::from(prepared["context"].as_str().unwrap())
+                    .with_file_name(format!("{capture_id}.context.json"));
+                prepared["capture_id"] = capture_id.clone().into();
+                prepared["context"] = serde_json::to_value(&context).unwrap();
+                #[derive(serde::Serialize, serde::Deserialize)]
+                struct ExpectedGit {
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    author_name: Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    author_email: Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    committer_name: Option<String>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    committer_email: Option<String>,
+                }
+                let git: ExpectedGit = serde_json::from_value(prepared["git"].clone()).unwrap();
+                prepared["projection_digest"] =
+                    serde_json::to_value(hash(&(&capture_id, &context, &git)).unwrap()).unwrap();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO capture_runs VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,?9)",
+                        rusqlite::params![
+                            run,
+                            group,
+                            a.checkout.to_string(),
+                            spec.operation().to_string(),
+                            json(&spec).unwrap(),
+                            hash(&spec).unwrap().to_vec(),
+                            capture.intent_wall,
+                            json(&prepared).unwrap(),
+                            json(&capture.group_end).unwrap()
+                        ],
+                    )
+                    .unwrap();
+                let record = crate::run_journal::read(&store.conn, &root.identity().run)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(record.children.len(), 4);
+                let (capture, spec) = crate::capture_journal::qualified(&store.conn, &record)
+                    .unwrap()
+                    .unwrap();
+                let mut intent = frozen.intent.clone();
+                intent.context =
+                    crate::capture_finalization::context(&record, &capture, &spec).unwrap();
+                intent.body = intent.body.replace(&intent.capture_id, &capture_id);
+                intent.capture_id = capture_id;
+                use sha2::Digest;
+                intent.fingerprint = sha2::Sha256::digest(intent.body.as_bytes()).into();
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO capture_finalizations VALUES(?1,?2,?3,2)",
+                        rusqlite::params![
+                            run,
+                            json(&intent).unwrap(),
+                            json(&frozen.confirmation).unwrap()
+                        ],
+                    )
+                    .unwrap();
+            }
+            let db: String = store
+                .conn
+                .query_row("PRAGMA database_list", [], |r| r.get(2))
+                .unwrap();
+            let bytes = [db.clone(), format!("{db}-wal"), format!("{db}-shm")]
+                .iter()
+                .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                .sum::<u64>();
+            assert!(bytes < 16 * 1024 * 1024, "authority size {bytes}");
+            let _phase = store.sql_phase();
+            let _snapshot = crate::run_journal::read_transaction(&store.conn).unwrap();
+            let started = std::time::Instant::now();
+            let result = frontier(&store.conn, a.checkout);
+            eprintln!("frontier_elapsed={:?}", started.elapsed());
+            eprintln!("roots={count} contained_terminal_children={} authority_bytes={bytes} result={result:?}", (count-1)*4);
+            assert!(
+                result.is_ok(),
+                "legal captured history must fit unchanged SQL budget: {result:?}"
+            );
+            drop(_snapshot);
+            drop(_phase);
+            {
+                let _phase = store.sql_phase();
+                crate::run_journal::with_capture_history(&store.conn, a.checkout, |history| {
+                    assert_eq!(history.len(), count);
+                    assert_eq!(
+                        history.iter().map(|(r, _)| r.children.len()).sum::<usize>(),
+                        (count - 1) * 4
+                    );
+                    for (root, (capture, spec, frozen)) in history {
+                        assert!(root.closed);
+                        assert!(root.children.iter().all(|c| c.enrollment
+                            == crate::run_participants::Enrollment::Contained
+                            && c.outcome
+                                == Some(crate::run_participants::ChildOutcome::Completed)));
+                        assert!(
+                            frozen.unwrap().intent.context
+                                == crate::capture_finalization::context(&root, &capture, &spec)?
+                        );
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            // Extend the synthetic fixture's passive frontier; no runtime proof
+            // or physical execution is manufactured by this metadata setup.
+            let mut cert = certificate(&store.conn, a.checkout).unwrap();
+            cert.frontier = result.unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE capture_readiness SET certificate=?1 WHERE checkout=?2",
+                    rusqlite::params![json(&cert).unwrap(), a.checkout.to_string()],
+                )
+                .unwrap();
+            {
+                let _phase = store.sql_phase();
+                guard_certified_identity(&store.conn, a.checkout).unwrap();
+            }
+            let next = next_root(&original);
+            let spec = cfg
+                .capture_spec(&next, &a, uuid::Uuid::now_v7(), vec!["task".into()], None)
+                .unwrap();
+            let result = crate::capture_setup::begin(&cfg, &next, &spec);
+            assert!(
+                result.is_ok(),
+                "large-history admission: {:?}",
+                result.as_ref().err()
+            );
+        }
     }
     fn git_at(a: &crate::allocate::Allocation, args: &[&str]) -> String {
         let out = std::process::Command::new("/usr/bin/git")

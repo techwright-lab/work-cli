@@ -432,6 +432,46 @@ fn apply_interruptions(record: &mut RunRecord, ids: &[RunId]) -> Result<()> {
     }
     Ok(())
 }
+// Validated tuples never escape their read snapshot. No context is retained
+// across physical I/O, mutations, or subsequent admission transactions.
+pub(crate) fn with_capture_history<T>(
+    conn: &Connection,
+    checkout: uuid::Uuid,
+    use_history: impl FnOnce(Vec<(RunRecord, crate::capture_journal::QualifiedTerminal)>) -> Result<T>,
+) -> Result<T> {
+    let _snapshot = read_transaction(conn)?;
+    let mut stmt = conn.prepare("SELECT run FROM capture_runs WHERE checkout=?1 ORDER BY run")?;
+    let ids = stmt
+        .query_map([checkout.to_string()], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut history = Vec::new();
+    if ids.is_empty() {
+        return use_history(history);
+    }
+    let mut rosters = crate::run_participants::TargetRosters::read(conn, &checkout.to_string())?;
+    for id in ids {
+        let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
+        let mut root = conn
+            .query_row(
+                &format!("{SELECT} WHERE r.id=?1"),
+                [run.to_string()],
+                read_row,
+            )
+            .optional()?
+            .transpose()?
+            .ok_or(StoreError::Invalid)?;
+        if root.request.identity().checkout.to_string() != checkout.to_string() {
+            return Err(StoreError::Invalid);
+        }
+        root.children = rosters.roster(conn, &root.request, root.binding.as_ref())?;
+        validate_child_history(&root)?;
+        exact_record(conn, &root.request, &root)?;
+        let tuple =
+            crate::capture_journal::qualified_terminal(conn, &root)?.ok_or(StoreError::Invalid)?;
+        history.push((root, tuple));
+    }
+    use_history(history)
+}
 pub(crate) fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     let _snapshot = read_transaction(conn)?;
     let record = read_base(conn, run)?;

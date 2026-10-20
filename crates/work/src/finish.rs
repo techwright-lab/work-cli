@@ -427,24 +427,41 @@ pub fn finish_with_sink_observed(
 pub fn finish(config: &Config, checkout: Uuid) -> Result<Report> {
     finish_with_sink_observed(config, checkout, None, |_| {})
 }
+fn guard_unconfigured_capture(conn: &Connection, checkout: Uuid) -> Result<()> {
+    if crate::capture_requirement::present(conn, checkout)?
+        || crate::capture_journal::unresolved_checkout(conn, checkout)?
+    {
+        return Err(StoreError::Invalid);
+    }
+    Ok(())
+}
 fn prepare(
     config: &Config,
     store: &mut Store,
     checkout: Uuid,
     boundary: &mut impl FnMut(&str),
 ) -> Result<Receipt> {
+    let configured = config
+        .allocation
+        .as_ref()
+        .and_then(|a| a.capture_sink.as_ref());
+    let guard_capture = |conn: &Connection| -> Result<()> {
+        // Current configuration cannot erase durable attribution obligations.
+        // Captured task finish is deferred; historical receipts remain replayable.
+        if configured.is_none() {
+            guard_unconfigured_capture(conn, checkout)?;
+        }
+        Ok(())
+    };
     {
         let _phase = store.sql_phase();
         if let Some(r) = load(&store.conn, checkout)? {
             return Ok(r);
         }
+        guard_capture(&store.conn)?;
         eligible(&store.conn, checkout)?;
     }
     let a = allocate::verified_checkout(store, checkout).map_err(|_| StoreError::Invalid)?;
-    let configured = config
-        .allocation
-        .as_ref()
-        .and_then(|a| a.capture_sink.as_ref());
     let operation = Uuid::now_v7();
     let receipt = Receipt {
         version: 1,
@@ -472,6 +489,7 @@ fn prepare(
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        guard_capture(&tx)?;
         eligible(&tx, checkout)?;
         crate::store::exclude_journal_identity(&tx, operation)?;
         let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)",[operation.to_string()],|r|r.get(0))?;
@@ -505,6 +523,42 @@ fn prepare(
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_selection_fence_uses_raw_presence_including_v10_history() {
+        use super::*;
+        // Deliberately malformed payloads: this fence must never decode them.
+        for (version, requirement, history) in [
+            (13, false, false),
+            (13, true, false),
+            (13, false, true),
+            (13, true, true),
+            (10, false, true),
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE capture_requirements(checkout TEXT); CREATE TABLE capture_runs(checkout TEXT, prepared TEXT);").unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            let checkout = Uuid::now_v7();
+            if requirement {
+                conn.execute(
+                    "INSERT INTO capture_requirements VALUES(?1)",
+                    [checkout.to_string()],
+                )
+                .unwrap();
+            }
+            if history {
+                conn.execute(
+                    "INSERT INTO capture_runs VALUES(?1,'not-json')",
+                    [checkout.to_string()],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                guard_unconfigured_capture(&conn, checkout).is_err(),
+                requirement || history
+            );
+            assert!(guard_unconfigured_capture(&conn, Uuid::now_v7()).is_ok());
+        }
+    }
     #[test]
     fn legal_finish_history_has_no_schema_quota_or_receipt_read_amplification() {
         use super::*;
