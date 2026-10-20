@@ -28,6 +28,13 @@ pub(crate) enum Event {
         primary: Option<i32>,
         extended: Option<i32>,
     },
+    /// Inclusive wall time; nested regions overlap and totals are NONADDITIVE.
+    SubphaseSummary {
+        region: Subphase,
+        count: u64,
+        total_elapsed_us: u128,
+        max_elapsed_us: u128,
+    },
     FinishRefused,
     FinishCodec {
         accepted: bool,
@@ -64,15 +71,125 @@ pub(crate) enum ProcessOutcome {
     Nonzero,
     Success,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum Subphase {
+    BeginCaptureTotal,
+    BeforeSqlJson,
+    AdmissionAgrees,
+    RelatedQualification,
+    NamespaceExisting,
+    CaptureProof,
+    OperationCollision,
+    BeginRunWriter,
+    WriteFreshCommitTail,
+    HistoryIds,
+    HistoryTargetRosters,
+    HistoryRootReadDecode,
+    HistoryRoster,
+    HistoryChildExact,
+    HistoryTerminal,
+    TerminalRowVersion,
+    TerminalSpecDecode,
+    TerminalAgrees,
+    TerminalNamespaceHeaderDigest,
+    TerminalPreparedEndChecks,
+    TerminalFinalization,
+}
+const REGIONS: [Subphase; 21] = [
+    Subphase::BeginCaptureTotal,
+    Subphase::BeforeSqlJson,
+    Subphase::AdmissionAgrees,
+    Subphase::RelatedQualification,
+    Subphase::NamespaceExisting,
+    Subphase::CaptureProof,
+    Subphase::OperationCollision,
+    Subphase::BeginRunWriter,
+    Subphase::WriteFreshCommitTail,
+    Subphase::HistoryIds,
+    Subphase::HistoryTargetRosters,
+    Subphase::HistoryRootReadDecode,
+    Subphase::HistoryRoster,
+    Subphase::HistoryChildExact,
+    Subphase::HistoryTerminal,
+    Subphase::TerminalRowVersion,
+    Subphase::TerminalSpecDecode,
+    Subphase::TerminalAgrees,
+    Subphase::TerminalNamespaceHeaderDigest,
+    Subphase::TerminalPreparedEndChecks,
+    Subphase::TerminalFinalization,
+];
+#[derive(Clone, Copy, Default)]
+struct Stats {
+    count: u64,
+    total_elapsed_us: u128,
+    max_elapsed_us: u128,
+}
+pub(crate) struct ProfileRoot(bool);
+impl ProfileRoot {
+    pub(crate) fn new() -> Self {
+        Self(ACTIVE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let Some(c) = slot.as_mut() else { return false };
+            if c.profile.is_some() {
+                return false;
+            }
+            c.profile = Some([Stats::default(); REGIONS.len()]);
+            true
+        }))
+    }
+}
+impl Drop for ProfileRoot {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let stats = ACTIVE.with(|slot| slot.borrow_mut().as_mut().and_then(|c| c.profile.take()));
+        if let Some(stats) = stats {
+            for (region, s) in REGIONS.into_iter().zip(stats) {
+                if s.count != 0 {
+                    record(Event::SubphaseSummary {
+                        region,
+                        count: s.count,
+                        total_elapsed_us: s.total_elapsed_us,
+                        max_elapsed_us: s.max_elapsed_us,
+                    });
+                }
+            }
+        }
+    }
+}
+pub(crate) struct Span(Subphase, Option<std::time::Instant>);
+pub(crate) fn span(region: Subphase) -> Span {
+    let active = ACTIVE.with(|slot| slot.borrow().as_ref().is_some_and(|c| c.profile.is_some()));
+    Span(region, active.then(std::time::Instant::now))
+}
+impl Drop for Span {
+    fn drop(&mut self) {
+        let Some(start) = self.1 else { return };
+        let elapsed = start.elapsed().as_micros();
+        ACTIVE.with(|slot| {
+            if let Some(stats) = slot.borrow_mut().as_mut().and_then(|c| c.profile.as_mut()) {
+                let s = &mut stats[self.0 as usize];
+                s.count += 1;
+                s.total_elapsed_us += elapsed;
+                s.max_elapsed_us = s.max_elapsed_us.max(elapsed);
+            }
+        });
+    }
+}
+
 struct Collector {
     events: [Option<Event>; 256],
     count: usize,
+    profile: Option<[Stats; REGIONS.len()]>,
 }
 impl Collector {
     fn new() -> Self {
         Self {
             events: [None; 256],
             count: 0,
+            profile: None,
         }
     }
 }
@@ -170,7 +287,7 @@ impl Drop for Guard {
         if std::thread::panicking() {
             if let Some(c) = current {
                 eprintln!(
-                    "capture diagnostics (last 256; discarded={}):",
+                    "capture diagnostics (inclusive wall subphases overlap; totals NONADDITIVE; last 256; discarded={}):",
                     c.count.saturating_sub(256)
                 );
                 for i in c.count.saturating_sub(256)..c.count {
@@ -183,6 +300,65 @@ impl Drop for Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn subphase_profiles_aggregate_scoped_wall_spans_on_early_return() {
+        fn attempt() -> Result<(), ()> {
+            let _root = ProfileRoot::new();
+            let _outer = span(Subphase::BeginCaptureTotal);
+            for _ in 0..2 {
+                let _inner = span(Subphase::TerminalSpecDecode);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(())?
+        }
+        assert!(!enabled());
+        assert_eq!(attempt(), Err(()));
+        let guard = Guard::new();
+        // A collector alone does not enable per-record spans.
+        drop(span(Subphase::TerminalAgrees));
+        assert!(guard.events().is_empty());
+        for _ in 0..2 {
+            assert_eq!(attempt(), Err(()));
+        }
+        let events = guard.events();
+        assert_eq!(events.len(), 4, "missing aggregate events at profile exit");
+        for pair in events.chunks_exact(2) {
+            let Event::SubphaseSummary {
+                region,
+                count,
+                total_elapsed_us,
+                max_elapsed_us,
+            } = pair[0]
+            else {
+                panic!("summary required")
+            };
+            assert_eq!(region, Subphase::BeginCaptureTotal);
+            assert_eq!(count, 1);
+            assert_eq!(total_elapsed_us, max_elapsed_us);
+            let Event::SubphaseSummary {
+                region,
+                count,
+                total_elapsed_us,
+                max_elapsed_us,
+            } = pair[1]
+            else {
+                panic!("summary required")
+            };
+            assert_eq!(region, Subphase::TerminalSpecDecode);
+            assert_eq!(count, 2);
+            assert!(total_elapsed_us >= max_elapsed_us);
+        }
+        {
+            let inner = Guard::new();
+            assert_eq!(attempt(), Err(()));
+            assert_eq!(inner.events().len(), 2);
+        }
+        assert_eq!(guard.events(), events);
+        drop(guard);
+        assert_eq!(attempt(), Err(()));
+        assert!(!enabled());
+    }
+
     #[test]
     fn collector_is_scoped_bounded_and_classifies_without_error_text() {
         assert!(!enabled());

@@ -439,18 +439,30 @@ pub(crate) fn with_capture_history<T>(
     checkout: uuid::Uuid,
     use_history: impl FnOnce(Vec<(RunRecord, crate::capture_journal::QualifiedTerminal)>) -> Result<T>,
 ) -> Result<T> {
+    #[cfg(test)]
+    use crate::capture_diagnostics::{span, Subphase};
     let _snapshot = read_transaction(conn)?;
+    #[cfg(test)]
+    let ids_profile = span(Subphase::HistoryIds);
     let mut stmt = conn.prepare("SELECT run FROM capture_runs WHERE checkout=?1 ORDER BY run")?;
     let ids = stmt
         .query_map([checkout.to_string()], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    #[cfg(test)]
+    drop(ids_profile);
     let mut history = Vec::new();
     if ids.is_empty() {
         return use_history(history);
     }
+    #[cfg(test)]
+    let rosters_profile = span(Subphase::HistoryTargetRosters);
     let mut rosters = crate::run_participants::TargetRosters::read(conn, &checkout.to_string())?;
+    #[cfg(test)]
+    drop(rosters_profile);
     crate::capture_journal::with_qualification_batch(conn, checkout, |batch| {
         for id in ids {
+            #[cfg(test)]
+            let read_profile = span(Subphase::HistoryRootReadDecode);
             let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
             let mut root = conn
                 .query_row(
@@ -464,10 +476,24 @@ pub(crate) fn with_capture_history<T>(
             if root.request.identity().checkout.to_string() != checkout.to_string() {
                 return Err(StoreError::Invalid);
             }
+            #[cfg(test)]
+            drop(read_profile);
+            #[cfg(test)]
+            let roster_profile = span(Subphase::HistoryRoster);
             root.children = rosters.roster(conn, &root.request, root.binding.as_ref())?;
+            #[cfg(test)]
+            drop(roster_profile);
+            #[cfg(test)]
+            let child_profile = span(Subphase::HistoryChildExact);
             validate_child_history(&root)?;
             exact_record(conn, &root.request, &root)?;
+            #[cfg(test)]
+            drop(child_profile);
+            #[cfg(test)]
+            let terminal_profile = span(Subphase::HistoryTerminal);
             let tuple = batch.terminal(&root)?.ok_or(StoreError::Invalid)?;
+            #[cfg(test)]
+            drop(terminal_profile);
             history.push((root, tuple));
         }
         Ok(())

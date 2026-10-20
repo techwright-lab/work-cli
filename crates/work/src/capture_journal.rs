@@ -774,13 +774,29 @@ impl Store {
         spec: &CaptureSpec,
         proof: Option<&crate::capture_setup::AdmissionProof<'_>>,
     ) -> Result<BeginCapturedRun> {
+        #[cfg(test)]
+        use crate::capture_diagnostics::{span, ProfileRoot, Subphase};
+        #[cfg(test)]
+        let _profile = ProfileRoot::new();
+        #[cfg(test)]
+        let _total = span(Subphase::BeginCaptureTotal);
+        #[cfg(test)]
+        let before_sql = span(Subphase::BeforeSqlJson);
         // Bound the actual durable representation before acquiring SQL authority.
         let body = json(spec)?;
+        #[cfg(test)]
+        drop(before_sql);
         let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        #[cfg(test)]
+        let agrees = span(Subphase::AdmissionAgrees);
         let allocation = spec.agrees(&tx, request)?;
+        #[cfg(test)]
+        drop(agrees);
+        #[cfg(test)]
+        let related_profile = span(Subphase::RelatedQualification);
         // Construct only for an actual private admission proof, at the old
         // validate_related position. No frontier check precedes Existing.
         let related = if proof.is_some() {
@@ -792,7 +808,11 @@ impl Store {
             validate_related(&tx, &request.identity().checkout)?;
             None
         };
+        #[cfg(test)]
+        drop(related_profile);
         let admission = proof.zip(related.as_ref());
+        #[cfg(test)]
+        let existing_profile = span(Subphase::NamespaceExisting);
         exclude_operation(&tx, &request.identity().run)?;
         exclude_operation(&tx, &request.identity().group)?;
         if let Some(existing) = crate::run_journal::read(&tx, &request.identity().run)? {
@@ -803,19 +823,35 @@ impl Store {
             }
             return Ok(BeginCapturedRun::Existing(record));
         }
+        #[cfg(test)]
+        drop(existing_profile);
+        #[cfg(test)]
+        let capture_proof = span(Subphase::CaptureProof);
         if let Some((proof, related)) = admission {
             proof.validate_capture(&tx, request, spec, related)?;
         } else if allocation.stage != "ready" {
             return Err(StoreError::Invalid);
         }
+        #[cfg(test)]
+        drop(capture_proof);
+        #[cfg(test)]
+        let collision_profile = span(Subphase::OperationCollision);
         crate::store::exclude_journal_identity(&tx, spec.operation)?;
         let collision:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)", [spec.operation.to_string()], |r|r.get(0))?;
         if collision {
             return Err(StoreError::Conflict);
         }
+        #[cfg(test)]
+        drop(collision_profile);
+        #[cfg(test)]
+        let writer_profile = span(Subphase::BeginRunWriter);
         if crate::run_journal::begin_run_context(&tx, request, admission)? != BeginRun::Created {
             return Err(StoreError::Conflict);
         }
+        #[cfg(test)]
+        drop(writer_profile);
+        #[cfg(test)]
+        let _tail = span(Subphase::WriteFreshCommitTail);
         // The last consumer was validate_writer, before INSERT INTO writers.
         // No qualified SQL fact is consulted after that mutation.
         drop(related);
@@ -1022,6 +1058,10 @@ fn qualify_terminal(
     root: &RunRecord,
     agree: impl FnOnce(&CaptureSpec) -> Result<()>,
 ) -> Result<Option<QualifiedTerminal>> {
+    #[cfg(test)]
+    use crate::capture_diagnostics::{span, Subphase};
+    #[cfg(test)]
+    let row_profile = span(Subphase::TerminalRowVersion);
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 10 {
         return Ok(None);
@@ -1060,8 +1100,20 @@ fn qualify_terminal(
     else {
         return Ok(None);
     };
+    #[cfg(test)]
+    drop(row_profile);
+    #[cfg(test)]
+    let decode_profile = span(Subphase::TerminalSpecDecode);
     let spec = CaptureSpec::decode(&body)?;
+    #[cfg(test)]
+    drop(decode_profile);
+    #[cfg(test)]
+    let agrees_profile = span(Subphase::TerminalAgrees);
     agree(&spec)?;
+    #[cfg(test)]
+    drop(agrees_profile);
+    #[cfg(test)]
+    let namespace_profile = span(Subphase::TerminalNamespaceHeaderDigest);
     let collision:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1) OR EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1) OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1) OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1) OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1) OR EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)",[spec.operation.to_string()],|r|r.get(0))?;
     if collision {
         return Err(StoreError::Invalid);
@@ -1077,6 +1129,10 @@ fn qualify_terminal(
     if fingerprint != spec_digest {
         return Err(StoreError::Invalid);
     }
+    #[cfg(test)]
+    drop(namespace_profile);
+    #[cfg(test)]
+    let prepared_profile = span(Subphase::TerminalPreparedEndChecks);
     date(&intent_wall)?;
     if revision != 1 || root.revision < revision as u64 {
         return Err(StoreError::Invalid);
@@ -1129,6 +1185,10 @@ fn qualify_terminal(
         prepared,
         group_end,
     };
+    #[cfg(test)]
+    drop(prepared_profile);
+    #[cfg(test)]
+    let _finalization = span(Subphase::TerminalFinalization);
     let terminal = crate::capture_finalization::validate(conn, root, &record, &spec)?;
     Ok(Some((record, spec, terminal)))
 }
