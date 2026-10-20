@@ -301,7 +301,11 @@ These commands require a UUIDv7 root run and an existing registered current-sche
 (13) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
 They never initialize, migrate or repair an authority. Help/version are read-only;
 invalid arguments exit 2 without echoing argument values. Historical operations need
-no current supervisor, actor profile or capture selection.
+no current supervisor, actor profile or capture selection. Their configuration loader
+validates only `store_dir`, `trusted_registry` and `roots`; unrelated current execution,
+capture, allocation and repository declarations are ignored, even when invalid.
+The bounded, regular-file/no-symlink reader and global TOML syntax checks still apply;
+normal execution commands retain full configuration validation.
 
 `status` reads the **WORK journal only**, not the receiver's external status operation.
 The allowlisted JSON reports recorded root closure/outcome, actual task-open and

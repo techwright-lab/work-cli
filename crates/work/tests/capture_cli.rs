@@ -230,6 +230,151 @@ fn capture_reconciliation_uses_sealed_settings_after_config_change() {
     assert_eq!(calls(&f), "finish\nretry\n");
 }
 #[test]
+fn capture_historical_commands_ignore_current_execution_policies() {
+    let policies = [
+        // Complete current supervisor declaration, but its last actor was removed.
+        "[supervisor]\nruntime_directory = '/unused-runtime'\nbus_address = 'unix:path=/unused-runtime/bus'\nruntime_max_seconds = 1\npreexec_ms = 1\nclosure_grace_ms = 1\ncancel_grace_ms = 1\nactors = {}\n".to_owned(),
+        // Complete current capture declaration, but its last actor was removed.
+        format!("[capture]\nexecutable = '/unused-producer'\nregistry = '/unused-registry'\nstate_dir = '/unused-state'\ntimeout_ms = 1\nresponse_cap = 1\nregistry_sha256 = '{}'\nendpoint_identity = 'https://changed.invalid'\nreceiver_credential_names = ['CHANGED_TOKEN']\nactor_refs = {{}}\n", "f".repeat(64)),
+        // Types, missing fields, relative locators and invalid limits are irrelevant here.
+        "repositories = false\nallocation = 'SECRET invalid allocation'\ncapture = 7\n[supervisor]\nruntime_directory = 'SECRET relative runtime'\npreexec_ms = -1\nactors = false\n".to_owned(),
+    ];
+    for policy in policies {
+        let f = Fixture::new(true, Some(RootOutcome::Completed));
+        let task_receipt = recorded_task_finish(&f);
+        let before = truth(&f);
+        report(&cli(&f, "finalize"));
+        let config = f.dir.path().join("cli.toml");
+        let text = format!("{}\n{policy}", fs::read_to_string(&config).unwrap());
+        assert!(work_cli::config::Config::from_text(&text).is_err());
+        fs::write(&config, text).unwrap();
+        let producer = fs::read(f.dir.path().join("producer")).unwrap();
+        fs::remove_file(f.dir.path().join("producer")).unwrap();
+        let files = authority_files(&f);
+        let status = report(&cli_config(&f, "status", &config));
+        assert_eq!(status["local_freeze"], "frozen");
+        assert_eq!(status["runtime"], "not_inspected");
+        assert_eq!(status["task_open"], false);
+        assert_eq!(status["lease_charged"], true);
+        assert_eq!(
+            report(&cli_config(&f, "finalize", &config))["attempt"],
+            "existing_confirmation"
+        );
+        assert_eq!(calls(&f), "finish\n");
+        assert_eq!(authority_files(&f), files);
+        fs::write(f.dir.path().join("producer"), producer).unwrap();
+        fs::set_permissions(
+            f.dir.path().join("producer"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        delivered(&f, "historical-sealed-retry");
+        let retry = report(&cli_config(&f, "retry", &config));
+        assert_eq!(retry["attempt"], "response_recorded");
+        assert_eq!(retry["delivery"], "delivered");
+        assert_eq!(retry["receipt"]["event_id"], "historical-sealed-retry");
+        assert_eq!(calls(&f), "finish\nretry\n");
+        assert_eq!(truth(&f), before);
+        assert_eq!(
+            f.sql()
+                .query_row("SELECT record FROM task_finishes", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            task_receipt
+        );
+    }
+}
+#[test]
+fn capture_authority_loader_rejects_unsafe_inputs_without_creation() {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    report(&cli(&f, "status"));
+    let config = f.dir.path().join("cli.toml");
+    let valid = fs::read_to_string(&config).unwrap();
+    let store = f.config.store_dir.as_ref().unwrap();
+    let registry = f.config.trusted_registry.as_ref().unwrap();
+    let root = &f.config.roots[0];
+    let missing = f.dir.path().join("SECRET-missing");
+    let link = f.dir.path().join("SECRET-link");
+    std::os::unix::fs::symlink(root, &link).unwrap();
+    let inputs = [
+        "SECRET = [".to_owned(),
+        format!("store_dir = 7\ntrusted_registry = {registry:?}\nroots = [{root:?}]"),
+        format!("store_dir = {store:?}\ntrusted_registry = false\nroots = [{root:?}]"),
+        format!("store_dir = {store:?}\ntrusted_registry = {registry:?}\nroots = 'SECRET'"),
+        format!("store_dir = {store:?}\ntrusted_registry = {registry:?}\nroots = [7]"),
+        format!(
+            "store_dir = 'SECRET-relative'\ntrusted_registry = {registry:?}\nroots = [{root:?}]"
+        ),
+        format!("store_dir = {store:?}\ntrusted_registry = 'SECRET-relative'\nroots = [{root:?}]"),
+        format!(
+            "store_dir = {store:?}\ntrusted_registry = {registry:?}\nroots = ['SECRET-relative']"
+        ),
+        format!("store_dir = {link:?}\ntrusted_registry = {registry:?}\nroots = [{root:?}]"),
+        format!("store_dir = {store:?}\ntrusted_registry = {link:?}\nroots = [{root:?}]"),
+        format!("store_dir = {store:?}\ntrusted_registry = {registry:?}\nroots = [{link:?}]"),
+        format!("store_dir = {store:?}\ntrusted_registry = {registry:?}\nroots = [{missing:?}]"),
+        format!("store_dir = {missing:?}\ntrusted_registry = {registry:?}\nroots = [{root:?}]"),
+        format!("trusted_registry = {registry:?}\nroots = [{root:?}]"),
+        format!("store_dir = {store:?}\nroots = [{root:?}]"),
+        format!("store_dir = {store:?}\ntrusted_registry = {registry:?}"),
+        format!("# SECRET{}", "x".repeat(1024 * 1024)),
+    ];
+    let held = b"capture held: invalid_metadata_or_existing_authority; result unknown\n";
+    let files = authority_files(&f);
+    let before = truth(&f);
+    for text in inputs {
+        fs::write(&config, text).unwrap();
+        for action in ["status", "finalize", "retry"] {
+            let out = cli_config(&f, action, &config);
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty());
+            assert_eq!(out.stderr, held);
+        }
+        assert!(!missing.exists());
+        assert_eq!(authority_files(&f), files);
+        assert_eq!(truth(&f), before);
+    }
+    fs::write(&config, &valid).unwrap();
+    for kind in ["symlink", "fifo", "directory"] {
+        let unsafe_config = f.dir.path().join(format!("SECRET-{kind}"));
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&config, &unsafe_config).unwrap(),
+            "fifo" => rustix::fs::mkfifoat(rustix::fs::CWD, &unsafe_config, rustix::fs::Mode::RUSR)
+                .unwrap(),
+            "directory" => fs::create_dir(&unsafe_config).unwrap(),
+            _ => unreachable!(),
+        }
+        for action in ["status", "finalize", "retry"] {
+            let out = cli_config(&f, action, &unsafe_config);
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty());
+            assert_eq!(out.stderr, held);
+        }
+    }
+    assert_eq!(authority_files(&f), files);
+    f.sql().execute_batch("PRAGMA user_version=12").unwrap();
+    let legacy_files = authority_files(&f);
+    for action in ["status", "finalize", "retry"] {
+        let out = cli_config(&f, action, &config);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            out.stderr,
+            b"capture held: authority schema upgrade required; result unknown\n"
+        );
+        assert_eq!(
+            f.sql()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            12
+        );
+    }
+    assert_eq!(authority_files(&f), legacy_files);
+    assert!(calls(&f).is_empty());
+    assert_eq!(truth(&f), before);
+    assert!(!missing.exists());
+}
+#[test]
 fn capture_terminal_uncertainty_is_explicit_and_retains_task_truth() {
     let f = Fixture::new(true, Some(RootOutcome::Completed));
     report(&cli(&f, "finalize"));

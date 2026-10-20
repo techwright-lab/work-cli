@@ -69,11 +69,31 @@ impl Config {
     }
     /// Load configuration if a file already exists. Never creates files or directories.
     pub fn load() -> Result<Self, Error> {
-        let Some(path) = Self::discover_path() else {
+        Self::read_text()?
+            .map(|text| Self::from_toml(&text))
+            .unwrap_or_else(|| Ok(Self::default()))
+    }
+
+    /// Historical capture operations use sealed policies, not current execution declarations.
+    pub(crate) fn load_capture_authority() -> Result<Self, Error> {
+        let Some(text) = Self::read_text()? else {
             return Ok(Self::default());
         };
+        let value = parse_toml(&text)?;
+        Ok(Self {
+            store_dir: single_path(&value, "store_dir")?,
+            trusted_registry: single_path(&value, "trusted_registry")?,
+            roots: many_paths(&value, "roots")?,
+            ..Self::default()
+        })
+    }
+
+    fn read_text() -> Result<Option<String>, Error> {
+        let Some(path) = Self::discover_path() else {
+            return Ok(None);
+        };
         if !path.exists() && std::env::var_os("WORK_CONFIG").is_none() {
-            return Ok(Self::default());
+            return Ok(None);
         }
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
         const MAX_BYTES: u64 = 1024 * 1024;
@@ -97,7 +117,7 @@ impl Config {
         if text.len() as u64 > MAX_BYTES {
             return Err(unreadable());
         }
-        Self::from_toml(&text)
+        Ok(Some(text))
     }
 
     fn discover_path() -> Option<PathBuf> {
@@ -116,52 +136,12 @@ impl Config {
     }
 
     fn from_toml(text: &str) -> Result<Self, Error> {
-        if text.len() > 1024 * 1024 {
-            return Err(Error::Config("configuration exceeds size limit".into()));
-        }
-        let value: toml::Value = toml::from_str(text).map_err(|err: toml::de::Error| {
-            // Parser diagnostics include source text and values; expose only location.
-            let mut diagnostic = "invalid TOML".to_owned();
-            if let Some(span) = err.span() {
-                let prefix = &text[..span.start.min(text.len())];
-                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
-                let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-                diagnostic.push_str(&format!(" at line {line}, column {column}"));
-            }
-            Error::Config(diagnostic)
-        })?;
-        if !value.is_table() {
-            return Err(Error::Config("expected configuration table".into()));
-        }
-        let single = |key: &str| -> Result<Option<PathBuf>, Error> {
-            value
-                .get(key)
-                .map(|v| {
-                    let s = v.as_str().ok_or_else(invalid_path)?;
-                    validate_path(std::path::Path::new(s), false)
-                })
-                .transpose()
-        };
-        let many = |key: &str| -> Result<Vec<PathBuf>, Error> {
-            let Some(v) = value.get(key) else {
-                return Ok(Vec::new());
-            };
-            v.as_array()
-                .ok_or_else(invalid_path)?
-                .iter()
-                .map(|v| {
-                    validate_path(
-                        std::path::Path::new(v.as_str().ok_or_else(invalid_path)?),
-                        true,
-                    )
-                })
-                .collect()
-        };
+        let value = parse_toml(text)?;
         Ok(Self {
-            store_dir: single("store_dir")?,
-            trusted_registry: single("trusted_registry")?,
-            roots: many("roots")?,
-            repositories: many("repositories")?,
+            store_dir: single_path(&value, "store_dir")?,
+            trusted_registry: single_path(&value, "trusted_registry")?,
+            roots: many_paths(&value, "roots")?,
+            repositories: many_paths(&value, "repositories")?,
             supervisor: value
                 .get("supervisor")
                 .map(|v| {
@@ -195,6 +175,53 @@ impl Config {
         })
     }
 }
+fn parse_toml(text: &str) -> Result<toml::Value, Error> {
+    if text.len() > 1024 * 1024 {
+        return Err(Error::Config("configuration exceeds size limit".into()));
+    }
+    let value: toml::Value = toml::from_str(text).map_err(|err: toml::de::Error| {
+        // Parser diagnostics include source text and values; expose only location.
+        let mut diagnostic = "invalid TOML".to_owned();
+        if let Some(span) = err.span() {
+            let prefix = &text[..span.start.min(text.len())];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+            diagnostic.push_str(&format!(" at line {line}, column {column}"));
+        }
+        Error::Config(diagnostic)
+    })?;
+    if !value.is_table() {
+        return Err(Error::Config("expected configuration table".into()));
+    }
+    Ok(value)
+}
+
+fn single_path(value: &toml::Value, key: &str) -> Result<Option<PathBuf>, Error> {
+    value
+        .get(key)
+        .map(|v| {
+            let s = v.as_str().ok_or_else(invalid_path)?;
+            validate_path(std::path::Path::new(s), false)
+        })
+        .transpose()
+}
+
+fn many_paths(value: &toml::Value, key: &str) -> Result<Vec<PathBuf>, Error> {
+    let Some(v) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    v.as_array()
+        .ok_or_else(invalid_path)?
+        .iter()
+        .map(|v| {
+            validate_path(
+                std::path::Path::new(v.as_str().ok_or_else(invalid_path)?),
+                true,
+            )
+        })
+        .collect()
+}
+
 fn invalid_path() -> Error {
     Error::Config("expected absolute canonical path(s) without symlinks".into())
 }

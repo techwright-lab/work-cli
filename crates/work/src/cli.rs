@@ -109,7 +109,7 @@ pub fn run() {
     };
     match cli.command {
         Command::Capture { command } => {
-            let result = Config::load()
+            let result = Config::load_capture_authority()
                 .map_err(|_| crate::store::StoreError::Unsafe)
                 .and_then(|config| crate::capture_cli::command(&config, command));
             match result {
