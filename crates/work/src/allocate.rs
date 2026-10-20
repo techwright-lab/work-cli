@@ -55,7 +55,11 @@ pub(crate) fn err(message: &str) -> io::Error {
     io::Error::other(message)
 }
 pub(crate) fn db<T>(r: crate::store::Result<T>) -> io::Result<T> {
-    r.map_err(|e| err(&e.to_string()))
+    r.map_err(|e| {
+        #[cfg(test)]
+        crate::capture_diagnostics::store_error("allocate::db", &e);
+        err(&e.to_string())
+    })
 }
 pub(crate) fn sql<T>(r: rusqlite::Result<T>) -> io::Result<T> {
     r.map_err(|e| err(&e.to_string()))

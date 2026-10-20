@@ -264,6 +264,7 @@ fn roots(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(result)
 }
 impl Store {
+    #[cfg_attr(test, track_caller)]
     pub(crate) fn sql_phase(&self) -> SqlPhase {
         self.budget.enter()
     }
@@ -732,6 +733,10 @@ struct BudgetState {
     depth: usize,
     deadline: Option<Instant>,
     ticks: u32,
+    #[cfg(test)]
+    origin: Option<&'static std::panic::Location<'static>>,
+    #[cfg(test)]
+    recorded: bool,
 }
 pub(crate) struct SqlPhase(SqlBudget);
 impl SqlBudget {
@@ -746,16 +751,42 @@ impl SqlBudget {
                     return false;
                 }
                 state.ticks = state.ticks.saturating_add(1);
-                state.ticks >= 200 || state.deadline.is_some_and(|d| Instant::now() >= d)
+                let interrupted =
+                    state.ticks >= 200 || state.deadline.is_some_and(|d| Instant::now() >= d);
+                #[cfg(test)]
+                if interrupted && !state.recorded {
+                    state.recorded = true;
+                    let now = Instant::now();
+                    let origin = state.origin.unwrap();
+                    crate::capture_diagnostics::record(crate::capture_diagnostics::Event::Sql {
+                        file: origin.file(),
+                        line: origin.line(),
+                        ticks: state.ticks,
+                        vm: state.ticks >= 200,
+                        wall: state.deadline.is_some_and(|d| now >= d),
+                        elapsed_ms: state.deadline.map_or(0, |d| {
+                            now.saturating_duration_since(d - Duration::from_millis(500))
+                                .as_millis()
+                        }),
+                        depth: state.depth,
+                    });
+                }
+                interrupted
             }),
         )?;
         Ok(budget)
     }
+    #[cfg_attr(test, track_caller)]
     fn enter(&self) -> SqlPhase {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.depth == 0 {
             state.deadline = Some(Instant::now() + Duration::from_millis(500));
             state.ticks = 0;
+            #[cfg(test)]
+            {
+                state.origin = Some(std::panic::Location::caller());
+                state.recorded = false;
+            }
         }
         state.depth += 1;
         SqlPhase(self.clone())
@@ -1112,6 +1143,40 @@ pub(crate) fn identity(value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     const SCAN: &str = "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n";
+
+    #[test]
+    fn diagnostics_distinguish_sql_limits_and_outer_origin() {
+        let diagnostics = crate::capture_diagnostics::Guard::new();
+        let mut observed = Vec::new();
+        for wall in [false, true] {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            let budget = super::SqlBudget::install(&conn).unwrap();
+            let outer_line = line!() + 1;
+            let outer = budget.enter();
+            if wall {
+                // Private deterministic deadline control, not a production threshold change.
+                budget.0.lock().unwrap().deadline =
+                    Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+            }
+            let inner = budget.enter();
+            let error = conn
+                .query_row(&SCAN.replace("5000", "20000"), [], |r| r.get::<_, i64>(0))
+                .unwrap_err();
+            assert!(
+                matches!(error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::OperationInterrupted)
+            );
+            drop(inner);
+            drop(outer);
+            drop(budget);
+            drop(conn);
+            observed.push((wall, outer_line, diagnostics.events()));
+        }
+        for (wall, line, events) in observed {
+            assert!(events.iter().any(|event| matches!(event,
+                crate::capture_diagnostics::Event::Sql { file, line: origin, wall: expired, vm, depth: 2, .. }
+                if *file == file!() && *origin == line && *expired == wall && *vm != wall)), "missing classified interruption: {events:?}");
+        }
+    }
 
     #[test]
     fn nested_sql_phases_share_instruction_budget_and_disarm_on_unwind() {

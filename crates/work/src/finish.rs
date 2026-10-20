@@ -378,8 +378,14 @@ fn finish_internal(
     let compatible = receipt.capture_binding == digest(json(&Some("devdiary"))?);
     let capture_ready = !integrated
         || (compatible
-            && (!matches!(receipt.local_freeze, Freeze::Pending | Freeze::Failed)
-                || captured::intents(&mut store, checkout).is_ok()));
+            && (!matches!(receipt.local_freeze, Freeze::Pending | Freeze::Failed) || {
+                let intents = captured::intents(&mut store, checkout);
+                #[cfg(test)]
+                if let Err(error) = &intents {
+                    crate::capture_diagnostics::store_error("finish::intents-discard", error);
+                }
+                intents.is_ok()
+            }));
     drop(lock);
     let adapter = CapturedFinish { config };
     let sink: Option<&dyn LocalSink> = match mode {
@@ -469,7 +475,14 @@ fn finish_internal(
         })();
         match persisted {
             Ok(()) => boundary("outcome_committed"),
-            Err(StoreError::Database(_)) if integrated => updated = receipt.clone(),
+            Err(_error @ StoreError::Database(_)) if integrated => {
+                #[cfg(test)]
+                crate::capture_diagnostics::store_error(
+                    "finish::aggregate-persistence-fallback",
+                    &_error,
+                );
+                updated = receipt.clone();
+            }
             Err(error) => return Err(error),
         }
         updated
@@ -1114,6 +1127,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
     }
     #[test]
     fn lost_finish_reply_replays_exact_intent_without_reexecuting_actor() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         let (temp, mut cfg, a, root, _seal) = closed_capture();
         std::fs::write(temp.path().join("producer"), "#!/bin/sh\nexit 1\n").unwrap();
         let first = super::finish(&cfg, a.checkout).unwrap();
@@ -1156,6 +1170,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
     }
     #[test]
     fn held_known_capture_freezes_only_after_task_fence() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         let (temp, cfg, a, _root, _seal) = closed_capture();
         std::fs::write(temp.path().join("producer"), format!("#!/usr/bin/python3\nimport json,sqlite3,sys\nr=json.load(sys.stdin)\nc=sqlite3.connect({:?})\nassert c.execute('SELECT count(*) FROM task_finishes').fetchone()[0]==1\nassert c.execute('SELECT count(*) FROM capture_finalizations').fetchone()[0]==1\njson.dump(json.load(open({:?})),sys.stdout)\n", cfg.store_dir.as_ref().unwrap().join("store.sqlite"), temp.path().join("response"))).unwrap();
         let report = super::finish(&cfg, a.checkout).unwrap();

@@ -453,9 +453,16 @@ fn finalize_after_preflight(
     };
     let frozen = ProcessSink::new(spec.sink().process_settings()?)
         .finish(&binding, &finish)
-        .map_err(|_| StoreError::CaptureFinishUncertain)?;
-    let snapshot = confirm(&mut store, run, &intent, &spec, &frozen)
-        .map_err(|_| StoreError::CaptureFinishUncertain)?;
+        .map_err(|_| {
+            #[cfg(test)]
+            crate::capture_diagnostics::record(crate::capture_diagnostics::Event::FinishRefused);
+            StoreError::CaptureFinishUncertain
+        })?;
+    let snapshot = confirm(&mut store, run, &intent, &spec, &frozen).map_err(|_error| {
+        #[cfg(test)]
+        crate::capture_diagnostics::store_error("finalization::confirm", &_error);
+        StoreError::CaptureFinishUncertain
+    })?;
     Ok((
         store,
         FinalizeResult::Confirmed {

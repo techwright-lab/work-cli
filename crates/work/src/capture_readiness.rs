@@ -1153,6 +1153,7 @@ mod tests {
     }
     #[test]
     fn many_closed_captured_roots_with_terminal_children_fit_sql_budget() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         many_closed_history(|cfg, _store, a, original| {
             let next = next_root(original);
             let spec = cfg
@@ -1168,6 +1169,7 @@ mod tests {
     }
     #[test]
     fn captured_finish_many_roots_preserves_shared_sql_budgets() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         many_closed_history(|cfg, _store, a, _original| {
             Store::open_finish_authority(
                 cfg.trusted_registry.as_ref().unwrap(),
@@ -1335,6 +1337,7 @@ mod tests {
     }
     #[test]
     fn captured_finish_prepares_all_intents_before_any_producer() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         many_closed_history(|cfg, store, a, _| {
             store
                 .conn
@@ -1356,6 +1359,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
     }
     #[test]
     fn missing_capture_remains_failed_even_when_another_finish_is_uncertain() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         many_closed_history(|cfg, store, a, original| {
             let run: String = store
                 .conn
@@ -1392,6 +1396,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
     }
     #[test]
     fn captured_finish_counts_closed_roots_without_maps() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         many_closed_history(|cfg, store, a, original| {
             let run: String = store
                 .conn
@@ -1429,6 +1434,9 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
         use crate::capture_journal::json;
         use crate::run_participants::{ChildRequest, EnrollmentRecord, ExpectedHost, HostSnapshot};
         for count in [2, 48] {
+            crate::capture_diagnostics::record(crate::capture_diagnostics::Event::Workload {
+                roots: count,
+            });
             let (_temp, cfg, store, a, original, seal, ack) = closed();
             restore(&cfg, seal, ack).unwrap();
             let template = crate::run_journal::read(&store.conn, &original.identity().run)

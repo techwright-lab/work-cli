@@ -19,6 +19,8 @@ mod capture_artifacts;
 pub mod capture_bridge;
 pub mod capture_cli;
 pub mod capture_config;
+#[cfg(test)]
+mod capture_diagnostics;
 pub mod capture_finalization;
 pub mod capture_journal;
 pub mod capture_preparation;

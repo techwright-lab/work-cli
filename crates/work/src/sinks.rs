@@ -58,13 +58,18 @@ impl ProcessSink {
             .arg("--state-dir")
             .arg(&s.state)
             .arg("--json");
+        #[cfg(test)]
+        let started = crate::capture_diagnostics::enabled().then(std::time::Instant::now);
         let output = bounded_process::output_with_input_aggregate(
             &mut command,
             s.timeout,
             s.response_cap,
             input,
-        )
-        .map_err(|_| Refused)?;
+        );
+        // Elapsed includes the existing process cleanup, not just its deadline.
+        #[cfg(test)]
+        crate::capture_diagnostics::process(operation, s.timeout, started, input.len(), &output);
+        let output = output.map_err(|_| Refused)?;
         if !output.status.success() {
             return Err(Refused);
         }
@@ -102,7 +107,12 @@ impl ProcessSink {
             return Err(Refused);
         }
         let input = request.encode()?;
-        decode_terminal(&self.invoke("finish", &input)?, binding)
+        let decoded = decode_terminal(&self.invoke("finish", &input)?, binding);
+        #[cfg(test)]
+        crate::capture_diagnostics::record(crate::capture_diagnostics::Event::FinishCodec {
+            accepted: decoded.is_ok(),
+        });
+        decoded
     }
     pub fn retry(&self, binding: &CaptureBinding) -> Result<LocalFrozen, Refused> {
         let input = RetryRequest {
@@ -120,5 +130,42 @@ impl fmt::Debug for ProcessSinkSettings {
 impl fmt::Debug for ProcessSink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProcessSink([REDACTED])")
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn diagnostics_classify_real_process_outcomes() {
+        use crate::capture_diagnostics::{Event, Guard, Operation, ProcessOutcome};
+        use std::os::unix::fs::PermissionsExt;
+        let diagnostics = Guard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut observed = Vec::new();
+        for (index, body, expected) in [
+            (0, "sleep 1", ProcessOutcome::Timeout),
+            (1, "exit 3", ProcessOutcome::Nonzero),
+            (2, "printf ok", ProcessOutcome::Success),
+        ] {
+            let executable = dir.path().join(index.to_string());
+            std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sink = super::ProcessSink::new(
+                super::ProcessSinkSettings::new(
+                    executable,
+                    dir.path().join("registry"),
+                    dir.path().join("state"),
+                    std::time::Duration::from_millis(50),
+                    1024,
+                )
+                .unwrap(),
+            );
+            let result = sink.invoke("finish", b"");
+            observed.push((expected, result.is_ok(), diagnostics.events()));
+        }
+        for (expected, success, events) in observed {
+            assert_eq!(success, expected == ProcessOutcome::Success);
+            assert!(events.iter().any(|e| matches!(e,
+                Event::Process { operation: Operation::Finish, timeout_ms: 50, outcome, .. } if *outcome == expected)), "missing process classification {expected:?}: {events:?}");
+        }
     }
 }
