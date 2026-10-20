@@ -5,6 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+extern crate self as work_cli;
+
 pub mod admission;
 pub mod adopted;
 pub mod allocate;

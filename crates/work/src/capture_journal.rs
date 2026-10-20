@@ -76,9 +76,9 @@ fn id(v: &impl ToString) -> Result<Uuid> {
 // Per-record technical bound, not a history quota. Twice the 1 MiB wire
 // allowance leaves room for sink paths/labels, 128 credential names and all
 // four 4096-character Git identities, including full-width UTF-8/JSON escaping.
-const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_CREDENTIAL_NAMES: usize = 128;
-fn json<T: Serialize>(v: &T) -> Result<String> {
+pub(crate) fn json<T: Serialize>(v: &T) -> Result<String> {
     struct Bounded(Vec<u8>);
     impl std::io::Write for Bounded {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {

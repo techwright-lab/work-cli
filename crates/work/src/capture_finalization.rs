@@ -1,7 +1,7 @@
 //! Terminal capture metadata only. Never grants writer or retirement authority.
 use crate::{
     capture_bridge::{CaptureBinding, CaptureOutcome, EndedAt, FinishRequest},
-    capture_journal::{CaptureRecord, CaptureSpec},
+    capture_journal::{json, CaptureRecord, CaptureSpec, MAX_RECORD_BYTES},
     config::Config,
     run_journal::{RootOutcome, RunRecord},
     sinks::ProcessSink,
@@ -49,6 +49,49 @@ pub struct Intent {
     pub intent_wall: String,
     pub body: String,
     pub fingerprint: [u8; 32],
+    pub context: ContextSeal,
+}
+/// Immutable terminal context, separate from the finalization journal's revision.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSeal {
+    pub root_digest: [u8; 32],
+    pub capture_digest: [u8; 32],
+    pub spec_digest: [u8; 32],
+    pub binding_digest: [u8; 32],
+    pub operation: uuid::Uuid,
+}
+fn digest(value: &impl Serialize) -> Result<[u8; 32]> {
+    // Stream the closed roster rather than impose a new roster-size restriction.
+    struct HashWriter(Sha256);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, value).map_err(|_| StoreError::Invalid)?;
+    Ok(writer.0.finalize().into())
+}
+fn binding_digest(binding: &CaptureBinding) -> Result<[u8; 32]> {
+    digest(&(
+        binding.capture_id().as_str(),
+        binding.actor_ref(),
+        binding.run_ref(),
+    ))
+}
+fn context(root: &RunRecord, capture: &CaptureRecord, spec: &CaptureSpec) -> Result<ContextSeal> {
+    Ok(ContextSeal {
+        root_digest: digest(root)?,
+        capture_digest: digest(capture)?,
+        spec_digest: digest(spec)?,
+        binding_digest: binding_digest(&binding(capture, spec)?)?,
+        operation: capture.operation,
+    })
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -152,7 +195,8 @@ pub(crate) fn validate(
     };
     let req = request(capture, root)?;
     let bytes = req.encode().map_err(|_| StoreError::Invalid)?;
-    if snapshot.intent.body.as_bytes() != bytes
+    if snapshot.intent.context != context(root, capture, spec)?
+        || snapshot.intent.body.as_bytes() != bytes
         || snapshot.intent.fingerprint != <[u8; 32]>::from(Sha256::digest(&bytes))
         || snapshot.intent.capture_id != req.capture_id.as_str()
         || snapshot.intent.ended_at
@@ -214,6 +258,7 @@ pub struct Snapshot {
 /// ```
 pub struct FreezeAcknowledgement {
     run: RunId,
+    intent: Box<Intent>,
 }
 impl std::fmt::Debug for FreezeAcknowledgement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -224,6 +269,10 @@ impl FreezeAcknowledgement {
     pub fn run(&self) -> &RunId {
         &self.run
     }
+    /// Exact acknowledged claims and context digests; not permission to resume writing.
+    pub fn intent(&self) -> &Intent {
+        &self.intent
+    }
 }
 pub enum FinalizeResult {
     Existing(Snapshot),
@@ -231,13 +280,6 @@ pub enum FinalizeResult {
         snapshot: Snapshot,
         acknowledgement: FreezeAcknowledgement,
     },
-}
-fn json(v: &impl Serialize) -> Result<String> {
-    let body = serde_json::to_string(v).map_err(|_| StoreError::Invalid)?;
-    if body.len() > 65536 {
-        return Err(StoreError::Invalid);
-    }
-    Ok(body)
 }
 fn request(capture: &CaptureRecord, root: &RunRecord) -> Result<FinishRequest> {
     let end = capture.group_end.as_ref().ok_or(StoreError::Invalid)?;
@@ -269,7 +311,7 @@ fn load(conn: &Connection, run: &RunId) -> Result<Option<Snapshot>> {
             [run.to_string()],
             |r| {
                 for i in [0, 1] {
-                    if matches!(r.get_ref(i)?, rusqlite::types::ValueRef::Text(b) if b.len()>65536)
+                    if matches!(r.get_ref(i)?, rusqlite::types::ValueRef::Text(b) if b.len()>MAX_RECORD_BYTES)
                     {
                         return Err(rusqlite::Error::InvalidQuery);
                     }
@@ -344,8 +386,9 @@ pub fn retry_delivery(config: &Config, run: &RunId) -> Result<(Store, Snapshot)>
     };
     let frozen = ProcessSink::new(spec.sink().process_settings()?)
         .retry(&binding)
-        .map_err(|_| StoreError::Invalid)?;
-    let snapshot = confirm(&mut store, run, &intent, &spec, &frozen)?;
+        .map_err(|_| StoreError::CaptureDeliveryUncertain)?;
+    let snapshot = confirm(&mut store, run, &intent, &spec, &frozen)
+        .map_err(|_| StoreError::CaptureDeliveryUncertain)?;
     Ok((store, snapshot))
 }
 pub fn finalize(config: &Config, run: &RunId) -> Result<(Store, FinalizeResult)> {
@@ -357,6 +400,16 @@ pub fn finalize_observed(
     run: &RunId,
     before_process: impl FnOnce(),
 ) -> Result<(Store, FinalizeResult)> {
+    finalize_after_preflight(config, run, before_process, || {})
+}
+// The private boundary makes a competing commit between preflight and dispatch
+// deterministic in tests. Both callbacks execute outside every SQL phase.
+fn finalize_after_preflight(
+    config: &Config,
+    run: &RunId,
+    before_process: impl FnOnce(),
+    after_preflight: impl FnOnce(),
+) -> Result<(Store, FinalizeResult)> {
     let mut store = open(config)?;
     let existing = {
         let _phase = store.sql_phase();
@@ -367,6 +420,7 @@ pub fn finalize_observed(
     if let Some(snapshot) = existing.filter(|s| s.confirmation.is_some()) {
         return Ok((store, FinalizeResult::Existing(snapshot)));
     }
+    after_preflight();
     let (spec, binding, intent) = {
         let _phase = store.sql_phase();
         let tx = store
@@ -388,6 +442,7 @@ pub fn finalize_observed(
             intent_wall: chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now())
                 .to_rfc3339(),
             fingerprint: Sha256::digest(body.as_bytes()).into(),
+            context: context(&root, &capture, &spec)?,
             body,
         };
         let declaration = spec.begin_request();
@@ -398,6 +453,11 @@ pub fn finalize_observed(
         )
         .map_err(|_| StoreError::Invalid)?;
         if let Some(existing) = validate(&tx, &root, &capture, &spec)? {
+            if existing.confirmation.is_some() {
+                tx.commit()?;
+                drop(_phase);
+                return Ok((store, FinalizeResult::Existing(existing)));
+            }
             intent = existing.intent;
         } else {
             if date(&intent.intent_wall)? < date(&intent.ended_at)? {
@@ -424,13 +484,17 @@ pub fn finalize_observed(
     };
     let frozen = ProcessSink::new(spec.sink().process_settings()?)
         .finish(&binding, &finish)
-        .map_err(|_| StoreError::Invalid)?;
-    let snapshot = confirm(&mut store, run, &intent, &spec, &frozen)?;
+        .map_err(|_| StoreError::CaptureFinishUncertain)?;
+    let snapshot = confirm(&mut store, run, &intent, &spec, &frozen)
+        .map_err(|_| StoreError::CaptureFinishUncertain)?;
     Ok((
         store,
         FinalizeResult::Confirmed {
             snapshot,
-            acknowledgement: FreezeAcknowledgement { run: run.clone() },
+            acknowledgement: FreezeAcknowledgement {
+                run: run.clone(),
+                intent: Box::new(intent),
+            },
         },
     ))
 }
@@ -448,12 +512,17 @@ fn confirm(
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (root, capture, sealed) = target(&tx, run)?;
     let mut snapshot = validate(&tx, &root, &capture, &sealed)?.ok_or(StoreError::Invalid)?;
-    if snapshot.intent != *intent {
+    if snapshot.intent != *intent
+        || context(&root, &capture, spec)? != intent.context
+        || binding_digest(frozen.binding())? != intent.context.binding_digest
+    {
         return Err(StoreError::Conflict);
     }
+    // Historical delivered state is not evidence that this attempt succeeded.
+    let incoming_success = confirmation.delivered && confirmation.error_code.is_none();
     if let Some(old) = &snapshot.confirmation {
         if let (Some(a), Some(b)) = (&old.receipt, &confirmation.receipt) {
-            if a.event_id() != b.event_id() {
+            if a.event_id() != b.event_id() || (!incoming_success && a != b) {
                 return Err(StoreError::Conflict);
             }
         }
@@ -512,6 +581,10 @@ fn confirm(
     tx.commit()?;
     Ok(snapshot)
 }
+#[cfg(test)]
+#[path = "capture_finalization_tests.rs"]
+mod tests;
+
 impl Store {
     pub fn capture_finalization_snapshot(&self, run: &RunId) -> Result<Option<Snapshot>> {
         let _phase = self.sql_phase();

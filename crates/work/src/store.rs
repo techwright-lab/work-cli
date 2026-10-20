@@ -30,6 +30,12 @@ pub enum StoreError {
     Writer,
     #[error("invalid store record")]
     Invalid,
+    /// FINISH was attempted; no reliable confirmation was committed.
+    #[error("capture FINISH may have occurred; confirmation unknown")]
+    CaptureFinishUncertain,
+    /// RETRY was attempted; the previously confirmed freeze is unchanged.
+    #[error("capture delivery observation unknown; prior freeze retained")]
+    CaptureDeliveryUncertain,
     #[error("historical run status unknown: schema upgrade required")]
     UpgradeRequired,
 }

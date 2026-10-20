@@ -7,11 +7,262 @@ use capture_fixture::Fixture;
 use work_cli::{capture_finalization::finalize, run_journal::RootOutcome};
 
 #[test]
+fn legal_full_width_source_survives_confirmation_and_reopen() {
+    for value in ["\u{10000}".repeat(4096), "\"\\".repeat(2048)] {
+        let source = work_cli::capture_bridge::Source {
+            system: Some(value.clone()),
+            company_id: Some(value.clone()),
+            agent_id: Some(value.clone()),
+            run_id: Some(value),
+        };
+        let f = Fixture::with_source(true, Some(RootOutcome::Completed), Some(source.clone()));
+        f.respond("pending", serde_json::json!({"source":source}), false);
+        assert!(
+            finalize(&f.config, &f.root.identity().run).is_ok(),
+            "legal source confirmation refused"
+        );
+        let reopened = fixture_support::reopen(&f.dir).unwrap();
+        let snapshot = reopened
+            .capture_finalization_snapshot(&f.root.identity().run)
+            .unwrap()
+            .unwrap();
+        assert!(snapshot.confirmation.unwrap().source == Some(source));
+    }
+}
+
+#[test]
+fn legal_source_synthetic_validation_wire_survives_reopen() {
+    let value = "\u{10000}".repeat(4088);
+    let source = work_cli::capture_bridge::Source {
+        system: Some(value.clone()),
+        company_id: Some(value.clone()),
+        agent_id: Some(value.clone()),
+        run_id: Some(value),
+    };
+    let f = Fixture::with_source(true, Some(RootOutcome::Completed), Some(source.clone()));
+    f.respond("pending", serde_json::json!({"source":source}), false);
+    assert!(
+        finalize(&f.config, &f.root.identity().run).is_ok(),
+        "confirmation must fit old record ceiling"
+    );
+    let bytes: i64 = f
+        .sql()
+        .query_row(
+            "SELECT length(CAST(confirmation AS BLOB)) FROM capture_finalizations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bytes < 65536);
+    let reopened = fixture_support::reopen(&f.dir).unwrap();
+    assert!(
+        reopened
+            .capture_finalization_snapshot(&f.root.identity().run)
+            .is_ok(),
+        "synthesized wire refused legal persisted confirmation"
+    );
+}
+
+fn retarget(f: &Fixture, spec: bool) {
+    let sql = f.sql();
+    if spec {
+        use sha2::{Digest, Sha256};
+        let old: String = sql
+            .query_row("SELECT spec FROM capture_runs", [], |r| r.get(0))
+            .unwrap();
+        let changed = old.replace(
+            "\"task_refs\":[\"task\"]",
+            "\"task_refs\":[\"task\",\"additional\"]",
+        );
+        assert_ne!(old, changed);
+        sql.execute(
+            "UPDATE capture_runs SET spec=?1,fingerprint=?2",
+            rusqlite::params![changed, Sha256::digest(changed.as_bytes()).as_slice()],
+        )
+        .unwrap();
+    } else {
+        let old: String = sql
+            .query_row("SELECT request FROM runs", [], |r| r.get(0))
+            .unwrap();
+        let mut changed: serde_json::Value = serde_json::from_str(&old).unwrap();
+        changed["input"]["command_digest"] = serde_json::json!([91; 32].to_vec());
+        assert_ne!(
+            serde_json::from_str::<serde_json::Value>(&old).unwrap(),
+            changed
+        );
+        sql.execute("UPDATE runs SET request=?1", [changed.to_string()])
+            .unwrap();
+    }
+}
+fn retarget_confirmation(spec: bool) {
+    let control = Fixture::new(true, Some(RootOutcome::Completed));
+    retarget(&control, spec);
+    assert!(
+        control
+            .store
+            .run_snapshot(&control.root.identity().run)
+            .is_ok(),
+        "mutation must be independently valid"
+    );
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    let result = work_cli::capture_finalization::finalize_observed(
+        &f.config,
+        &f.root.identity().run,
+        || retarget(&f, spec),
+    );
+    assert!(
+        result.is_err(),
+        "changed sealed context minted acknowledgement"
+    );
+    assert!(f
+        .sql()
+        .query_row(
+            "SELECT confirmation IS NULL FROM capture_finalizations",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+}
+#[test]
+fn root_retarget_during_finish_cannot_confirm() {
+    retarget_confirmation(false);
+}
+#[test]
+fn spec_retarget_during_finish_cannot_confirm() {
+    retarget_confirmation(true);
+}
+#[test]
+fn unconfirmed_replay_cannot_retarget_original_context() {
+    for spec in [false, true] {
+        let f = Fixture::new(true, Some(RootOutcome::Completed));
+        f.respond("pending", serde_json::json!({}), true);
+        assert!(finalize(&f.config, &f.root.identity().run).is_err());
+        retarget(&f, spec);
+        f.respond("pending", serde_json::json!({}), false);
+        assert!(
+            finalize(&f.config, &f.root.identity().run).is_err(),
+            "replay retargeted original intent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(f.dir.path().join("calls")).unwrap(),
+            "finish\n"
+        );
+        assert!(f
+            .store
+            .capture_finalization_snapshot(&f.root.identity().run)
+            .is_err());
+    }
+}
+
+#[test]
+fn finish_lost_reply_reports_explicit_sanitized_uncertainty() {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    f.respond("pending", serde_json::json!({}), true);
+    let error = finalize(&f.config, &f.root.identity().run).err().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("calls")).unwrap(),
+        "finish\n"
+    );
+    assert!(!std::fs::read(f.dir.path().join("input"))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        error.to_string(),
+        "capture FINISH may have occurred; confirmation unknown"
+    );
+    assert!(matches!(
+        error,
+        work_cli::store::StoreError::CaptureFinishUncertain
+    ));
+    assert_eq!(format!("{error:?}"), "CaptureFinishUncertain");
+}
+// Supplemental phase-error matrix, added after the F3 behavioral RED/GREEN.
+#[test]
+fn retry_confirmation_faults_retain_known_receipt_and_outbox() {
+    for trigger in [
+        "CREATE TRIGGER fault BEFORE UPDATE ON capture_finalizations BEGIN SELECT RAISE(ABORT,'secret fixture'); END",
+        "CREATE TRIGGER fault BEFORE INSERT ON outbox WHEN json_extract(NEW.payload,'$.change')='delivery' BEGIN SELECT RAISE(ABORT,'secret fixture'); END",
+    ] {
+        let f = Fixture::new(true, Some(RootOutcome::Completed));
+        let extra = |session: u64| serde_json::json!({"receipt":{"actor_ref":"actor","run_ref":f.root.identity().run_ref.as_str(),"event_id":"event","session_id":session}});
+        f.respond("delivered", extra(1), false);
+        assert!(finalize(&f.config, &f.root.identity().run).is_ok());
+        let before = serde_json::to_string(&f.store.capture_finalization_snapshot(&f.root.identity().run).unwrap()).unwrap();
+        let events = f.store.pending_events(100).unwrap();
+        f.sql().execute_batch(trigger).unwrap();
+        f.respond("delivered", extra(2), false);
+        let error = work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run).err().unwrap();
+        assert!(matches!(error, work_cli::store::StoreError::CaptureDeliveryUncertain));
+        assert_eq!(error.to_string(), "capture delivery observation unknown; prior freeze retained");
+        assert_eq!(format!("{error:?}"), "CaptureDeliveryUncertain");
+        assert_eq!(serde_json::to_string(&f.store.capture_finalization_snapshot(&f.root.identity().run).unwrap()).unwrap(), before);
+        assert_eq!(f.store.pending_events(100).unwrap(), events);
+        assert_eq!(std::fs::read_to_string(f.dir.path().join("calls")).unwrap(), "finish\nretry\n");
+    }
+}
+
+#[test]
+fn retry_lost_reply_reports_delivery_uncertainty_retaining_freeze() {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    let receipt = serde_json::json!({"actor_ref":"actor","run_ref":f.root.identity().run_ref.as_str(),"event_id":"event","session_id":1});
+    f.respond("delivered", serde_json::json!({"receipt":receipt}), false);
+    assert!(finalize(&f.config, &f.root.identity().run).is_ok());
+    let before = serde_json::to_string(
+        &f.store
+            .capture_finalization_snapshot(&f.root.identity().run)
+            .unwrap(),
+    )
+    .unwrap();
+    f.respond("pending", serde_json::json!({}), true);
+    let error = work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run)
+        .err()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_string(
+            &f.store
+                .capture_finalization_snapshot(&f.root.identity().run)
+                .unwrap()
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.dir.path().join("calls")).unwrap(),
+        "finish\nretry\n"
+    );
+    assert_eq!(
+        error.to_string(),
+        "capture delivery observation unknown; prior freeze retained"
+    );
+    assert!(matches!(
+        error,
+        work_cli::store::StoreError::CaptureDeliveryUncertain
+    ));
+    assert_eq!(format!("{error:?}"), "CaptureDeliveryUncertain");
+}
+
+#[test]
 fn closed_known_root_freezes_without_rewriting_root_or_writer() {
     let f = Fixture::new(true, Some(RootOutcome::Completed));
     let before = f.store.run_snapshot(&f.root.identity().run).unwrap();
     let result = finalize(&f.config, &f.root.identity().run);
     assert!(result.is_ok(), "closed known capture must finalize");
+    let (
+        _,
+        work_cli::capture_finalization::FinalizeResult::Confirmed {
+            snapshot,
+            acknowledgement,
+        },
+    ) = result.unwrap()
+    else {
+        panic!("actual FINISH acknowledgement required")
+    };
+    assert_eq!(acknowledgement.run(), &f.root.identity().run);
+    assert!(acknowledgement.intent() == &snapshot.intent);
+    assert_eq!(
+        format!("{acknowledgement:?}"),
+        "FreezeAcknowledgement([REDACTED])"
+    );
     assert_eq!(
         f.store.run_snapshot(&f.root.identity().run).unwrap(),
         before
@@ -130,6 +381,81 @@ fn explicit_retry_delivers_without_refreeze_and_keeps_receipt() {
     );
 }
 
+fn failed_receipt_refresh(state: &str) {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    let extra = |session: u64| serde_json::json!({"receipt":{"actor_ref":"actor","run_ref":f.root.identity().run_ref.as_str(),"event_id":"event","session_id":session}});
+    f.respond("delivered", extra(1), false);
+    assert!(finalize(&f.config, &f.root.identity().run).is_ok());
+    let original = serde_json::to_string(
+        &f.store
+            .capture_finalization_snapshot(&f.root.identity().run)
+            .unwrap(),
+    )
+    .unwrap();
+    let events = f.store.pending_events(100).unwrap();
+    let mut failed = extra(2);
+    failed["error_code"] = serde_json::json!("delivery_failed");
+    f.respond(state, failed, false);
+    assert!(
+        work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run).is_err(),
+        "failed response replaced known receipt"
+    );
+    assert_eq!(
+        serde_json::to_string(
+            &f.store
+                .capture_finalization_snapshot(&f.root.identity().run)
+                .unwrap()
+        )
+        .unwrap(),
+        original
+    );
+    assert_eq!(f.store.pending_events(100).unwrap(), events);
+    for receipt in [Some(extra(1)), None] {
+        let state = if receipt.is_some() { state } else { "pending" };
+        let mut failed = receipt.unwrap_or_else(|| serde_json::json!({}));
+        failed["error_code"] = serde_json::json!("delivery_failed");
+        f.respond(state, failed, false);
+        let (_, snapshot) =
+            work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run)
+                .unwrap();
+        let c = snapshot.confirmation.unwrap();
+        assert!(c.delivered);
+        assert_eq!(c.receipt.unwrap().session_id(), 1);
+    }
+    f.respond("delivered", extra(2), false);
+    let (_, snapshot) =
+        work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run).unwrap();
+    assert_eq!(
+        snapshot.confirmation.unwrap().receipt.unwrap().session_id(),
+        2
+    );
+}
+#[test]
+fn pending_failed_replay_cannot_replace_known_receipt() {
+    failed_receipt_refresh("pending");
+}
+#[test]
+fn delivered_failed_replay_cannot_replace_known_receipt() {
+    failed_receipt_refresh("delivered");
+}
+#[test]
+fn lost_finish_can_learn_historical_receipt_despite_delivery_error() {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    f.respond("pending", serde_json::json!({}), true);
+    assert!(finalize(&f.config, &f.root.identity().run).is_err());
+    f.respond("delivered", serde_json::json!({"error_code":"delivery_failed","receipt":{"actor_ref":"actor","run_ref":f.root.identity().run_ref.as_str(),"event_id":"event","session_id":1}}), false);
+    assert!(finalize(&f.config, &f.root.identity().run).is_ok());
+    let c = f
+        .store
+        .capture_finalization_snapshot(&f.root.identity().run)
+        .unwrap()
+        .unwrap()
+        .confirmation
+        .unwrap();
+    assert!(c.delivered);
+    assert_eq!(c.receipt.unwrap().session_id(), 1);
+}
+
 #[test]
 fn delivery_merge_preserves_identity_and_success_but_allows_session_refresh() {
     let f = Fixture::new(true, Some(RootOutcome::Completed));
@@ -230,7 +556,19 @@ fn sql_faults_rollback_intent_or_confirmation_and_replay_finish() {
         let sql = f.sql();
         sql.execute_batch(trigger).unwrap();
         let before = f.store.pending_events(100).unwrap();
-        assert!(finalize(&f.config, &f.root.identity().run).is_err());
+        let error = finalize(&f.config, &f.root.identity().run).err().unwrap();
+        if !point.starts_with("intent") {
+            assert_eq!(
+                error.to_string(),
+                "capture FINISH may have occurred; confirmation unknown"
+            );
+            assert!(matches!(
+                error,
+                work_cli::store::StoreError::CaptureFinishUncertain
+            ));
+        } else {
+            assert_eq!(error.to_string(), "store database failure");
+        }
         let called = f.dir.path().join("calls").exists();
         assert_eq!(called, !point.starts_with("intent"));
         assert_eq!(
@@ -511,6 +849,27 @@ fn actual_retry_rejects_receipt_time_source_and_binding_contradictions() {
             )
             .unwrap(),
             original
+        );
+    }
+}
+
+#[test]
+fn readme_current_authority_requirements_match_actual_schema() {
+    let (dir, _, _) = fixture_support::fixture();
+    let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    let version: i64 = sql
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    let readme = include_str!("../../../README.md");
+    for phrase in [
+        format!("existing initialized trusted schema-{version} authority"),
+        format!("store to schema {version}; malformed schemas"),
+        format!("Status is read-only existing-schema-{version}-authority metadata"),
+        format!("Existing-authority reads require schema {version}."),
+    ] {
+        assert!(
+            readme.contains(&phrase),
+            "stale README requirement: {phrase}"
         );
     }
 }

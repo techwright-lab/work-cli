@@ -17,6 +17,9 @@ pub struct Fixture {
 }
 impl Fixture {
     pub fn new(closed: bool, outcome: Option<RootOutcome>) -> Self {
+        Self::with_source(closed, outcome, None)
+    }
+    pub fn with_source(closed: bool, outcome: Option<RootOutcome>, source: Option<Source>) -> Self {
         let (dir, mut store, checkout) = fixture_support::fixture();
         let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
         let operation: String = sql
@@ -74,7 +77,7 @@ impl Fixture {
                 .as_ref()
                 .map(|r| r.as_str().into()),
             key_file: None,
-            source: None,
+            source,
             lifecycle: WorkLifecycle {
                 checkout_id: root.identity().checkout.clone(),
                 mode: work_contract::ExecutionMode::Supervised,
@@ -89,7 +92,7 @@ impl Fixture {
                 registry: dir.path().join("missing-registry"),
                 state: dir.path().join("state"),
                 timeout: Duration::from_secs(2),
-                response_cap: 65536,
+                response_cap: 1024 * 1024,
                 endpoint_identity: "https://receiver.invalid".into(),
                 registry_identity: "registry".into(),
                 receiver_credential_names: vec![],
