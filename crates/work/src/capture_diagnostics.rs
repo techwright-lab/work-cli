@@ -500,7 +500,7 @@ mod tests {
         }
         let events = guard.events();
         assert_eq!(events.len(), 4, "missing aggregate events at profile exit");
-        for pair in events.chunks_exact(2) {
+        for pair in events.as_chunks::<2>().0 {
             let Event::SubphaseSummary {
                 region,
                 count,
