@@ -2629,6 +2629,201 @@ fn public_history_and_finish_use_genuine_created_gap_records() {
     }
 }
 
+#[test]
+fn historical_finish_receipts_refuse_raw_gap_corruption() {
+    struct Sink(std::cell::Cell<usize>);
+    impl crate::finish::LocalSink for Sink {
+        fn freeze(&self, _: &crate::finish::CaptureContext) -> crate::finish::CaptureResult {
+            self.0.set(self.0.get() + 1);
+            crate::finish::CaptureResult::Failed
+        }
+    }
+    let mut h = ScopeHarness::new(false);
+    let report = crate::supervisor::supervise_off(
+        &h.config,
+        h.command.clone(),
+        &h.driver,
+        Some(h.io()),
+        &crate::supervisor::CancelToken::default(),
+        |boundary, root| {
+            if boundary == crate::supervisor::Boundary::RootTerminal {
+                h.empty(root);
+            }
+        },
+    )
+    .unwrap();
+    assert!(report.record.closed);
+    let root = &report.record.request;
+    // Keep a native Store alive through every raw client mutation and finish
+    // reopen: last-close WAL/SHM cleanup is not the behavior under test.
+    let store = Store::open_existing_registered_mut(
+        h.config.trusted_registry.as_ref().unwrap(),
+        h.config.store_dir.as_ref().unwrap(),
+        &h.config.roots,
+    )
+    .unwrap();
+    let finished = crate::finish::finish(&h.config, h.allocation.checkout).unwrap();
+    assert_eq!(finished.local_freeze, crate::finish::Freeze::NotConfigured);
+    assert_eq!(
+        finished.delivery,
+        Some(crate::finish::Delivery::NotConfigured)
+    );
+    assert!(finished.task_finished && finished.charge_retained && finished.lease_held);
+    let original = super::read_record(&store.conn, root).unwrap();
+    let original_bytes = super::encode(&original).unwrap();
+    let receipt = || {
+        store
+            .conn
+            .query_row("SELECT record FROM task_finishes", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+    };
+    let original_receipt = receipt();
+    let pristine = durable_rows(&store);
+    let sql = Connection::open(h.temp.path().join("private/store.sqlite")).unwrap();
+    // Fixture-only corruption, never admission, recovery or live authority.
+    sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    let stray_run = uuid::Uuid::now_v7().to_string();
+    let stray_group = uuid::Uuid::now_v7().to_string();
+    let stray_event = uuid::Uuid::now_v7().to_string();
+    let insert_stray = || {
+        sql.execute(
+            "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?4,'{}',zeroblob(32))",
+            rusqlite::params![
+                stray_run,
+                stray_group,
+                h.allocation.checkout.to_string(),
+                stray_event
+            ],
+        )
+        .unwrap();
+    };
+    let remove_stray = || {
+        assert_eq!(
+            sql.execute("DELETE FROM attribution_gaps WHERE run=?1", [&stray_run])
+                .unwrap(),
+            1
+        );
+    };
+    let replace_event = |event: &str, bytes: &str| {
+        let fingerprint = sha2::Sha256::digest(bytes.as_bytes());
+        assert_eq!(
+            sql.execute(
+                "UPDATE attribution_gaps SET event_id=?1,record=?2,fingerprint=?3 WHERE run=?4",
+                rusqlite::params![event, bytes, fingerprint.as_slice(), original.run],
+            )
+            .unwrap(),
+            1
+        );
+    };
+    let sink = Sink(std::cell::Cell::new(0));
+    let mut unexpected = Vec::new();
+    for case in ["orphan", "checkout-event-collision"] {
+        if case == "orphan" {
+            insert_stray();
+        } else {
+            let mut corrupt = original.clone();
+            corrupt.event_id = h.allocation.checkout.to_string();
+            corrupt.event = super::event(&corrupt.event_id).unwrap();
+            replace_event(&corrupt.event_id, &super::encode(&corrupt).unwrap());
+        }
+        // The genuine record still passes strict per-record checks; only raw
+        // structure/namespace validation detects the intended invalidity.
+        assert!(super::read_record(&store.conn, root).is_ok(), "{case}");
+        assert!(super::validate_raw(&store.conn).is_err(), "{case}");
+        let before = durable_rows(&store);
+        assert!(store.run_snapshot(&root.identity().run).is_err(), "{case}");
+        for integrated in [true, false] {
+            let result = if integrated {
+                crate::finish::finish(&h.config, h.allocation.checkout)
+            } else {
+                crate::finish::finish_with_sink_observed(
+                    &h.config,
+                    h.allocation.checkout,
+                    Some(&sink),
+                    |_| {},
+                )
+            };
+            if result.is_ok() {
+                unexpected.push(format!("{case}: integrated={integrated}"));
+            }
+            assert_eq!(
+                durable_rows(&store),
+                before,
+                "{case}: integrated={integrated}"
+            );
+            assert_eq!(receipt(), original_receipt);
+            assert_eq!(sink.0.get(), 0);
+        }
+        if case == "orphan" {
+            remove_stray();
+        } else {
+            replace_event(&original.event_id, &original_bytes);
+        }
+        assert_eq!(durable_rows(&store), pristine);
+        assert_eq!(
+            crate::finish::finish(&h.config, h.allocation.checkout).unwrap(),
+            finished
+        );
+    }
+    let mut late_snapshot = None;
+    let result = crate::finish::finish_with_sink_observed(
+        &h.config,
+        h.allocation.checkout,
+        Some(&sink),
+        |boundary| {
+            if boundary == "before_ack" {
+                assert!(late_snapshot.is_none());
+                assert_eq!(durable_rows(&store), pristine);
+                // Observer runs after SQL phases and the allocator lock drop.
+                // Autocommit makes the corruption visible to the final snapshot.
+                insert_stray();
+                late_snapshot = Some(durable_rows(&store));
+            }
+        },
+    );
+    if result.is_ok() {
+        unexpected.push("late-orphan: before_ack library".into());
+    }
+    assert_eq!(
+        durable_rows(&store),
+        late_snapshot.expect("reached before_ack")
+    );
+    assert_eq!(receipt(), original_receipt);
+    assert_eq!(sink.0.get(), 0);
+    remove_stray();
+    assert_eq!(durable_rows(&store), pristine);
+
+    // Existing receipts stay passive despite later selection and irrelevant
+    // missing profile/host settings and malformed current registry contents.
+    h.config.allocation.as_mut().unwrap().capture_sink = Some("devdiary".into());
+    h.config.supervisor.as_mut().unwrap().actors.clear();
+    assert!(h.config.capture.is_none());
+    std::fs::write(h.temp.path().join("registry.json"), "malformed registry").unwrap();
+    assert_eq!(
+        crate::finish::finish(&h.config, h.allocation.checkout).unwrap(),
+        finished
+    );
+    assert_eq!(
+        crate::finish::finish_with_sink_observed(
+            &h.config,
+            h.allocation.checkout,
+            Some(&sink),
+            |_| {},
+        )
+        .unwrap(),
+        finished
+    );
+    assert_eq!(sink.0.get(), 0);
+    assert_eq!(receipt(), original_receipt);
+    assert_eq!(durable_rows(&store), pristine);
+    assert!(
+        unexpected.is_empty(),
+        "historical finish acknowledged corrupt raw Gap authority: {unexpected:?}"
+    );
+}
+
 fn isolated_environment() {
     use std::os::unix::ffi::OsStrExt;
     let required = std::env::var_os("GAP_ENV_FIXTURE").unwrap() == "required";

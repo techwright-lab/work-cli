@@ -316,6 +316,7 @@ fn writer_fence(conn: &Connection, checkout: Uuid) -> Result<()> {
     if blocked {
         return Err(StoreError::Writer);
     }
+    crate::attribution_gap::validate_raw(conn)?;
     crate::run_journal::validate_enrollment_rosters(conn)
 }
 /// Trusted library-only capture seam. Production never obtains a sink from CLI,
