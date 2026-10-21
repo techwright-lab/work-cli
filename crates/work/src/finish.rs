@@ -796,7 +796,18 @@ mod tests {
         crate::run_journal::RootRunRequest,
         crate::capture_readiness::ClosureSeal,
     ) {
-        let (temp, cfg, a, root, seal) = closed_capture_case("known");
+        closed_capture_with_timeout(50)
+    }
+    fn closed_capture_with_timeout(
+        timeout_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        crate::config::Config,
+        crate::allocate::Allocation,
+        crate::run_journal::RootRunRequest,
+        crate::capture_readiness::ClosureSeal,
+    ) {
+        let (temp, cfg, a, root, seal) = closed_capture_case_with_timeout("known", timeout_ms);
         (temp, cfg, a, root, seal.unwrap())
     }
     fn closed_capture_case(
@@ -808,8 +819,20 @@ mod tests {
         crate::run_journal::RootRunRequest,
         Option<crate::capture_readiness::ClosureSeal>,
     ) {
+        closed_capture_case_with_timeout(case, 50)
+    }
+    fn closed_capture_case_with_timeout(
+        case: &str,
+        timeout_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        crate::config::Config,
+        crate::allocate::Allocation,
+        crate::run_journal::RootRunRequest,
+        Option<crate::capture_readiness::ClosureSeal>,
+    ) {
         let (temp, mut cfg, a, root, mut spec) =
-            crate::capture_preparation::tests::qualified_fixture();
+            crate::capture_preparation::tests::qualified_fixture_with_timeout(timeout_ms);
         if case == "delay" {
             cfg.capture.as_mut().unwrap().timeout_ms = 2000;
             spec = cfg
@@ -1294,7 +1317,23 @@ json.dump(json.load(open({response:?})),sys.stdout)
     #[test]
     fn held_known_capture_freezes_only_after_task_fence() {
         let _diagnostics = crate::capture_diagnostics::Guard::new();
-        let (temp, cfg, a, _root, _seal) = closed_capture();
+        let (temp, cfg, a, root, _seal) = closed_capture_with_timeout(1000);
+        assert_eq!(cfg.capture.as_ref().unwrap().timeout_ms, 1000);
+        let sql = rusqlite::Connection::open_with_flags(
+            cfg.store_dir.as_ref().unwrap().join("store.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let spec: String = sql
+            .query_row(
+                "SELECT spec FROM capture_runs WHERE run=?1",
+                [root.identity().run.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let spec: serde_json::Value = serde_json::from_str(&spec).unwrap();
+        assert_eq!(spec["sink"]["timeout_ms"], 1000);
+        drop(sql);
         std::fs::write(temp.path().join("producer"), format!("#!/usr/bin/python3\nimport json,sqlite3,sys\nr=json.load(sys.stdin)\nc=sqlite3.connect({:?})\nassert c.execute('SELECT count(*) FROM task_finishes').fetchone()[0]==1\nassert c.execute('SELECT count(*) FROM capture_finalizations').fetchone()[0]==1\njson.dump(json.load(open({:?})),sys.stdout)\n", cfg.store_dir.as_ref().unwrap().join("store.sqlite"), temp.path().join("response"))).unwrap();
         let report = super::finish(&cfg, a.checkout).unwrap();
         assert_eq!(report.local_freeze, super::Freeze::Frozen);
