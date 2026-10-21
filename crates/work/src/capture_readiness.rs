@@ -1722,9 +1722,45 @@ pub(crate) mod tests {
         });
     }
     #[test]
+    fn ordering_fixture_timeout_is_selected_before_any_root_intent() {
+        for selected in [None, Some(1000_u64)] {
+            let (temp, cfg, _a, _root, spec) = match selected {
+                None => crate::capture_preparation::tests::qualified_fixture(),
+                Some(timeout_ms) => {
+                    crate::capture_preparation::tests::qualified_fixture_with_timeout(timeout_ms)
+                }
+            };
+            let sql = rusqlite::Connection::open(temp.path().join("private/store.sqlite")).unwrap();
+            for table in ["runs", "capture_runs"] {
+                let count: i64 = sql
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0, "fixture must not have sealed a root intent");
+            }
+            let expected = selected.unwrap_or(50);
+            assert_eq!(cfg.capture.as_ref().unwrap().timeout_ms, expected);
+            assert_eq!(
+                serde_json::to_value(&spec).unwrap()["sink"]["timeout_ms"],
+                serde_json::json!(expected)
+            );
+        }
+    }
+    #[test]
     fn captured_finish_prepares_all_intents_before_any_producer() {
         let _diagnostics = crate::capture_diagnostics::Guard::new();
-        many_closed_history(|cfg, store, a, _| {
+        // Success-path ordering qualification, not a 50ms timing qualification.
+        // Choose the approved deadline before the first Config/spec/root intent.
+        many_closed_history_with_timeout(1000, |cfg, store, a, _| {
+            crate::run_journal::with_capture_history(&store.conn, a.checkout, |history| {
+                for (_, (_, spec, _)) in history {
+                    assert_eq!(
+                        serde_json::to_value(&spec).unwrap()["sink"]["timeout_ms"],
+                        serde_json::json!(1000)
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
             store
                 .conn
                 .execute("DELETE FROM capture_finalizations", [])
@@ -1810,6 +1846,17 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
         });
     }
     pub(crate) fn many_closed_history(
+        completed: impl FnMut(
+            &crate::config::Config,
+            &Store,
+            &crate::allocate::Allocation,
+            &crate::run_journal::RootRunRequest,
+        ),
+    ) {
+        many_closed_history_with_timeout(50, completed);
+    }
+    fn many_closed_history_with_timeout(
+        timeout_ms: u64,
         mut completed: impl FnMut(
             &crate::config::Config,
             &Store,
@@ -1823,7 +1870,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             crate::capture_diagnostics::record(crate::capture_diagnostics::Event::Workload {
                 roots: count,
             });
-            let (_temp, cfg, store, a, original, seal, ack) = closed();
+            let (_temp, cfg, store, a, original, seal, ack) = closed_with_timeout(timeout_ms);
             restore(&cfg, seal, ack).unwrap();
             let template = crate::run_journal::read(&store.conn, &original.identity().run)
                 .unwrap()
@@ -2534,7 +2581,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             );
         }
     }
-    fn closed() -> (
+    type ClosedFixture = (
         tempfile::TempDir,
         crate::config::Config,
         Store,
@@ -2542,8 +2589,13 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
         crate::run_journal::RootRunRequest,
         ClosureSeal,
         crate::capture_finalization::FreezeAcknowledgement,
-    ) {
-        let (_temp, cfg, a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+    );
+    fn closed() -> ClosedFixture {
+        closed_with_timeout(50)
+    }
+    fn closed_with_timeout(timeout_ms: u64) -> ClosedFixture {
+        let (_temp, cfg, a, root, spec) =
+            crate::capture_preparation::tests::qualified_fixture_with_timeout(timeout_ms);
         let (mut store, crate::capture_preparation::PreparationResult::Live(live)) =
             crate::capture_preparation::prepare(&cfg, &root, &spec).unwrap()
         else {

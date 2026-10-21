@@ -32,8 +32,20 @@ pub(crate) fn materialized() -> (
     RootRunRequest,
     CaptureSpec,
 ) {
+    materialized_with_timeout(50)
+}
+pub(crate) fn materialized_with_timeout(
+    timeout_ms: u64,
+) -> (
+    tempfile::TempDir,
+    Config,
+    Store,
+    Allocation,
+    RootRunRequest,
+    CaptureSpec,
+) {
     let (temp, repo, root) = fixture::git_fixture();
-    let config=Config::from_text(&format!("store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\nrepositories=[{:?}]\n[allocation]\nrepository_limit=10\nowner_limit=10\nfloor_bytes=0\nwarn_bytes=0\ncapture_sink='devdiary'\n[capture]\nexecutable='/private/capture'\nregistry='/private/registry'\nstate_dir='/private/state'\ntimeout_ms=50\nresponse_cap=65536\nregistry_sha256='{}'\nendpoint_identity='receiver:fixture'\nreceiver_credential_names=['TOKEN']\n[capture.actor_refs]\nalice='actor:alice'\n[supervisor]\nruntime_directory='/private/runtime'\nbus_address='unix:path=/private/runtime/bus'\nruntime_max_seconds=60\npreexec_ms=100\nclosure_grace_ms=100\ncancel_grace_ms=100\n[supervisor.actors.alice]\nauthor_name='Alice'\nauthor_email='alice@example.invalid'\ncommitter_name='Alice'\ncommitter_email='alice@example.invalid'\n",temp.path().join("private"),temp.path().join(".work-authorities"),root,repo,"a".repeat(64))).unwrap();
+    let config=Config::from_text(&format!("store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\nrepositories=[{:?}]\n[allocation]\nrepository_limit=10\nowner_limit=10\nfloor_bytes=0\nwarn_bytes=0\ncapture_sink='devdiary'\n[capture]\nexecutable='/private/capture'\nregistry='/private/registry'\nstate_dir='/private/state'\ntimeout_ms={timeout_ms}\nresponse_cap=65536\nregistry_sha256='{}'\nendpoint_identity='receiver:fixture'\nreceiver_credential_names=['TOKEN']\n[capture.actor_refs]\nalice='actor:alice'\n[supervisor]\nruntime_directory='/private/runtime'\nbus_address='unix:path=/private/runtime/bus'\nruntime_max_seconds=60\npreexec_ms=100\nclosure_grace_ms=100\ncancel_grace_ms=100\n[supervisor.actors.alice]\nauthor_name='Alice'\nauthor_email='alice@example.invalid'\ncommitter_name='Alice'\ncommitter_email='alice@example.invalid'\n",temp.path().join("private"),temp.path().join(".work-authorities"),root,repo,"a".repeat(64))).unwrap();
     let a = crate::allocate::start(
         &config,
         crate::allocate::Start {

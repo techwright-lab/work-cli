@@ -9,7 +9,19 @@ pub(crate) fn qualified_fixture() -> (
     RootRunRequest,
     crate::capture_journal::CaptureSpec,
 ) {
-    let (temp, mut cfg, _store, a, root, old) = crate::capture_setup::tests::materialized();
+    qualified_fixture_with_timeout(50)
+}
+pub(crate) fn qualified_fixture_with_timeout(
+    timeout_ms: u64,
+) -> (
+    tempfile::TempDir,
+    Config,
+    crate::allocate::Allocation,
+    RootRunRequest,
+    crate::capture_journal::CaptureSpec,
+) {
+    let (temp, mut cfg, _store, a, root, old) =
+        crate::capture_setup::tests::materialized_with_timeout(timeout_ms);
     let mut value = serde_json::to_value(&root).unwrap();
     let bytes = b"/usr/bin/true";
     let mut hash = Sha256::new();
