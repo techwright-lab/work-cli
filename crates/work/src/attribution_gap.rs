@@ -232,6 +232,10 @@ fn event(event_id: &str) -> Result<String> {
     })
 }
 pub(crate) fn read_record(conn: &Connection, root: &RootRunRequest) -> Result<GapRecord> {
+    // Raw checkout presence wins even when the contradictory payload is invalid.
+    if capture_history_present(conn, id(&root.identity().checkout.to_string())?)? {
+        return Err(StoreError::Invalid);
+    }
     let row: Option<(String,String,String,String,Vec<u8>)> = conn.query_row(
         "SELECT group_id,checkout,event_id,record,fingerprint FROM attribution_gaps WHERE run=?1",
         [root.identity().run.to_string()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)),
@@ -391,6 +395,19 @@ fn exclude_new_event(conn: &Connection, event: &str) -> Result<()> {
         return Err(StoreError::Conflict);
     }
     Ok(())
+}
+
+pub(crate) fn capture_history_present(conn: &Connection, checkout: Uuid) -> Result<bool> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version >= 10 && crate::capture_journal::unresolved_checkout(conn, checkout)? {
+        return Ok(true);
+    }
+    Ok(version >= 13
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM capture_readiness WHERE checkout=?1)",
+            [checkout.to_string()],
+            |r| r.get(0),
+        )?)
 }
 
 pub(crate) fn raw_history(conn: &Connection, checkout: Uuid) -> Result<bool> {
@@ -818,7 +835,13 @@ pub(crate) fn begin(
     #[cfg(test)]
     tests::observe_admission("inspect", &store.conn);
     let physical = crate::capture_setup::inspect_physical(&allocation, &context.repository)?;
-    if allocation.identity.as_ref() != Some(&physical.checkout)
+    // inspect_physical delegates to Ready verification, including real Git
+    // ancestry and immutable lease/registration identity checks. Ordinary
+    // history may advance HEAD without refreshing the stored allocation. Keep
+    // pending RequiredInitial exact; both origins retain exact reinspection and
+    // release comparison against this fresh physical observation.
+    if (origin == Origin::RequiredInitial
+        && allocation.identity.as_ref() != Some(&physical.checkout))
         || physical.checkout.boot_id != root.input().boot
     {
         return Err(StoreError::Conflict);

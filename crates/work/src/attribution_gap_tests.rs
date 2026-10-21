@@ -98,6 +98,582 @@ fn materialized_mode(
     )
 }
 
+// Public capture declarations/codecs only. Injection below is deliberately
+// contradictory persisted history, never a preparation or execution capability.
+fn mixed_history_spec(
+    temp: &std::path::Path,
+    config: &crate::config::Config,
+    allocation: &crate::allocate::Allocation,
+    root: &crate::run_journal::RootRunRequest,
+) -> crate::capture_journal::CaptureSpec {
+    let operation = uuid::Uuid::now_v7();
+    let sink = crate::capture_journal::SinkSnapshot::new(crate::capture_journal::SinkSettings {
+        executable: temp.join("negative-producer"),
+        registry: temp.join("registry.json"),
+        state: temp.join("negative-state"),
+        timeout: std::time::Duration::from_millis(50),
+        response_cap: 65536,
+        endpoint_identity: "receiver:mixed-history-fixture".into(),
+        registry_identity: "fixture-registry".into(),
+        receiver_credential_names: vec!["ACTUAL_RECEIVER_TOKEN".into()],
+        registry_actor_ref: "actor:alice".into(),
+    })
+    .unwrap();
+    crate::capture_journal::CaptureSpec::new(
+        operation,
+        sink,
+        crate::capture_bridge::BeginRequest {
+            actor_ref: "actor:alice".into(),
+            run_ref: root.identity().run_ref.as_str().into(),
+            cwd: allocation.destination.clone(),
+            execution_chain: root.identity().execution_chain.clone(),
+            task_refs: vec![allocation.request.task.clone()],
+            parent_run_ref: root
+                .identity()
+                .parent_run_ref
+                .as_ref()
+                .map(|r| r.as_str().into()),
+            key_file: None,
+            source: None,
+            lifecycle: crate::capture_bridge::WorkLifecycle {
+                checkout_id: root.identity().checkout.clone(),
+                mode: work_contract::ExecutionMode::Supervised,
+                group_id: Some(root.identity().group.clone()),
+                operation_id: Some(
+                    work_contract::AllocationOperationId::parse(&operation.to_string()).unwrap(),
+                ),
+            },
+        },
+        config.supervisor.as_ref().unwrap().actors["alice"].capture_profile(),
+    )
+    .unwrap()
+}
+fn inject_unprepared_capture(
+    store: &Store,
+    root: &crate::run_journal::RootRunRequest,
+    spec: &crate::capture_journal::CaptureSpec,
+) {
+    let body = serde_json::to_string(spec).unwrap();
+    store.conn.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,'2026-10-21T00:00:00Z',1)",
+        rusqlite::params![root.identity().run.to_string(), root.identity().group.to_string(), root.identity().checkout.to_string(), spec.operation().to_string(), body, sha2::Sha256::digest(body.as_bytes()).as_slice()]).unwrap();
+}
+
+#[test]
+fn historical_gap_capture_coexistence_refuses_before_receiver() {
+    let mut violations = Vec::new();
+    for case in [
+        "mapping",
+        "bad_mapping",
+        "certificate_only",
+        "bad_gap",
+        "off_without_gap",
+    ] {
+        let (temp, config, allocation, root, argv) = materialized(true);
+        let (store, created) = super::begin(&config, &root, &argv).unwrap();
+        assert!(matches!(created, super::BeginGap::Created(_)));
+        let gap_root = store.run_snapshot(&root.identity().run).unwrap().unwrap();
+        assert!(gap_root.binding.is_none() && !gap_root.closed);
+        assert!(store
+            .capture_snapshot(&root.identity().run)
+            .unwrap()
+            .is_none());
+        assert!(crate::capture_journal::qualified(&store.conn, &gap_root)
+            .unwrap()
+            .is_none());
+        assert!(crate::capture_journal::with_qualification_batch(
+            &store.conn,
+            allocation.checkout,
+            |batch| batch.terminal(&gap_root)
+        )
+        .unwrap()
+        .is_none());
+
+        // A genuine captured sibling in the SAME authority is the isolation
+        // control; no receiver call or prepared response is needed to create it.
+        let mut start = allocation.request.clone();
+        start.operation = uuid::Uuid::now_v7();
+        start.task = "capture-control".into();
+        start.branch = Some("capture-control".into());
+        let sibling = crate::allocate::start(&config, start).unwrap();
+        let mut identity = root.identity().clone();
+        identity.checkout =
+            work_contract::CheckoutId::parse(&sibling.checkout.to_string()).unwrap();
+        identity.run = work_contract::RunId::generate();
+        identity.group = work_contract::GroupId::generate();
+        identity.run_ref = work_contract::RunRef::parse("capture-control").unwrap();
+        let mut input = root.input().clone();
+        input.attribution = None;
+        let sibling_root = crate::run_journal::RootRunRequest::new(identity, input).unwrap();
+        let sibling_spec = config
+            .capture_spec(
+                &sibling_root,
+                &sibling,
+                uuid::Uuid::now_v7(),
+                vec!["capture-control".into()],
+                None,
+            )
+            .unwrap();
+        let (_, capture) =
+            crate::capture_setup::begin(&config, &sibling_root, &sibling_spec).unwrap();
+        assert!(matches!(
+            capture,
+            crate::capture_journal::BeginCapturedRun::Created(_)
+        ));
+        let sibling_record = store
+            .run_snapshot(&sibling_root.identity().run)
+            .unwrap()
+            .unwrap();
+
+        let spec = mixed_history_spec(temp.path(), &config, &allocation, &root);
+        // Validate all public wire fields before introducing the contradiction.
+        spec.begin_request().encode().unwrap();
+        spec.expected_git().validate().unwrap();
+        executable(&temp.path().join("negative-producer"), format!("#!/bin/sh\nprintf 'begin\\n' >> '{}'\n/usr/bin/cat >/dev/null\nprintf '{{\"error\":\"fixture_refusal\"}}\\n'\nexit 1\n", temp.path().join("producer-calls").display()));
+        if case == "certificate_only" {
+            // Certificate presence alone is a raw contradiction, even with an
+            // invalid payload/missing mapping. Do not mint a fake certificate.
+            store.conn.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO capture_readiness VALUES(?1,?2,'{',0)",
+                    (
+                        allocation.checkout.to_string(),
+                        root.identity().run.to_string(),
+                    ),
+                )
+                .unwrap();
+            store.conn.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+        } else {
+            inject_unprepared_capture(&store, &root, &spec);
+            if case == "bad_mapping" {
+                store
+                    .conn
+                    .execute(
+                        "UPDATE capture_runs SET spec='{' WHERE run=?1",
+                        [root.identity().run.to_string()],
+                    )
+                    .unwrap();
+            } else if case == "bad_gap" {
+                store
+                    .conn
+                    .execute("UPDATE attribution_gaps SET record='{'", [])
+                    .unwrap();
+            } else if case == "off_without_gap" {
+                store
+                    .conn
+                    .execute("DELETE FROM attribution_gaps", [])
+                    .unwrap();
+            }
+        }
+        let before = durable_rows(&store);
+        let checks = [
+            (
+                "Gap record",
+                super::read_record(&store.conn, &root).is_err(),
+            ),
+            (
+                "public Root",
+                store.run_snapshot(&root.identity().run).is_err(),
+            ),
+            (
+                "public capture",
+                store.capture_snapshot(&root.identity().run).is_err(),
+            ),
+            (
+                "direct capture read",
+                crate::capture_journal::read(&store.conn, &gap_root).is_err(),
+            ),
+            (
+                "direct capture qualified",
+                crate::capture_journal::qualified(&store.conn, &gap_root).is_err(),
+            ),
+            (
+                "direct terminal",
+                crate::capture_journal::qualified_terminal(&store.conn, &gap_root).is_err(),
+            ),
+            (
+                "batch terminal",
+                crate::capture_journal::with_qualification_batch(
+                    &store.conn,
+                    allocation.checkout,
+                    |batch| batch.terminal(&gap_root),
+                )
+                .is_err(),
+            ),
+            (
+                "capture status",
+                crate::capture_cli::command(
+                    &config,
+                    crate::capture_cli::Command::Status {
+                        run: root.identity().run.clone(),
+                    },
+                )
+                .is_err(),
+            ),
+            (
+                "reconcile-begin command",
+                crate::capture_cli::command(
+                    &config,
+                    crate::capture_cli::Command::ReconcileBegin {
+                        run: root.identity().run.clone(),
+                    },
+                )
+                .is_err(),
+            ),
+            (
+                "direct reconcile",
+                crate::capture_recovery::reconcile(&config, &root.identity().run).is_err(),
+            ),
+            ("Existing Gap", super::begin(&config, &root, &argv).is_err()),
+        ];
+        for (route, refused) in checks {
+            if !refused {
+                violations.push(format!("{case}: {route} accepted contradiction"));
+            }
+        }
+        let calls = std::fs::read_to_string(temp.path().join("producer-calls"))
+            .unwrap_or_default()
+            .lines()
+            .count();
+        if calls != 0 {
+            violations.push(format!("{case}: producer BEGIN calls={calls}"));
+        }
+        assert_eq!(
+            durable_rows(&store),
+            before,
+            "{case}: refusal changed durable authority"
+        );
+        assert!(
+            store
+                .run_snapshot(&sibling_root.identity().run)
+                .unwrap()
+                .is_some(),
+            "{case}: unrelated Root poisoned"
+        );
+        assert!(
+            store
+                .capture_snapshot(&sibling_root.identity().run)
+                .unwrap()
+                .is_some(),
+            "{case}: unrelated capture poisoned"
+        );
+        assert!(
+            crate::capture_journal::qualified(&store.conn, &sibling_record)
+                .unwrap()
+                .is_some()
+        );
+        assert!(crate::capture_journal::with_qualification_batch(
+            &store.conn,
+            sibling.checkout,
+            |batch| batch.terminal(&sibling_record)
+        )
+        .unwrap()
+        .is_some());
+    }
+    // A default Root on a checkout with OTHER Gap history must not hide the raw
+    // checkout fence, even when that unrelated-to-the-root Gap payload is bad.
+    for bad_gap in [false, true] {
+        let h = ScopeHarness::new(false);
+        let closed = crate::supervisor::supervise_off(
+            &h.config,
+            h.command.clone(),
+            &h.driver,
+            Some(h.io()),
+            &crate::supervisor::CancelToken::default(),
+            |boundary, root| {
+                if boundary == crate::supervisor::Boundary::RootTerminal {
+                    h.empty(root);
+                }
+            },
+        )
+        .unwrap();
+        assert!(closed.record.closed);
+        let (mut store, lock) = crate::allocate::locked(&h.config).unwrap();
+        drop(lock);
+        let next = test_run_fixture::request(h.allocation.checkout);
+        store.begin_run(&next).unwrap();
+        let default_root = store.run_snapshot(&next.identity().run).unwrap().unwrap();
+        let spec = mixed_history_spec(h.temp.path(), &h.config, &h.allocation, &next);
+        inject_unprepared_capture(&store, &next, &spec);
+        if bad_gap {
+            store
+                .conn
+                .execute("UPDATE attribution_gaps SET record='{'", [])
+                .unwrap();
+        }
+        let before = durable_rows(&store);
+        for (route, refused) in [
+            (
+                "default direct",
+                crate::capture_journal::qualified(&store.conn, &default_root).is_err(),
+            ),
+            (
+                "default batch",
+                crate::capture_journal::with_qualification_batch(
+                    &store.conn,
+                    h.allocation.checkout,
+                    |batch| batch.terminal(&default_root),
+                )
+                .is_err(),
+            ),
+            (
+                "default public",
+                store.run_snapshot(&next.identity().run).is_err(),
+            ),
+        ] {
+            if !refused {
+                violations.push(format!(
+                    "other Gap bad={bad_gap}: {route} accepted contradiction"
+                ));
+            }
+        }
+        assert_eq!(durable_rows(&store), before);
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
+#[test]
+fn ordinary_off_continuation_accepts_verified_descendant_heads() {
+    for prior_ordinary in [false, true] {
+        let mut h = ScopeHarness::new(false);
+        if prior_ordinary {
+            let ordinary = crate::supervisor::supervise_with_io(
+                &h.config,
+                h.command.clone(),
+                &h.driver,
+                h.io(),
+                &crate::supervisor::CancelToken::default(),
+                |boundary, root| {
+                    if boundary == crate::supervisor::Boundary::RootTerminal {
+                        h.empty(root);
+                    }
+                },
+            )
+            .unwrap();
+            assert!(ordinary.record.closed);
+            h.command.run_id = uuid::Uuid::now_v7();
+        }
+        let closed = crate::supervisor::supervise_off(
+            &h.config,
+            h.command.clone(),
+            &h.driver,
+            Some(h.io()),
+            &crate::supervisor::CancelToken::default(),
+            |boundary, root| {
+                if boundary == crate::supervisor::Boundary::RootTerminal {
+                    h.empty(root);
+                }
+            },
+        )
+        .unwrap();
+        assert!(closed.record.closed);
+        let (store, lock) = crate::allocate::locked(&h.config).unwrap();
+        drop(lock);
+        let old = &closed.record.request;
+        let gap_bytes: String = store
+            .conn
+            .query_row(
+                "SELECT record FROM attribution_gaps WHERE run=?1",
+                [old.identity().run.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let allocation_bytes: String = store
+            .conn
+            .query_row("SELECT record FROM allocations", [], |r| r.get(0))
+            .unwrap();
+        let marker_path = h
+            .allocation
+            .identity
+            .as_ref()
+            .unwrap()
+            .private_git_dir
+            .join("work-lease.json");
+        let marker = std::fs::read(&marker_path).unwrap();
+        // Real committed descendant BEFORE admission. No Work refresh/load path
+        // or rewritten allocation HEAD may disguise this valid stale snapshot.
+        crate::identity::query(
+            &h.allocation.destination,
+            &["commit", "--allow-empty", "-m", "legitimate descendant"],
+        )
+        .unwrap();
+        let current = crate::recovery::verify(&h.allocation).unwrap();
+        assert_ne!(current.head, h.allocation.identity.as_ref().unwrap().head);
+        let mut identity = old.identity().clone();
+        identity.run = work_contract::RunId::generate();
+        identity.group = work_contract::GroupId::generate();
+        identity.run_ref = work_contract::RunRef::parse("next-off-descendant").unwrap();
+        let next = crate::run_journal::RootRunRequest::new(identity, old.input().clone()).unwrap();
+        let (_, admitted) = super::begin(&h.config, &next, &h.command.argv).expect(
+            "closed ordinary Gap history must admit a verified preexisting descendant HEAD",
+        );
+        let super::BeginGap::Created(live) = admitted else {
+            panic!("new root must carry private authority")
+        };
+        assert_eq!(live.proof.physical.checkout, current);
+        assert_eq!(live.record.delivery, super::GapDelivery::NotConfigured);
+        live.release_proof()
+            .expect("release must reverify the same descendant, not stale allocation equality");
+        assert_eq!(std::fs::read(marker_path).unwrap(), marker);
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT record FROM allocations", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            allocation_bytes
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT record FROM attribution_gaps WHERE run=?1",
+                    [old.identity().run.to_string()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            gap_bytes
+        );
+        assert_eq!(
+            store.run_snapshot(&old.identity().run).unwrap().unwrap(),
+            closed.record
+        );
+        assert_eq!(
+            store
+                .charged(h.allocation.request.repository.as_ref().unwrap(), None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM capture_runs", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        // New private release proof still fences drift after successful admission.
+        crate::identity::query(
+            &h.allocation.destination,
+            &["commit", "--allow-empty", "-m", "after admission"],
+        )
+        .unwrap();
+        assert!(live.release_proof().is_err());
+    }
+    for case in [
+        "pending_head",
+        "non_descendant",
+        "rewind",
+        "directory",
+        "branch",
+        "marker",
+        "root_boot",
+        "during_reinspection",
+    ] {
+        let (_temp, config, mut allocation, mut root, argv) = materialized(case == "pending_head");
+        if case == "rewind" {
+            // Allocate a NEW disposable checkout at a commit with a real parent;
+            // rewind below its stored head without rewriting any lease evidence.
+            let repository = allocation.request.repository.as_ref().unwrap();
+            crate::identity::query(
+                repository,
+                &["commit", "--allow-empty", "-m", "new allocation base"],
+            )
+            .unwrap();
+            let mut start = allocation.request.clone();
+            start.operation = uuid::Uuid::now_v7();
+            start.task = "rewind-control".into();
+            start.branch = Some("rewind-control".into());
+            allocation = crate::allocate::start(&config, start).unwrap();
+            let mut identity = root.identity().clone();
+            identity.checkout =
+                work_contract::CheckoutId::parse(&allocation.checkout.to_string()).unwrap();
+            root = crate::run_journal::RootRunRequest::new(identity, root.input().clone()).unwrap();
+            let parent =
+                crate::identity::query(&allocation.destination, &["rev-parse", "HEAD^"]).unwrap();
+            crate::identity::query(&allocation.destination, &["update-ref", "HEAD", &parent])
+                .unwrap();
+        } else if case == "non_descendant" {
+            let tree =
+                crate::identity::query(&allocation.destination, &["rev-parse", "HEAD^{tree}"])
+                    .unwrap();
+            let unrelated = crate::identity::query(
+                &allocation.destination,
+                &["commit-tree", &tree, "-m", "unrelated root"],
+            )
+            .unwrap();
+            crate::identity::query(&allocation.destination, &["update-ref", "HEAD", &unrelated])
+                .unwrap();
+        } else {
+            crate::identity::query(
+                &allocation.destination,
+                &["commit", "--allow-empty", "-m", "preexisting descendant"],
+            )
+            .unwrap();
+            match case {
+                "directory" => physical_fixture::replace_directory(&allocation.destination),
+                "branch" => {
+                    crate::identity::query(
+                        &allocation.destination,
+                        &["symbolic-ref", "HEAD", "refs/heads/main"],
+                    )
+                    .unwrap();
+                }
+                "marker" => std::fs::write(
+                    allocation
+                        .identity
+                        .as_ref()
+                        .unwrap()
+                        .private_git_dir
+                        .join("work-lease.json"),
+                    "{}",
+                )
+                .unwrap(),
+                "root_boot" => {
+                    let mut input = root.input().clone();
+                    input.boot = test_run_fixture::BOOT.into();
+                    assert_ne!(input.boot, allocation.identity.as_ref().unwrap().boot_id);
+                    root = crate::run_journal::RootRunRequest::new(root.identity().clone(), input)
+                        .unwrap();
+                }
+                _ => (),
+            }
+        }
+        let reinspections = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = reinspections.clone();
+        let path = allocation.destination.clone();
+        let _observer = observing_admission(move |stage, _| {
+            if stage == "reinspect" && case == "during_reinspection" {
+                count.set(count.get() + 1);
+                crate::identity::query(
+                    &path,
+                    &["commit", "--allow-empty", "-m", "concurrent descendant"],
+                )
+                .unwrap();
+            }
+        });
+        let (store, lock) = crate::allocate::locked(&config).unwrap();
+        drop(lock);
+        let before = durable_rows(&store);
+        assert!(
+            super::begin(&config, &root, &argv).is_err(),
+            "{case} must refuse"
+        );
+        assert_eq!(durable_rows(&store), before, "{case} changed authority");
+        if case == "during_reinspection" {
+            assert_eq!(reinspections.get(), 1);
+        }
+    }
+}
+
 #[test]
 fn atomic_queue_creation_and_existing_are_not_live() {
     {

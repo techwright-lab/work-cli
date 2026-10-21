@@ -335,6 +335,9 @@ impl CaptureSpec {
         Ok(row.allocation)
     }
     fn agrees_with(&self, row: &AgreementRow, r: &RootRunRequest) -> Result<()> {
+        if r.input().attribution.is_some() {
+            return Err(StoreError::Invalid);
+        }
         let d = &self.declaration;
         let i = r.identity();
         let AgreementRow {
@@ -1024,8 +1027,8 @@ pub(crate) fn qualified_terminal(
     conn: &Connection,
     root: &RunRecord,
 ) -> Result<Option<QualifiedTerminal>> {
-    qualify_terminal(conn, root, |spec| {
-        spec.agrees(conn, &root.request).map(|_| ())
+    with_qualification_batch(conn, id(&root.request.identity().checkout)?, |batch| {
+        batch.terminal(root)
     })
 }
 // The batch can only be constructed inside its own nested read snapshot. Its
@@ -1041,6 +1044,15 @@ pub(crate) fn with_qualification_batch<T>(
     use_batch: impl FnOnce(&mut QualificationBatch<'_>) -> Result<T>,
 ) -> Result<T> {
     let _snapshot = crate::run_journal::read_transaction(conn)?;
+    // Optional qualification also visits genuine Gap roots with no capture
+    // authority. Only raw coexistence is invalid. Scan target marker history
+    // once per snapshot-local batch, never once per root in the history fold;
+    // unrelated Gap payloads are neither selected nor decoded.
+    if crate::attribution_gap::capture_history_present(conn, checkout)?
+        && crate::attribution_gap::raw_history(conn, checkout)?
+    {
+        return Err(StoreError::Invalid);
+    }
     use_batch(&mut QualificationBatch {
         conn,
         checkout,
