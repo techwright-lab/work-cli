@@ -62,6 +62,101 @@ impl SupervisorConfig {
         Ok(())
     }
 }
+/// One immutable invocation snapshot, not execution or recovery authority.
+pub(crate) struct ConfigDocument {
+    value: toml::Value,
+}
+impl ConfigDocument {
+    pub(crate) fn load() -> Result<Self, Error> {
+        let text = Config::read_text()?.unwrap_or_default();
+        Self::from_text(&text)
+    }
+    pub(crate) fn from_text(text: &str) -> Result<Self, Error> {
+        Ok(Self {
+            value: parse_toml(text)?,
+        })
+    }
+    pub(crate) fn authority(&self) -> Result<Config, Error> {
+        Ok(Config {
+            store_dir: single_path(&self.value, "store_dir")?,
+            trusted_registry: single_path(&self.value, "trusted_registry")?,
+            roots: many_paths(&self.value, "roots")?,
+            ..Config::default()
+        })
+    }
+    pub(crate) fn execution(&self) -> Result<Config, Error> {
+        Config::from_value(&self.value)
+    }
+    pub(crate) fn recovery_target(
+        &self,
+    ) -> Result<Option<crate::capture_config::HostCaptureConfig>, Error> {
+        let policy: Option<AllocationPolicy> = self
+            .value
+            .get("allocation")
+            .map(|v| {
+                v.clone()
+                    .try_into()
+                    .map_err(|_| Error::Config("invalid allocation policy".into()))
+            })
+            .transpose()?;
+        match policy.as_ref().and_then(|p| p.capture_sink.as_deref()) {
+            None => Ok(None),
+            Some("devdiary") => {
+                let host: crate::capture_config::HostCaptureConfig = self
+                    .value
+                    .get("capture")
+                    .ok_or_else(|| Error::Config("invalid capture policy".into()))?
+                    .clone()
+                    .try_into()
+                    .map_err(|_| Error::Config("invalid capture policy".into()))?;
+                host.validate()?;
+                Ok(Some(host))
+            }
+            _ => Err(Error::Config("invalid capture policy".into())),
+        }
+    }
+    pub(crate) fn recovery_runtime(&self) -> Result<RecoveryRuntime, Error> {
+        let invalid = || Error::Config("invalid supervisor policy".into());
+        let wire: RecoveryRuntimeWire = self
+            .value
+            .get("supervisor")
+            .ok_or_else(invalid)?
+            .clone()
+            .try_into()
+            .map_err(|_| invalid())?;
+        if !(1..=86_400).contains(&wire.runtime_max_seconds)
+            || !(1..=30_000).contains(&wire.preexec_ms)
+            || !(1..=30_000).contains(&wire.closure_grace_ms)
+            || !(1..=30_000).contains(&wire.cancel_grace_ms)
+            || wire.bus_address
+                != format!("unix:path={}", wire.runtime_directory.join("bus").display())
+        {
+            return Err(invalid());
+        }
+        validate_path(&wire.runtime_directory, false).map_err(|_| invalid())?;
+        Ok(RecoveryRuntime {
+            runtime_directory: wire.runtime_directory,
+            bus_address: wire.bus_address,
+        })
+    }
+}
+/// Removal-independent runtime declarations; never an execution Config carrier.
+pub(crate) struct RecoveryRuntime {
+    pub(crate) runtime_directory: PathBuf,
+    pub(crate) bus_address: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryRuntimeWire {
+    runtime_directory: PathBuf,
+    bus_address: String,
+    runtime_max_seconds: u64,
+    preexec_ms: u64,
+    closure_grace_ms: u64,
+    cancel_grace_ms: u64,
+    #[serde(rename = "actors")]
+    _actors: Option<serde::de::IgnoredAny>,
+}
 impl Config {
     /// Parse host configuration without filesystem initialization or diagnostic values.
     pub fn from_text(text: &str) -> Result<Self, Error> {
@@ -76,16 +171,7 @@ impl Config {
 
     /// Historical capture operations use sealed policies, not current execution declarations.
     pub(crate) fn load_capture_authority() -> Result<Self, Error> {
-        let Some(text) = Self::read_text()? else {
-            return Ok(Self::default());
-        };
-        let value = parse_toml(&text)?;
-        Ok(Self {
-            store_dir: single_path(&value, "store_dir")?,
-            trusted_registry: single_path(&value, "trusted_registry")?,
-            roots: many_paths(&value, "roots")?,
-            ..Self::default()
-        })
+        ConfigDocument::load()?.authority()
     }
 
     fn read_text() -> Result<Option<String>, Error> {
@@ -136,12 +222,14 @@ impl Config {
     }
 
     fn from_toml(text: &str) -> Result<Self, Error> {
-        let value = parse_toml(text)?;
+        Self::from_value(&parse_toml(text)?)
+    }
+    fn from_value(value: &toml::Value) -> Result<Self, Error> {
         Ok(Self {
-            store_dir: single_path(&value, "store_dir")?,
-            trusted_registry: single_path(&value, "trusted_registry")?,
-            roots: many_paths(&value, "roots")?,
-            repositories: many_paths(&value, "repositories")?,
+            store_dir: single_path(value, "store_dir")?,
+            trusted_registry: single_path(value, "trusted_registry")?,
+            roots: many_paths(value, "roots")?,
+            repositories: many_paths(value, "repositories")?,
             supervisor: value
                 .get("supervisor")
                 .map(|v| {

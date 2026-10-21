@@ -12,6 +12,29 @@ use work_cli::{
     run_journal::RootRunRequest,
 };
 const CAPTURE: &str = "550e8400-e29b-41d4-a716-446655440001";
+
+#[test]
+fn off_marker_refuses_before_preparation_artifacts() {
+    let mut h = Harness::new();
+    let mut value = serde_json::to_value(&h.root).unwrap();
+    value["input"]["attribution"] = "off".into();
+    let off: RootRunRequest = serde_json::from_value(value).unwrap();
+    let untouched = h.f.temp.path().join("must-not-create-authority");
+    h.cfg.store_dir = Some(untouched.clone());
+    h.cfg.trusted_registry = Some(h.f.temp.path().join("must-not-create-registry"));
+    let mut calls = 0;
+    assert!(
+        capture_preparation::prepare_observed(&h.cfg, &off, &h.spec, |_, _| calls += 1).is_err()
+    );
+    assert_eq!(calls, 0);
+    assert!(
+        !untouched.exists(),
+        "Off must refuse before opening/creating authority artifacts"
+    );
+    assert!(!h.cfg.trusted_registry.as_ref().unwrap().exists());
+    assert!(!h.f.temp.path().join("calls").exists());
+}
+
 struct Harness {
     f: Fixture,
     cfg: Config,

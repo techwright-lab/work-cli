@@ -115,6 +115,28 @@ pub struct AttributedCommand<'a> {
     pub argv: &'a [OsString],
     pub git: &'a ActorGitProfile,
 }
+enum LaunchGuard {
+    Ordinary,
+    Captured(crate::capture_preparation::CapturedGuard),
+    Gap(crate::attribution_gap::GapGuard),
+}
+enum ReleaseProof<'a> {
+    Ordinary,
+    Captured(&'a crate::capture_preparation::CapturedReleaseProof),
+    Gap(&'a crate::attribution_gap::GapReleaseProof),
+}
+impl ReleaseProof<'_> {
+    fn validate(&self, guard: &LaunchGuard) -> Result<()> {
+        match (self, guard) {
+            (Self::Ordinary, LaunchGuard::Ordinary) => Ok(()),
+            (Self::Captured(proof), LaunchGuard::Captured(guard)) => {
+                proof.validate(guard).and_then(|()| proof.fresh())
+            }
+            (Self::Gap(proof), LaunchGuard::Gap(guard)) => proof.validate(guard).map_err(|_| HOLD),
+            _ => Err(HOLD),
+        }
+    }
+}
 pub struct OwnedLaunch {
     gate: GuardedLaunch,
     child: Option<Child>,
@@ -122,7 +144,7 @@ pub struct OwnedLaunch {
     deadline: Instant,
     /// Set BEFORE publication: an fsync failure may still have exposed a permit.
     permit_attempted: bool,
-    capture_guard: Option<crate::capture_preparation::CapturedGuard>,
+    guard: LaunchGuard,
 }
 impl OwnedLaunch {
     /// Fixed production tools and real controller birth/boot identity. Inherited
@@ -185,6 +207,37 @@ impl OwnedLaunch {
             Some(command.git),
             None,
         )
+    }
+    pub(crate) fn spawn_gap(
+        driver: &Driver,
+        intent: LaunchIntent,
+        directory: &Path,
+        command: AttributedCommand<'_>,
+        policy: LaunchPolicy,
+        io: Option<LaunchIo>,
+        live: &crate::attribution_gap::CreatedOffLive,
+    ) -> Result<Self> {
+        live.validate_launch(&intent, &command).map_err(|_| HOLD)?;
+        let io = match io {
+            Some(io) => io,
+            None => LaunchIo {
+                systemd_run: "/usr/bin/systemd-run".into(),
+                self_binary: std::env::current_exe().map_err(|_| HOLD)?,
+            },
+        };
+        let mut launch = Self::spawn_inner(
+            driver,
+            intent,
+            directory,
+            command.cwd,
+            command.argv,
+            policy,
+            io,
+            Some(command.git),
+            None,
+        )?;
+        launch.guard = LaunchGuard::Gap(live.guard());
+        Ok(launch)
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_captured(
@@ -317,7 +370,9 @@ impl OwnedLaunch {
             pid,
             deadline,
             permit_attempted: false,
-            capture_guard: capture.map(|live| live.guard()),
+            guard: capture
+                .map(|live| LaunchGuard::Captured(live.guard()))
+                .unwrap_or(LaunchGuard::Ordinary),
         })
     }
     pub fn pid(&self) -> u32 {
@@ -354,30 +409,25 @@ impl OwnedLaunch {
         self.check_owned()
     }
     pub fn release(&mut self, driver: &Driver) -> Result<()> {
-        if self.capture_guard.is_some() {
-            return self.preexec_result(Err(HOLD));
-        }
-        self.release_inner(driver, None)
+        self.release_inner(driver, ReleaseProof::Ordinary)
     }
     pub(crate) fn release_captured(
         &mut self,
         driver: &Driver,
         proof: crate::capture_preparation::CapturedReleaseProof,
     ) -> Result<()> {
-        let checked = self
-            .capture_guard
-            .as_ref()
-            .ok_or(HOLD)
-            .and_then(|guard| proof.validate(guard))
-            .and_then(|()| proof.fresh());
-        self.preexec_result(checked)?;
-        self.release_inner(driver, Some(&proof))
+        self.release_inner(driver, ReleaseProof::Captured(&proof))
     }
-    fn release_inner(
+    pub(crate) fn release_gap(
         &mut self,
         driver: &Driver,
-        proof: Option<&crate::capture_preparation::CapturedReleaseProof>,
+        proof: crate::attribution_gap::GapReleaseProof,
     ) -> Result<()> {
+        self.release_inner(driver, ReleaseProof::Gap(&proof))
+    }
+    fn release_inner(&mut self, driver: &Driver, proof: ReleaseProof<'_>) -> Result<()> {
+        let checked = proof.validate(&self.guard);
+        self.preexec_result(checked)?;
         if self.permit_attempted {
             return Err(HOLD);
         }
@@ -388,15 +438,8 @@ impl OwnedLaunch {
         let result = self.gate.validate_release(driver);
         self.preexec_result(result)?;
         self.check_owned()?;
-        if let Some(proof) = proof {
-            let checked = self
-                .capture_guard
-                .as_ref()
-                .ok_or(HOLD)
-                .and_then(|guard| proof.validate(guard))
-                .and_then(|()| proof.fresh());
-            self.preexec_result(checked)?;
-        }
+        let checked = proof.validate(&self.guard);
+        self.preexec_result(checked)?;
         self.permit_attempted = true;
         self.gate.publish_release()
     }

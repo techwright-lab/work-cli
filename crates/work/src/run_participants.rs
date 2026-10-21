@@ -347,7 +347,8 @@ pub(crate) fn validate_orphans(conn: &rusqlite::Connection) -> Result<()> {
     }
 }
 fn namespace_conflict(conn: &rusqlite::Connection, request: &ChildRequest) -> Result<bool> {
-    if crate::finish::operation_reserved(conn, &request.run.to_string())?
+    if crate::attribution_gap::event_reserved(conn, &request.run.to_string())?
+        || crate::finish::operation_reserved(conn, &request.run.to_string())?
         || crate::capture_journal::operation_reserved(conn, &request.run.to_string())?
     {
         return Ok(true);

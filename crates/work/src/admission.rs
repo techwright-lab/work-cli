@@ -112,6 +112,10 @@ impl Store {
             return Err(StoreError::Capacity);
         }
         let checkout = Uuid::now_v7();
+        #[cfg(test)]
+        let checkout = candidate_fixture::CHECKOUT
+            .with(|slot| slot.take())
+            .unwrap_or(checkout);
         exclude_journal_identity(&tx, checkout)?;
         let reserved: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1)
@@ -145,5 +149,11 @@ impl Store {
         }
         tx.commit()?;
         Ok(checkout)
+    }
+}
+#[cfg(test)]
+pub(crate) mod candidate_fixture {
+    thread_local! {
+        pub(crate) static CHECKOUT: std::cell::Cell<Option<uuid::Uuid>> = const { std::cell::Cell::new(None) };
     }
 }

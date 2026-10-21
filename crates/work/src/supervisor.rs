@@ -9,6 +9,7 @@
 //! indefinitely. Released roots retain an owned reaper on drop (see scope_spawn).
 //! Interactive TTY/job-control is not qualified: CLI refuses terminal stdio rather
 //! than moving a foreground protocol into a background process group silently.
+pub use crate::attribution_gap::{GapDelivery, GapObservation};
 use crate::{
     allocate::{self, db, err, verified_checkout},
     config::{Config, SupervisorConfig},
@@ -37,6 +38,9 @@ use work_contract::{ActorId, ChainText, CheckoutId, ExecutionChain, GroupId, Run
 #[derive(Debug, clap::Args)]
 pub struct Run {
     pub checkout: Uuid,
+    /// Explicit per-run non-session Gap intent; delivery transport is deferred
+    #[arg(long, value_enum)]
+    pub attribution: Option<crate::run_journal::AttributionDecision>,
     #[arg(long)]
     pub actor: Option<String>,
     #[arg(long)]
@@ -78,6 +82,7 @@ pub enum Boundary {
 }
 #[derive(Debug)]
 pub struct RunReport {
+    pub gap: Option<GapObservation>,
     pub record: RunRecord,
     pub existing: bool,
     pub exit_code: Option<i32>,
@@ -185,6 +190,7 @@ fn request(
             execution_chain: command.execution_chain.clone(),
         },
         RunInput {
+            attribution: None,
             command_digest,
             input_digest,
             context_ref: match existing {
@@ -228,13 +234,19 @@ fn report(
             crate::capture_bridge::DeliveryObservation::Pending
         }
     });
-    let attribution_not_configured = !mapped
+    let gap = db(crate::attribution_gap::observation(
+        &store.conn,
+        &record.request,
+    ))?;
+    let attribution_not_configured = gap.is_none()
+        && !mapped
         && db(crate::finish::capture_not_configured(
             &store.conn,
             Uuid::parse_str(&record.request.identity().checkout.to_string())
                 .map_err(|_| err("invalid checkout"))?,
         ))?;
     Ok(RunReport {
+        gap,
         record,
         existing,
         exit_code,
@@ -246,58 +258,28 @@ fn report(
         capture_delivery,
     })
 }
-/// Historical finished-task receipt, without restoring actor/runtime authority.
-pub fn existing_report(config: &Config, command: &RootCommand) -> io::Result<Option<RunReport>> {
-    let (Some(registry), Some(dir)) = (
-        config.trusted_registry.as_deref(),
-        config.store_dir.as_deref(),
-    ) else {
-        return Ok(None);
-    };
-    if !dir.exists() {
-        return Ok(None);
-    }
-    let store = db(Store::open_existing_registered_readonly(
-        registry,
-        dir,
-        &config.roots,
-    ))?;
-    let run = RunId::parse(&command.run_id.to_string()).map_err(|_| err("invalid run"))?;
-    let Some(record) = db(store.run_snapshot(&run))? else {
-        return Ok(None);
-    };
-    let result = report(&store, &run, true, None)?;
-    if result.task_open {
-        return Ok(None);
-    }
-    if record.request.identity().checkout.to_string() != command.checkout.to_string()
-        || command
-            .actor
-            .as_ref()
-            .is_some_and(|a| a != record.request.identity().actor.as_str())
-        || record.request.identity().execution_chain != command.execution_chain
-        || record.request.input().command_digest != command_digest(&command.argv)?
-    {
-        return Err(err("historical request conflicts"));
-    }
-    Ok(Some(result))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExpectedMode {
+    Default,
+    /// Default attribution, additionally requiring an existing capture mapping.
+    CapturedDefault,
+    Off,
 }
-/// Actual accepted backend with explicit library-only IO fixtures. Production
-/// never reads manager/launcher selectors from flags or the environment.
-pub fn supervise_with_io(
-    config: &Config,
-    command: RootCommand,
-    driver: &Driver,
-    io: LaunchIo,
-    cancel: &CancelToken,
-    observer: impl FnMut(Boundary, &RunRecord),
-) -> io::Result<RunReport> {
-    supervise(config, command, driver, Some(io), cancel, observer)
-}
-fn captured_existing_report(
+pub(crate) fn off_existing_report(
     config: &Config,
     command: &RootCommand,
-    captured_only: bool,
+) -> io::Result<Option<RunReport>> {
+    historical_report(config, command, ExpectedMode::Off)
+}
+/// Historical finished-task receipt, without restoring actor/runtime authority.
+pub fn existing_report(config: &Config, command: &RootCommand) -> io::Result<Option<RunReport>> {
+    Ok(historical_report(config, command, ExpectedMode::Default)?
+        .filter(|report| !report.task_open))
+}
+fn historical_report(
+    config: &Config,
+    command: &RootCommand,
+    expected: ExpectedMode,
 ) -> io::Result<Option<RunReport>> {
     let (Some(registry), Some(dir)) = (
         config.trusted_registry.as_deref(),
@@ -319,11 +301,17 @@ fn captured_existing_report(
     let Some(record) = db(store.run_snapshot(&run))? else {
         return Ok(None);
     };
-    if db(store.capture_snapshot(&run))?.is_none() {
-        if captured_only {
-            return Err(err("ordinary root cannot acquire capture"));
-        }
-        return Ok(None);
+    if record.request.input().attribution.is_some() != (expected == ExpectedMode::Off) {
+        return Err(err("historical attribution mode conflicts"));
+    }
+    // Qualify the existing report in the same snapshot before any route-specific
+    // refusal. Reuse it below rather than adding another history traversal.
+    let receipt = report(&store, &run, true, None)?;
+    if expected == ExpectedMode::CapturedDefault
+        && !receipt.capture_unfrozen
+        && receipt.capture_delivery.is_none()
+    {
+        return Err(err("ordinary root cannot acquire capture"));
     }
     if record.request.identity().checkout.to_string() != command.checkout.to_string()
         || command
@@ -333,9 +321,39 @@ fn captured_existing_report(
         || record.request.identity().execution_chain != command.execution_chain
         || record.request.input().command_digest != command_digest(&command.argv)?
     {
-        return Err(err("historical captured request conflicts"));
+        return Err(err("historical request conflicts"));
     }
-    report(&store, &run, true, None).map(Some)
+    Ok(Some(receipt))
+}
+/// Actual accepted backend with explicit library-only IO fixtures. Production
+/// never reads manager/launcher selectors from flags or the environment.
+pub fn supervise_with_io(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: LaunchIo,
+    cancel: &CancelToken,
+    observer: impl FnMut(Boundary, &RunRecord),
+) -> io::Result<RunReport> {
+    supervise(config, command, driver, Some(io), cancel, observer)
+}
+fn captured_existing_report(
+    config: &Config,
+    command: &RootCommand,
+    captured_only: bool,
+) -> io::Result<Option<RunReport>> {
+    let expected = if captured_only {
+        ExpectedMode::CapturedDefault
+    } else {
+        ExpectedMode::Default
+    };
+    let Some(report) = historical_report(config, command, expected)? else {
+        return Ok(None);
+    };
+    if !report.capture_unfrozen && report.capture_delivery.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(report))
 }
 /// Trusted integrated captured execution with explicit library-only IO fixtures.
 /// Changed live closure, actual FINISH acknowledgement and new physical evidence
@@ -445,8 +463,77 @@ fn supervise_captured(
         allocation,
         root,
         profile,
-        Some(live),
-        completion,
+        ExecutionMode::Captured {
+            live: Box::new(live),
+            completion,
+        },
+    )
+}
+pub(crate) fn supervise_off(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: Option<LaunchIo>,
+    cancel: &CancelToken,
+    observer: impl FnMut(Boundary, &RunRecord),
+) -> io::Result<RunReport> {
+    if let Some(report) = off_existing_report(config, &command)? {
+        return Ok(report);
+    }
+    let settings = config
+        .supervisor
+        .as_ref()
+        .ok_or_else(|| err("supervisor not configured"))?;
+    settings.policy()?;
+    let (store, lock) = allocate::locked(config)?;
+    let allocation: allocate::Allocation = {
+        let _phase = store.sql_phase();
+        let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
+        let bytes: String = allocate::sql(store.conn.query_row(
+            "SELECT record FROM allocations WHERE checkout=?1",
+            [command.checkout.to_string()],
+            |r| r.get(0),
+        ))?;
+        serde_json::from_str(&bytes).map_err(|_| err("invalid allocation"))?
+    };
+    drop(lock);
+    drop(store);
+    let actor = command
+        .actor
+        .as_deref()
+        .or(allocation.request.actor.as_deref())
+        .ok_or_else(|| err("explicit actor required"))?;
+    let profile = settings
+        .actors
+        .get(actor)
+        .ok_or_else(|| err("actor Git profile not registered"))?;
+    let default = request(&command, &allocation, actor, profile, None)?;
+    let mut input = default.input().clone();
+    input.attribution = Some(crate::run_journal::AttributionDecision::Off);
+    let root = db(RootRunRequest::new(default.identity().clone(), input))?;
+    let (store, began) = db(crate::attribution_gap::begin(config, &root, &command.argv))?;
+    let live = match began {
+        crate::attribution_gap::BeginGap::Created(live) => live,
+        crate::attribution_gap::BeginGap::Existing(committed) => {
+            let receipt = report(&store, &root.identity().run, true, None)?;
+            if receipt.gap != Some(db(committed.observation())?) {
+                return Err(err("committed Gap receipt changed"));
+            }
+            return Ok(receipt);
+        }
+    };
+    execute(
+        config,
+        command,
+        driver,
+        io,
+        cancel,
+        observer,
+        store,
+        allocation,
+        root,
+        profile,
+        ExecutionMode::Gap(live),
     )
 }
 fn supervise(
@@ -460,7 +547,7 @@ fn supervise(
     // Optional read-only finished receipt. Otherwise retain the ordinary run
     // preflight, which independently validates authority and cannot revive a
     // held finish fence (including when strict reader bookkeeping is absent).
-    if let Ok(Some(report)) = existing_report(config, &command) {
+    if let Some(report) = existing_report(config, &command)? {
         return Ok(report);
     }
     let settings = config
@@ -510,9 +597,16 @@ fn supervise(
         allocation,
         request,
         profile,
-        None,
-        CaptureCompletion::Unfrozen,
+        ExecutionMode::Ordinary,
     )
+}
+enum ExecutionMode {
+    Ordinary,
+    Captured {
+        live: Box<crate::capture_preparation::LiveCapture>,
+        completion: CaptureCompletion,
+    },
+    Gap(Box<crate::attribution_gap::CreatedOffLive>),
 }
 #[allow(clippy::too_many_arguments)] // one execution/physical-closure loop for both admission paths
 fn execute(
@@ -526,8 +620,7 @@ fn execute(
     allocation: allocate::Allocation,
     request: RootRunRequest,
     profile: &ActorGitProfile,
-    live: Option<crate::capture_preparation::LiveCapture>,
-    completion: CaptureCompletion,
+    mode: ExecutionMode,
 ) -> io::Result<RunReport> {
     let settings = config
         .supervisor
@@ -535,8 +628,16 @@ fn execute(
         .ok_or_else(|| err("supervisor not configured"))?;
     let policy = settings.policy()?;
     let run = request.identity().run.clone();
-    let captured_driver = live.as_ref().map(|live| driver.for_capture(live));
-    let driver = captured_driver.as_ref().unwrap_or(driver);
+    let (live, completion) = match &mode {
+        ExecutionMode::Captured { live, completion } => (Some(live), *completion),
+        _ => (None, CaptureCompletion::Unfrozen),
+    };
+    let owned_driver = match &mode {
+        ExecutionMode::Captured { live, .. } => Some(driver.for_capture(live)),
+        ExecutionMode::Gap(live) => Some(driver.for_gap(&live.removal_policy())),
+        ExecutionMode::Ordinary => None,
+    };
+    let driver = owned_driver.as_ref().unwrap_or(driver);
     observer(Boundary::Intent, &record(&store, &request)?);
     // Before physical closure, failures retain writer and charge. Once closure
     // commits, subsequent capture/readiness errors must never rewrite that fact.
@@ -570,11 +671,14 @@ fn execute(
             argv: &command.argv,
             git: profile,
         };
-        let mut launch = match &live {
-            Some(live) => OwnedLaunch::spawn_captured(
+        let mut launch = match &mode {
+            ExecutionMode::Captured { live, .. } => OwnedLaunch::spawn_captured(
                 driver, intent, &directory, &request, attributed, policy, io, live,
             ),
-            None => {
+            ExecutionMode::Gap(live) => {
+                OwnedLaunch::spawn_gap(driver, intent, &directory, attributed, policy, io, live)
+            }
+            ExecutionMode::Ordinary => {
                 OwnedLaunch::spawn_attributed(driver, intent, &directory, attributed, policy, io)
             }
         }
@@ -616,6 +720,10 @@ fn execute(
             if capture_proof.is_some() {
                 observer(Boundary::CapturedPreflight, &record(&store, &request)?);
             }
+            let gap_proof = match &mode {
+                ExecutionMode::Gap(live) => Some(db(live.release_proof())?),
+                _ => None,
+            };
             // Do not reconcile/revive holds at the irreversible boundary. Other
             // checkouts remain allocatable for the entire running actor lifetime.
             let (mut fresh_store, lock) = allocate::locked(config)?;
@@ -623,19 +731,34 @@ fn execute(
                 proof.validate(&live.guard()).map_err(err)?;
                 proof.fresh().map_err(err)?;
             }
-            let fresh = verified_checkout(&mut fresh_store, command.checkout)?;
-            let current = record(&fresh_store, &request)?;
-            if fresh.destination != allocation.destination
-                || current.closed
-                || current.recovery_hold
-                || current.outcome.is_some()
-                || cancel.requested()
-            {
-                return Err(err("release held"));
+            if let Some(proof) = &gap_proof {
+                db(proof.validate_current(
+                    &fresh_store,
+                    launch.binding().ok_or_else(|| err("missing binding"))?,
+                ))?;
+                if cancel.requested() {
+                    return Err(err("release held"));
+                }
+            } else {
+                let fresh = verified_checkout(&mut fresh_store, command.checkout)?;
+                let current = record(&fresh_store, &request)?;
+                if fresh.destination != allocation.destination
+                    || current.closed
+                    || current.recovery_hold
+                    || current.outcome.is_some()
+                    || cancel.requested()
+                {
+                    return Err(err("release held"));
+                }
             }
-            match capture_proof {
-                Some(proof) => launch.release_captured(driver, proof),
-                None => launch.release(driver),
+            // Every SQL guard has dropped; the allocator lease remains held through publication.
+            if let Some(proof) = gap_proof {
+                launch.release_gap(driver, proof)
+            } else {
+                match capture_proof {
+                    Some(proof) => launch.release_captured(driver, proof),
+                    None => launch.release(driver),
+                }
             }
             .map_err(err)?;
             drop(lock);
@@ -728,8 +851,9 @@ fn execute(
     }
     result
 }
-/// CLI signal handlers only request cancellation; no handler sends OS signals.
-pub fn command(config: &Config, request: Run) -> io::Result<i32> {
+fn parse_command(
+    request: Run,
+) -> io::Result<(RootCommand, Option<crate::run_journal::AttributionDecision>)> {
     if io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -740,6 +864,7 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
         .map_err(|_| err("execution chain file unreadable or oversized"))?;
     let execution_chain: ExecutionChain =
         serde_json::from_slice(&bytes).map_err(|_| err("invalid typed execution chain JSON"))?;
+    let attribution = request.attribution;
     let command = RootCommand {
         checkout: request.checkout,
         actor: request.actor,
@@ -747,11 +872,49 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
         execution_chain,
         argv: request.argv,
     };
-    if let Some(report) = captured_existing_report(config, &command, false)? {
+    Ok((command, attribution))
+}
+/// Explicit-Off history is resolved before execution policy from the same document.
+pub(crate) fn command_off_document(
+    document: &crate::config::ConfigDocument,
+    request: Run,
+) -> io::Result<i32> {
+    let (command, attribution) = parse_command(request)?;
+    if attribution != Some(crate::run_journal::AttributionDecision::Off) {
+        return Err(err("Off required"));
+    }
+    let authority = document
+        .authority()
+        .map_err(|_| err("invalid configuration"))?;
+    if let Some(report) = off_existing_report(&authority, &command)? {
         return Ok(print_report(&report));
     }
-    if let Ok(Some(report)) = existing_report(config, &command) {
-        return Ok(print_report(&report));
+    let config = document
+        .execution()
+        .map_err(|_| err("invalid configuration"))?;
+    command_parsed(&config, command, attribution)
+}
+/// CLI signal handlers only request cancellation; no handler sends OS signals.
+pub fn command(config: &Config, request: Run) -> io::Result<i32> {
+    let (command, attribution) = parse_command(request)?;
+    command_parsed(config, command, attribution)
+}
+fn command_parsed(
+    config: &Config,
+    command: RootCommand,
+    attribution: Option<crate::run_journal::AttributionDecision>,
+) -> io::Result<i32> {
+    if attribution.is_some() {
+        if let Some(report) = off_existing_report(config, &command)? {
+            return Ok(print_report(&report));
+        }
+    } else {
+        if let Some(report) = captured_existing_report(config, &command, false)? {
+            return Ok(print_report(&report));
+        }
+        if let Some(report) = existing_report(config, &command)? {
+            return Ok(print_report(&report));
+        }
     }
     let settings = config
         .supervisor
@@ -777,7 +940,9 @@ pub fn command(config: &Config, request: Run) -> io::Result<i32> {
             }
         }
     }
-    let result = if config
+    let result = if attribution.is_some() {
+        supervise_off(config, command, &driver, None, &cancel, |_, _| {})
+    } else if config
         .allocation
         .as_ref()
         .is_some_and(|a| a.capture_sink.is_some())
@@ -813,9 +978,9 @@ fn print_report(report: &RunReport) -> i32 {
         if report.lease_charged { "charged" } else { "uncharged" },
         if report.task_open { "open" } else { "finished" },
         if report.checkout_ready { "ready" } else { "not_ready" },
-        if report.capture_unfrozen { "unfrozen" } else if report.capture_delivery.is_some() { "frozen" } else { "not_configured" },
+        if report.gap.is_some() { "gap_no_session" } else if report.capture_unfrozen { "unfrozen" } else if report.capture_delivery.is_some() { "frozen" } else { "not_configured" },
         report.capture_delivery,
-        if report.attribution_not_configured {
+        if report.gap.is_some() { "off" } else if report.attribution_not_configured {
             "not_configured"
         } else {
             "configured"
@@ -823,5 +988,11 @@ fn print_report(report: &RunReport) -> i32 {
         report.existing,
         report.exit_code
     );
+    if let Some(gap) = &report.gap {
+        eprintln!("attribution_gap: event_recorded={}; event_id={}; delivery={:?}; transport_deferred={}; origin={}",gap.event_recorded,gap.event_id,gap.delivery,gap.transport_deferred,gap.origin);
+        if gap.origin == "required_initial" {
+            eprintln!("RequiredInitial: charge retained; physical closure leaves held/not_ready; next root and new finish unsupported");
+        }
+    }
     report.process_exit_code()
 }

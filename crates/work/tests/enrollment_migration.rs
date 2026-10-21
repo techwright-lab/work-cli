@@ -2,7 +2,7 @@
 mod support;
 use rusqlite::Connection;
 use support::*;
-const V7: &str = "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; ALTER TABLE run_participants RENAME TO v8_children;
+const V7: &str = "DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; ALTER TABLE run_participants RENAME TO v8_children;
 CREATE TABLE run_participants(id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES run_groups(id), run_ref TEXT NOT NULL UNIQUE, parent_run TEXT NOT NULL, request TEXT NOT NULL, enrollment TEXT NOT NULL CHECK(enrollment IN ('pending','unverified')), outcome TEXT, depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 16));
 INSERT INTO run_participants SELECT id,group_id,run_ref,parent_run,request,enrollment,outcome,depth FROM v8_children ORDER BY rowid;
 DROP TABLE v8_children; PRAGMA user_version=7;";
@@ -67,7 +67,7 @@ fn v7_to_v8_preserves_mixed_child_tree_outcomes_and_every_other_table() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
 }
 #[test]

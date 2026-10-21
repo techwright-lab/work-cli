@@ -452,6 +452,7 @@ fn cli_captured_existing_precedes_runtime_profile_receiver_and_artifacts() {
     let result = work_cli::supervisor::command(
         &h.cfg,
         Run {
+            attribution: None,
             checkout: h.command.checkout,
             actor: None,
             run_id: h.command.run_id,

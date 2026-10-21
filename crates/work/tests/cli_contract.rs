@@ -1,3 +1,6 @@
+#[path = "support/run_fixture.rs"]
+mod run_fixture;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
@@ -94,6 +97,119 @@ fn combined(output: &Output) -> String {
     let mut text = stdout_str(output);
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     text
+}
+
+#[test]
+fn attribution_off_is_per_run_and_default_remains_legacy() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct ParseRun {
+        #[command(flatten)]
+        run: work_cli::supervisor::Run,
+    }
+    let isolated = IsolatedRoot::new();
+    let help = run_work(&isolated, &["run", "--help"]);
+    assert!(help.status.success());
+    assert!(
+        stdout_str(&help).contains("--attribution"),
+        "run must expose the explicit per-invocation option"
+    );
+    assert!(!stdout_str(&run_work(&isolated, &["--help"])).contains("--attribution"));
+    let checkout = "0194aabd-aaaa-7000-8000-000000000001";
+    let run = "0194aabd-aaaa-7000-8000-000000000002";
+    let base = [
+        "fixture",
+        checkout,
+        "--run-id",
+        run,
+        "--execution-chain",
+        "chain.json",
+    ];
+    let mut args = base.to_vec();
+    args.extend(["--attribution", "off", "--", "/usr/bin/true"]);
+    let parsed = ParseRun::try_parse_from(args).unwrap();
+    assert!(format!("{:?}", parsed.run).contains("Some(Off)"));
+    let mut args = base.to_vec();
+    args.extend(["--", "/usr/bin/echo", "--attribution", "off"]);
+    let parsed = ParseRun::try_parse_from(args).unwrap();
+    assert!(format!("{:?}", parsed.run).contains("attribution: None"));
+    assert_eq!(
+        parsed.run.argv,
+        vec![
+            OsString::from("/usr/bin/echo"),
+            "--attribution".into(),
+            "off".into()
+        ]
+    );
+    for invalid in [
+        vec!["--attribution", "on"],
+        vec!["--attribution", "null"],
+        vec!["--attribution", "off", "--attribution", "off"],
+    ] {
+        let mut args = base.to_vec();
+        args.extend(invalid);
+        args.extend(["--", "/usr/bin/true"]);
+        assert!(ParseRun::try_parse_from(args).is_err());
+    }
+    assert!(!run_work(&isolated, &["--attribution", "off", "status"])
+        .status
+        .success());
+
+    // Built-work executable outer wiring: public ordinary unbound intent is
+    // passive despite irrelevant current policy. No physical Gap-success claim.
+    let (fixture, mut store, checkout) = run_fixture::fixture();
+    let root = run_fixture::request(checkout);
+    store.begin_run(&root).unwrap();
+    let config = isolated.root.join("config/work");
+    fs::create_dir(&config).unwrap();
+    fs::write(config.join("config.toml"),format!("store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\nsupervisor=false\nallocation=42\ncapture=false\n",fixture.path().join("private"),fixture.path().join(".work-authorities"),fixture.path().join("root"))).unwrap();
+    let before = store.run_snapshot(&root.identity().run).unwrap();
+    let output = run_work(&isolated, &["recover", &root.identity().run.to_string()]);
+    assert!(stdout_str(&output).contains("unbound intent: historical proof unsupported"));
+    assert_eq!(store.run_snapshot(&root.identity().run).unwrap(), before);
+
+    let chain = isolated.root.join("chain.json");
+    fs::write(
+        &chain,
+        serde_json::to_vec(&root.identity().execution_chain).unwrap(),
+    )
+    .unwrap();
+    let args = [
+        "run",
+        &checkout.to_string(),
+        "--run-id",
+        &root.identity().run.to_string(),
+        "--execution-chain",
+        chain.to_str().unwrap(),
+        "--attribution",
+        "off",
+        "--",
+        "/usr/bin/true",
+    ];
+    let output = run_work(&isolated, &args);
+    assert!(!output.status.success());
+    assert!(!combined(&output).contains("event_recorded=true"));
+    assert_eq!(store.run_snapshot(&root.identity().run).unwrap(), before);
+    // Corrupt historical marker without a record proves refusal only.
+    let sql = rusqlite::Connection::open(fixture.path().join("private/store.sqlite")).unwrap();
+    let mut value = serde_json::to_value(&root).unwrap();
+    value["input"]["attribution"] = "off".into();
+    let bytes = value.to_string();
+    sql.execute("UPDATE runs SET request=?1", [&bytes]).unwrap();
+    let output = run_work(&isolated, &args);
+    assert!(!output.status.success());
+    assert!(!combined(&output).contains("event_recorded=true"));
+    assert_eq!(
+        sql.query_row("SELECT request FROM runs", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM attribution_gaps", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]

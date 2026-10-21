@@ -774,6 +774,9 @@ impl Store {
         spec: &CaptureSpec,
         proof: Option<&crate::capture_setup::AdmissionProof<'_>>,
     ) -> Result<BeginCapturedRun> {
+        if request.input().attribution.is_some() {
+            return Err(StoreError::Invalid);
+        }
         #[cfg(test)]
         use crate::capture_diagnostics::{span, ProfileRoot, Subphase};
         #[cfg(test)]
@@ -825,6 +828,9 @@ impl Store {
         }
         #[cfg(test)]
         drop(existing_profile);
+        if crate::attribution_gap::raw_history(&tx, id(&request.identity().checkout)?)? {
+            return Err(StoreError::Invalid);
+        }
         #[cfg(test)]
         let capture_proof = span(Subphase::CaptureProof);
         if let Some((proof, related)) = admission {
@@ -845,7 +851,13 @@ impl Store {
         drop(collision_profile);
         #[cfg(test)]
         let writer_profile = span(Subphase::BeginRunWriter);
-        if crate::run_journal::begin_run_context(&tx, request, admission)? != BeginRun::Created {
+        let writer_admission = match admission {
+            Some((proof, related)) => crate::run_journal::WriterAdmission::Captured(proof, related),
+            None => crate::run_journal::WriterAdmission::Ordinary,
+        };
+        if crate::run_journal::begin_run_context(&tx, request, writer_admission)?
+            != BeginRun::Created
+        {
             return Err(StoreError::Conflict);
         }
         #[cfg(test)]
@@ -955,7 +967,9 @@ pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<b
         .query_row([operation], |r| r.get(0))?)
 }
 pub(crate) fn exclude_operation(conn: &Connection, value: &impl ToString) -> Result<()> {
-    if operation_reserved(conn, &value.to_string())? {
+    if crate::attribution_gap::event_reserved(conn, &value.to_string())?
+        || operation_reserved(conn, &value.to_string())?
+    {
         Err(StoreError::Conflict)
     } else {
         Ok(())

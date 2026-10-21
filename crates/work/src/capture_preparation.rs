@@ -190,6 +190,9 @@ pub fn prepare_observed(
     spec: &CaptureSpec,
     mut observer: impl FnMut(Boundary, &Store),
 ) -> std::io::Result<(Store, PreparationResult)> {
+    if root.input().attribution.is_some() {
+        return Err(std::io::Error::other("capture rejects Off declaration"));
+    }
     let (mut store, result) = crate::capture_setup::begin(config, root, spec)
         .map_err(|_| std::io::Error::other("capture setup refused"))?;
     let crate::capture_journal::BeginCapturedRun::Created(handle) = result else {

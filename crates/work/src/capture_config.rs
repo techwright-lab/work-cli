@@ -112,6 +112,9 @@ impl crate::config::Config {
             capture_bridge::{BeginRequest, WorkLifecycle},
             store::StoreError,
         };
+        if root.input().attribution.is_some() {
+            return Err(StoreError::Invalid);
+        }
         let host = self
             .selected_capture()
             .map_err(|_| StoreError::Invalid)?

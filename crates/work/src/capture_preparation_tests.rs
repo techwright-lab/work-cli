@@ -1,5 +1,4 @@
 use super::*;
-use crate as collector_target;
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
 pub(crate) fn qualified_fixture() -> (
@@ -153,8 +152,7 @@ fn live_launch_binding_refuses_command_root_profile_cwd_and_proof_swaps() {
     let debug = format!("{live:?}");
     assert_eq!(debug, "LiveCapture([REDACTED])");
 }
-#[path = "../tests/support/capture_collector.rs"]
-mod collector;
+use crate::test_capture_collector as collector;
 #[test]
 fn scope_fixture_child() {
     let Some(context) = std::env::var_os("B2_UNIT_CONTEXT") else {

@@ -64,6 +64,7 @@ pub fn request(checkout: Uuid) -> RootRunRequest {
             .unwrap(),
         },
         RunInput {
+            attribution: None,
             command_digest: [1; 32],
             input_digest: [2; 32],
             context_ref: ChainText::new("context".into()).unwrap(),

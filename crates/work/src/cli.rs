@@ -80,6 +80,12 @@ pub fn run() {
         eprintln!("scope child held");
         std::process::exit(1);
     }
+    dispatch_public(&args);
+}
+
+/// Shared public argv boundary; the private scope-child entry remains in `run`.
+pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
+    let argv = std::iter::once(std::ffi::OsString::from("work")).chain(args.iter().cloned());
     let cli = if args.first().is_some_and(|a| {
         a == "capture"
             || a == "finish"
@@ -89,7 +95,7 @@ pub fn run() {
             || a == "adopt"
             || a == "participant"
     }) {
-        match Cli::try_parse() {
+        match Cli::try_parse_from(argv) {
             Ok(cli) => cli,
             Err(error)
                 if matches!(
@@ -105,7 +111,7 @@ pub fn run() {
             }
         }
     } else {
-        Cli::parse()
+        Cli::parse_from(argv)
     };
     match cli.command {
         Command::Capture { command } => {
@@ -207,9 +213,17 @@ pub fn run() {
         }
         Command::Run(request) => {
             eprintln!("run: {} (retain --run-id for retries)", request.run_id);
-            let result = Config::load()
-                .map_err(|_| std::io::Error::other("invalid configuration"))
-                .and_then(|config| crate::supervisor::command(&config, request));
+            let result = if request.attribution.is_some() {
+                crate::config::ConfigDocument::load()
+                    .map_err(|_| std::io::Error::other("invalid configuration"))
+                    .and_then(|document| {
+                        crate::supervisor::command_off_document(&document, request)
+                    })
+            } else {
+                Config::load()
+                    .map_err(|_| std::io::Error::other("invalid configuration"))
+                    .and_then(|config| crate::supervisor::command(&config, request))
+            };
             match result {
                 Ok(code) => std::process::exit(code),
                 Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
@@ -243,9 +257,9 @@ pub fn run() {
             }
         }
         Command::Recover { run } => {
-            let result = Config::load()
+            let result = crate::config::ConfigDocument::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)
-                .and_then(|config| crate::run_recovery::command_recover(&config, run));
+                .and_then(|document| crate::run_recovery::command_recover_document(&document, run));
             match result {
                 Ok(state) => {
                     println!(

@@ -22,8 +22,7 @@ fn observing(observer: impl FnMut(&Connection) + 'static) -> ObserverGuard {
     PHYSICAL_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
     ObserverGuard
 }
-#[path = "../tests/support/lifecycle_regressions.rs"]
-mod fixture;
+use crate::test_lifecycle_fixture as fixture;
 pub(crate) fn materialized() -> (
     tempfile::TempDir,
     Config,

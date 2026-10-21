@@ -212,7 +212,7 @@ Only after final artifact revalidation does a private verified-observation metho
 consume the Created handle through the existing exact preparation CAS. It atomically
 promotes allocation JSON/readiness and adds an optional typed context digest/stat
 observation. That preparation increment required no change beyond schema 11;
-older preparation JSON omits this field unchanged. Current authority requires schema 13.
+older preparation JSON omits this field unchanged. Current authority requires schema 14.
 The public `record_capture_prepared` remains a metadata observer without an artifact
 claim. Failures retain tree, charge and exact writer, record the root recovery hold
 (without inventing outcome/capture ID), and return no live result. If hold persistence
@@ -298,7 +298,7 @@ work capture retry <run-id>
 ```
 
 These commands require a UUIDv7 root run and an existing registered current-schema
-(13) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
+(14) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
 They never initialize, migrate or repair an authority. Help/version are read-only;
 invalid arguments exit 2 without echoing argument values. Historical operations need
 no current supervisor, actor profile or capture selection. Their configuration loader
@@ -453,9 +453,9 @@ Reports keep observed process exit/root outcome, group closure, local freeze, de
 durable readiness, task openness and retained charge separate. Reported readiness is an
 observation, not fresh physical proof or permission to launch.
 
-Captured adopted execution, explicit attribution-off, full operator recovery,
+Captured adopted execution, complete attribution-off support, full operator recovery,
 privacy qualification and real private-CLI/HTTP contract qualification
-remain deferred. Existing credential filtering and bounded public-JSON interoperability are
+remain deferred. The bounded initial Off/local-queue increment below does not complete Task 8. Existing credential filtering and bounded public-JSON interoperability are
 not a claim that those later reviews are complete. No installation, host-policy changes,
 live manager/receiver test or production activation is implied by this implementation.
 
@@ -662,7 +662,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted schema-13 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-14 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -674,11 +674,65 @@ between operations inspecting Git or runtime state does not consume that limit.
 Neither command needs the original actor's current Git profile. Existing `work run`
 retries remain receipts/holds, not relaunches or automatic recovery.
 
+### Explicit per-run Off and local Gap queue (bounded construction increment)
+
+```sh
+work run CHECKOUT_UUID --run-id RUN_UUIDV7 --execution-chain /absolute/chain.json --attribution off -- command arg
+```
+
+The option applies to this run only. Omitting it retains the default configured/ordinary
+policy; there is no global Off default or `on` value. Public `RootCommand` and
+`AttributedCommand` shapes are unchanged. A durable Off marker is intent, not launch authority.
+
+| Supported initial class | Admission | Immutable queue | After fresh full-roster closure |
+| --- | --- | --- | --- |
+| OrdinaryUnconfigured | Current selection genuinely absent; Ready allocation; no permanent capture requirement, capture history or certificate | NoTarget / NotConfigured | Ordinary no-sink continuation and receipt-v1 finish remain possible after complete history validation |
+| RequiredInitial | First exact capture_pending allocation; permanent requirement; valid selected target; partial/not-ready; no previous run/writer/history | Configured target / Pending | Held, not-ready and charged; no next root, Ready restoration or new task-finish receipt |
+
+Other combinations refuse. Off cannot repair an uncertain captured intent, change a past
+run's mode, bypass a certificate, or mix Gap and capture history. Root exit/cancellation
+alone never releases a writer. RequiredInitial closure is not task completion.
+
+Schema 14 adds an immutable typed non-session Gap decision/local queue without rewriting
+old Root, capture, readiness, finalization, receipt or outbox bytes. Its exact public
+AttributionGap event uses `operator_attribution_off`. A separate generic
+`AttributionGapRecorded` journal notification cannot acknowledge the typed queue.
+Pending means **local intent recorded, transport deferred**, not sent or delivered.
+There is no queue consumer, acknowledgement or Delivered API, and no fabricated
+BEGIN/FINISH, capture ID, session, freeze or receiver call.
+
+Matching Off retries return the same recorded event before current execution profiles,
+registry or runtime work. Conflicts/corruption refuse rather than falling through to a new
+run. Run/status/finish observations distinguish event recording, execution, physical closure,
+charge and delivery. Status includes actual checkout state/readiness and RequiredInitial
+limitations; historical metadata never restores live launch or closure authority.
+
+Off filters verified receiver credential names plus `AGENT_ATTRIBUTION_CONTEXT`,
+`DEVDIARY_ATTRIBUTION_CONTEXT` and `DEVDIARY_CAPTURE_ID` from owned helper/actor commands.
+It preserves declared Work Git identity, unrelated raw bytes and original delegate runtime
+address presence/bytes. It never changes the caller's global environment.
+
+Recovery uses one immutable configuration-document snapshot. Strict historical validation
+and closed/unbound/unverified-host receipts precede unused target/runtime declarations.
+Open bound Gap inspection combines sealed receiver names with the current selected host's
+actual pinned registry names (complete deduplicated union at most 129); no current supervisor
+Git actor profile, producer, key value or session artifact is needed. Genuine selection None
+uses sealed names even if the old registry is gone. Unqualifiable current selection stays
+held before runtime inspection. Ordinary/captured recovery gains no new capture dependency.
+`recover_with_config` shares this removal/physical core; configuration-less library `recover`
+cannot inspect an open bound Gap. No historical metadata becomes live/release authority.
+Normal execution configuration still requires and validates execution actors.
+
+A later selected sink blocks a **new** NoTarget Gap finish before either library callbacks
+or integrated capture aggregation. Already-persisted receipts remain passive and unchanged.
+This is construction/testing only: no live private-product/systemd qualification, transport,
+retirement, deletion, uncharging, operational activation or whole-Task-8 completion.
+
 ### Explicit task finish (retirement disabled)
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8/v9/v10/v11/v12 store to schema 13; malformed schemas, missing tables, views, incorrect
+upgrade a valid v8/v9/v10/v11/v12/v13 store to schema 14; malformed schemas, missing tables, views, incorrect
 claims and non-WAL authority fail closed, without repair. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
@@ -962,7 +1016,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-schema-13-authority metadata, with
+Status is read-only existing-schema-14-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -971,7 +1025,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema 13.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 14.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned

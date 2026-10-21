@@ -556,7 +556,7 @@ fn schema_eleven_preserves_v10_capture_finish_allocation_and_outbox_bytes_withou
     };
     let before = rows();
     db.execute_batch(
-        "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10",
+        "DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10",
     )
     .unwrap();
     drop(store);
@@ -580,7 +580,7 @@ fn schema_eleven_preserves_v10_capture_finish_allocation_and_outbox_bytes_withou
         if ddl.starts_with("DROP INDEX") {db.execute_batch("CREATE INDEX capture_requirement_operation ON capture_requirements(allocation_operation)").unwrap();}
         else {db.execute_batch("DROP VIEW capture_requirements; ALTER TABLE old_requirements RENAME TO capture_requirements").unwrap();}
     }
-    db.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10; CREATE VIEW capture_requirements AS SELECT 1 AS obstruction").unwrap();
+    db.execute_batch("DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10; CREATE VIEW capture_requirements AS SELECT 1 AS obstruction").unwrap();
     assert!(work_cli::store::Store::open_registered(
         &f.temp.path().join("registry"),
         &f.temp.path().join("private"),

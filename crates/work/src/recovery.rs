@@ -36,11 +36,66 @@ impl From<&Allocation> for Marker {
     }
 }
 pub(crate) fn hold(store: &mut Store, a: &mut Allocation, reason: &str) -> io::Result<()> {
+    let _phase = store.sql_phase();
+    {
+        let tx = allocate::sql(
+            store
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate),
+        )?;
+        if allocate::db(crate::attribution_gap::required_origin(&tx, a.checkout))? {
+            let (state,record,finished):(String,String,bool)=allocate::sql(tx.query_row(
+                "SELECT c.state,a.record,EXISTS(SELECT 1 FROM task_finishes WHERE checkout=c.id) FROM checkouts c JOIN allocations a ON a.checkout=c.id WHERE c.id=?1",
+                [a.checkout.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+            ))?;
+            if finished || !matches!(state.as_str(), "active" | "partial" | "held") {
+                return Ok(());
+            }
+            let mut current: Allocation = serde_json::from_str(&record)?;
+            if current
+                .reason
+                .as_deref()
+                .is_none_or(|r| r == "capture required; root preparation pending")
+            {
+                current.reason = Some(reason.into());
+            }
+            let updated = serde_json::to_string(&current)?;
+            if state != "held" || updated != record {
+                allocate::sql(tx.execute(
+                    "UPDATE checkouts SET state='held',ready=0 WHERE id=?1",
+                    [a.checkout.to_string()],
+                ))?;
+                allocate::sql(tx.execute(
+                    "UPDATE allocations SET record=?2 WHERE checkout=?1",
+                    (a.checkout.to_string(), updated),
+                ))?;
+                allocate::db(crate::store::emit(
+                    &tx,
+                    &crate::events::Event::AllocationStage {
+                        checkout: a.checkout,
+                        operation: current.request.operation,
+                        stage: current.stage.clone(),
+                        reason: current.reason.clone(),
+                    },
+                ))?;
+            }
+            allocate::sql(tx.commit())?;
+            *a = current;
+            return Ok(());
+        }
+    }
     a.stage = "held".into();
     a.reason = Some(reason.into());
     allocate::save(store, a)
 }
 pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()> {
+    {
+        let _phase = store.sql_phase();
+        allocate::db(crate::attribution_gap::guard_legacy_allocation(
+            &store.conn,
+            a.checkout,
+        ))?;
+    }
     let required =
         allocate::db(crate::capture_requirement::read(&store.conn, a.checkout))?.is_some();
     if required

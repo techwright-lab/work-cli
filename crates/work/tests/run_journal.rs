@@ -10,6 +10,105 @@ mod fixture_support;
 use fixture_support::*;
 
 #[test]
+fn attribution_marker_preserves_legacy_shapes_and_rejects_positional_marker() {
+    use serde_json::{json, Value};
+    use sha2::{Digest, Sha256};
+
+    let original = request(Uuid::now_v7());
+    let canonical = serde_json::to_vec(&original).unwrap();
+    let digest = Sha256::digest(&canonical);
+    let object = serde_json::to_value(&original).unwrap();
+    let input = &object["input"];
+    assert!(input.get("attribution").is_none());
+    let legacy_input = json!([
+        input["command_digest"],
+        input["input_digest"],
+        input["context_ref"],
+        input["intent_ref"],
+        input["boot"]
+    ]);
+    let identity = &object["identity"];
+    let legacy_identity = json!([
+        identity["checkout"],
+        identity["group"],
+        identity["run"],
+        identity["run_ref"],
+        identity["actor"],
+        identity["parent_run_ref"],
+        identity["execution_chain"]
+    ]);
+    for identity in [identity.clone(), legacy_identity] {
+        for input in [input.clone(), legacy_input.clone()] {
+            for outer in [
+                json!({"identity":identity,"input":input}),
+                json!([identity, input]),
+            ] {
+                let decoded: RootRunRequest = serde_json::from_value(outer).unwrap();
+                assert_eq!(decoded, original);
+                let encoded = serde_json::to_vec(&decoded).unwrap();
+                assert_eq!(encoded, canonical);
+                assert_eq!(Sha256::digest(&encoded), digest);
+            }
+        }
+    }
+    let mut off = object.clone();
+    off["input"]["attribution"] = json!("off");
+    let decoded: RootRunRequest = serde_json::from_value(off.clone())
+        .expect("map-only off declaration must decode without granting authority");
+    assert_eq!(serde_json::to_value(decoded).unwrap(), off);
+    for marker in [
+        Value::Null,
+        json!("on"),
+        json!("unknown"),
+        json!(true),
+        json!(1),
+        json!({}),
+        json!({"off":null}),
+        json!([]),
+    ] {
+        let mut invalid = object.clone();
+        invalid["input"]["attribution"] = marker;
+        assert!(serde_json::from_value::<RootRunRequest>(invalid).is_err());
+    }
+    let input_text = serde_json::to_string(input).unwrap();
+    let duplicate = format!(
+        "{},\"attribution\":\"off\",\"attribution\":\"off\"}}",
+        input_text.strip_suffix('}').unwrap()
+    );
+    let duplicate = format!(
+        "{{\"identity\":{},\"input\":{duplicate}}}",
+        serde_json::to_string(identity).unwrap()
+    );
+    assert!(serde_json::from_str::<RootRunRequest>(&duplicate).is_err());
+    for sixth in [
+        json!("off"),
+        Value::Null,
+        json!(false),
+        json!(0),
+        json!({}),
+        json!([]),
+    ] {
+        let mut sequence = legacy_input.as_array().unwrap().clone();
+        sequence.push(sixth);
+        let mut invalid = object.clone();
+        invalid["input"] = json!(sequence);
+        assert!(serde_json::from_value::<RootRunRequest>(invalid).is_err());
+    }
+    for length in 0..5 {
+        let mut invalid = object.clone();
+        invalid["input"] = json!(&legacy_input.as_array().unwrap()[..length]);
+        assert!(serde_json::from_value::<RootRunRequest>(invalid).is_err());
+    }
+    for index in 0..5 {
+        let mut invalid = object.clone();
+        let mut sequence = legacy_input.as_array().unwrap().clone();
+        sequence[index] = Value::Null;
+        invalid["input"] = json!(sequence);
+        assert!(serde_json::from_value::<RootRunRequest>(invalid).is_err());
+    }
+}
+
+#[test]
 fn lifecycle_sql_budget_does_not_charge_later_accounting_for_idle_time() {
     let (dir, mut store, checkout) = fixture();
     let root = dir.path().join("root");
@@ -300,7 +399,7 @@ fn v4_migration_preserves_runs_and_fails_closed_on_missing_v5_state() {
     };
     drop(store);
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
+    sql.execute_batch("DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
         .unwrap();
     assert!(
         report().is_ok(),
@@ -460,7 +559,7 @@ fn closure_schema_preserves_existing_charges_and_writer() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     assert_eq!(
         sql.query_row("SELECT closed FROM run_groups", [], |row| row
@@ -793,7 +892,7 @@ fn report_rejects_missing_older_versioned_tables_and_views_are_not_journals() {
             r.get::<_, i64>(0)
         })
         .unwrap();
-    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP VIEW runs; ALTER TABLE saved_runs RENAME TO runs; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3;").unwrap();
+    sql.execute_batch("DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP VIEW runs; ALTER TABLE saved_runs RENAME TO runs; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3;").unwrap();
     work_cli::store::report_existing(
         &dir.path().join(".work-authorities"),
         &dir.path().join("private"),
@@ -947,7 +1046,7 @@ fn old_schemas_preserve_charges_outbox_legacy_writers_and_aliases() {
             [dir.path().join("root").to_str().unwrap()],
         )
         .unwrap();
-        sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups;")
+        sql.execute_batch("DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups;")
             .unwrap();
         if version < 3 {
             sql.execute_batch("DROP TABLE repository_aliases").unwrap();
@@ -1001,7 +1100,7 @@ fn old_schemas_preserve_charges_outbox_legacy_writers_and_aliases() {
 fn failed_migration_rolls_back_new_tables_and_version_without_repairing_old_loss() {
     let (dir, store, _) = fixture();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; PRAGMA user_version=3").unwrap();
+    sql.execute_batch("DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; PRAGMA user_version=3").unwrap();
     drop(store);
     assert!(reopen(&dir).is_err());
     let version: i64 = sql
@@ -1026,7 +1125,7 @@ fn schema_five_is_durable_and_missing_versioned_tables_fail_closed() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 13,
+        version, 14,
         "positive child enrollment requires a durable v8 migration"
     );
     for table in ["run_groups", "runs"] {

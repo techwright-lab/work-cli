@@ -264,7 +264,7 @@ fn operation_statement_safety_reads_fresh_versions_rows_and_schema_errors() {
     .unwrap();
     conn.execute("INSERT INTO capture_runs SELECT id,group_id,?1,?2,'{malformed',zeroblob(32),'2026-01-01T00:00:00Z',1,NULL,NULL FROM runs", (child.checkout.to_string(), &operation)).unwrap();
     let changes = conn.total_changes();
-    for version in [13, 8, 9, 10, 8, 13] {
+    for version in [14, 8, 9, 10, 8, 14] {
         conn.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(
             crate::finish::operation_reserved(conn, &operation).unwrap(),

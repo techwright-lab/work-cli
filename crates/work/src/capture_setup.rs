@@ -27,6 +27,9 @@ pub fn begin(
     request: &RootRunRequest,
     spec: &CaptureSpec,
 ) -> std::io::Result<(Store, BeginCapturedRun)> {
+    if request.input().attribution.is_some() {
+        return Err(crate::allocate::err("capture rejects Off declaration"));
+    }
     let (mut store, lock) = crate::allocate::locked(config)?;
     // Exact historical receipts use their sealed settings, with no FS refresh,
     // current actor/profile requirement or new preparation capability.

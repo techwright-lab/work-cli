@@ -19,6 +19,35 @@ fn config(f: &Fixture) -> Config {
     Config::from_text(&std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap()).unwrap()
 }
 #[test]
+fn gap_finish_guard_precedes_integrated_capture_aggregation() {
+    let f = Fixture::new();
+    let a = allocate(&f);
+    f.config(10, true);
+    let sql = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    sql.execute(
+        "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?4,'{',zeroblob(32))",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            Uuid::now_v7().to_string(),
+            a.checkout.to_string(),
+            Uuid::now_v7().to_string()
+        ],
+    )
+    .unwrap();
+    assert!(finish::finish(&config(&f), a.checkout).is_err());
+    for table in ["task_finishes", "capture_runs", "capture_finalizations"] {
+        assert_eq!(
+            sql.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0,
+            "{table}"
+        );
+    }
+}
+
+#[test]
 fn zero_or_missing_capture_is_incomplete() {
     for root_present in [false, true] {
         let f = Fixture::new();

@@ -79,6 +79,9 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
     let tx = sql(store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+    db(crate::attribution_gap::guard_legacy_allocation(
+        &tx, a.checkout,
+    ))?;
     let finished: bool = sql(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",
         [a.checkout.to_string()],
@@ -158,6 +161,11 @@ pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allo
         ))?;
         return Ok(Some(a));
     }
+    // Gap reconciliation is forbidden even when the allocation itself is malformed.
+    db(crate::attribution_gap::guard_legacy_allocation(
+        &store.conn,
+        checkout,
+    ))?;
     // Keep corrupt evidence untouched, but revoke eligibility using the trusted row
     // key, never an ID supplied by malformed JSON.
     let tx = sql(store.conn.transaction())?;
@@ -391,6 +399,24 @@ pub fn start_observed(
 ) -> io::Result<Allocation> {
     let r = normalize(config, request)?;
     let (mut store, _lock) = locked(config)?;
+    {
+        let _phase = store.sql_phase();
+        let checkout: Option<String> = sql(store
+            .conn
+            .query_row(
+                "SELECT id FROM checkouts WHERE operation=?1",
+                [r.operation.to_string()],
+                |row| row.get(0),
+            )
+            .optional())?;
+        if let Some(checkout) = checkout {
+            let checkout = Uuid::parse_str(&checkout).map_err(|_| err("invalid checkout key"))?;
+            db(crate::attribution_gap::guard_legacy_allocation(
+                &store.conn,
+                checkout,
+            ))?;
+        }
+    }
     if let Some(mut a) = load(&mut store, r.operation)? {
         refuse_finished(&store, a.checkout)?;
         if a.request != r {
@@ -519,6 +545,13 @@ pub fn start_observed(
             return Err(err(
                 "ambiguous matching allocations; hold for reconciliation",
             ));
+        }
+        {
+            let _phase = store.sql_phase();
+            db(crate::attribution_gap::guard_legacy_allocation(
+                &store.conn,
+                matches[0],
+            ))?;
         }
         refuse_finished(&store, matches[0])?;
         let (operation, state): (String, String) = sql(store.conn.query_row(
@@ -651,6 +684,13 @@ pub(crate) fn verify_source_authority(
     }
 }
 fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf> {
+    {
+        let _phase = store.sql_phase();
+        db(crate::attribution_gap::guard_legacy_allocation(
+            &store.conn,
+            a.checkout,
+        ))?;
+    }
     match source_authority_evidence(&store.conn, a) {
         Ok(common) => Ok(common),
         Err(_) => {
@@ -670,6 +710,13 @@ fn create(
     mut a: Allocation,
     boundary: &mut impl FnMut(&str),
 ) -> io::Result<Allocation> {
+    {
+        let _phase = store.sql_phase();
+        db(crate::attribution_gap::guard_legacy_allocation(
+            &store.conn,
+            a.checkout,
+        ))?;
+    }
     crate::config::validate_path(a.destination.parent().unwrap(), true)
         .map_err(|_| err("destination ancestor changed"))?;
     if fs::symlink_metadata(&a.destination).is_ok() {

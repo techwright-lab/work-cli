@@ -50,6 +50,7 @@ struct Receipt {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunOutcome {
+    pub gap: Option<crate::supervisor::GapObservation>,
     pub run: work_contract::RunId,
     pub outcome: Option<crate::run_journal::RootOutcome>,
     /// Current passive per-run observation, not the recorded task receipt.
@@ -58,6 +59,7 @@ pub struct RunOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RunCapture {
+    AttributionOff,
     Missing,
     UnknownOutcome,
     UncertainClock,
@@ -363,6 +365,20 @@ fn finish_internal(
         .ok_or(StoreError::Unsafe)?;
     let mut store = Store::open_finish_authority(registry, dir, &config.roots)?;
     let integrated = matches!(mode, Mode::Integrated);
+    {
+        let _phase = store.sql_phase();
+        let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
+        if load(&store.conn, checkout)?.is_none() {
+            crate::attribution_gap::guard_finish(
+                &store.conn,
+                checkout,
+                config
+                    .allocation
+                    .as_ref()
+                    .is_some_and(|p| p.capture_sink.is_some()),
+            )?;
+        }
+    }
     let captured_new = {
         let _phase = store.sql_phase();
         integrated
@@ -508,10 +524,14 @@ fn finish_internal(
     // The complete writer fence validated every base root, roster and exact
     // writer. The projection below qualifies target capture history once in
     // this same snapshot; receipt-only validation never escapes this path.
-    let mut stmt=store.conn.prepare("SELECT r.id,r.outcome FROM runs r JOIN run_groups g ON r.group_id=g.id WHERE g.checkout=?1 ORDER BY r.id")?;
+    let mut stmt=store.conn.prepare("SELECT r.id,r.outcome,r.request FROM runs r JOIN run_groups g ON r.group_id=g.id WHERE g.checkout=?1 ORDER BY r.id")?;
     let roots = stmt
         .query_map([checkout.to_string()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut captured =
@@ -550,7 +570,9 @@ fn finish_internal(
                 .collect::<std::collections::BTreeMap<_, _>>())
         })?;
     let mut outcomes = Vec::new();
-    for (id, outcome) in roots {
+    for (id, outcome, request) in roots {
+        let root: crate::run_journal::RootRunRequest = parse(&request)?;
+        let gap = crate::attribution_gap::observation(&store.conn, &root)?;
         let run = work_contract::RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
         let (outcome, capture) = if let Some(pair) = captured.remove(&id) {
             pair
@@ -561,9 +583,14 @@ fn finish_internal(
             )
         };
         outcomes.push(RunOutcome {
+            capture: if gap.is_some() {
+                RunCapture::AttributionOff
+            } else {
+                capture
+            },
+            gap,
             run,
             outcome,
-            capture,
         });
     }
     Ok(report(current, outcomes))
@@ -705,6 +732,14 @@ fn prepare(
         if let Some(r) = load(&store.conn, checkout)? {
             return Ok(r);
         }
+        crate::attribution_gap::guard_finish(
+            &store.conn,
+            checkout,
+            config
+                .allocation
+                .as_ref()
+                .is_some_and(|p| p.capture_sink.is_some()),
+        )?;
         guard_capture(&store.conn)?;
         if let Some(proof) = proof {
             proof.validate(&store.conn)?;
@@ -718,6 +753,10 @@ fn prepare(
         allocate::verified_checkout(store, checkout).map_err(|_| StoreError::Invalid)?
     };
     let operation = Uuid::now_v7();
+    #[cfg(test)]
+    let operation = candidate_fixture::OPERATION
+        .with(|slot| slot.take())
+        .unwrap_or(operation);
     let receipt = Receipt {
         version: 1,
         checkout,
@@ -744,6 +783,17 @@ fn prepare(
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = load(&tx, checkout)? {
+            return Ok(receipt);
+        }
+        crate::attribution_gap::guard_finish(
+            &tx,
+            checkout,
+            config
+                .allocation
+                .as_ref()
+                .is_some_and(|p| p.capture_sink.is_some()),
+        )?;
         guard_capture(&tx)?;
         if let Some(proof) = proof {
             proof.validate(&tx)?;
@@ -786,6 +836,12 @@ fn prepare(
         tx.commit()?;
     }
     Ok(receipt)
+}
+#[cfg(test)]
+pub(crate) mod candidate_fixture {
+    thread_local! {
+        pub(crate) static OPERATION: std::cell::Cell<Option<uuid::Uuid>> = const { std::cell::Cell::new(None) };
+    }
 }
 #[cfg(test)]
 mod tests {

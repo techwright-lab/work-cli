@@ -20,8 +20,24 @@ pub struct RunIdentity {
     pub parent_run_ref: Option<RunRef>,
     pub execution_chain: ExecutionChain,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// An explicit declaration, never writer or launch authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AttributionDecision {
+    Off,
+}
+impl<'de> Deserialize<'de> for AttributionDecision {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "off" => Ok(Self::Off),
+            _ => Err(serde::de::Error::unknown_variant(&value, &["off"])),
+        }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunInput {
     /// Digests only; callers must never supply raw commands, environment or prompts.
     pub command_digest: [u8; 32],
@@ -29,6 +45,101 @@ pub struct RunInput {
     pub context_ref: ChainText,
     pub intent_ref: ChainText,
     pub boot: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution: Option<AttributionDecision>,
+}
+impl<'de> Deserialize<'de> for RunInput {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        use serde::de::{Error, MapAccess, SeqAccess, Visitor};
+        const FIELDS: &[&str] = &[
+            "command_digest",
+            "input_digest",
+            "context_ref",
+            "intent_ref",
+            "boot",
+            "attribution",
+        ];
+        struct InputVisitor;
+        impl<'de> Visitor<'de> for InputVisitor {
+            type Value = RunInput;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("RunInput object or legacy five-field sequence")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<RunInput, A::Error> {
+                let (
+                    mut command_digest,
+                    mut input_digest,
+                    mut context_ref,
+                    mut intent_ref,
+                    mut boot,
+                    mut attribution,
+                ) = (None, None, None, None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    macro_rules! field {
+                        ($slot:ident, $name:literal) => {{
+                            if $slot.is_some() {
+                                return Err(A::Error::duplicate_field($name));
+                            }
+                            $slot = Some(map.next_value()?);
+                        }};
+                    }
+                    match key.as_str() {
+                        "command_digest" => field!(command_digest, "command_digest"),
+                        "input_digest" => field!(input_digest, "input_digest"),
+                        "context_ref" => field!(context_ref, "context_ref"),
+                        "intent_ref" => field!(intent_ref, "intent_ref"),
+                        "boot" => field!(boot, "boot"),
+                        "attribution" => field!(attribution, "attribution"),
+                        _ => return Err(A::Error::unknown_field(&key, FIELDS)),
+                    }
+                }
+                Ok(RunInput {
+                    command_digest: command_digest
+                        .ok_or_else(|| A::Error::missing_field("command_digest"))?,
+                    input_digest: input_digest
+                        .ok_or_else(|| A::Error::missing_field("input_digest"))?,
+                    context_ref: context_ref
+                        .ok_or_else(|| A::Error::missing_field("context_ref"))?,
+                    intent_ref: intent_ref.ok_or_else(|| A::Error::missing_field("intent_ref"))?,
+                    boot: boot.ok_or_else(|| A::Error::missing_field("boot"))?,
+                    attribution,
+                })
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<RunInput, A::Error> {
+                let input = RunInput {
+                    command_digest: seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(0, &self))?,
+                    input_digest: seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(1, &self))?,
+                    context_ref: seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(2, &self))?,
+                    intent_ref: seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(3, &self))?,
+                    boot: seq
+                        .next_element()?
+                        .ok_or_else(|| A::Error::invalid_length(4, &self))?,
+                    attribution: None,
+                };
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(A::Error::invalid_length(6, &self));
+                }
+                Ok(input)
+            }
+        }
+        deserializer.deserialize_struct("RunInput", FIELDS, InputVisitor)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RequestWire")]
@@ -491,6 +602,7 @@ pub(crate) fn with_capture_history<T>(
             drop(child_profile);
             #[cfg(test)]
             let terminal_profile = span(Subphase::HistoryTerminal);
+            crate::attribution_gap::qualify_root(conn, &root.request)?;
             let tuple = batch.terminal(&root)?.ok_or(StoreError::Invalid)?;
             #[cfg(test)]
             drop(terminal_profile);
@@ -502,8 +614,10 @@ pub(crate) fn with_capture_history<T>(
 }
 pub(crate) fn read(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
     let _snapshot = read_transaction(conn)?;
+    crate::attribution_gap::validate_raw(conn)?;
     let record = read_base(conn, run)?;
     if let Some(r) = &record {
+        crate::attribution_gap::validate_related(conn, uuid(&r.request.identity.checkout)?)?;
         crate::capture_journal::read(conn, r)?;
     }
     Ok(record)
@@ -525,10 +639,34 @@ fn read_base(conn: &Connection, run: &RunId) -> Result<Option<RunRecord>> {
         .optional()?
         .transpose()?;
     if let Some(r) = &mut record {
+        crate::attribution_gap::qualify_presence(conn, &r.request)?;
         r.children = crate::run_participants::roster(conn, &r.request, r.binding.as_ref())?;
         validate_child_history(r)?;
     }
     Ok(record)
+}
+/// One snapshot-local target batch; never recursively invokes public Root reads.
+pub(crate) fn gap_history(
+    conn: &Connection,
+    checkout: uuid::Uuid,
+) -> Result<Vec<(RunRecord, Option<crate::attribution_gap::GapRecord>)>> {
+    let _snapshot = read_transaction(conn)?;
+    crate::attribution_gap::validate_raw(conn)?;
+    let mut rosters = crate::run_participants::TargetRosters::read(conn, &checkout.to_string())?;
+    let rows = conn
+        .prepare(&format!("{SELECT} WHERE g.checkout=?1 ORDER BY r.id"))?
+        .query_map([checkout.to_string()], read_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut history = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut record = row?;
+        record.children = rosters.roster(conn, &record.request, record.binding.as_ref())?;
+        validate_child_history(&record)?;
+        exact_record(conn, &record.request, &record)?;
+        let gap = crate::attribution_gap::validated_record(conn, &record.request)?;
+        history.push((record, gap));
+    }
+    Ok(history)
 }
 pub(crate) fn validate_enrollment_rosters(conn: &Connection) -> Result<()> {
     let _snapshot = read_transaction(conn)?;
@@ -542,6 +680,7 @@ pub(crate) fn validate_enrollment_rosters(conn: &Connection) -> Result<()> {
         record.children = rosters.roster(conn, &record.request, record.binding.as_ref())?;
         validate_child_history(&record)?;
         exact_record(conn, &record.request, &record)?;
+        crate::attribution_gap::qualify_presence(conn, &record.request)?;
     }
     Ok(())
 }
@@ -604,18 +743,27 @@ impl Store {
         )
     }
 }
+#[derive(Clone, Copy)]
+pub(crate) enum WriterAdmission<'a, 'tx, 'conn> {
+    Ordinary,
+    Captured(
+        &'a crate::capture_setup::AdmissionProof<'a>,
+        &'a crate::capture_setup::Related<'tx, 'conn>,
+    ),
+    Gap(&'a crate::attribution_gap::GapAdmissionProof),
+}
 pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<BeginRun> {
-    begin_run_context(tx, request, None)
+    begin_run_context(tx, request, WriterAdmission::Ordinary)
 }
 pub(crate) fn begin_run_context(
     tx: &Connection,
     request: &RootRunRequest,
-    materialized: Option<(
-        &crate::capture_setup::AdmissionProof<'_>,
-        &crate::capture_setup::Related<'_, '_>,
-    )>,
+    materialized: WriterAdmission<'_, '_, '_>,
 ) -> Result<BeginRun> {
-    if let Some((_, related)) = materialized {
+    if !matches!(materialized, WriterAdmission::Gap(_)) && request.input.attribution.is_some() {
+        return Err(StoreError::Invalid);
+    }
+    if let WriterAdmission::Captured(_, related) = materialized {
         related.check(tx, uuid(&request.identity.checkout)?)?;
     } else {
         crate::capture_journal::validate_related(tx, &request.identity.checkout)?;
@@ -625,6 +773,9 @@ pub(crate) fn begin_run_context(
     if read(tx, &request.identity.run)?.is_some() {
         exact(tx, request)?;
         return Ok(BeginRun::Existing);
+    }
+    if !matches!(materialized, WriterAdmission::Gap(_)) {
+        crate::attribution_gap::validate_related(tx, uuid(&request.identity.checkout)?)?;
     }
     let i = &request.identity;
     let conflict: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE run_ref=?1 OR id=?2 OR group_id=?2 OR group_id=?3)
@@ -656,7 +807,10 @@ pub(crate) fn begin_run_context(
             i.run.to_string(),
             i.group.to_string(),
             i.run_ref.as_str(),
-            json(request)?,
+            match materialized {
+                WriterAdmission::Gap(proof) => proof.request_bytes(request)?.to_owned(),
+                _ => json(request)?,
+            },
         ),
     )?;
     journal_event(tx, request, 1, JournalChange::Intent)?;
@@ -704,7 +858,7 @@ impl Store {
         let _snapshot = read_transaction(&self.conn)?;
         let record = read(&self.conn, run)?.ok_or(StoreError::Invalid)?;
         crate::capture_journal::validate_related(&self.conn, &record.request.identity.checkout)?;
-        let record = exact(&self.conn, &record.request)?;
+        exact_record(&self.conn, &record.request, &record)?;
         let state: String = self.conn.query_row(
             "SELECT CASE WHEN length(state)<=32 THEN state ELSE '' END FROM checkouts WHERE id=?1",
             [record.request.identity.checkout.to_string()],
@@ -741,7 +895,9 @@ impl Store {
         let mut records = rows
             .map(|r| r.map_err(StoreError::from).and_then(|v| v))
             .collect::<Result<Vec<_>>>()?;
+        crate::attribution_gap::validate_raw(&self.conn)?;
         for record in &mut records {
+            crate::attribution_gap::qualify_root(&self.conn, &record.request)?;
             record.children = crate::run_participants::roster(
                 &self.conn,
                 &record.request,
@@ -860,6 +1016,9 @@ impl Store {
             (i.group.to_string(), revision as i64),
         )?;
         journal_event(&tx, &expected.request, revision, JournalChange::GroupClosed)?;
+        if crate::attribution_gap::required_origin(&tx, uuid(&i.checkout)?)? {
+            tx.execute("UPDATE checkouts SET state='held',ready=0 WHERE id=?1 AND state IN ('active','partial','held') AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)", [i.checkout.to_string()])?;
+        }
         // Capture eligibility never vetoes proven physical closure. Only this
         // Changed transaction can seal its exact post-close context.
         let seal = if seal_eligible {

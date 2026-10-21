@@ -14,6 +14,7 @@ pub(crate) mod test_run_fixture;
 pub mod admission;
 pub mod adopted;
 pub mod allocate;
+mod attribution_gap;
 mod bounded_process;
 mod capture_artifacts;
 pub mod capture_bridge;
@@ -51,3 +52,12 @@ pub mod scope_spawn;
 pub mod sinks;
 pub mod store;
 pub mod supervisor;
+
+#[cfg(test)]
+use crate as collector_target;
+#[cfg(test)]
+#[path = "../tests/support/capture_collector.rs"]
+pub(crate) mod test_capture_collector;
+#[cfg(test)]
+#[path = "../tests/support/lifecycle_regressions.rs"]
+pub(crate) mod test_lifecycle_fixture;

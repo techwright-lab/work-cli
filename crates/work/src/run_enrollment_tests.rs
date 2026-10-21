@@ -54,6 +54,7 @@ fn fixture() -> (
             .unwrap(),
         },
         RunInput {
+            attribution: None,
             boot: boot.into(),
             command_digest: [1; 32],
             input_digest: [2; 32],

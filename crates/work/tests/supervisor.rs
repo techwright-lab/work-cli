@@ -19,6 +19,73 @@ use work_cli::{
     supervisor::*,
 };
 
+#[path = "support/run_fixture.rs"]
+mod gap_wire_fixture;
+#[test]
+fn default_history_never_acknowledges_off() {
+    let (dir, mut store, checkout) = gap_wire_fixture::fixture();
+    let root = gap_wire_fixture::request(checkout);
+    store.begin_run(&root).unwrap();
+    let mut malformed = serde_json::to_value(&root).unwrap();
+    malformed["input"]["attribution"] = "off".into();
+    let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.execute(
+        "UPDATE runs SET request=?1",
+        [serde_json::to_string(&malformed).unwrap()],
+    )
+    .unwrap();
+    let config = Config {
+        store_dir: Some(dir.path().join("private")),
+        trusted_registry: Some(dir.path().join(".work-authorities")),
+        roots: vec![dir.path().join("root")],
+        ..Default::default()
+    };
+    let command = RootCommand {
+        checkout,
+        actor: None,
+        run_id: Uuid::parse_str(&root.identity().run.to_string()).unwrap(),
+        execution_chain: root.identity().execution_chain.clone(),
+        argv: vec!["/usr/bin/true".into()],
+    };
+    let os = gap_wire_fixture::ClosureOs::new(&root, &gap_wire_fixture::binding(&root));
+    let before = store.pending_events(100).unwrap();
+    assert!(existing_report(&config, &command).is_err());
+    for route in 0..3 {
+        let io = LaunchIo {
+            systemd_run: dir.path().join("must-not-run"),
+            self_binary: dir.path().join("must-not-run"),
+        };
+        let result = match route {
+            0 => supervise_with_io(
+                &config,
+                command.clone(),
+                &os.driver,
+                io,
+                &CancelToken::default(),
+                |_, _| panic!("runtime"),
+            ),
+            1 => supervise_captured_with_io(
+                &config,
+                command.clone(),
+                &os.driver,
+                io,
+                &CancelToken::default(),
+                |_, _| panic!("runtime"),
+            ),
+            _ => supervise_captured_integrated_with_io(
+                &config,
+                command.clone(),
+                &os.driver,
+                io,
+                &CancelToken::default(),
+                |_, _| panic!("runtime"),
+            ),
+        };
+        assert!(result.is_err());
+    }
+    assert_eq!(store.pending_events(100).unwrap(), before);
+}
+
 #[test]
 fn run_is_a_public_command_with_explicit_chain_and_retry_identity() {
     let output = Command::new(env!("CARGO_BIN_EXE_work"))
@@ -932,13 +999,32 @@ fn existing_receipt_preserves_original_context_references_instead_of_minting_the
     let mut value = serde_json::to_value(&r.record.request).unwrap();
     value["input"]["context_ref"] = "urn:original:context".into();
     value["input"]["intent_ref"] = "urn:original:intent".into();
+    let sidecar_state = || {
+        let wal = fs::symlink_metadata(h.f.temp.path().join("private/store.sqlite-wal"));
+        let shm = fs::symlink_metadata(h.f.temp.path().join("private/store.sqlite-shm"));
+        (
+            wal.is_ok(),
+            wal.as_ref().is_ok_and(|m| m.file_type().is_file()),
+            shm.is_ok(),
+            shm.as_ref().is_ok_and(|m| m.file_type().is_file()),
+        )
+    };
     let conn = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    // Match native writers: closing this fixture client must not delete the
+    // legitimate WAL bookkeeping required by strict read-only receipt lookup.
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .unwrap();
     conn.execute(
         "UPDATE runs SET request=?1",
         [serde_json::to_string(&value).unwrap()],
     )
     .unwrap();
+    assert_eq!(sidecar_state(), (true, true, true, true));
     drop(conn);
+    assert_eq!(sidecar_state(), (true, true, true, true));
     let receipt = h
         .execute(h.request(), &CancelToken::default(), |_, _| {
             panic!("existing launched")

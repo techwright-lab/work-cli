@@ -5,6 +5,33 @@ use support::*;
 mod regressions;
 
 #[test]
+fn configurationless_recovery_refuses_open_bound_gap() {
+    let (dir, mut store, checkout) = fixture();
+    let root = request(checkout);
+    store.begin_run(&root).unwrap();
+    let bound = binding(&root);
+    store.record_bound(&root, &bound).unwrap();
+    let os = ClosureOs::new(&root, &bound);
+    let mut malformed = serde_json::to_value(&root).unwrap();
+    malformed["input"]["attribution"] = "off".into();
+    let sql = rusqlite::Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    sql.execute(
+        "UPDATE runs SET request=?1",
+        [serde_json::to_string(&malformed).unwrap()],
+    )
+    .unwrap();
+    // Marker without a matching strict record is corruption, not a proof fixture.
+    let before = store.pending_events(100).unwrap();
+    assert!(work_cli::run_recovery::recover(&mut store, &root.identity().run, &os.driver).is_err());
+    assert_eq!(store.pending_events(100).unwrap(), before);
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn ordinary_lifecycle_status_reads_committed_wal_without_keepers_or_mutation() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);

@@ -107,6 +107,89 @@ fn spec(r: &RootRunRequest) -> CaptureSpec {
 }
 
 #[test]
+fn off_marker_and_raw_gap_history_refuse_capture_creation() {
+    let (dir, mut store, checkout) = fixture();
+    let root = request(checkout);
+    let mut value = serde_json::to_value(&root).unwrap();
+    value["input"]["attribution"] = "off".into();
+    let off: RootRunRequest = serde_json::from_value(value).unwrap();
+    let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    let allocation: work_cli::allocate::Allocation = serde_json::from_str(
+        &sql.query_row("SELECT record FROM allocations", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let config = work_cli::config::Config::from_text(&format!("[allocation]\nrepository_limit=10\nowner_limit=10\nfloor_bytes=0\nwarn_bytes=0\ncapture_sink='devdiary'\n[capture]\nexecutable='/private/producer'\nregistry='/private/registry'\nstate_dir='/private/state'\ntimeout_ms=50\nresponse_cap=65536\nregistry_sha256='{}'\nendpoint_identity='receiver:test'\nreceiver_credential_names=['TOKEN']\n[capture.actor_refs]\nreviewer-not-owner='actor:test'\n[supervisor]\nruntime_directory='/private/runtime'\nbus_address='unix:path=/private/runtime/bus'\nruntime_max_seconds=60\npreexec_ms=100\nclosure_grace_ms=100\ncancel_grace_ms=100\n[supervisor.actors.reviewer-not-owner]\nauthor_name='Test'\nauthor_email='test@example.invalid'\ncommitter_name='Test'\ncommitter_email='test@example.invalid'\n", "a".repeat(64))).unwrap();
+    assert!(
+        config
+            .capture_spec(
+                &root,
+                &allocation,
+                Uuid::now_v7(),
+                vec!["task".into()],
+                None
+            )
+            .is_ok(),
+        "default control must be valid"
+    );
+    assert!(
+        config
+            .capture_spec(&off, &allocation, Uuid::now_v7(), vec!["task".into()], None)
+            .is_err(),
+        "capture specification must reject Off declarations"
+    );
+    let events = store.pending_events(100).unwrap();
+    assert!(store.begin_captured_run(&off, &spec(&off)).is_err());
+    assert_eq!(store.pending_events(100).unwrap(), events);
+    sql.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    sql.execute(
+        "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?4,'{',zeroblob(32))",
+        rusqlite::params![
+            Uuid::now_v7().to_string(),
+            Uuid::now_v7().to_string(),
+            checkout.to_string(),
+            Uuid::now_v7().to_string()
+        ],
+    )
+    .unwrap();
+    assert!(
+        store.begin_captured_run(&root, &spec(&root)).is_err(),
+        "raw corrupt Gap must fence new capture"
+    );
+    assert_eq!(store.pending_events(100).unwrap(), events);
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    sql.execute("DELETE FROM attribution_gaps", []).unwrap();
+    store.begin_run(&root).unwrap();
+    // Malformed historical fixture only: never a physical closure proof.
+    sql.execute_batch("DELETE FROM writers; UPDATE run_groups SET closed=1;")
+        .unwrap();
+    sql.execute(
+        "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?4,'{',zeroblob(32))",
+        rusqlite::params![
+            root.identity().run.to_string(),
+            root.identity().group.to_string(),
+            checkout.to_string(),
+            Uuid::now_v7().to_string()
+        ],
+    )
+    .unwrap();
+    let next = request(checkout);
+    let before = store.pending_events(100).unwrap();
+    assert!(
+        store.begin_captured_run(&next, &spec(&next)).is_err(),
+        "related raw Gap must fence capture even when not the requested run"
+    );
+    assert_eq!(store.pending_events(100).unwrap(), before);
+}
+
+#[test]
 fn canonical_capture_snapshot_matches_transport_without_duplicate_amplification() {
     let (dir, mut store, checkout) = fixture();
     let r = request(checkout);
@@ -1137,7 +1220,7 @@ fn v9_upgrade_preserves_receipt_bytes_and_missing_v10_shapes_fail_closed() {
         .unwrap();
     let events = store.pending_events(100).unwrap();
     sql.execute_batch(
-        "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9",
+        "DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9",
     )
     .unwrap();
     drop(store);
@@ -1189,7 +1272,7 @@ fn v9_capture_migration_failure_rolls_back_version_and_all_existing_rows() {
     let r = request(checkout);
     store.begin_run(&r).unwrap();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9; CREATE VIEW capture_runs AS SELECT 1 AS obstruction").unwrap();
+    sql.execute_batch("DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9; CREATE VIEW capture_runs AS SELECT 1 AS obstruction").unwrap();
     let body: String = sql
         .query_row("SELECT request FROM runs", [], |r| r.get(0))
         .unwrap();
@@ -1765,7 +1848,7 @@ fn schema_ten_adds_empty_capture_journal_without_rewriting_no_sink_history() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        13
+        14
     );
     assert_eq!(
         sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r

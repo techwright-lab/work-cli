@@ -89,6 +89,7 @@ pub struct Driver {
     io: std::rc::Rc<LibraryIo>,
     limits: Limits,
     removal_names: Vec<String>,
+    remove_attribution_context: bool,
 }
 impl Driver {
     pub fn new(context: RuntimeContext) -> Result<Self> {
@@ -123,6 +124,7 @@ impl Driver {
             io: std::rc::Rc::new(io),
             limits,
             removal_names: Vec::new(),
+            remove_attribution_context: false,
         })
     }
     /// Command-local filtering from the actual live preparation only; same IO,
@@ -133,9 +135,37 @@ impl Driver {
             io: self.io.clone(),
             limits: self.limits.clone(),
             removal_names: live.receiver_removal_names().to_vec(),
+            remove_attribution_context: false,
         }
     }
+    pub(crate) fn for_gap(&self, policy: &crate::attribution_gap::RemovalPolicy) -> Self {
+        Self {
+            context: self.context.clone(),
+            io: self.io.clone(),
+            limits: self.limits.clone(),
+            removal_names: policy.receivers().to_vec(),
+            remove_attribution_context: true,
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn assert_same_gap_io_and_limits(&self, derived: &Self) {
+        assert!(std::rc::Rc::ptr_eq(&self.io, &derived.io));
+        assert_eq!(self.limits.duration, derived.limits.duration);
+        assert_eq!(self.limits.total_bytes, derived.limits.total_bytes);
+        assert_eq!(self.limits.groups, derived.limits.groups);
+        assert_eq!(self.limits.pids, derived.limits.pids);
+        assert_eq!(self.limits.depth, derived.limits.depth);
+    }
     fn remove_receiver_credentials(&self, command: &mut Command) {
+        if self.remove_attribution_context {
+            for name in [
+                "AGENT_ATTRIBUTION_CONTEXT",
+                "DEVDIARY_ATTRIBUTION_CONTEXT",
+                "DEVDIARY_CAPTURE_ID",
+            ] {
+                command.env_remove(name);
+            }
+        }
         for name in &self.removal_names {
             command.env_remove(name);
         }
