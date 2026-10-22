@@ -1,3 +1,6 @@
+#[path = "attribution_gap_lease_tests.rs"]
+mod lease_tests;
+
 use crate::{store::Store, test_run_fixture};
 use rusqlite::Connection;
 use sha2::Digest;
@@ -1109,6 +1112,7 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
         "generic",
         "captured",
         "cross_root",
+        "wrong_store",
         "nonce",
         "cwd",
         "argv",
@@ -1185,6 +1189,16 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
                 .is_err());
         } else if case == "generic" {
             assert!(launch.release(&driver).is_err());
+        } else if case == "wrong_store" {
+            let other = Store::open_existing_registered_mut(
+                h.config.trusted_registry.as_ref().unwrap(),
+                h.config.store_dir.as_ref().unwrap(),
+                &h.config.roots,
+            )
+            .unwrap();
+            let proof = live.release_proof().unwrap();
+            let lease = crate::allocate::lifecycle_lock(&other).unwrap();
+            assert!(launch.release_gap(&driver, proof, &store, &lease).is_err());
         } else if case == "cross_root" {
             let (_temp, cfg, _a, other, argv) = ordinary();
             let (_store, super::BeginGap::Created(other_live)) =
@@ -1192,9 +1206,9 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
             else {
                 panic!("actual other live required")
             };
-            assert!(launch
-                .release_gap(&driver, other_live.release_proof().unwrap())
-                .is_err());
+            let proof = other_live.release_proof().unwrap();
+            let lease = crate::allocate::lifecycle_lock(&store).unwrap();
+            assert!(launch.release_gap(&driver, proof, &store, &lease).is_err());
         } else {
             // Test-only tampering with an actually observed proof checks private
             // guard bindings, not successful physical authority from synthetic data.
@@ -1214,8 +1228,9 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
                 }
                 _ => unreachable!(),
             }
+            let lease = crate::allocate::lifecycle_lock(&store).unwrap();
             assert!(
-                launch.release_gap(&driver, proof).is_err(),
+                launch.release_gap(&driver, proof, &store, &lease).is_err(),
                 "{case} swapped guard permitted release"
             );
         }
@@ -1254,6 +1269,20 @@ fn release_cas_and_original_age_survive_contention_and_kernel_gate() {
     ] {
         let h = ScopeHarness::new(true);
         let private = h.config.store_dir.clone().unwrap();
+        let lock_store = Store::open_existing_registered_mut(
+            h.config.trusted_registry.as_ref().unwrap(),
+            &private,
+            &h.config.roots,
+        )
+        .unwrap();
+        let mut contender_store = Some(
+            Store::open_existing_registered_mut(
+                h.config.trusted_registry.as_ref().unwrap(),
+                &private,
+                &h.config.roots,
+            )
+            .unwrap(),
+        );
         let waiter = std::rc::Rc::new(std::cell::RefCell::new(None));
         let join = waiter.clone();
         RELEASE_OBSERVER.with(|slot| {
@@ -1261,16 +1290,16 @@ fn release_cas_and_original_age_survive_contention_and_kernel_gate() {
                 let sql = Connection::open(private.join("store.sqlite")).unwrap();
                 sql.busy_timeout(std::time::Duration::ZERO).unwrap();
                 sql.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
-                drop(crate::allocate::lifecycle_lock(&private).unwrap());
+                drop(crate::allocate::lifecycle_lock(&lock_store).unwrap());
                 match case {
                     "kernel_age" => std::thread::sleep(std::time::Duration::from_millis(1200)),
                     "age" => std::thread::sleep(std::time::Duration::from_millis(2100)),
                     "contention" => {
                         std::thread::sleep(std::time::Duration::from_millis(1850));
-                        let path = private.clone();
+                        let contender = contender_store.take().unwrap();
                         let (ready, wait) = std::sync::mpsc::channel();
                         *join.borrow_mut() = Some(std::thread::spawn(move || {
-                            let lock = crate::allocate::lifecycle_lock(&path).unwrap();
+                            let lock = crate::allocate::lifecycle_lock(&contender).unwrap();
                             ready.send(()).unwrap();
                             std::thread::sleep(std::time::Duration::from_millis(300));
                             drop(lock);
@@ -3563,7 +3592,12 @@ fn admission_reobserves_physical_identity_outside_guards() {
         let (temp, config, a, root, argv) = materialized(case == "registry");
         let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
         sql.busy_timeout(Duration::ZERO).unwrap();
-        let lock_path = config.store_dir.clone().unwrap();
+        let lock_store = Store::open_existing_registered_mut(
+            config.trusted_registry.as_ref().unwrap(),
+            config.store_dir.as_ref().unwrap(),
+            &config.roots,
+        )
+        .unwrap();
         let registry = config.capture.as_ref().map(|h| h.registry.clone());
         let observations = std::rc::Rc::new(std::cell::Cell::new(0));
         let count = observations.clone();
@@ -3575,7 +3609,7 @@ fn admission_reobserves_physical_identity_outside_guards() {
             sql.execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
                 .expect("physical observation retains SQL writer");
             drop(
-                crate::allocate::lifecycle_lock(&lock_path)
+                crate::allocate::lifecycle_lock(&lock_store)
                     .expect("physical observation retains allocator lock"),
             );
             count.set(count.get() + 1);

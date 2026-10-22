@@ -43,7 +43,7 @@ fn identity_refresh_transaction_refuses_durable_fence_inserted_after_preflight()
             )
             .unwrap();
             let (mut store, lock) = locked(&config).unwrap();
-            a = verified_checkout(&mut store, a.checkout).unwrap();
+            a = verified_checkout_under_lease(&mut store, a.checkout, &lock).unwrap();
             drop(lock);
             // The receipt arrives after successful preflight, but before its final
             // identity transaction. Readiness corruption must not bypass that CAS.

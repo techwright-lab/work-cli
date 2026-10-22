@@ -576,6 +576,18 @@ impl Store {
         proof: &EnrollmentProof,
         now: impl FnOnce() -> std::time::Instant,
     ) -> Result<Transition> {
+        let lease = self.authority_lease()?;
+        self.record_child_enrollment_under_lease(root, child, proof, now, &lease)
+    }
+    fn record_child_enrollment_under_lease(
+        &mut self,
+        root: &RootRunRequest,
+        child: &ChildRequest,
+        proof: &EnrollmentProof,
+        now: impl FnOnce() -> std::time::Instant,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<Transition> {
+        lease.check(self)?;
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -640,6 +652,16 @@ impl Store {
         root: &RootRunRequest,
         request: &ChildRequest,
     ) -> Result<BeginRun> {
+        let lease = self.authority_lease()?;
+        self.register_child_under_lease(root, request, &lease)
+    }
+    fn register_child_under_lease(
+        &mut self,
+        root: &RootRunRequest,
+        request: &ChildRequest,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<BeginRun> {
+        lease.check(self)?;
         request.validate()?;
         let _phase = self.sql_phase();
         let tx = self
@@ -722,6 +744,17 @@ impl Store {
         request: &ChildRequest,
         outcome: Option<ChildOutcome>,
     ) -> Result<Transition> {
+        let lease = self.authority_lease()?;
+        self.child_change_under_lease(root, request, outcome, &lease)
+    }
+    fn child_change_under_lease(
+        &mut self,
+        root: &RootRunRequest,
+        request: &ChildRequest,
+        outcome: Option<ChildOutcome>,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<Transition> {
+        lease.check(self)?;
         let _phase = self.sql_phase();
         let tx = self
             .conn

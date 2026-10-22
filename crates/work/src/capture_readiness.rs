@@ -288,7 +288,8 @@ pub(crate) fn restore(
     #[cfg(test)]
     tests::observe("physical", &store.conn, observed);
     fresh(observed)?;
-    let _lock = crate::allocate::lifecycle_lock(dir)?;
+    let lease = store.authority_lease()?;
+    lease.check(&store)?;
     let _phase = store.sql_phase();
     let tx = store
         .conn
@@ -342,7 +343,13 @@ pub(crate) fn restore(
     Ok(())
 }
 
-pub(crate) fn invalidate(conn: &rusqlite::Connection, checkout: uuid::Uuid) -> Result<()> {
+pub(crate) fn invalidate(
+    conn: &rusqlite::Connection,
+    checkout: uuid::Uuid,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+) -> Result<()> {
+    lease.check_authority(authority)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= 13 {
         conn.execute(
@@ -698,6 +705,12 @@ pub(crate) mod tests {
     fn external_physical_delay_does_not_hold_sql_or_allocator_authority() {
         let (_temp, cfg, store, _a, _r, seal, ack) = closed();
         let dir = cfg.store_dir.clone().unwrap();
+        let lock_store = Store::open_existing_registered_mut(
+            cfg.trusted_registry.as_ref().unwrap(),
+            &dir,
+            &cfg.roots,
+        )
+        .unwrap();
         let _observation = observing(move |stage, conn, _| {
             if stage != "physical" {
                 return;
@@ -707,7 +720,7 @@ pub(crate) mod tests {
             let other = rusqlite::Connection::open(dir.join("store.sqlite")).unwrap();
             other.busy_timeout(std::time::Duration::ZERO).unwrap();
             other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
-            drop(crate::allocate::lifecycle_lock(&dir).unwrap());
+            drop(crate::allocate::lifecycle_lock(&lock_store).unwrap());
             let sum:i64=conn.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n",[],|r|r.get(0)).unwrap();
             assert_eq!(sum, 12_502_500);
         });
@@ -723,6 +736,12 @@ pub(crate) mod tests {
         for stage in ["contention", "commit"] {
             let (_temp, cfg, store, _a, _r, seal, ack) = closed();
             let dir = cfg.store_dir.clone().unwrap();
+            let lock_store = Store::open_existing_registered_mut(
+                cfg.trusted_registry.as_ref().unwrap(),
+                &dir,
+                &cfg.roots,
+            )
+            .unwrap();
             let joined = std::rc::Rc::new(std::cell::RefCell::new(None));
             let child = joined.clone();
             let _observation = observing(move |boundary, conn, at| {
@@ -733,7 +752,7 @@ pub(crate) mod tests {
                     other.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
                     std::thread::sleep(Duration::from_millis(1750).saturating_sub(at.elapsed()));
                     if stage == "contention" {
-                        let lock = crate::allocate::lifecycle_lock(&dir).unwrap();
+                        let lock = crate::allocate::lifecycle_lock(&lock_store).unwrap();
                         *child.borrow_mut() = Some(std::thread::spawn(move || {
                             std::thread::sleep(Duration::from_millis(350));
                             drop(lock);

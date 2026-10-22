@@ -555,7 +555,13 @@ pub(crate) fn observation(
     })
 }
 /// Shared metadata transition only; callers own all eligibility and CAS decisions.
-pub(crate) fn reconcile_hold(conn: &Connection, root: &RunRecord) -> Result<()> {
+pub(crate) fn reconcile_hold(
+    conn: &Connection,
+    root: &RunRecord,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+) -> Result<()> {
+    lease.check_authority(authority)?;
     let request = &root.request;
     let revision = root
         .revision
@@ -579,6 +585,41 @@ pub(crate) fn reconcile_hold(conn: &Connection, root: &RunRecord) -> Result<()> 
 pub enum BeginCapturedRun {
     Created(PreparationHandle),
     Existing(CaptureRecord),
+}
+// Standalone admission serializes before acquiring the lease. Carry the original
+// diagnostic spans through the complete admission, including its SQL tail.
+struct CaptureAdmissionBody {
+    bytes: String,
+    #[cfg(test)]
+    _total: crate::capture_diagnostics::Span,
+    #[cfg(test)]
+    _profile: crate::capture_diagnostics::ProfileRoot,
+}
+impl CaptureAdmissionBody {
+    fn new(request: &RootRunRequest, spec: &CaptureSpec) -> Result<Self> {
+        if request.input().attribution.is_some() {
+            return Err(StoreError::Invalid);
+        }
+        #[cfg(test)]
+        let profile = crate::capture_diagnostics::ProfileRoot::new();
+        #[cfg(test)]
+        let total = crate::capture_diagnostics::span(
+            crate::capture_diagnostics::Subphase::BeginCaptureTotal,
+        );
+        #[cfg(test)]
+        let before_sql =
+            crate::capture_diagnostics::span(crate::capture_diagnostics::Subphase::BeforeSqlJson);
+        let bytes = json(spec)?;
+        #[cfg(test)]
+        drop(before_sql);
+        Ok(Self {
+            bytes,
+            #[cfg(test)]
+            _total: total,
+            #[cfg(test)]
+            _profile: profile,
+        })
+    }
 }
 impl Store {
     pub fn capture_snapshot(&self, run: &RunId) -> Result<Option<CaptureRecord>> {
@@ -645,6 +686,9 @@ impl Store {
     ) -> Result<()> {
         let mut observation = observation(spec, prepared, live_revision.is_some())?;
         observation.context_artifact = artifact;
+        let lease = self.authority_lease()?;
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -707,14 +751,14 @@ impl Store {
         }
         if live_revision.is_some() {
             if let Some(pending) = pending {
-                pending.promote(&tx, id(&request.identity().checkout)?)?;
+                pending.promote(&tx, id(&request.identity().checkout)?, &lease, &authority)?;
             }
             tx.execute(
                 "UPDATE checkouts SET ready=1 WHERE id=?1",
                 [request.identity().checkout.to_string()],
             )?;
         } else {
-            reconcile_hold(&tx, &root)?;
+            reconcile_hold(&tx, &root, &lease, &authority)?;
             tx.commit()?;
             return Ok(());
         }
@@ -742,8 +786,25 @@ impl Store {
         request: &RootRunRequest,
         spec: &CaptureSpec,
     ) -> Result<BeginCapturedRun> {
-        self.begin_capture_context(request, spec, None)
+        let body = CaptureAdmissionBody::new(request, spec)?;
+        let lease = self.authority_lease()?;
+        self.begin_capture_context_under_lease(request, spec, None, body, &lease)
     }
+    pub(crate) fn begin_captured_run_under_lease(
+        &mut self,
+        request: &RootRunRequest,
+        spec: &CaptureSpec,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<BeginCapturedRun> {
+        self.begin_capture_context_under_lease(
+            request,
+            spec,
+            None,
+            CaptureAdmissionBody::new(request, spec)?,
+            lease,
+        )
+    }
+    #[cfg(test)]
     pub(crate) fn begin_materialized_capture(
         &mut self,
         request: &RootRunRequest,
@@ -753,45 +814,80 @@ impl Store {
         // Physical reinspection is outside every SQL phase/transaction. Only
         // sealed context and original-age checks run after IMMEDIATE locking.
         proof.reinspect(self)?;
-        self.begin_capture_context(
+        let body = CaptureAdmissionBody::new(request, spec)?;
+        let lease = self.authority_lease()?;
+        self.begin_capture_context_under_lease(
             request,
             spec,
             Some(&crate::capture_setup::AdmissionProof::Pending(proof)),
+            body,
+            &lease,
         )
     }
+    pub(crate) fn begin_materialized_capture_under_lease(
+        &mut self,
+        request: &RootRunRequest,
+        spec: &CaptureSpec,
+        proof: &crate::capture_setup::MaterializationProof,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<BeginCapturedRun> {
+        lease.check(self)?;
+        proof.reinspect(self)?;
+        self.begin_capture_context_under_lease(
+            request,
+            spec,
+            Some(&crate::capture_setup::AdmissionProof::Pending(proof)),
+            CaptureAdmissionBody::new(request, spec)?,
+            lease,
+        )
+    }
+    #[cfg(test)]
     pub(crate) fn begin_certified_capture(
         &mut self,
         request: &RootRunRequest,
         spec: &CaptureSpec,
         proof: &crate::capture_readiness::ContinuationProof,
     ) -> Result<BeginCapturedRun> {
-        self.begin_capture_context(
+        let body = CaptureAdmissionBody::new(request, spec)?;
+        let lease = self.authority_lease()?;
+        self.begin_capture_context_under_lease(
             request,
             spec,
             Some(&crate::capture_setup::AdmissionProof::Certified(proof)),
+            body,
+            &lease,
         )
     }
-    fn begin_capture_context(
+    pub(crate) fn begin_certified_capture_under_lease(
+        &mut self,
+        request: &RootRunRequest,
+        spec: &CaptureSpec,
+        proof: &crate::capture_readiness::ContinuationProof,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<BeginCapturedRun> {
+        self.begin_capture_context_under_lease(
+            request,
+            spec,
+            Some(&crate::capture_setup::AdmissionProof::Certified(proof)),
+            CaptureAdmissionBody::new(request, spec)?,
+            lease,
+        )
+    }
+    fn begin_capture_context_under_lease(
         &mut self,
         request: &RootRunRequest,
         spec: &CaptureSpec,
         proof: Option<&crate::capture_setup::AdmissionProof<'_>>,
+        body: CaptureAdmissionBody,
+        lease: &crate::allocate::AuthorityLease,
     ) -> Result<BeginCapturedRun> {
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         if request.input().attribution.is_some() {
             return Err(StoreError::Invalid);
         }
         #[cfg(test)]
-        use crate::capture_diagnostics::{span, ProfileRoot, Subphase};
-        #[cfg(test)]
-        let _profile = ProfileRoot::new();
-        #[cfg(test)]
-        let _total = span(Subphase::BeginCaptureTotal);
-        #[cfg(test)]
-        let before_sql = span(Subphase::BeforeSqlJson);
-        // Bound the actual durable representation before acquiring SQL authority.
-        let body = json(spec)?;
-        #[cfg(test)]
-        drop(before_sql);
+        use crate::capture_diagnostics::{span, Subphase};
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -858,7 +954,7 @@ impl Store {
             Some((proof, related)) => crate::run_journal::WriterAdmission::Captured(proof, related),
             None => crate::run_journal::WriterAdmission::Ordinary,
         };
-        if crate::run_journal::begin_run_context(&tx, request, writer_admission)?
+        if crate::run_journal::begin_run_context(&tx, request, writer_admission, lease, &authority)?
             != BeginRun::Created
         {
             return Err(StoreError::Conflict);
@@ -870,7 +966,7 @@ impl Store {
         // The last consumer was validate_writer, before INSERT INTO writers.
         // No qualified SQL fact is consulted after that mutation.
         drop(related);
-        tx.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",rusqlite::params![request.identity().run.to_string(), request.identity().group.to_string(),request.identity().checkout.to_string(),spec.operation.to_string(),body,digest(spec)?.as_slice(),wall()])?;
+        tx.execute("INSERT INTO capture_runs(run,group_id,checkout,operation,spec,fingerprint,intent_wall,preparation_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",rusqlite::params![request.identity().run.to_string(), request.identity().group.to_string(),request.identity().checkout.to_string(),spec.operation.to_string(),body.bytes,digest(spec)?.as_slice(),wall()])?;
         crate::run_journal::journal_event(
             &tx,
             request,
@@ -982,7 +1078,10 @@ pub(crate) fn observe_group_end(
     conn: &Connection,
     root: &RunRecord,
     observed: std::time::SystemTime,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
 ) -> Result<()> {
+    lease.check_authority(authority)?;
     let Some(record) = read(conn, root)? else {
         return Ok(());
     };

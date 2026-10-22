@@ -115,7 +115,13 @@ impl Completion {
 
 /// Prepare every known terminal intent under the lifecycle lock, after the task
 /// transaction committed. Any failure is capture failure, never task rollback.
-pub(super) fn intents(store: &mut Store, checkout: Uuid) -> Result<()> {
+pub(super) fn intents(
+    store: &mut Store,
+    checkout: Uuid,
+    lease: &allocate::AuthorityLease,
+) -> Result<()> {
+    lease.check(store)?;
+    let authority = store.authority_identity().clone();
     let _phase = store.sql_phase();
     let tx = store
         .conn
@@ -127,7 +133,9 @@ pub(super) fn intents(store: &mut Store, checkout: Uuid) -> Result<()> {
             {
                 continue;
             }
-            crate::capture_finalization::prepare_intent(&tx, &root, &capture, &spec)?;
+            crate::capture_finalization::prepare_intent(
+                &tx, &root, &capture, &spec, lease, &authority,
+            )?;
         }
         Ok(())
     })?;

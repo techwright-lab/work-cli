@@ -391,7 +391,7 @@ fn finish_internal(
     } else {
         None
     };
-    let lock = allocate::lifecycle_lock(dir)?;
+    let lock = store.authority_lease()?;
     let receipt = prepare(
         config,
         &mut store,
@@ -399,12 +399,13 @@ fn finish_internal(
         &mode,
         proof.as_ref(),
         &mut boundary,
+        &lock,
     )?;
     let compatible = receipt.capture_binding == digest(json(&Some("devdiary"))?);
     let capture_ready = !integrated
         || (compatible
             && (!matches!(receipt.local_freeze, Freeze::Pending | Freeze::Failed) || {
-                let intents = captured::intents(&mut store, checkout);
+                let intents = captured::intents(&mut store, checkout, &lock);
                 #[cfg(test)]
                 if let Err(error) = &intents {
                     crate::capture_diagnostics::store_error("finish::intents-discard", error);
@@ -470,6 +471,8 @@ fn finish_internal(
             }
         }
         let persisted = (|| -> Result<()> {
+            let lease = store.authority_lease()?;
+            lease.check(&store)?;
             let _phase = store.sql_phase();
             let tx = store
                 .conn
@@ -702,7 +705,10 @@ fn prepare(
     mode: &Mode<'_>,
     proof: Option<&captured::Completion>,
     boundary: &mut impl FnMut(&str),
+    lease: &allocate::AuthorityLease,
 ) -> Result<Receipt> {
+    lease.check(store)?;
+    let authority = store.authority_identity().clone();
     let configured = {
         let _phase = store.sql_phase();
         let current = config
@@ -751,7 +757,8 @@ fn prepare(
     let a = if let Some(proof) = proof {
         proof.allocation()
     } else {
-        allocate::verified_checkout(store, checkout).map_err(|_| StoreError::Invalid)?
+        allocate::verified_checkout_under_lease(store, checkout, lease)
+            .map_err(|_| StoreError::Invalid)?
     };
     let operation = Uuid::now_v7();
     #[cfg(test)]
@@ -818,7 +825,7 @@ fn prepare(
             "INSERT INTO task_finishes VALUES(?1,?2,?3)",
             (checkout.to_string(), operation.to_string(), json(&receipt)?),
         )?;
-        crate::capture_readiness::invalidate(&tx, checkout)?;
+        crate::capture_readiness::invalidate(&tx, checkout, lease, &authority)?;
         tx.execute(
             "UPDATE checkouts SET state='held',ready=0 WHERE id=?1",
             [checkout.to_string()],
@@ -1061,7 +1068,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
                 "expired" => std::thread::sleep(std::time::Duration::from_millis(2100)),
                 _ => {}
             }
-            let _lock = allocate::lifecycle_lock(cfg.store_dir.as_ref().unwrap()).unwrap();
+            let lease = allocate::lifecycle_lock(&store).unwrap();
             let result = prepare(
                 &cfg,
                 &mut store,
@@ -1073,6 +1080,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
                         std::thread::sleep(std::time::Duration::from_millis(2100));
                     }
                 },
+                &lease,
             );
             assert!(result.is_err(), "{change}");
             assert_eq!(
@@ -1129,7 +1137,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
                         [rowid],
                     )
                     .unwrap();
-                let _lock = allocate::lifecycle_lock(cfg.store_dir.as_ref().unwrap()).unwrap();
+                let lease = allocate::lifecycle_lock(&store).unwrap();
                 let result = prepare(
                     cfg,
                     &mut store,
@@ -1137,6 +1145,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
                     &Mode::Integrated,
                     Some(&proof),
                     &mut |_| {},
+                    &lease,
                 );
                 assert!(
                     matches!(result, Err(StoreError::Invalid)),

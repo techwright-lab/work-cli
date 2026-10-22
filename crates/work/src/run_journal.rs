@@ -722,11 +722,21 @@ impl Store {
     /// ONE IMMEDIATE transaction. No OS calls occur inside it. On any error,
     /// including uncertain commit durability, recover by RunId; never launch.
     pub fn begin_run(&mut self, request: &RootRunRequest) -> Result<BeginRun> {
+        let lease = self.authority_lease()?;
+        self.begin_run_under_lease(request, &lease)
+    }
+    pub(crate) fn begin_run_under_lease(
+        &mut self,
+        request: &RootRunRequest,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<BeginRun> {
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let result = begin_run_tx(&tx, request)?;
+        let result = begin_run_tx(&tx, request, lease, &authority)?;
         tx.commit()?;
         Ok(result)
     }
@@ -752,14 +762,22 @@ pub(crate) enum WriterAdmission<'a, 'tx, 'conn> {
     ),
     Gap(&'a crate::attribution_gap::GapAdmissionProof),
 }
-pub(crate) fn begin_run_tx(tx: &Connection, request: &RootRunRequest) -> Result<BeginRun> {
-    begin_run_context(tx, request, WriterAdmission::Ordinary)
+pub(crate) fn begin_run_tx(
+    tx: &Connection,
+    request: &RootRunRequest,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+) -> Result<BeginRun> {
+    begin_run_context(tx, request, WriterAdmission::Ordinary, lease, authority)
 }
 pub(crate) fn begin_run_context(
     tx: &Connection,
     request: &RootRunRequest,
     materialized: WriterAdmission<'_, '_, '_>,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
 ) -> Result<BeginRun> {
+    lease.check_authority(authority)?;
     if !matches!(materialized, WriterAdmission::Gap(_)) && request.input.attribution.is_some() {
         return Err(StoreError::Invalid);
     }
@@ -796,6 +814,8 @@ pub(crate) fn begin_run_context(
         uuid(&i.group)?,
         false,
         materialized,
+        lease,
+        authority,
     )?;
     tx.execute(
         "INSERT INTO run_groups(id,checkout,mode,revision) VALUES(?1,?2,'supervised',1)",
@@ -938,6 +958,18 @@ impl Store {
         proof: &GroupEmptyProof,
         live: Option<&crate::capture_preparation::LiveCapture>,
     ) -> Result<(Transition, Option<crate::capture_readiness::ClosureSeal>)> {
+        let lease = self.authority_lease()?;
+        self.close_supervised_group_context_under_lease(snapshot, proof, live, &lease)
+    }
+    pub(crate) fn close_supervised_group_context_under_lease(
+        &mut self,
+        snapshot: &GroupSnapshot,
+        proof: &GroupEmptyProof,
+        live: Option<&crate::capture_preparation::LiveCapture>,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<(Transition, Option<crate::capture_readiness::ClosureSeal>)> {
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         if snapshot.record != proof.record {
             return Err(StoreError::Conflict);
@@ -995,7 +1027,13 @@ impl Store {
                 JournalChange::ChildrenInterrupted,
             )?;
         }
-        crate::capture_journal::observe_group_end(&tx, &current, proof.observed_wall)?;
+        crate::capture_journal::observe_group_end(
+            &tx,
+            &current,
+            proof.observed_wall,
+            lease,
+            &authority,
+        )?;
         // Child updates/outbox work consume the original evidence window too.
         if Instant::now()
             .checked_duration_since(proof.collected_at)
@@ -1038,6 +1076,16 @@ impl Store {
         Ok((Transition::Changed, seal))
     }
     fn transition(&mut self, request: &RootRunRequest, change: Change) -> Result<Transition> {
+        let lease = self.authority_lease()?;
+        self.transition_under_lease(request, change, &lease)
+    }
+    fn transition_under_lease(
+        &mut self,
+        request: &RootRunRequest,
+        change: Change,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<Transition> {
+        lease.check(self)?;
         let _phase = self.sql_phase();
         let tx = self
             .conn

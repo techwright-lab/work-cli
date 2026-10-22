@@ -34,7 +34,8 @@ pub fn begin(
     // Exact historical receipts use their sealed settings, with no FS refresh,
     // current actor/profile requirement or new preparation capability.
     if crate::allocate::db(store.run_snapshot(&request.identity().run))?.is_some() {
-        let result = crate::allocate::db(store.begin_captured_run(request, spec))?;
+        let result =
+            crate::allocate::db(store.begin_captured_run_under_lease(request, spec, &lock))?;
         drop(lock);
         return Ok((store, result));
     }
@@ -62,18 +63,17 @@ pub fn begin(
             &store, config, request, spec,
         ))?;
         crate::allocate::db(proof.reinspect(&store))?;
-        let lock = crate::allocate::lifecycle_lock(
-            config
-                .store_dir
-                .as_ref()
-                .ok_or_else(|| crate::allocate::err("missing store"))?,
+        let lock = crate::allocate::lifecycle_lock(&store)?;
+        let result = crate::allocate::db(
+            store.begin_certified_capture_under_lease(request, spec, &proof, &lock),
         )?;
-        let result = crate::allocate::db(store.begin_certified_capture(request, spec, &proof))?;
         drop(lock);
         return Ok((store, result));
     }
     let proof = crate::allocate::db(MaterializationProof::inspect(&store, request, spec))?;
-    let result = crate::allocate::db(store.begin_materialized_capture(request, spec, &proof))?;
+    let result = crate::allocate::db(
+        store.begin_materialized_capture_under_lease(request, spec, &proof, &lock),
+    )?;
     drop(lock);
     Ok((store, result))
 }
@@ -122,7 +122,14 @@ impl PendingPreparation {
     pub(crate) fn source_common(&self) -> &std::path::Path {
         &self.source_common
     }
-    pub(crate) fn promote(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
+    fn promote(
+        &self,
+        conn: &Connection,
+        checkout: uuid::Uuid,
+        lease: &crate::allocate::AuthorityLease,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> Result<()> {
+        lease.check_authority(authority)?;
         if Self::read(conn, checkout)? != *self {
             return Err(StoreError::Conflict);
         }
@@ -247,9 +254,16 @@ pub(crate) enum PreparationContext {
     Certified(PendingPreparation),
 }
 impl PreparationContext {
-    pub(crate) fn promote(&self, conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
+    pub(crate) fn promote(
+        &self,
+        conn: &Connection,
+        checkout: uuid::Uuid,
+        lease: &crate::allocate::AuthorityLease,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> Result<()> {
+        lease.check_authority(authority)?;
         match self {
-            Self::Pending(p) => p.promote(conn, checkout),
+            Self::Pending(p) => p.promote(conn, checkout, lease, authority),
             Self::Certified(p) => {
                 if PendingPreparation::read(conn, checkout)? != *p
                     || p.allocation()?.stage != "ready"

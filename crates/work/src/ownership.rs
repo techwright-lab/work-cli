@@ -8,6 +8,17 @@ use rusqlite::TransactionBehavior;
 use uuid::Uuid;
 impl Store {
     pub fn transfer(&mut self, checkout: Uuid, recipient: &str, limits: Limits) -> Result<()> {
+        let lease = self.authority_lease()?;
+        self.transfer_under_lease(checkout, recipient, limits, &lease)
+    }
+    pub(crate) fn transfer_under_lease(
+        &mut self,
+        checkout: Uuid,
+        recipient: &str,
+        limits: Limits,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<()> {
+        lease.check(self)?;
         identity(recipient)?;
         let _phase = self.sql_phase();
         let tx = self
@@ -52,6 +63,8 @@ impl Store {
         operator: Option<&str>,
         limits: Limits,
     ) -> Result<usize> {
+        let lease = self.authority_lease()?;
+        lease.check(self)?;
         identity(owner)?;
         let _phase = self.sql_phase();
         let operator = operator.ok_or(StoreError::Invalid)?;

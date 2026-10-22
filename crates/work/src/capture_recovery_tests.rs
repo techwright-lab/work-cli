@@ -681,6 +681,12 @@ fn begin_replay_observations_and_process_hold_no_sql_or_flock() {
     drop(created);
     fs::write(&cfg.capture.as_ref().unwrap().executable, format!("#!/usr/bin/python3\nimport sqlite3,fcntl,pathlib,sys,time\np=pathlib.Path({:?})\nc=sqlite3.connect(p/'private/store.sqlite',timeout=0)\nc.execute('begin immediate')\nc.rollback()\nf=open(p/'private/allocation.lock','r+')\nfcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nfcntl.flock(f,fcntl.LOCK_UN)\nsys.stdin.buffer.read()\ntime.sleep(0.65)\nsys.stdout.buffer.write((p/'response').read_bytes())\n", temp.path().to_str().unwrap())).unwrap();
     let dir = cfg.store_dir.clone().unwrap();
+    let lock_store = Store::open_existing_registered_mut(
+        cfg.trusted_registry.as_ref().unwrap(),
+        &dir,
+        &cfg.roots,
+    )
+    .unwrap();
     let count = std::rc::Rc::new(Cell::new(0));
     let seen = count.clone();
     let _guard = observing(move |_, store| {
@@ -688,7 +694,7 @@ fn begin_replay_observations_and_process_hold_no_sql_or_flock() {
         let db = Connection::open(dir.join("store.sqlite")).unwrap();
         db.busy_timeout(Duration::ZERO).unwrap();
         db.execute_batch("BEGIN IMMEDIATE; ROLLBACK").unwrap();
-        let lock = crate::allocate::lifecycle_lock(&dir).unwrap();
+        let lock = crate::allocate::lifecycle_lock(&lock_store).unwrap();
         drop(lock);
         std::thread::sleep(Duration::from_millis(650));
         let sum: i64 = store.conn.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n", [], |r| r.get(0)).unwrap();
@@ -707,12 +713,18 @@ fn begin_replay_real_lock_contention_expires_post_observation() {
     let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
     drop(created);
     let dir = cfg.store_dir.clone().unwrap();
+    let lock_store = Store::open_existing_registered_mut(
+        cfg.trusted_registry.as_ref().unwrap(),
+        &dir,
+        &cfg.roots,
+    )
+    .unwrap();
     let worker = std::rc::Rc::new(RefCell::new(None));
     let slot = worker.clone();
     let _guard = observing(move |stage, _| {
         if stage == "post_physical" {
             std::thread::sleep(Duration::from_millis(1800));
-            let lock = crate::allocate::lifecycle_lock(&dir).unwrap();
+            let lock = crate::allocate::lifecycle_lock(&lock_store).unwrap();
             *slot.borrow_mut() = Some(std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(350));
                 drop(lock);

@@ -158,6 +158,9 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
     }
     let mut store = Store::open_existing_registered_mut(registry, dir, &config.roots)?;
     if before.capture.prepared.is_some() {
+        let lease = store.authority_lease()?;
+        lease.check(&store)?;
+        let authority = store.authority_identity().clone();
         let _phase = store.sql_phase();
         let tx = store
             .conn
@@ -166,7 +169,7 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
         if current.seal != before.seal {
             return Err(StoreError::Conflict);
         }
-        capture_journal::reconcile_hold(&tx, &current.root)?;
+        capture_journal::reconcile_hold(&tx, &current.root, &lease, &authority)?;
         tx.commit()?;
         return Ok("metadata_reconciled");
     }
@@ -193,7 +196,9 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
         }
         #[cfg(test)]
         tests::observe("post_physical", &store);
-        let _lock = crate::allocate::lifecycle_lock(dir)?;
+        let lease = store.authority_lease()?;
+        lease.check(&store)?;
+        let authority = store.authority_identity().clone();
         fresh(observed)?;
         let _phase = store.sql_phase();
         let tx = store
@@ -207,7 +212,7 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
             "UPDATE capture_runs SET prepared=?2 WHERE run=?1",
             (run.to_string(), capture_journal::json(&observation)?),
         )?;
-        capture_journal::reconcile_hold(&tx, &current.root)?;
+        capture_journal::reconcile_hold(&tx, &current.root, &lease, &authority)?;
         fresh(observed)?;
         tx.commit()?;
         Ok(())

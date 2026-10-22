@@ -490,6 +490,7 @@ fn eligible_history(conn: &Connection, checkout: Uuid, origin: Origin) -> Result
 }
 
 pub(crate) struct GapAdmissionProof {
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
     origin: Origin,
     registry: Option<crate::capture_artifacts::Registry>,
     root: RootRunRequest,
@@ -513,7 +514,13 @@ impl GapAdmissionProof {
         conn: &Connection,
         checkout: Uuid,
         group: Uuid,
+        lease: &crate::allocate::AuthorityLease,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
     ) -> Result<()> {
+        lease.check_authority(authority)?;
+        if self.authority.as_ref() != authority.as_ref() {
+            return Err(StoreError::Conflict);
+        }
         self.fresh()?;
         if self.root.identity().checkout.to_string() != checkout.to_string()
             || self.root.identity().group.to_string() != group.to_string()
@@ -579,12 +586,24 @@ pub(crate) struct GapGuard {
     git: ActorGitProfile,
 }
 pub(crate) struct GapReleaseProof {
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
     guard: GapGuard,
     record: GapRecord,
     context: Context,
     observed: Instant,
 }
 impl GapReleaseProof {
+    pub(crate) fn validate_authority(
+        &self,
+        store: &Store,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<()> {
+        lease.check(store)?;
+        if self.authority.as_ref() != store.authority_identity().as_ref() {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
     pub(crate) fn validate(&self, guard: &GapGuard) -> Result<()> {
         if &self.guard != guard {
             return Err(StoreError::Conflict);
@@ -604,7 +623,9 @@ impl GapReleaseProof {
         &self,
         store: &Store,
         binding: &crate::runtime_scope::Binding,
+        lease: &crate::allocate::AuthorityLease,
     ) -> Result<()> {
+        self.validate_authority(store, lease)?;
         self.fresh()?;
         let _phase = store.sql_phase();
         let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
@@ -687,6 +708,7 @@ impl CreatedOffLive {
             registry.revalidate().map_err(|_| StoreError::Conflict)?;
         }
         let proof = GapReleaseProof {
+            authority: self.proof.authority.clone(),
             guard: self.guard(),
             record: self.record.clone(),
             context: self.proof.context.clone(),
@@ -847,6 +869,7 @@ pub(crate) fn begin(
         return Err(StoreError::Conflict);
     }
     let proof = GapAdmissionProof {
+        authority: store.authority_identity().clone(),
         origin,
         registry,
         root: root.clone(),
@@ -900,8 +923,8 @@ pub(crate) fn begin(
     if let Some(registry) = &proof.registry {
         registry.revalidate().map_err(|_| StoreError::Conflict)?;
     }
-    let lock =
-        crate::allocate::lifecycle_lock(config.store_dir.as_ref().ok_or(StoreError::Invalid)?)?;
+    let lock = store.authority_lease()?;
+    let authority = store.authority_identity().clone();
     {
         let _phase = store.sql_phase();
         let tx = store
@@ -923,6 +946,8 @@ pub(crate) fn begin(
             &tx,
             root,
             crate::run_journal::WriterAdmission::Gap(&proof),
+            &lock,
+            &authority,
         )?;
         tx.execute("INSERT INTO attribution_gaps(run,group_id,checkout,event_id,record,fingerprint) VALUES(?1,?2,?3,?4,?5,?6)",
             rusqlite::params![record.run,record.group,record.checkout,record.event_id,bytes,fingerprint.as_slice()])?;

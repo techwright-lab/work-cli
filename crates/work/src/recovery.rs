@@ -35,7 +35,18 @@ impl From<&Allocation> for Marker {
         }
     }
 }
+#[cfg(test)]
 pub(crate) fn hold(store: &mut Store, a: &mut Allocation, reason: &str) -> io::Result<()> {
+    let lease = allocate::lifecycle_lock(store)?;
+    hold_under_lease(store, a, reason, &lease)
+}
+pub(crate) fn hold_under_lease(
+    store: &mut Store,
+    a: &mut Allocation,
+    reason: &str,
+    lease: &allocate::AuthorityLease,
+) -> io::Result<()> {
+    allocate::db(lease.check(store))?;
     let _phase = store.sql_phase();
     {
         let tx = allocate::sql(
@@ -86,9 +97,19 @@ pub(crate) fn hold(store: &mut Store, a: &mut Allocation, reason: &str) -> io::R
     }
     a.stage = "held".into();
     a.reason = Some(reason.into());
-    allocate::save(store, a)
+    allocate::save_under_lease(store, a, lease)
 }
+#[cfg(test)]
 pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()> {
+    let lease = allocate::lifecycle_lock(store)?;
+    reconcile_under_lease(store, a, &lease)
+}
+pub(crate) fn reconcile_under_lease(
+    store: &mut Store,
+    a: &mut Allocation,
+    lease: &allocate::AuthorityLease,
+) -> io::Result<()> {
+    allocate::db(lease.check(store))?;
     {
         let _phase = store.sql_phase();
         allocate::db(crate::attribution_gap::guard_legacy_allocation(
@@ -133,9 +154,9 @@ pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()>
             } else {
                 a.stage = "ready".into(); a.reason = None;
             }
-            allocate::save(store, a)
+            allocate::save_under_lease(store, a, lease)
         }
-        Err(_) => hold(store, a, "identity/marker/registration incomplete or changed; operator reconciliation required (slot retained)"),
+        Err(_) => hold_under_lease(store, a, "identity/marker/registration incomplete or changed; operator reconciliation required (slot retained)", lease),
     }
 }
 pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {

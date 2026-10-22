@@ -72,7 +72,18 @@ fn component(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
+#[cfg(test)]
 pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
+    let lease = lifecycle_lock(store)?;
+    save_under_lease(store, a, &lease)
+}
+pub(crate) fn save_under_lease(
+    store: &mut Store,
+    a: &Allocation,
+    lease: &AuthorityLease,
+) -> io::Result<()> {
+    db(lease.check(store))?;
+    let authority = store.authority_identity().clone();
     let record = serde_json::to_string(a)?;
     let request = serde_json::to_string(&a.request)?;
     let _phase = store.sql_phase();
@@ -103,7 +114,9 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
         ))?;
     }
     if a.stage != "ready" {
-        db(crate::capture_readiness::invalidate(&tx, a.checkout))?;
+        db(crate::capture_readiness::invalidate(
+            &tx, a.checkout, lease, &authority,
+        ))?;
     }
     sql(tx.execute("INSERT INTO allocations VALUES(?1,?2,?3) ON CONFLICT(checkout) DO UPDATE SET record=excluded.record", rusqlite::params![a.checkout.to_string(), request, record]))?;
     sql(tx.execute(
@@ -131,7 +144,18 @@ pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
     ))?;
     sql(tx.commit())
 }
+#[cfg(test)]
 pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allocation>> {
+    let lease = lifecycle_lock(store)?;
+    load_under_lease(store, operation, &lease)
+}
+pub(crate) fn load_under_lease(
+    store: &mut Store,
+    operation: Uuid,
+    lease: &AuthorityLease,
+) -> io::Result<Option<Allocation>> {
+    db(lease.check(store))?;
+    let authority = store.authority_identity().clone();
     let _phase = store.sql_phase();
     db(crate::capture_journal::exclude_operation(
         &store.conn,
@@ -169,7 +193,9 @@ pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allo
     // Keep corrupt evidence untouched, but revoke eligibility using the trusted row
     // key, never an ID supplied by malformed JSON.
     let tx = sql(store.conn.transaction())?;
-    db(crate::capture_readiness::invalidate(&tx, checkout))?;
+    db(crate::capture_readiness::invalidate(
+        &tx, checkout, lease, &authority,
+    ))?;
     sql(tx.execute(
         "UPDATE checkouts SET state='held',ready=0 WHERE id=?1",
         [&id],
@@ -206,7 +232,17 @@ fn refuse_finished(store: &Store, checkout: Uuid) -> io::Result<()> {
 /// Fresh checkout-by-ID validation. Caller holds allocation lock only for a
 /// short preflight/transaction, never for the supervised actor lifetime.
 /// Unlike allocation reconciliation this never revives held/quarantined rows.
+#[cfg(test)]
 pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result<Allocation> {
+    let lease = lifecycle_lock(store)?;
+    verified_checkout_under_lease(store, checkout, &lease)
+}
+pub(crate) fn verified_checkout_under_lease(
+    store: &mut Store,
+    checkout: Uuid,
+    lease: &AuthorityLease,
+) -> io::Result<Allocation> {
+    db(lease.check(store))?;
     refuse_finished(store, checkout)?;
     {
         let _phase = store.sql_phase();
@@ -223,34 +259,47 @@ pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result
     if state != "active" || !ready {
         return Err(err("checkout not active and ready"));
     }
-    let mut a = load(
+    let mut a = load_under_lease(
         store,
         Uuid::parse_str(&operation).map_err(|_| err("invalid operation"))?,
+        lease,
     )?
     .filter(|a| a.checkout == checkout && a.stage == "ready")
     .ok_or_else(|| err("checkout allocation not ready"))?;
-    source_authority(store, &mut a)?;
+    source_authority(store, &mut a, lease)?;
     let current = match crate::recovery::verify(&a) {
         Ok(current) => current,
         Err(_) => {
-            crate::recovery::hold(
+            crate::recovery::hold_under_lease(
                 store,
                 &mut a,
                 "fresh lease identity verification failed; charge retained",
+                lease,
             )?;
             return Err(err("lease identity changed; held"));
         }
     };
-    refresh_ready_identity(store, &mut a, current)?;
+    refresh_ready_identity_under_lease(store, &mut a, current, lease)?;
     Ok(a)
 }
 /// Identity evidence only: atomically refresh a still-active/ready allocation
 /// and its HEAD event. Never changes checkout eligibility, stage, or lease base.
+#[cfg(test)]
 fn refresh_ready_identity(
     store: &mut Store,
     a: &mut Allocation,
     current: CheckoutIdentity,
 ) -> io::Result<()> {
+    let lease = lifecycle_lock(store)?;
+    refresh_ready_identity_under_lease(store, a, current, &lease)
+}
+fn refresh_ready_identity_under_lease(
+    store: &mut Store,
+    a: &mut Allocation,
+    current: CheckoutIdentity,
+    lease: &AuthorityLease,
+) -> io::Result<()> {
+    db(lease.check(store))?;
     let _phase = store.sql_phase();
     let tx = sql(store
         .conn
@@ -300,7 +349,32 @@ fn refresh_ready_identity(
     *a = refreshed;
     Ok(())
 }
-pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
+/// A live, Store-instance-bound exclusion capability, never a wire value.
+pub(crate) struct AuthorityLease {
+    _file: fs::File,
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+}
+impl AuthorityLease {
+    pub(crate) fn check(&self, store: &Store) -> crate::store::Result<()> {
+        if !store.writable_authority() {
+            return Err(crate::store::StoreError::Unsafe);
+        }
+        self.check_authority(store.authority_identity())
+    }
+    pub(crate) fn check_authority(
+        &self,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> crate::store::Result<()> {
+        if !std::sync::Arc::ptr_eq(&self.authority, authority)
+            || self.authority.as_ref() != authority.as_ref()
+            || authority.lock_id.is_none()
+        {
+            return Err(crate::store::StoreError::Invalid);
+        }
+        Ok(())
+    }
+}
+pub(crate) fn locked(config: &Config) -> io::Result<(Store, AuthorityLease)> {
     let dir = config
         .store_dir
         .as_ref()
@@ -310,18 +384,29 @@ pub(crate) fn locked(config: &Config) -> io::Result<(Store, fs::File)> {
         .as_ref()
         .ok_or_else(|| err("configure trusted_registry in WORK_CONFIG"))?;
     let store = db(Store::open_registered(registry, dir, &config.roots))?;
-    let lock = lifecycle_lock(dir)?;
+    let lock = lifecycle_lock(&store)?;
     Ok((store, lock))
 }
-pub(crate) fn lifecycle_lock(dir: &std::path::Path) -> io::Result<fs::File> {
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
-        .open(dir.join("allocation.lock"))?;
+pub(crate) fn lifecycle_lock(store: &Store) -> io::Result<AuthorityLease> {
+    use std::os::unix::fs::MetadataExt;
+    db(store.may_acquire_lease())?;
+    let authority = store.authority_identity();
+    let directory = fs::symlink_metadata(&authority.directory)?;
+    if !directory.is_dir()
+        || directory.uid() != rustix::process::geteuid().as_raw()
+        || directory.mode() & 0o077 != 0
+        || (directory.dev(), directory.ino()) != authority.directory_id
+    {
+        return Err(err("authority directory changed"));
+    }
+    let lock = db(crate::store::AuthorityIdentity::open_lock(
+        &authority.directory,
+        false,
+    ))?;
+    let metadata = lock.metadata()?;
+    if Some((metadata.dev(), metadata.ino())) != authority.lock_id {
+        return Err(err("authority lock changed"));
+    }
     // Bound contention; do not wait indefinitely behind an unknown allocator.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     loop {
@@ -335,7 +420,10 @@ pub(crate) fn lifecycle_lock(dir: &std::path::Path) -> io::Result<fs::File> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(lock)
+    Ok(AuthorityLease {
+        _file: lock,
+        authority: std::sync::Arc::clone(authority),
+    })
 }
 fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {
     let policy = config
@@ -398,7 +486,8 @@ pub fn start_observed(
     mut boundary: impl FnMut(&str),
 ) -> io::Result<Allocation> {
     let r = normalize(config, request)?;
-    let (mut store, _lock) = locked(config)?;
+    let (mut store, lease) = locked(config)?;
+    let authority = store.authority_identity().clone();
     {
         let _phase = store.sql_phase();
         let checkout: Option<String> = sql(store
@@ -417,7 +506,7 @@ pub fn start_observed(
             ))?;
         }
     }
-    if let Some(mut a) = load(&mut store, r.operation)? {
+    if let Some(mut a) = load_under_lease(&mut store, r.operation, &lease)? {
         refuse_finished(&store, a.checkout)?;
         if a.request != r {
             return Err(err("operation request conflicts"));
@@ -435,20 +524,21 @@ pub fn start_observed(
         if !db(crate::capture_requirement::present(&store.conn, a.checkout))?
             && config.allocation.as_ref().unwrap().capture_sink.is_some()
         {
-            crate::recovery::hold(
+            crate::recovery::hold_under_lease(
                 &mut store,
                 &mut a,
                 "configured capture unsupported; no capture prepared",
+                &lease,
             )?;
             return Err(err(
                 "configured capture unsupported; writer eligibility revoked",
             ));
         }
         if a.stage == "reserved" {
-            return create(config, &mut store, a, &mut boundary);
+            return create(config, &mut store, a, &mut boundary, &lease);
         }
-        source_authority(&mut store, &mut a)?;
-        crate::recovery::reconcile(&mut store, &mut a)?;
+        source_authority(&mut store, &mut a, &lease)?;
+        crate::recovery::reconcile_under_lease(&mut store, &mut a, &lease)?;
         return if matches!(a.stage.as_str(), "ready" | "capture_pending") {
             Ok(a)
         } else {
@@ -520,7 +610,9 @@ pub fn start_observed(
         if matches.len() != 1 {
             let tx = sql(store.conn.transaction())?;
             for id in matches {
-                db(crate::capture_readiness::invalidate(&tx, id))?;
+                db(crate::capture_readiness::invalidate(
+                    &tx, id, &lease, &authority,
+                ))?;
                 sql(tx.execute("UPDATE checkouts SET ready=0,state=CASE WHEN state IN ('reserved','partial','active') THEN 'held' ELSE state END WHERE id=?1", [id.to_string()]))?;
                 let operation: String = sql(tx.query_row(
                     "SELECT operation FROM checkouts WHERE id=?1",
@@ -559,9 +651,10 @@ pub fn start_observed(
             [matches[0].to_string()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         ))?;
-        let mut a = load(
+        let mut a = load_under_lease(
             &mut store,
             Uuid::parse_str(&operation).map_err(|_| err("invalid stored operation"))?,
+            &lease,
         )?
         .ok_or_else(|| err("matching charge lacks intent; hold"))?;
         let required = db(crate::capture_requirement::read(&store.conn, a.checkout))?.is_some();
@@ -573,11 +666,16 @@ pub fn start_observed(
             ));
         }
         if !required && config.allocation.as_ref().unwrap().capture_sink.is_some() {
-            crate::recovery::hold(&mut store, &mut a, "configured capture unsupported")?;
+            crate::recovery::hold_under_lease(
+                &mut store,
+                &mut a,
+                "configured capture unsupported",
+                &lease,
+            )?;
             return Err(err("configured capture unsupported"));
         }
-        source_authority(&mut store, &mut a)?;
-        crate::recovery::reconcile(&mut store, &mut a)?;
+        source_authority(&mut store, &mut a, &lease)?;
+        crate::recovery::reconcile_under_lease(&mut store, &mut a, &lease)?;
         return if matches!(a.stage.as_str(), "ready" | "capture_pending") {
             Ok(a)
         } else {
@@ -655,7 +753,7 @@ pub fn start_observed(
     ))?;
     boundary("charged");
     boundary("reserved");
-    create(config, &mut store, a, &mut boundary)
+    create(config, &mut store, a, &mut boundary, &lease)
 }
 // The charged row, not a second fresh Git query, is repository authority.
 fn source_authority_evidence(conn: &rusqlite::Connection, a: &Allocation) -> io::Result<PathBuf> {
@@ -683,7 +781,12 @@ pub(crate) fn verify_source_authority(
         _ => Err(err("source repository authority mismatch")),
     }
 }
-fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf> {
+fn source_authority(
+    store: &mut Store,
+    a: &mut Allocation,
+    lease: &AuthorityLease,
+) -> io::Result<PathBuf> {
+    db(lease.check(store))?;
     {
         let _phase = store.sql_phase();
         db(crate::attribution_gap::guard_legacy_allocation(
@@ -694,10 +797,11 @@ fn source_authority(store: &mut Store, a: &mut Allocation) -> io::Result<PathBuf
     match source_authority_evidence(&store.conn, a) {
         Ok(common) => Ok(common),
         Err(_) => {
-            crate::recovery::hold(
+            crate::recovery::hold_under_lease(
                 store,
                 a,
                 "source repository differs from durable charged authority or is unavailable",
+                lease,
             )?;
             Err(err("source repository authority mismatch; allocation held"))
         }
@@ -709,7 +813,9 @@ fn create(
     store: &mut Store,
     mut a: Allocation,
     boundary: &mut impl FnMut(&str),
+    lease: &AuthorityLease,
 ) -> io::Result<Allocation> {
+    db(lease.check(store))?;
     {
         let _phase = store.sql_phase();
         db(crate::attribution_gap::guard_legacy_allocation(
@@ -720,17 +826,22 @@ fn create(
     crate::config::validate_path(a.destination.parent().unwrap(), true)
         .map_err(|_| err("destination ancestor changed"))?;
     if fs::symlink_metadata(&a.destination).is_ok() {
-        return crate::recovery::hold(store, &mut a, "destination collision")
+        return crate::recovery::hold_under_lease(store, &mut a, "destination collision", lease)
             .and_then(|()| Err(err("destination collision")));
     }
     a.stage = "creating".into();
-    save(store, &a)?;
+    save_under_lease(store, &a, lease)?;
     boundary("intent");
-    let charged_common = source_authority(store, &mut a)?;
+    let charged_common = source_authority(store, &mut a, lease)?;
     let repo = a.request.repository.as_ref().unwrap();
     let branch = a.request.branch.as_ref().unwrap();
     if let Err(e) = crate::identity::preflight_creation(repo) {
-        crate::recovery::hold(store, &mut a, &format!("creation preflight failed: {e}"))?;
+        crate::recovery::hold_under_lease(
+            store,
+            &mut a,
+            &format!("creation preflight failed: {e}"),
+            lease,
+        )?;
         return Err(e);
     }
     let result = if a.request.reuse_branch {
@@ -740,10 +851,11 @@ fn create(
             .as_deref()
             != Some(a.base_commit.as_str())
         {
-            crate::recovery::hold(
+            crate::recovery::hold_under_lease(
                 store,
                 &mut a,
                 "branch moved or unavailable; charged intent requires reconciliation",
+                lease,
             )?;
             return Err(err("branch moved; allocation held"));
         }
@@ -777,10 +889,11 @@ fn create(
     };
     boundary("created");
     if result.is_err() {
-        crate::recovery::hold(
+        crate::recovery::hold_under_lease(
             store,
             &mut a,
             "Git creation failed; inspect path and registration (charge retained)",
+            lease,
         )?;
         return Err(err("Git creation failed; allocation held"));
     }
@@ -789,13 +902,18 @@ fn create(
         || identity.private_git_dir == identity.common_git_dir
         || identity.head != a.base_commit
     {
-        crate::recovery::hold(store, &mut a, "unsupported or changed Git identity")?;
+        crate::recovery::hold_under_lease(
+            store,
+            &mut a,
+            "unsupported or changed Git identity",
+            lease,
+        )?;
         return Err(err("Git identity mismatch; held"));
     }
     a.identity = Some(identity);
     // Identity commit BEFORE marker: an interrupted marker write is not adopted.
     a.stage = "created".into();
-    save(store, &a)?;
+    save_under_lease(store, &a, lease)?;
     boundary("identity");
     let marker = a
         .identity
@@ -814,7 +932,7 @@ fn create(
     fs::File::open(&a.destination)?.sync_all()?;
     fs::File::open(a.destination.parent().unwrap())?.sync_all()?;
     boundary("marker");
-    crate::recovery::reconcile(store, &mut a)?;
+    crate::recovery::reconcile_under_lease(store, &mut a, lease)?;
     if !matches!(a.stage.as_str(), "ready" | "capture_pending") {
         return Err(err("identity changed before readiness; allocation held"));
     }

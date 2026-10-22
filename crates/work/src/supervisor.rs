@@ -11,7 +11,7 @@
 //! than moving a foreground protocol into a background process group silently.
 pub use crate::attribution_gap::{GapDelivery, GapObservation};
 use crate::{
-    allocate::{self, db, err, verified_checkout},
+    allocate::{self, db, err, verified_checkout_under_lease},
     config::{Config, SupervisorConfig},
     run_journal::{BeginRun, RootOutcome, RootRunRequest, RunIdentity, RunInput, RunRecord},
     runtime_scope::LaunchIntent,
@@ -566,7 +566,7 @@ fn supervise(
         RunId::parse(&command.run_id.to_string()).map_err(|_| err("run-id must be UUIDv7"))?;
     // Fresh lease BEFORE begin/writer/spawn, under the same short allocator lock.
     let (mut store, lock) = allocate::locked(config)?;
-    let allocation = verified_checkout(&mut store, command.checkout)?;
+    let allocation = verified_checkout_under_lease(&mut store, command.checkout, &lock)?;
     let actor = command
         .actor
         .as_deref()
@@ -578,7 +578,7 @@ fn supervise(
         .ok_or_else(|| err("actor Git profile not registered"))?;
     let existing = db(store.run_snapshot(&run))?;
     let request = request(&command, &allocation, actor, profile, existing.as_ref())?;
-    let began = db(store.begin_run(&request))?;
+    let began = db(store.begin_run_under_lease(&request, &lock))?;
     drop(lock);
     if began == BeginRun::Existing {
         if !record(&store, &request)?.closed {
@@ -735,12 +735,14 @@ fn execute(
                 db(proof.validate_current(
                     &fresh_store,
                     launch.binding().ok_or_else(|| err("missing binding"))?,
+                    &lock,
                 ))?;
                 if cancel.requested() {
                     return Err(err("release held"));
                 }
             } else {
-                let fresh = verified_checkout(&mut fresh_store, command.checkout)?;
+                let fresh =
+                    verified_checkout_under_lease(&mut fresh_store, command.checkout, &lock)?;
                 let current = record(&fresh_store, &request)?;
                 if fresh.destination != allocation.destination
                     || current.closed
@@ -753,7 +755,7 @@ fn execute(
             }
             // Every SQL guard has dropped; the allocator lease remains held through publication.
             if let Some(proof) = gap_proof {
-                launch.release_gap(driver, proof)
+                launch.release_gap(driver, proof, &fresh_store, &lock)
             } else {
                 match capture_proof {
                     Some(proof) => launch.release_captured(driver, proof),

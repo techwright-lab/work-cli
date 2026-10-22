@@ -426,12 +426,15 @@ fn finalize_after_preflight(
     }
     after_preflight();
     let (spec, binding, intent) = {
+        let lease = store.authority_lease()?;
+        lease.check(&store)?;
+        let authority = store.authority_identity().clone();
         let _phase = store.sql_phase();
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (root, capture, spec) = target(&tx, run)?;
-        let snapshot = prepare_intent(&tx, &root, &capture, &spec)?;
+        let snapshot = prepare_intent(&tx, &root, &capture, &spec, &lease, &authority)?;
         if snapshot.confirmation.is_some() {
             tx.commit()?;
             drop(_phase);
@@ -481,7 +484,10 @@ pub(crate) fn prepare_intent(
     root: &RunRecord,
     capture: &CaptureRecord,
     spec: &CaptureSpec,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
 ) -> Result<Snapshot> {
+    lease.check_authority(authority)?;
     if let Some(existing) = validate(conn, root, capture, spec)? {
         return Ok(existing);
     }
@@ -525,6 +531,8 @@ fn confirm(
     frozen: &crate::capture_bridge::LocalFrozen,
 ) -> Result<Snapshot> {
     let mut confirmation = facts(frozen, intent, spec)?;
+    let lease = store.authority_lease()?;
+    lease.check(store)?;
     let _phase = store.sql_phase();
     let tx = store
         .conn

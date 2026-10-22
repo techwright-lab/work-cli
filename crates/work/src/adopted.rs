@@ -51,13 +51,14 @@ pub fn begin(
     let (mut store, lock) = crate::allocate::locked(config)?;
     // Exact retries confer no new grant and do not refresh activity or Git metadata.
     if db(store.adopted_status_optional(&request.identity.run))?.is_some() {
-        return db(store.begin_adopted(request));
+        return db(store.begin_adopted_under_lease(request, &lock));
     }
-    crate::allocate::verified_checkout(
+    crate::allocate::verified_checkout_under_lease(
         &mut store,
         uuid(&request.identity.checkout).map_err(|_| err("invalid checkout"))?,
+        &lock,
     )?;
-    let result = db(store.begin_adopted(request));
+    let result = db(store.begin_adopted_under_lease(request, &lock));
     drop(lock);
     result
 }
@@ -215,6 +216,16 @@ impl Store {
     /// Low-level transaction on an active/ready allocation. Integrated callers
     /// MUST use begin(), which performs fresh lease verification under the allocator lock.
     pub fn begin_adopted(&mut self, request: &AdoptedRequest) -> Result<BeginRun> {
+        let lease = self.authority_lease()?;
+        self.begin_adopted_under_lease(request, &lease)
+    }
+    pub(crate) fn begin_adopted_under_lease(
+        &mut self,
+        request: &AdoptedRequest,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<BeginRun> {
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         request.validate()?;
         let _phase = self.sql_phase();
         let tx = self
@@ -253,7 +264,14 @@ impl Store {
         if conflict {
             return Err(StoreError::Conflict);
         }
-        crate::store::acquire_writer_tx(&tx, uuid(&i.checkout)?, uuid(&i.group)?, false)?;
+        crate::store::acquire_writer_tx(
+            &tx,
+            uuid(&i.checkout)?,
+            uuid(&i.group)?,
+            false,
+            lease,
+            &authority,
+        )?;
         tx.execute("INSERT INTO adopted_groups(id,checkout,run_id,run_ref,operation,request,revision) VALUES(?1,?2,?3,?4,?5,?6,1)",
             (i.group.to_string(),i.checkout.to_string(),i.run.to_string(),i.run_ref.as_str(),request.operation.to_string(),json(request)?))?;
         tx.execute("INSERT INTO adopted_sessions(group_id,source,session,agent,actor,parent,closed,depth) VALUES(?1,?2,?3,?4,NULL,NULL,0,0)",

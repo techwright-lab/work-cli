@@ -123,7 +123,11 @@ enum LaunchGuard {
 enum ReleaseProof<'a> {
     Ordinary,
     Captured(&'a crate::capture_preparation::CapturedReleaseProof),
-    Gap(&'a crate::attribution_gap::GapReleaseProof),
+    Gap(
+        &'a crate::attribution_gap::GapReleaseProof,
+        &'a crate::store::Store,
+        &'a crate::allocate::AuthorityLease,
+    ),
 }
 impl ReleaseProof<'_> {
     fn validate(&self, guard: &LaunchGuard) -> Result<()> {
@@ -132,7 +136,10 @@ impl ReleaseProof<'_> {
             (Self::Captured(proof), LaunchGuard::Captured(guard)) => {
                 proof.validate(guard).and_then(|()| proof.fresh())
             }
-            (Self::Gap(proof), LaunchGuard::Gap(guard)) => proof.validate(guard).map_err(|_| HOLD),
+            (Self::Gap(proof, store, lease), LaunchGuard::Gap(guard)) => proof
+                .validate_authority(store, lease)
+                .and_then(|()| proof.validate(guard))
+                .map_err(|_| HOLD),
             _ => Err(HOLD),
         }
     }
@@ -422,8 +429,10 @@ impl OwnedLaunch {
         &mut self,
         driver: &Driver,
         proof: crate::attribution_gap::GapReleaseProof,
+        store: &crate::store::Store,
+        lease: &crate::allocate::AuthorityLease,
     ) -> Result<()> {
-        self.release_inner(driver, ReleaseProof::Gap(&proof))
+        self.release_inner(driver, ReleaseProof::Gap(&proof, store, lease))
     }
     fn release_inner(&mut self, driver: &Driver, proof: ReleaseProof<'_>) -> Result<()> {
         let checked = proof.validate(&self.guard);

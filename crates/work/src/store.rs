@@ -43,6 +43,69 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct Store {
     pub(crate) conn: Connection,
     budget: SqlBudget,
+    authority: Arc<AuthorityIdentity>,
+    access: StoreAccess,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StoreAccess {
+    ReadOnly,
+    ReadWrite,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AuthorityIdentity {
+    registry: PathBuf,
+    pub(crate) directory: PathBuf,
+    pub(crate) directory_id: (u64, u64),
+    database_id: (u64, u64),
+    pub(crate) lock_id: Option<(u64, u64)>,
+}
+impl AuthorityIdentity {
+    fn collect(registry: &Path, directory: &Path, writable: bool) -> Result<Arc<Self>> {
+        existing_directory(registry)?;
+        existing_directory(directory)?;
+        check_file(&directory.join("store.sqlite"))?;
+        let dir = fs::symlink_metadata(directory)?;
+        let db = fs::symlink_metadata(directory.join("store.sqlite"))?;
+        let lock_id = if writable {
+            let file = Self::open_lock(directory, true)?;
+            let m = file.metadata()?;
+            Some((m.dev(), m.ino()))
+        } else {
+            None
+        };
+        Ok(Arc::new(Self {
+            registry: fs::canonicalize(registry)?,
+            directory: fs::canonicalize(directory)?,
+            directory_id: (dir.dev(), dir.ino()),
+            database_id: (db.dev(), db.ino()),
+            lock_id,
+        }))
+    }
+    pub(crate) fn open_lock(directory: &Path, create: bool) -> Result<fs::File> {
+        let path = directory.join("allocation.lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
+            .open(&path)?;
+        check_file(&path)?;
+        let descriptor = file.metadata()?;
+        let named = fs::symlink_metadata(&path)?;
+        if !descriptor.is_file()
+            || descriptor.nlink() != 1
+            || descriptor.uid() != rustix::process::geteuid().as_raw()
+            || descriptor.mode() & 0o777 != 0o600
+            || (descriptor.dev(), descriptor.ino()) != (named.dev(), named.ino())
+        {
+            return Err(StoreError::Unsafe);
+        }
+        Ok(file)
+    }
 }
 
 // Linux filesystem magic allowlist: ext, Btrfs, XFS, tmpfs and local
@@ -268,6 +331,25 @@ impl Store {
     pub(crate) fn sql_phase(&self) -> SqlPhase {
         self.budget.enter()
     }
+    pub(crate) fn authority_identity(&self) -> &Arc<AuthorityIdentity> {
+        &self.authority
+    }
+    pub(crate) fn may_acquire_lease(&self) -> Result<()> {
+        if self.access != StoreAccess::ReadWrite {
+            return Err(StoreError::Unsafe);
+        }
+        if self.budget.is_active() || !self.conn.is_autocommit() {
+            return Err(StoreError::Invalid);
+        }
+        Ok(())
+    }
+    pub(crate) fn authority_lease(&self) -> Result<crate::allocate::AuthorityLease> {
+        self.may_acquire_lease()?;
+        Ok(crate::allocate::lifecycle_lock(self)?)
+    }
+    pub(crate) fn writable_authority(&self) -> bool {
+        self.access == StoreAccess::ReadWrite
+    }
     /// Existing authority only. No bootstrap, schema migration, event writes or
     /// repair; reads committed WAL through SQLite's ordinary read-only mode.
     pub fn open_existing_registered_readonly(
@@ -275,14 +357,20 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
+        let (conn, budget, _, authority) = existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 14 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
-        Ok(Self { conn, budget })
+        drop(_phase);
+        Ok(Self {
+            conn,
+            budget,
+            authority,
+            access: StoreAccess::ReadOnly,
+        })
     }
     /// Recovery can mutate an established current-schema authority only; never initializes
     /// an empty authority for an unknown RunId or upgrades historical schemas.
@@ -291,14 +379,20 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, budget, _) = existing_authority(registry, dir, managed, true)?;
+        let (conn, budget, _, authority) = existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 14 {
             return Err(StoreError::UpgradeRequired);
         }
         validate_existing_schema(&conn, version)?;
-        Ok(Self { conn, budget })
+        drop(_phase);
+        Ok(Self {
+            conn,
+            budget,
+            authority,
+            access: StoreAccess::ReadWrite,
+        })
     }
     /// Finish may upgrade a proven established v8 authority, never bootstrap or
     /// repair an invalid authority. The read-only preflight precedes mutable open.
@@ -307,7 +401,7 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, budget, _) = existing_authority(registry, dir, managed, false)?;
+        let (conn, budget, _, _) = existing_authority(registry, dir, managed, false)?;
         {
             let (reg, reg_budget) = existing_database(registry, "authorities.sqlite")?;
             let _reg_phase = reg_budget.enter();
@@ -586,7 +680,13 @@ impl Store {
             persist_initialization(&registry, &record)?;
         }
         initialization_boundary("initialized");
-        Ok(Self { conn, budget })
+        let authority = AuthorityIdentity::collect(&registry, &dir, true)?;
+        Ok(Self {
+            conn,
+            budget,
+            authority,
+            access: StoreAccess::ReadWrite,
+        })
     }
     pub fn charged(&self, repository: &Path, owner: Option<&str>) -> Result<u64> {
         let repo = canonical(repository)?;
@@ -605,6 +705,9 @@ impl Store {
             .collect()
     }
     pub fn acquire_writer(&mut self, checkout: Uuid, group: Uuid) -> Result<()> {
+        let lease = self.authority_lease()?;
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         if group.get_version_num() != 7 || group.get_variant() != uuid::Variant::RFC4122 {
             return Err(StoreError::Invalid);
         }
@@ -612,7 +715,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        acquire_writer_tx(&tx, checkout, group, true)?;
+        acquire_writer_tx(&tx, checkout, group, true, &lease, &authority)?;
         tx.commit()?;
         Ok(())
     }
@@ -744,6 +847,9 @@ struct BudgetState {
 }
 pub(crate) struct SqlPhase(SqlBudget);
 impl SqlBudget {
+    fn is_active(&self) -> bool {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).depth != 0
+    }
     fn install(conn: &Connection) -> Result<Self> {
         let budget = Self::default();
         let callback = budget.clone();
@@ -827,7 +933,7 @@ fn existing_authority(
     dir: &Path,
     managed: &[PathBuf],
     writable: bool,
-) -> Result<(Connection, SqlBudget, usize)> {
+) -> Result<(Connection, SqlBudget, usize, Arc<AuthorityIdentity>)> {
     existing_directory(registry)?;
     existing_directory(dir)?;
     let marker = registry.join("initialization.json");
@@ -865,7 +971,12 @@ fn existing_authority(
     {
         return Err(StoreError::Unsafe);
     }
+    drop(rows);
+    drop(stmt);
+    drop(_reg_phase);
+    drop(reg);
     let (conn, budget) = existing_database(dir, "store.sqlite")?;
+    let readonly_authority = AuthorityIdentity::collect(registry, dir, false)?;
     let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -880,17 +991,17 @@ fn existing_authority(
         }
         // Complete the bounded read-only preflight before any mutable open.
         // In particular, do not switch a rejected DELETE-mode DB into WAL.
-        drop(rows);
-        drop(stmt);
-        drop(reg);
+        drop(_phase);
         drop(conn);
         let writer = database(dir, "store.sqlite", false)?;
         let writer_budget = SqlBudget::install(&writer)?;
         let _writer_phase = writer_budget.enter();
         query_protections(&writer)?;
-        Ok((writer, writer_budget, output_bytes))
+        drop(_writer_phase);
+        let authority = AuthorityIdentity::collect(registry, dir, true)?;
+        Ok((writer, writer_budget, output_bytes, authority))
     } else {
-        Ok((conn, budget, output_bytes))
+        Ok((conn, budget, output_bytes, readonly_authority))
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
@@ -962,7 +1073,7 @@ fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
 }
 /// Strict bounded accounting report using the same existing authority reader.
 pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Vec<Charge>> {
-    let (conn, budget, mut output_bytes) = existing_authority(registry, dir, managed, false)?;
+    let (conn, budget, mut output_bytes, _) = existing_authority(registry, dir, managed, false)?;
     let _phase = budget.enter();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     validate_existing_schema(&conn, version)?;
@@ -1044,7 +1155,10 @@ pub(crate) fn acquire_writer_tx(
     checkout: Uuid,
     group: Uuid,
     allow_existing: bool,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &Arc<AuthorityIdentity>,
 ) -> Result<()> {
+    lease.check_authority(authority)?;
     crate::attribution_gap::validate_related(conn, checkout)?;
     acquire_writer_context(
         conn,
@@ -1052,6 +1166,8 @@ pub(crate) fn acquire_writer_tx(
         group,
         allow_existing,
         crate::run_journal::WriterAdmission::Ordinary,
+        lease,
+        authority,
     )
 }
 pub(crate) fn acquire_writer_context(
@@ -1060,14 +1176,17 @@ pub(crate) fn acquire_writer_context(
     group: Uuid,
     allow_existing: bool,
     materialized: crate::run_journal::WriterAdmission<'_, '_, '_>,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &Arc<AuthorityIdentity>,
 ) -> Result<()> {
+    lease.check_authority(authority)?;
     // New managed groups acquire before inserting their journal. Existing
     // managed requests retry through their journal API, never as bare writers.
     exclude_journal_identity(conn, group)?;
     if let crate::run_journal::WriterAdmission::Captured(proof, related) = materialized {
         proof.validate_writer(conn, checkout, group, related)?;
     } else if let crate::run_journal::WriterAdmission::Gap(proof) = materialized {
-        proof.validate_writer(conn, checkout, group)?;
+        proof.validate_writer(conn, checkout, group, lease, authority)?;
     } else {
         if crate::capture_requirement::present(conn, checkout)?
             || crate::capture_journal::unresolved_checkout(conn, checkout)?
@@ -1328,6 +1447,127 @@ mod tests {
             // authority to migrate, demonstrating rollback and released locks.
             conn.execute("DELETE FROM run_participants", []).unwrap();
             super::Store::open(&dir, std::slice::from_ref(&root)).unwrap();
+        }
+    }
+
+    #[test]
+    fn authority_lease_rejects_readonly_sql_active_and_wrong_store() {
+        use super::{Store, StoreError};
+        use crate::allocate::lifecycle_lock;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let dir = temp.path().join("private");
+        let registry = temp.path().join(".work-authorities");
+        let roots = std::slice::from_ref(&root);
+        let mut store = Store::open(&dir, roots).unwrap();
+        let limits = crate::admission::Limits {
+            repository: 10,
+            owner: 10,
+            available_bytes: Some(10),
+            floor_bytes: 0,
+            warn_bytes: 0,
+        };
+        let checkout = store
+            .reserve(
+                &crate::admission::Reservation {
+                    operation: uuid::Uuid::now_v7(),
+                    repository: root.clone(),
+                    actor: "alice".into(),
+                    owner: "alice".into(),
+                    task: "lease".into(),
+                },
+                limits,
+            )
+            .unwrap();
+        let lease = lifecycle_lock(&store).unwrap();
+        lease.check(&store).unwrap();
+        let mut other = Store::open_existing_registered_mut(&registry, &dir, roots).unwrap();
+        assert_eq!(store.authority_identity(), other.authority_identity());
+        assert!(
+            lease.check(&other).is_err(),
+            "value equality is not Store-instance authority"
+        );
+        let before = other.pending_events(100).unwrap();
+        assert!(other
+            .transfer_under_lease(checkout, "bob", limits, &lease)
+            .is_err());
+        assert_eq!(other.pending_events(100).unwrap(), before);
+        assert_eq!(other.charged(&root, Some("alice")).unwrap(), 1);
+        store
+            .transfer_under_lease(checkout, "bob", limits, &lease)
+            .unwrap();
+        assert_eq!(store.charged(&root, Some("bob")).unwrap(), 1);
+        let foreign_temp = tempfile::tempdir().unwrap();
+        let foreign_root = foreign_temp.path().join("root");
+        std::fs::create_dir(&foreign_root).unwrap();
+        let foreign = Store::open(&foreign_temp.path().join("private"), &[foreign_root]).unwrap();
+        assert!(lease.check(&foreign).is_err());
+        // A borrowed check is cached-only, including inside an armed SQL phase.
+        let lock = dir.join("allocation.lock");
+        std::fs::rename(&lock, dir.join("original.lock")).unwrap();
+        let phase = store.sql_phase();
+        assert!(store.conn.is_autocommit());
+        lease.check(&store).unwrap();
+        assert!(matches!(store.authority_lease(), Err(StoreError::Invalid)));
+        assert!(!lock.exists());
+        drop(phase);
+        drop(lease);
+        store.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(matches!(store.authority_lease(), Err(StoreError::Invalid)));
+        assert!(!lock.exists());
+        store.conn.execute_batch("ROLLBACK").unwrap();
+        let mut readonly =
+            Store::open_existing_registered_readonly(&registry, &dir, roots).unwrap();
+        assert_eq!(readonly.charged(&root, Some("bob")).unwrap(), 1);
+        assert!(matches!(
+            readonly.transfer(checkout, "alice", limits),
+            Err(StoreError::Unsafe)
+        ));
+        assert!(
+            !lock.exists(),
+            "readonly mutation must not create allocation.lock"
+        );
+        assert!(
+            lifecycle_lock(&store).is_err(),
+            "missing pinned file is not recreated by acquisition"
+        );
+        drop(readonly);
+        for damage in ["symlink", "hardlink", "mode", "replacement"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            let dir = temp.path().join("private");
+            let store = Store::open(&dir, std::slice::from_ref(&root)).unwrap();
+            let lock = dir.join("allocation.lock");
+            match damage {
+                "symlink" => {
+                    std::fs::rename(&lock, dir.join("original.lock")).unwrap();
+                    symlink(dir.join("original.lock"), &lock).unwrap();
+                }
+                "hardlink" => std::fs::hard_link(&lock, dir.join("second.lock")).unwrap(),
+                "mode" => {
+                    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "replacement" => {
+                    std::fs::rename(&lock, dir.join("original.lock")).unwrap();
+                    std::fs::write(&lock, []).unwrap();
+                    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                lifecycle_lock(&store).is_err(),
+                "{damage} accepted by pinned Store"
+            );
+            if damage != "replacement" {
+                assert!(
+                    Store::open(&dir, std::slice::from_ref(&root)).is_err(),
+                    "unsafe {damage} accepted during opening"
+                );
+            }
         }
     }
 
