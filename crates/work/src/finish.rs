@@ -503,7 +503,15 @@ fn finish_internal(
         })();
         match persisted {
             Ok(()) => boundary("outcome_committed"),
-            Err(_error @ StoreError::Database(_)) if integrated => {
+            Err(_error)
+                if integrated
+                    && (matches!(&_error, StoreError::Database(_))
+                        || matches!(&_error, StoreError::Io(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock)) =>
+            {
+                // Task completion is committed; retain any per-run FINISH truth
+                // despite secondary aggregate contention. Final ack still checks
+                // the fresh receipt and complete writer/raw-Gap fence.
                 #[cfg(test)]
                 crate::capture_diagnostics::store_error(
                     "finish::aggregate-persistence-fallback",
@@ -1280,6 +1288,187 @@ json.dump(json.load(open({response:?})),sys.stdout)
                 .get::<_, String>(0))
                 .unwrap()
         );
+    }
+    #[test]
+    fn post_freeze_lease_contention_preserves_committed_task_report() {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        // Native authority and public fake-producer protocol, not an owned actor
+        // or Gap continuation. Corruption cases below are negative fixtures only.
+        for case in ["report", "unsafe_lock", "writer", "raw_gap"] {
+            let (_temp, cfg, a, root, _seal) = closed_capture();
+            assert_eq!(cfg.capture.as_ref().unwrap().timeout_ms, 50);
+            let other = Store::open_existing_registered_mut(
+                cfg.trusted_registry.as_ref().unwrap(),
+                cfg.store_dir.as_ref().unwrap(),
+                &cfg.roots,
+            )
+            .unwrap();
+            let durable = || {
+                let receipt: String = other
+                    .conn
+                    .query_row("SELECT record FROM task_finishes", [], |r| r.get(0))
+                    .unwrap();
+                let frozen: (String, String, i64) = other
+                    .conn
+                    .query_row(
+                        "SELECT intent,confirmation,revision FROM capture_finalizations WHERE run=?1",
+                        [root.identity().run.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .unwrap();
+                let events = other
+                    .conn
+                    .prepare("SELECT sequence,payload FROM outbox ORDER BY sequence")
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                (receipt, frozen, events)
+            };
+            let mut before = None;
+            let mut lease = None;
+            let mut before_ack = false;
+            let mut outcome_committed = false;
+            let result = finish_internal(&cfg, a.checkout, Mode::Integrated, |boundary| {
+                if boundary == "external_frozen" {
+                    // Verify genuine committed task and typed FINISH truth before
+                    // introducing contention from a separate Store participant.
+                    let receipt = load(&other.conn, a.checkout).unwrap().unwrap();
+                    assert_eq!(receipt.local_freeze, Freeze::Pending);
+                    assert_eq!(receipt.delivery, None);
+                    let frozen = other
+                        .capture_finalization_snapshot(&root.identity().run)
+                        .unwrap()
+                        .expect("committed FINISH intent");
+                    assert_eq!(
+                        frozen.intent.outcome,
+                        crate::run_journal::RootOutcome::Completed
+                    );
+                    assert_eq!(frozen.revision, 2);
+                    assert!(
+                        !frozen
+                            .confirmation
+                            .as_ref()
+                            .expect("known local FINISH")
+                            .delivered
+                    );
+                    let snapshot = durable();
+                    let events = snapshot
+                        .2
+                        .iter()
+                        .map(|(_, body)| serde_json::from_str::<serde_json::Value>(body).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| e["type"] == "task_finished"
+                                && e["operation"] == receipt.operation.to_string())
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|e| e["type"] == "capture_finalization_changed"
+                                && e["run"] == root.identity().run.to_string()
+                                && e["change"] == "frozen")
+                            .count(),
+                        1
+                    );
+                    assert!(!events.iter().any(|e| e["type"] == "finish_capture_result"));
+                    before = Some(snapshot);
+                    if case == "unsafe_lock" {
+                        std::fs::set_permissions(
+                            cfg.store_dir.as_ref().unwrap().join("allocation.lock"),
+                            std::fs::Permissions::from_mode(0o644),
+                        )
+                        .unwrap();
+                    } else {
+                        lease = Some(other.authority_lease().unwrap());
+                    }
+                }
+                if boundary == "outcome_committed" {
+                    outcome_committed = true;
+                }
+                if boundary == "before_ack" {
+                    before_ack = true;
+                    lease
+                        .as_ref()
+                        .expect("independent lease held through ack")
+                        .check(&other)
+                        .unwrap();
+                    // Deliberately invalid history must still fail the final fence
+                    // after fallback, never become successful forged authority.
+                    if case == "writer" {
+                        other
+                            .conn
+                            .execute(
+                                "INSERT INTO writers VALUES(?1,?2)",
+                                (a.checkout.to_string(), root.identity().group.to_string()),
+                            )
+                            .unwrap();
+                    }
+                    if case == "raw_gap" {
+                        other.conn.execute(
+                            "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?1,'invalid',zeroblob(32))",
+                            (root.identity().run.to_string(), root.identity().group.to_string(), a.checkout.to_string()),
+                        ).unwrap();
+                    }
+                }
+            });
+            if case == "report" {
+                let report =
+                    result.expect("committed task report survives post-freeze lease contention");
+                assert!(report.task_finished && report.charge_retained && report.lease_held);
+                assert!(report.is_held() && report.capture_incomplete);
+                assert_eq!(
+                    report.task_completion,
+                    work_contract::TaskCompletion::Finished
+                );
+                assert_eq!(report.local_freeze, Freeze::Pending);
+                assert_eq!(report.delivery, None);
+                assert_eq!(report.run_outcomes.len(), 1);
+                assert_eq!(report.run_outcomes[0].run, root.identity().run);
+                assert_eq!(
+                    report.run_outcomes[0].outcome,
+                    Some(crate::run_journal::RootOutcome::Completed)
+                );
+                assert_eq!(
+                    report.run_outcomes[0].capture,
+                    RunCapture::Frozen {
+                        delivery: Delivery::Pending
+                    }
+                );
+                let (state, ready): (String, bool) = other
+                    .conn
+                    .query_row(
+                        "SELECT state,ready FROM checkouts WHERE id=?1",
+                        [a.checkout.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(state, "held");
+                assert!(!ready);
+            } else {
+                match (case, result) {
+                    ("unsafe_lock", Err(StoreError::Io(error))) => {
+                        assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    }
+                    ("writer", Err(StoreError::Writer)) | ("raw_gap", Err(StoreError::Invalid)) => {
+                    }
+                    (_, unexpected) => panic!("{case}: {unexpected:?}"),
+                }
+            }
+            assert_eq!(before_ack, case != "unsafe_lock");
+            assert!(!outcome_committed);
+            assert_eq!(durable(), before.expect("external_frozen reached"));
+            // Do not release the independent participant until finish has returned
+            // and receipt/confirmation/event byte preservation has been checked.
+            drop(lease);
+        }
     }
     #[test]
     fn capture_outbox_fault_never_hides_committed_task_truth() {
