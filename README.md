@@ -101,6 +101,68 @@ Full Task10 still requires preservation of dirty/untracked/ignored, local-branch
 reflog-only work, verified local recovery refs, fresh quiescence, operator approval and
 separately reviewed retirement transactions. None is waived by HEAD ancestry.
 
+### Preservation audit pilot (Task10 source, not retirement acceptance)
+
+```sh
+work audit-preservation <checkout-uuidv7>
+```
+
+`inspection::audit_preservation(checkout)` composes fresh content inspection with
+configured remote verification and a bounded repository-wide local-work census.
+It reads `[inspection]` and `[remote_preservation]` from the same immutable config
+snapshot. No new config keys, URL/ref overrides, receipt imports or approval flags
+exist. `PreservationReport` has private fields and Serialize only; its result is
+historical metadata, not an action capability.
+
+The private collector uses the existing read-only authority snapshot, fully drops
+its SQL transaction/connection before filesystem/Git work, and shares the remote
+invocation's **one** deadline/read/output/process budget. It captures common and
+supported linked-worktree administrative HEADs, refs, plain pseudorefs and reflogs
+without walking sibling checkout payloads. Both nonzero reflog endpoints count;
+zero OIDs are sentinels. Only raw administrative path hex and record ordinals are
+reported, never reflog messages/authors. Unknown administrative layouts (including
+FETCH_HEAD, merge/sequencer state and nonempty private refs), malformed/missing
+objects, unsupported config/backend and exhausted bounds report incomplete.
+Existing Git 2.55.0/files-backend/physical-race restrictions remain unchanged.
+
+Native `cat-file --batch-all-objects` enumerates **all loose and packed** objects,
+not merely named refs or dangling tips. Strict OID/type/size parsing and native
+full fsck validation precede graph classification. HEAD, refs/tags, administrative
+pseudorefs, old/new reflog endpoints, unreachable commits and standalone
+unclassified trees/blobs/tags contribute deterministic recovery-manifest roots.
+Every local object is compared against a remote reachable-object set collected in
+the verified isolated remote repository **before local HEAD import**. Closing
+remote advertisement, repeated local/ref/reflog/object/boot/config/context checks
+and safe scratch cleanup must all finish before coverage can be complete.
+
+The JSON separates `coverage`, `inspection_findings`, `remote_head`,
+`additional_work_holds`, `recovery_manifest` and `cleanup`. Dirty tracked/staged,
+untracked and unclassified ignored findings hold independently of HEAD ancestry.
+Additional repository objects outside the current HEAD graph are conservatively
+reported as `shared_work_ownership_unknown`, even if present in the remote graph:
+the audit does not assign shared work to this checkout. Uncovered standalone
+objects explicitly hold as `unclassified_local_work`; all uncovered objects hold.
+`LOCAL` transport remains local storage, not off-host backup. Interrupted or changed
+closing evidence invalidates provisional positive graph relationships.
+
+The deterministic manifest binds checkout/common identity, object format,
+context/policy/input commitments and root provenance, with proposed refs exactly
+`refs/work-recovery/<checkout>/<object-format>/<oid>`. These are **metadata only**:
+no recovery refs, branches, index entries or original objects are written. Nothing
+is recorded in Work authority. Exit 0 requires complete coverage and no content or
+additional-work holds; exit 1 is held/incomplete, exit 2 sanitized invalid arguments.
+Even exit 0 always says `retirement_authority:false` and `recorded:false`, and does
+not promise future remote availability, checkout ownership or quiescence.
+
+The independent existing Task10 GitHub job selects preservation unit/integration
+source alongside remote regression tests and scoped Clippy. No local test/build
+execution or passing claim accompanies this source change. Full Task10 still needs
+fresh, verified durable recovery-ref creation, preservation of held content,
+versioned semantic approval binding (including adopted quiet-window/activity,
+maximum 30-minute age and backward-clock rules), fresh physical writer quiescence, and separately reviewed crash-safe
+retirement/quarantine/removal and charge-release gates. No gate is waived; Task8
+and performance qualification remain parked/opt-in.
+
 ### Capture construction (Tasks 8.1–8.4b; implementation, not acceptance)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and

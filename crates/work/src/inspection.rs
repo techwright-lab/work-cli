@@ -18,6 +18,9 @@ use uuid::Uuid;
 mod remote_proof;
 pub use remote_proof::{verify_remote, RemoteReport};
 
+mod preservation;
+pub use preservation::{audit_preservation, PreservationReport};
+
 mod receipts;
 pub use receipts::{
     inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,

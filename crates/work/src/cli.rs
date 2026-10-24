@@ -48,6 +48,11 @@ enum Command {
         #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
         checkout: uuid::Uuid,
     },
+    /// Audit configured preservation and additional local work; never retirement authority
+    AuditPreservation {
+        #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+    },
     /// Explicit task completion; retirement disabled, tree and charge retained
     Finish {
         #[arg(value_name = "checkout-id")]
@@ -102,6 +107,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         a == "capture"
             || a == "inspect"
             || a == "verify-remote"
+            || a == "audit-preservation"
             || a == "finish"
             || a == "run"
             || a == "recover"
@@ -228,6 +234,16 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             println!(
                 "{}",
                 serde_json::to_string(&report).expect("remote observation serialization")
+            );
+            if !report.observed() {
+                std::process::exit(1);
+            }
+        }
+        Command::AuditPreservation { checkout } => {
+            let report = crate::inspection::audit_preservation(checkout);
+            println!(
+                "{}",
+                serde_json::to_string(&report).expect("preservation audit serialization")
             );
             if !report.observed() {
                 std::process::exit(1);

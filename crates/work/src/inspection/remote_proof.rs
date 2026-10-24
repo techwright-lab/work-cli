@@ -154,12 +154,57 @@ enum Phase {
 #[cfg(test)]
 type Observer<'a> = Option<&'a mut dyn FnMut(Phase, &Scratch)>;
 
-fn verify_path(
+fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>) -> RemoteReport {
+    verify_with_audit(
+        path,
+        checkout,
+        None,
+        #[cfg(test)]
+        observer,
+        #[cfg(test)]
+        None,
+    )
+}
+pub(super) fn audit_configured(
+    checkout: Uuid,
+    audit: &mut super::preservation::Audit,
+) -> RemoteReport {
+    match Config::discover_path() {
+        Some(path) => audit_path(
+            &path,
+            checkout,
+            audit,
+            #[cfg(test)]
+            None,
+        ),
+        None => RemoteReport::held(checkout),
+    }
+}
+pub(super) fn audit_path(
     path: &Path,
     checkout: Uuid,
+    audit: &mut super::preservation::Audit,
+    #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
+) -> RemoteReport {
+    verify_with_audit(
+        path,
+        checkout,
+        Some(audit),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        before_recheck,
+    )
+}
+fn verify_with_audit(
+    path: &Path,
+    checkout: Uuid,
+    mut audit: Option<&mut super::preservation::Audit>,
     #[cfg(test)] mut observer: Observer<'_>,
+    #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
 ) -> RemoteReport {
     let mut b = Budget::new();
+    let mut audit_nonancestor = false;
     let mut report = RemoteReport::held(checkout);
     let mut scratch = None;
     let result = (|| -> Held<()> {
@@ -226,6 +271,9 @@ fn verify_path(
             .map_err(|_| "identity_unknown")?
             .to_string();
         report.local_oid = Some(head.clone());
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.begin(&document, &context, &census, &inputs, &proof, &mut b)?;
+        }
         let urls = native(
             &identity.path,
             &[
@@ -293,6 +341,18 @@ fn verify_path(
         // Crucially, fsck runs BEFORE local objects can mask an incomplete remote.
         validate_objects(&verification, &remote, &mut b)?;
         validate_scratch_repository(&verification, inputs.format, &mut b)?;
+        if let Some(audit) = audit.as_deref_mut() {
+            // Fixed Git 2.55.0 graph query in the VERIFIED REMOTE repository,
+            // before importing local objects. The consumer gets bytes, never
+            // a scratch path, fetch selector or externally supplied report.
+            let graph = native(
+                &verification,
+                &["rev-list", "--objects", "--no-object-names", &remote],
+                None,
+                &mut b,
+            )?;
+            audit.remote_graph(&graph, &remote, inputs.format, &mut b)?;
+        }
         let local_url = format!(
             "file://{}",
             identity.path.to_str().ok_or("identity_unknown")?
@@ -330,6 +390,7 @@ fn verify_path(
         )?;
         match ancestry.code {
             0 => (),
+            1 if audit.is_some() => audit_nonancestor = true,
             1 => return Err("nonancestor"),
             _ => return Err("ancestry_unknown"),
         }
@@ -348,6 +409,10 @@ fn verify_path(
         #[cfg(test)]
         if let Some(hook) = observer.as_deref_mut() {
             hook(Phase::BeforeRecheck, scratch);
+        }
+        #[cfg(test)]
+        if let Some(hook) = before_recheck {
+            hook();
         }
         let (current_document, current_config_manifest) = load_document(path, &mut b)?;
         if current_document
@@ -385,6 +450,9 @@ fn verify_path(
             || inputs.head != last_inputs.head
         {
             return Err("local_changed");
+        }
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.recheck(&current_document, &context, &last_inputs, &mut b)?;
         }
         if let Some(remote_manifest) = local_remote {
             input(remote_manifest.recheck(&mut b))?;
@@ -455,6 +523,18 @@ fn verify_path(
     }
     if report.reason == "consistent_observation" {
         report.outcome = "observed";
+        // Only this actual completed invocation can seal audit coverage. Public
+        // RemoteReport accessors/serialization cannot reconstruct this path.
+        if let Some(audit) = audit {
+            if let Err(reason) = audit.complete(&mut b) {
+                report.outcome = "held";
+                report.reason = reason;
+            }
+        }
+        if audit_nonancestor && report.reason == "consistent_observation" {
+            report.outcome = "held";
+            report.reason = "nonancestor";
+        }
     }
     if let Some(digest) = &report.evidence_digest {
         let mut closing = Vec::new();
