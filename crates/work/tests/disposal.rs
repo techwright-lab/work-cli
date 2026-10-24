@@ -10,7 +10,8 @@ fn document() -> PolicyDocument {
             "files":[{"path":"63616368652f61", "sha256":
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 "length":3, "mode":384}]}]
-    })).unwrap()
+    }))
+    .unwrap()
 }
 
 #[test]
@@ -27,24 +28,34 @@ fn policy_requires_exact_content_and_directory_coverage() {
             "length" => d.policies[0].files[0].length = 4,
             "hash" => d.policies[0].files[0].sha256 = "AA".repeat(32),
             "overlap" => {
-                let mut p = d.policies[0].clone(); p.id = "other".into(); d.policies.push(p);
+                let mut p = d.policies[0].clone();
+                p.id = "other".into();
+                d.policies.push(p);
             }
             "duplicate" => {
-                let p = d.policies[0].files[0].clone(); d.policies[0].files.push(p);
+                let p = d.policies[0].files[0].clone();
+                d.policies[0].files.push(p);
             }
             "parent" => d.policies[0].files[0].path = "63616368652f7375622f61".into(),
             _ => unreachable!(),
         }
         assert!(disposal::validate(d).is_err(), "{field}");
     }
-    assert!(serde_json::from_str::<PolicyDocument>(r#"{"format":1,"policies":[],"learn":true}"#).is_err());
-    let mut d = document(); d.format = 2;
+    assert!(
+        serde_json::from_str::<PolicyDocument>(r#"{"format":1,"policies":[],"learn":true}"#)
+            .is_err()
+    );
+    let mut d = document();
+    d.format = 2;
     assert!(disposal::validate(d).is_err());
 }
 
 #[test]
 fn raw_path_wire_rejects_aliases() {
-    for wire in ["", "2F61", "2f61", "61/62", "61ffFf", "0", "00", "2e", "2e2e", "612f", "612f2f62", "612f2e", "612f2e2e"] {
+    for wire in [
+        "", "2F61", "2f61", "61/62", "61ffFf", "0", "00", "2e", "2e2e", "612f", "612f2f62",
+        "612f2e", "612f2e2e",
+    ] {
         assert!(RawPath::from_hex(wire).is_err(), "{wire}");
     }
     for bytes in [b"-name".as_slice(), b"cache/\xff\n\t", b"arbitrary.pyc"] {
@@ -63,8 +74,12 @@ fn raw_path_wire_rejects_aliases() {
 #[test]
 fn policy_body_and_version_change_digest() {
     let original = disposal::validate(document()).unwrap();
-    let mut reordered = document(); reordered.policies[0].directories.reverse();
-    assert_eq!(original.digest(), disposal::validate(reordered).unwrap().digest());
+    let mut reordered = document();
+    reordered.policies[0].directories.reverse();
+    assert_eq!(
+        original.digest(),
+        disposal::validate(reordered).unwrap().digest()
+    );
     for field in ["version", "id", "mode", "hash", "max_files", "directory"] {
         let mut d = document();
         match field {
@@ -73,10 +88,16 @@ fn policy_body_and_version_change_digest() {
             "mode" => d.policies[0].files[0].mode = 0o644,
             "hash" => d.policies[0].files[0].sha256 = "00".repeat(32),
             "max_files" => d.policies[0].max_files = 2,
-            "directory" => d.policies[0].directories.push("63616368652f6f74686572".into()),
+            "directory" => d.policies[0]
+                .directories
+                .push("63616368652f6f74686572".into()),
             _ => unreachable!(),
         }
-        assert_ne!(original.digest(), disposal::validate(d).unwrap().digest(), "{field}");
+        assert_ne!(
+            original.digest(),
+            disposal::validate(d).unwrap().digest(),
+            "{field}"
+        );
     }
 }
 
@@ -102,7 +123,14 @@ fn policy_parser_and_canonical_body_are_bounded() {
 
 #[test]
 fn policy_limits_are_validation_not_content_proof() {
-    for field in ["id", "version", "files", "file_bytes", "total_bytes", "rules"] {
+    for field in [
+        "id",
+        "version",
+        "files",
+        "file_bytes",
+        "total_bytes",
+        "rules",
+    ] {
         let mut d = document();
         match field {
             "id" => d.policies[0].id = "a".repeat(129),
@@ -115,6 +143,9 @@ fn policy_limits_are_validation_not_content_proof() {
         }
         assert!(disposal::validate(d).is_err(), "{field}");
     }
-    let empty = PolicyDocument { format:1, policies:vec![] };
+    let empty = PolicyDocument {
+        format: 1,
+        policies: vec![],
+    };
     assert!(disposal::validate(empty).is_ok());
 }
