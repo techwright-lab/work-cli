@@ -292,10 +292,17 @@ fn validate_file(stat: &fs::Stat) -> Result<()> {
     Ok(())
 }
 fn open_relative(parent: &File, name: &str, flags: OFlags) -> Result<File> {
+    // openat2 rejects NONBLOCK with O_PATH. Metadata-only handles still use
+    // the same no-follow/no-mount resolution; data opens remain nonblocking.
+    let additional = if flags.contains(OFlags::PATH) {
+        OFlags::empty()
+    } else {
+        OFlags::NONBLOCK
+    };
     fs::openat2(
         parent,
         name,
-        flags | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        flags | OFlags::CLOEXEC | OFlags::NOFOLLOW | additional,
         Mode::empty(),
         RESOLVE,
     )
@@ -981,6 +988,40 @@ mod tests {
             .count()
     }
     #[test]
+    fn native_authority_metadata_and_readable_opens_share_bound_identity() {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let parent = File::open(f.temp.path().join("authority")).unwrap();
+        let authority = f.store.authority_identity();
+        for (name, expected) in [
+            ("store.sqlite", authority.database_id()),
+            ("allocation.lock", authority.lock_id.unwrap()),
+        ] {
+            for flags in [OFlags::PATH, OFlags::RDONLY] {
+                let file = open_relative(&parent, name, flags)
+                    .unwrap_or_else(|error| panic!("{name} {flags:?}: {error:?}"));
+                assert_eq!(identity(&stat(&file).unwrap()), expected);
+            }
+        }
+        assert_eq!(
+            identity(&stat(&open_authority(&f.store).unwrap()).unwrap()),
+            authority.directory_id
+        );
+        let reservation = reserve(&f.store, Uuid::now_v7(), 20).unwrap();
+        for flags in [
+            OFlags::PATH | OFlags::DIRECTORY,
+            OFlags::RDONLY | OFlags::DIRECTORY,
+        ] {
+            let dir = open_relative(&parent, DIRECTORY, flags)
+                .unwrap_or_else(|error| panic!("receipt directory {flags:?}: {error:?}"));
+            assert_eq!(
+                identity(&stat(&dir).unwrap()),
+                identity(&stat(&reservation.location.dir).unwrap())
+            );
+        }
+        // These are real native descriptors, not a synthetic freshness proof.
+        reservation.check(&f.store, false).unwrap();
+    }
+    #[test]
     fn original_context_conflict_leaves_charged_pending_no_final() {
         let mut f = fixture::ManagedFixture::new("sha1", "2");
         let mut captured =
@@ -993,10 +1034,10 @@ mod tests {
                 [f.allocation.checkout.to_string()],
             )
             .unwrap();
-        assert!(matches!(
-            persist(&mut f.store, &mut captured, Fault::None),
-            Err(ReceiptError::Conflict)
-        ));
+        assert_eq!(
+            persist(&mut f.store, &mut captured, Fault::None).unwrap_err(),
+            ReceiptError::Conflict
+        );
         assert_eq!(finals(&f), 0);
         assert_eq!(std::fs::read_dir(directory(&f)).unwrap().count(), 1);
     }
@@ -1006,10 +1047,10 @@ mod tests {
         let mut captured =
             super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
         std::fs::write(f.path(b"tracked"), b"changed").unwrap();
-        assert!(matches!(
-            persist(&mut f.store, &mut captured, Fault::None),
-            Err(ReceiptError::Conflict)
-        ));
+        assert_eq!(
+            persist(&mut f.store, &mut captured, Fault::None).unwrap_err(),
+            ReceiptError::Conflict
+        );
         assert_eq!(finals(&f), 0);
     }
     #[test]
@@ -1025,14 +1066,15 @@ mod tests {
                 super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
             let result = persist(&mut f.store, &mut captured, fault);
             if fault == Fault::DirectorySync {
-                let Err(ReceiptError::DurabilityUnknown { id, digest }) = result else {
-                    panic!("must report uncertain publication")
+                let (id, digest) = match result {
+                    Err(ReceiptError::DurabilityUnknown { id, digest }) => (id, digest),
+                    other => panic!("must report uncertain publication, got {other:?}"),
                 };
                 assert_eq!(digest, captured.observation.digest());
                 assert_eq!(read_receipt(&f.store, id).unwrap().digest(), digest);
                 assert_eq!(finals(&f), 1);
             } else {
-                assert!(matches!(result, Err(ReceiptError::Io)));
+                assert_eq!(result.unwrap_err(), ReceiptError::Io);
                 assert_eq!(finals(&f), 0);
                 assert_eq!(std::fs::read_dir(directory(&f)).unwrap().count(), 1);
             }
@@ -1065,19 +1107,24 @@ mod tests {
             })
             .collect();
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
         assert_eq!(
             results
                 .iter()
                 .filter(|r| matches!(r, Err(ReceiptError::CapacityFull)))
                 .count(),
-            1
+            1,
+            "{results:?}"
         );
         assert_eq!(std::fs::read_dir(directory(&f)).unwrap().count(), 8);
-        assert!(matches!(
-            reserve(&f.store, Uuid::now_v7(), 1),
-            Err(ReceiptError::CapacityFull)
-        ));
+        assert_eq!(
+            reserve(&f.store, Uuid::now_v7(), 1).err(),
+            Some(ReceiptError::CapacityFull)
+        );
     }
     #[test]
     fn unsafe_names_modes_links_lengths_and_duplicate_ids_refuse() {
@@ -1144,18 +1191,19 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(matches!(
-                reserve(&f.store, Uuid::now_v7(), 20),
-                Err(ReceiptError::UnsafeReceiptStore)
-            ));
+            assert_eq!(
+                reserve(&f.store, Uuid::now_v7(), 20).err(),
+                Some(ReceiptError::UnsafeReceiptStore),
+                "shape={shape}"
+            );
         }
         let f = fixture::ManagedFixture::new("sha1", "2");
         let id = Uuid::now_v7();
         let r = reserve(&f.store, id, 20).unwrap();
-        assert!(matches!(
-            reserve(&f.store, id, 21),
-            Err(ReceiptError::Conflict)
-        ));
+        assert_eq!(
+            reserve(&f.store, id, 21).err(),
+            Some(ReceiptError::Conflict)
+        );
         std::fs::rename(
             directory(&f).join(&r.pending),
             directory(&f).join(format!("{id}.receipt")),
@@ -1301,10 +1349,10 @@ mod tests {
         let mut captured =
             super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
         captured.budget.test_elapsed = Some(std::time::Duration::from_secs(31));
-        assert!(matches!(
-            persist(&mut f.store, &mut captured, Fault::None),
-            Err(ReceiptError::Conflict)
-        ));
+        assert_eq!(
+            persist(&mut f.store, &mut captured, Fault::None).unwrap_err(),
+            ReceiptError::Conflict
+        );
         assert!(!directory(&f).exists());
     }
     #[test]

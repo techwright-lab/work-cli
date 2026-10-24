@@ -43,6 +43,84 @@ fn help_invalid_arguments_and_missing_authority_are_readonly_redacted() {
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
 }
 #[test]
+fn existing_authority_missing_lock_is_never_repaired_by_inspect() {
+    let f = fixture::ManagedFixture::new("sha1", "2");
+    let config = config(&f);
+    let id = f.allocation.checkout.to_string();
+    let authority = f.temp.path().join("authority");
+    let registry = f.temp.path().join("registry");
+    let lock = authority.join("allocation.lock");
+    let receipts = authority.join("inspection-receipts-v1");
+    // Close the real writable fixture Store BEFORE removing its lock. This is
+    // an established current-schema database, not a missing-config substitute.
+    drop(f.store);
+    fs::remove_file(&lock).unwrap();
+    let read = || {
+        work_cli::store::Store::open_existing_registered_readonly(
+            &registry,
+            &authority,
+            std::slice::from_ref(&f.root),
+        )
+        .unwrap()
+    };
+    let store = read();
+    let events = store.pending_events(100).unwrap();
+    let charged = store.charged(&f.repo, None).unwrap();
+    assert_eq!(charged, 1);
+    drop(store);
+    let files: Vec<_> = [
+        authority.join("store.sqlite"),
+        authority.join("store.sqlite-wal"),
+        registry.join("authorities.sqlite"),
+        registry.join("authorities.sqlite-wal"),
+    ]
+    .into_iter()
+    .map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    })
+    .collect();
+    let names = || {
+        [&authority, &registry]
+            .into_iter()
+            .map(|dir| {
+                fs::read_dir(dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let before_names = names();
+    for record in [false, true] {
+        let output = if record {
+            command(&config, &["inspect", &id, "--record"])
+        } else {
+            command(&config, &["inspect", &id])
+        };
+        assert_eq!(output.status.code(), Some(1), "record={record}: {output:?}");
+        assert!(output.stdout.is_empty(), "record={record}: {output:?}");
+        assert!(
+            !lock.exists(),
+            "inspect repaired a missing lock (record={record})"
+        );
+        assert!(
+            !receipts.exists(),
+            "inspect created receipts without an existing lock"
+        );
+        let store = read();
+        assert_eq!(store.pending_events(100).unwrap(), events);
+        assert_eq!(store.charged(&f.repo, None).unwrap(), charged);
+        drop(store);
+        // Exact DB/WAL bytes cover all persisted rows, including accounting;
+        // existing SHM contents are deliberately not byte-immutability claims.
+        for (path, bytes) in &files {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(names(), before_names);
+    }
+}
+#[test]
 fn default_json_is_nondurable_record_is_explicit_and_findings_hold() {
     let f = fixture::ManagedFixture::new("sha1", "2");
     let config = config(&f);

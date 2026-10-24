@@ -143,15 +143,15 @@ fn nondurable_default_missing_context_and_unsafe_directory_do_not_publish() {
     let result =
         inspection::inspect_and_record(&mut f.store, uuid::Uuid::now_v7(), &empty()).unwrap();
     assert_eq!(result.observation.coverage(), Coverage::Incomplete);
-    assert!(matches!(result.receipt, Err(ReceiptError::Conflict)));
+    assert_eq!(result.receipt.unwrap_err(), ReceiptError::Conflict);
     assert!(!directory.exists());
     symlink(f.temp.path(), &directory).unwrap();
     let result =
         inspection::inspect_and_record(&mut f.store, f.allocation.checkout, &empty()).unwrap();
-    assert!(matches!(
-        result.receipt,
-        Err(ReceiptError::UnsafeReceiptStore)
-    ));
+    assert_eq!(
+        result.receipt.unwrap_err(),
+        ReceiptError::UnsafeReceiptStore
+    );
 }
 #[test]
 fn preservation_findings_remain_passive_after_recording() {
@@ -175,10 +175,10 @@ fn preservation_findings_remain_passive_after_recording() {
 #[test]
 fn corrupt_passive_read_is_not_missing_and_never_repairs() {
     let mut f = fixture::ManagedFixture::new("sha1", "2");
-    assert!(matches!(
-        inspection::read_receipt(&f.store, uuid::Uuid::now_v7()),
-        Err(ReceiptError::Missing)
-    ));
+    assert_eq!(
+        inspection::read_receipt(&f.store, uuid::Uuid::now_v7()).unwrap_err(),
+        ReceiptError::Missing
+    );
     let result =
         inspection::inspect_and_record(&mut f.store, f.allocation.checkout, &empty()).unwrap();
     let id = result.receipt.unwrap().id();
@@ -189,9 +189,9 @@ fn corrupt_passive_read_is_not_missing_and_never_repairs() {
     let mut bytes = fs::read(&path).unwrap();
     bytes[20] ^= 1;
     fs::write(&path, &bytes).unwrap();
-    assert!(matches!(
-        inspection::read_receipt(&f.store, id),
-        Err(ReceiptError::Corrupt)
-    ));
+    assert_eq!(
+        inspection::read_receipt(&f.store, id).unwrap_err(),
+        ReceiptError::Corrupt
+    );
     assert_eq!(fs::read(path).unwrap(), bytes);
 }

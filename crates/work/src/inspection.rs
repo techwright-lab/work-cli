@@ -240,12 +240,7 @@ pub(crate) fn configured_report(
     let policies = document
         .inspection_policies()
         .map_err(|_| InspectionError)?;
-    let mut store = Store::open_existing_registered_mut(
-        config.trusted_registry.as_deref().ok_or(InspectionError)?,
-        config.store_dir.as_deref().ok_or(InspectionError)?,
-        &config.roots,
-    )
-    .map_err(|_| InspectionError)?;
+    let mut store = open_configured_store(&config)?;
     let (observation, receipt) = if record {
         let result = inspect_and_record(&mut store, checkout, &policies)?;
         (result.observation, Some(result.receipt))
@@ -289,6 +284,55 @@ pub(crate) fn configured_report(
         recording,
         receipt_id,
     })
+}
+
+// Unlike general mutable Store opening, inspection must not repair a missing
+// allocation.lock. Participating lifecycle writers never unlink this lock.
+// Retaining/rechecking its descriptor detects rebinding, but cannot prevent a
+// hostile unlink race from reaching the general opener's create(true) path.
+fn open_configured_store(config: &crate::config::Config) -> Result<Store, InspectionError> {
+    use std::os::unix::fs::MetadataExt;
+    let registry = config.trusted_registry.as_deref().ok_or(InspectionError)?;
+    let directory = config.store_dir.as_deref().ok_or(InspectionError)?;
+    // Validate existing directories, claims, database and schema without any
+    // mutable opening. Drop its read transaction before subsequent file I/O.
+    let preflight = Store::open_existing_registered_readonly(registry, directory, &config.roots)
+        .map_err(|_| InspectionError)?;
+    let authority = std::sync::Arc::clone(preflight.authority_identity());
+    drop(preflight);
+    let lock = crate::store::AuthorityIdentity::open_lock(directory, false)
+        .map_err(|_| InspectionError)?;
+    let lock_identity = |metadata: std::fs::Metadata| {
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.mode() & 0o7777 != 0o600
+        {
+            return Err(InspectionError);
+        }
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let lock_id = lock_identity(lock.metadata().map_err(|_| InspectionError)?)?;
+    let store = Store::open_existing_registered_mut(registry, directory, &config.roots)
+        .map_err(|_| InspectionError)?;
+    // The original FD remains live through the entire mutable open. The second
+    // no-create open revalidates named ownership/type/mode/link/name binding.
+    let named = crate::store::AuthorityIdentity::open_lock(directory, false)
+        .map_err(|_| InspectionError)?;
+    let retained = lock_identity(lock.metadata().map_err(|_| InspectionError)?)?;
+    let current = lock_identity(named.metadata().map_err(|_| InspectionError)?)?;
+    let cached = store.authority_identity();
+    if retained != lock_id
+        || current != lock_id
+        || cached.lock_id != Some(lock_id)
+        || cached.registry() != authority.registry()
+        || cached.directory != authority.directory
+        || cached.directory_id != authority.directory_id
+        || cached.database_id() != authority.database_id()
+    {
+        return Err(InspectionError);
+    }
+    Ok(store)
 }
 
 #[derive(Debug, thiserror::Error)]

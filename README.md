@@ -468,7 +468,12 @@ work inspect CHECKOUT_UUIDV7 --record
 
 Inspection uses one bounded configuration snapshot: `store_dir`, `trusted_registry`,
 `roots` and only the optional `[inspection]` policy subtree. It requires an existing
-registered schema-15 authority; it never initializes or migrates one. Unrelated
+registered schema-15 authority with an existing qualified `allocation.lock`;
+plain inspection and `--record` refuse a missing lock rather than repair it.
+A no-create lock descriptor is retained across Store opening and checked against
+the named lock and cached authority afterward. This cooperative check does not
+prevent hostile same-UID unlink/replacement races. Inspection never initializes
+or migrates an authority. Unrelated
 malformed execution/capture declarations do not block inspection. An absent policy
 section means zero exemptions. An explicit empty section is:
 
