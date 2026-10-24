@@ -1,5 +1,6 @@
 //! Owned fixture SOURCE ONLY: never invoke without separate isolated CI permission.
 #![allow(dead_code)]
+use super::work_cli_api as work_cli;
 use std::{
     ffi::OsStr,
     fs,
@@ -12,6 +13,135 @@ pub struct InspectionFixture {
     pub temp: tempfile::TempDir,
     pub checkout: PathBuf,
 }
+pub struct ManagedFixture {
+    pub temp: tempfile::TempDir,
+    pub repo: PathBuf,
+    pub root: PathBuf,
+    pub allocation: work_cli::allocate::Allocation,
+    pub store: work_cli::store::Store,
+}
+impl ManagedFixture {
+    pub fn new(format: &str, version: &str) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repository");
+        let root = temp.path().join("managed");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(&root).unwrap();
+        git(
+            &repo,
+            &[
+                "init".as_ref(),
+                "--initial-branch=main".as_ref(),
+                format!("--object-format={format}").as_ref(),
+            ],
+        );
+        fs::write(repo.join("tracked"), b"tracked\n").unwrap();
+        fs::write(repo.join(".gitignore"), b"cache/\n").unwrap();
+        git(&repo, &["add".as_ref(), ".".as_ref()]);
+        git(
+            &repo,
+            &[
+                "commit".as_ref(),
+                "-m".as_ref(),
+                "owned inspection fixture".as_ref(),
+            ],
+        );
+        let config = work_cli::config::Config {
+            store_dir: Some(temp.path().join("authority")),
+            trusted_registry: Some(temp.path().join("registry")),
+            repositories: vec![repo.clone()],
+            roots: vec![root.clone()],
+            allocation: Some(work_cli::config::AllocationPolicy {
+                repository_limit: 10,
+                owner_limit: 10,
+                floor_bytes: 0,
+                warn_bytes: 0,
+                capture_sink: None,
+            }),
+            ..Default::default()
+        };
+        let allocation = work_cli::allocate::start(
+            &config,
+            work_cli::allocate::Start {
+                operation: uuid::Uuid::now_v7(),
+                repository: Some(repo.clone()),
+                root: Some(root.clone()),
+                actor: Some("fixture".into()),
+                owner: None,
+                task: "inspection".into(),
+                branch: Some("inspection".into()),
+                base: "HEAD".into(),
+                reuse_branch: false,
+            },
+        )
+        .unwrap();
+        if version == "3" {
+            // An extended flag forces native v3 rather than relying on Git's
+            // willingness to retain v3 for entries expressible as v2.
+            git(
+                &allocation.destination,
+                &[
+                    "update-index".as_ref(),
+                    "--skip-worktree".as_ref(),
+                    "tracked".as_ref(),
+                ],
+            );
+        }
+        git(
+            &allocation.destination,
+            &[
+                "update-index".as_ref(),
+                format!("--index-version={version}").as_ref(),
+            ],
+        );
+        let store = work_cli::store::Store::open_existing_registered_mut(
+            config.trusted_registry.as_ref().unwrap(),
+            config.store_dir.as_ref().unwrap(),
+            &config.roots,
+        )
+        .unwrap();
+        Self {
+            temp,
+            repo,
+            root,
+            allocation,
+            store,
+        }
+    }
+    pub fn path(&self, raw: &[u8]) -> PathBuf {
+        self.allocation.destination.join(OsStr::from_bytes(raw))
+    }
+    pub fn private(&self) -> &Path {
+        &self.allocation.identity.as_ref().unwrap().private_git_dir
+    }
+    pub fn common(&self) -> &Path {
+        &self.allocation.identity.as_ref().unwrap().common_git_dir
+    }
+    pub fn inspect(
+        &mut self,
+        policies: &work_cli::disposal::ValidatedPolicies,
+    ) -> work_cli::inspection::Observation {
+        work_cli::inspection::inspect(&mut self.store, self.allocation.checkout, policies).unwrap()
+    }
+    pub fn git(&self, args: &[&OsStr]) {
+        git(&self.allocation.destination, args);
+    }
+    pub fn sibling(&self) -> PathBuf {
+        let sibling = self.temp.path().join("sibling");
+        git(
+            &self.repo,
+            &[
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "-b".as_ref(),
+                "sibling".as_ref(),
+                sibling.as_os_str(),
+            ],
+        );
+        sibling
+    }
+}
+
 impl InspectionFixture {
     pub fn directory() -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -75,7 +205,7 @@ impl InspectionFixture {
         fs::write(self.path(raw), bytes).unwrap();
     }
 }
-fn git(cwd: &Path, args: &[&OsStr]) {
+pub fn git(cwd: &Path, args: &[&OsStr]) {
     // Fixture creation only, not the inspection process runner. No network.
     let result = Command::new("/usr/bin/git")
         .env_clear()

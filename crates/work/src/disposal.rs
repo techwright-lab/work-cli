@@ -1,5 +1,6 @@
 //! Strict policy input, not deletion authority. No default content exemptions.
-//! Validation binds a proposed allowlist; it does not inspect or classify files.
+//! Validation binds a proposed allowlist; only private fresh inspection evidence
+//! reaches classification. A match is an observation, never deletion authority.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -323,8 +324,61 @@ impl Encoder {
     }
 }
 
-// Pure comparison for test-only synthetic observations. A3 must supply real
-// private membership/coverage proof before enabling production classification.
+/// Compare the whole explicit scope, including empty directories. Only the
+/// inspector can construct this evidence after real index/ignore/blob proof.
+/// Returned matches annotate observations; they are not authorized delete paths.
+pub(crate) fn classify(
+    policies: &ValidatedPolicies,
+    evidence: &crate::inspection::PolicyEvidence,
+) -> (std::collections::BTreeMap<RawPath, String>, Vec<RawPath>) {
+    let mut matches = std::collections::BTreeMap::new();
+    let mut mismatches = Vec::new();
+    for rule in &policies.rules {
+        let entries: Vec<_> = evidence
+            .entries()
+            .iter()
+            .filter(|e| rule.scope.contains(e.path()))
+            .collect();
+        let mut files = Vec::new();
+        let mut directories = Vec::new();
+        let mut eligible = true;
+        for entry in entries {
+            if entry.tracked() || !entry.ignored() {
+                eligible = false;
+                break;
+            }
+            if entry.directory() {
+                directories.push(entry.path().clone());
+            } else if let Some(sha256) = entry.sha256() {
+                files.push(ExactFile {
+                    path: entry.path().clone(),
+                    sha256,
+                    length: entry.length(),
+                    mode: entry.mode(),
+                });
+            } else {
+                eligible = false;
+                break;
+            }
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        directories.sort();
+        if eligible && files == rule.files && directories == rule.directories {
+            for path in directories
+                .into_iter()
+                .chain(files.into_iter().map(|f| f.path))
+            {
+                matches.insert(path, rule.id.clone());
+            }
+        } else {
+            mismatches.push(rule.scope.clone());
+        }
+    }
+    (matches, mismatches)
+}
+
+// Pure comparison for explicitly synthetic unit observations. Integration
+// positives use owned native Store/Git fixtures, not this test-only helper.
 #[cfg(test)]
 fn exact_allowlist(rule: &Rule, files: &[ExactFile], directories: &[RawPath]) -> bool {
     let mut files = files.to_vec();

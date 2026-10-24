@@ -1,5 +1,84 @@
 //! Source-only contracts; execution requires separately authorized isolated CI.
+use work_cli as work_cli_api;
 use work_cli::disposal::{self, PolicyDocument, RawPath};
+
+#[path = "support/inspection_fixture.rs"]
+mod fixture;
+
+#[test]
+fn actual_ignored_policy_matching_requires_every_descendant() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+    use work_cli::inspection::{Coverage, FindingKind};
+    for case in [
+        "exact",
+        "secret",
+        "missing-directory",
+        "untracked",
+        "tracked",
+        "pyc",
+        "marker",
+        "mode",
+    ] {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        fs::create_dir_all(f.path(b"cache/empty")).unwrap();
+        fs::write(f.path(b"cache/a"), b"abc").unwrap();
+        fs::set_permissions(f.path(b"cache/a"), fs::Permissions::from_mode(0o600)).unwrap();
+        match case {
+            "secret" | "pyc" | "marker" => {
+                fs::write(f.path(format!("cache/{case}").as_bytes()), b"private").unwrap()
+            }
+            "missing-directory" => fs::remove_dir(f.path(b"cache/empty")).unwrap(),
+            "untracked" => fs::write(f.path(b".gitignore"), b"").unwrap(),
+            "tracked" => f.git(&["add".as_ref(), "-f".as_ref(), "cache/a".as_ref()]),
+            "mode" => {
+                fs::set_permissions(f.path(b"cache/a"), fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            _ => (),
+        }
+        let observation = f.inspect(&disposal::validate(document()).unwrap());
+        assert_eq!(
+            observation.coverage(),
+            Coverage::Complete,
+            "{case}: {:?}",
+            observation.reasons()
+        );
+        let matched = observation
+            .entries()
+            .iter()
+            .find(|e| e.path().as_bytes() == b"cache/a")
+            .unwrap()
+            .policy_match();
+        assert_eq!(matched.is_some(), case == "exact", "{case}");
+        if case != "exact" {
+            assert!(!observation.findings().is_empty(), "{case}");
+        }
+        if case == "untracked" {
+            assert!(observation
+                .findings()
+                .iter()
+                .any(|v| v.kind() == FindingKind::Untracked));
+        }
+    }
+}
+
+#[test]
+fn missing_scope_is_a_finding_not_a_successful_policy() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    let observation = f.inspect(&disposal::validate(document()).unwrap());
+    assert_eq!(
+        observation.coverage(),
+        work_cli::inspection::Coverage::Complete,
+        "{:?}",
+        observation.reasons()
+    );
+    assert!(observation.findings().iter().any(|f| f.kind()
+        == work_cli::inspection::FindingKind::PolicyMismatch
+        && f.path().as_bytes() == b"cache"));
+    assert!(observation
+        .entries()
+        .iter()
+        .all(|e| e.policy_match().is_none()));
+}
 
 fn document() -> PolicyDocument {
     serde_json::from_value(serde_json::json!({

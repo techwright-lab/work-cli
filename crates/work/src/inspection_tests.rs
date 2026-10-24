@@ -1,10 +1,369 @@
-//! Test source authored before the A2 walker. No execution/RED/GREEN claimed.
+//! Test source authored before the corresponding A2/A3 logic. CI-only; no RED/GREEN claim.
+
+#[test]
+fn sha1_index_and_blob_known_vectors() {
+    for (input, expected) in [
+        (b"".as_slice(), "da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+        (b"abc", "a9993e364706816aba3e25717850c26c9cd0d89d"),
+        (
+            b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1",
+        ),
+    ] {
+        for chunk in [1, 7, 64] {
+            let mut hash = Sha1::new();
+            for part in input.chunks(chunk) {
+                hash.update(part);
+            }
+            assert_eq!(hex(&hash.finish()), expected);
+        }
+    }
+    // Independently published padding-boundary vectors for repeated ASCII 'a'.
+    for (length, expected) in [
+        (55, "c1c8bbdc22796e28c0e15163d20899b65621d65a"),
+        (56, "c2db330f6083854c99d4b5bfb6e8f29f201be699"),
+        (63, "03f09f5b158a7a8cdad920bddc29b81c18a551f5"),
+        (64, "0098ba824b5c16427bd7a1122a5a442a25ec644d"),
+        (1_000_000, "34aa973cd4c4daa4f61eeb2bdbad27316534016f"),
+    ] {
+        let mut hash = Sha1::new();
+        for _ in 0..length {
+            hash.update(b"a");
+        }
+        assert_eq!(hex(&hash.finish()), expected);
+    }
+    assert_eq!(
+        hex(&object_digest(ObjectFormat::Sha1, b"blob", b"test\n")),
+        "9daeafb9864cf43055ae93beb0afd6c7d144bfa4"
+    );
+}
+
+#[test]
+fn runner_retains_leader_until_group_cleanup() {
+    let mut b = Budget::new();
+    let output = run_command(
+        std::process::Command::new("/usr/bin/printf").arg("raw\\0bytes"),
+        b"",
+        &mut b,
+        false,
+    )
+    .unwrap();
+    assert_eq!(output.stdout, b"raw\0bytes");
+    assert_eq!(
+        b.process_events,
+        ["spawn", "exit-nowait", "kill-group", "wait"]
+    );
+    assert_eq!(b.counters.child_launches, 1);
+    assert_eq!(b.counters.observed_process_bytes, 9);
+    assert_eq!(b.counters.uncertain_process_reservation_bytes, 0);
+}
+
+#[test]
+fn runner_counts_stderr_and_concurrent_input_without_exposing_diagnostics() {
+    let mut b = Budget::new();
+    let input = b"input\0with\nraw framing";
+    let output = run_command(
+        &mut std::process::Command::new("/usr/bin/cat"),
+        input,
+        &mut b,
+        false,
+    )
+    .unwrap();
+    assert_eq!(output.stdout, input);
+    assert_eq!(b.counters.observed_process_input_bytes, input.len() as u64);
+    assert_eq!(b.counters.observed_process_bytes, input.len() as u64);
+    let mut b = Budget::new();
+    b.counters.charged_read_bytes = MAX_CHARGED_BYTES - 4;
+    // Owned test child only. Production admits only the literal Git command set.
+    let result = run_command(
+        std::process::Command::new("/bin/sh").args(["-c", "printf secret-diagnostic >&2"]),
+        b"",
+        &mut b,
+        false,
+    );
+    assert!(result.is_err());
+    assert_eq!(b.counters.observed_process_bytes, 4);
+    assert!(b.process_events.ends_with(&["kill-group", "wait"]));
+}
+
+#[test]
+fn git_process_and_input_limits() {
+    let mut b = Budget::new();
+    b.counters.reserved_child_slots = 96;
+    assert!(run_command(
+        &mut std::process::Command::new("/usr/bin/printf"),
+        b"",
+        &mut b,
+        false
+    )
+    .is_err());
+    assert_eq!(b.counters.child_launches, 0);
+    let mut b = Budget::new();
+    b.counters.charged_read_bytes = MAX_CHARGED_BYTES - 4;
+    assert!(run_command(
+        std::process::Command::new("/usr/bin/printf").arg("12345678"),
+        b"",
+        &mut b,
+        false
+    )
+    .is_err());
+    assert_eq!(b.counters.observed_process_bytes, 4);
+    assert_eq!(b.counters.child_launches, 1);
+    assert!(b.process_events.ends_with(&["kill-group", "wait"]));
+}
+
+fn index_fixture(version: u32, extended: Option<u16>, extension: &[u8]) -> Vec<u8> {
+    let mut bytes = b"DIRC".to_vec();
+    bytes.extend(version.to_be_bytes());
+    bytes.extend(1u32.to_be_bytes());
+    let start = bytes.len();
+    let mut stat = [0u8; 40];
+    stat[24..28].copy_from_slice(&0o100644u32.to_be_bytes());
+    bytes.extend(stat);
+    bytes.extend([1u8; 20]);
+    bytes.extend((1u16 | if extended.is_some() { 0x4000 } else { 0 }).to_be_bytes());
+    if let Some(flags) = extended {
+        bytes.extend(flags.to_be_bytes());
+    }
+    bytes.extend(b"a\0");
+    while !(bytes.len() - start).is_multiple_of(8) {
+        bytes.push(0);
+    }
+    bytes.extend(extension);
+    let checksum = ObjectFormat::Sha1.hash(&bytes);
+    bytes.extend(checksum);
+    bytes
+}
+
+#[test]
+fn index_v2_v3_extensions_and_checksums() {
+    for (version, flags) in [(2, None), (3, Some(0x4000))] {
+        let bytes = index_fixture(version, flags, b"");
+        let entries = parse_index(&bytes, ObjectFormat::Sha1).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries.values().next().unwrap().skip_worktree,
+            flags.is_some()
+        );
+        let mut bad = bytes.clone();
+        bad[20] ^= 1;
+        assert!(parse_index(&bad, ObjectFormat::Sha1).is_err());
+    }
+    for (version, flags, extension) in [
+        (4, None, b"".as_slice()),
+        (2, Some(0x4000), b""),
+        (3, Some(0x2000), b""),
+        (3, Some(1), b""),
+        (2, None, b"UNTR\0\0\0\0"),
+        (2, None, b"TREE\0\0\0\x01x"),
+    ] {
+        assert!(parse_index(
+            &index_fixture(version, flags, extension),
+            ObjectFormat::Sha1
+        )
+        .is_err());
+    }
+    // Valid invalidated cache-tree node: no OID when entry_count is negative.
+    assert!(parse_index(
+        &index_fixture(2, None, b"TREE\0\0\0\x06\0-1 0\n"),
+        ObjectFormat::Sha1
+    )
+    .is_ok());
+}
+
+#[test]
+fn native_anchor_paths_reject_git_trimming_ambiguity() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+    for raw in [
+        b"/tmp/private\n".as_slice(),
+        b"/tmp/private\r",
+        b"/tmp/private ",
+        b"/tmp/a\nb",
+        b"/tmp/../private",
+        b"relative",
+    ] {
+        assert!(native_anchor_path(Path::new(OsStr::from_bytes(raw))).is_err());
+    }
+    assert!(native_anchor_path(Path::new("/tmp/ordinary space/private")).is_ok());
+    // This is only an administrative transport restriction, not path folding.
+    assert!(RawPath::from_bytes(b"payload/\xff\n\t").is_ok());
+}
+
+#[test]
+fn git_byte_protocols_reject_ambiguity() {
+    let oid = vec![b'1'; 40];
+    let mut stage = b"100644 ".to_vec();
+    stage.extend(&oid);
+    stage.extend(b" 0\t-x\xff\n\t\0");
+    let parsed = parse_stage(&stage, ObjectFormat::Sha1).unwrap();
+    assert!(parsed.contains_key(&crate::disposal::RawPath::from_bytes(b"-x\xff\n\t").unwrap()));
+    assert!(parse_stage(&[stage.clone(), stage.clone()].concat(), ObjectFormat::Sha1).is_err());
+    assert!(parse_stage(&stage[..stage.len() - 1], ObjectFormat::Sha1).is_err());
+    let requested = vec![crate::disposal::RawPath::from_bytes(b"cache/a\n").unwrap()];
+    assert!(
+        parse_ignored(
+            b".gitignore\0"
+                .iter()
+                .copied()
+                .chain(b"1\0cache/\0cache/a\n\0".iter().copied())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &requested
+        )
+        .unwrap()[&requested[0]]
+    );
+    assert!(parse_ignored(b"\0\0\0other\0", &requested).is_err());
+    assert!(parse_ignored(b"\0\0\0cache/a\n\0extra\0", &requested).is_err());
+    let payload = b"binary\0\n123 blob 9\n";
+    for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+        let oid = hex(&object_digest(format, b"blob", payload));
+        let mut wire = format!("{oid} blob {}\n", payload.len()).into_bytes();
+        wire.extend(payload);
+        wire.push(b'\n');
+        let expected = vec![(oid.as_bytes().to_vec(), payload.len() as u64)];
+        assert!(parse_blobs(&wire, &expected, format).is_ok());
+        let mut corrupt = wire.clone();
+        corrupt[oid.len() + 8] ^= 1;
+        assert!(parse_blobs(&corrupt, &expected, format).is_err());
+        wire.push(b'\n');
+        assert!(parse_blobs(&wire, &expected, format).is_err());
+    }
+}
+
+#[test]
+fn canonical_digest_binds_all_evidence() {
+    let p = crate::disposal::validate(crate::disposal::PolicyDocument {
+        format: 1,
+        policies: vec![],
+    })
+    .unwrap();
+    let mut b = Budget::new();
+    let first = finish_observation(&p, b"context", b"evidence", vec![], vec![], None, &b).unwrap();
+    let same = finish_observation(&p, b"context", b"evidence", vec![], vec![], None, &b).unwrap();
+    assert_eq!(first.digest(), same.digest());
+    for (context, evidence, reason) in [
+        (b"changed".as_slice(), b"evidence".as_slice(), None),
+        (b"context", b"changed", None),
+        (b"context", b"evidence", Some(IncompleteReason::Changed)),
+    ] {
+        let other = finish_observation(&p, context, evidence, vec![], vec![], reason, &b).unwrap();
+        assert_ne!(first.digest(), other.digest());
+    }
+    b.counters.child_launches = 1;
+    assert_ne!(
+        first.digest(),
+        finish_observation(&p, b"context", b"evidence", vec![], vec![], None, &b)
+            .unwrap()
+            .digest()
+    );
+}
+
 use super::filesystem::{self, Boundary, Event, Identity, SystemBoundary};
 use super::*;
+use crate as work_cli_api;
 use std::{fs, os::unix::fs::symlink, time::Duration};
 #[path = "../tests/support/inspection_fixture.rs"]
 mod fixture;
 use fixture::InspectionFixture;
+
+#[test]
+fn context_change_is_incomplete_without_inspection_mutations() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    let policies = crate::disposal::validate(crate::disposal::PolicyDocument {
+        format: 1,
+        policies: vec![],
+    })
+    .unwrap();
+    let checkout = f.allocation.checkout;
+    let events = f.store.pending_events(100).unwrap();
+    let mut reached = false;
+    let mut change = |store: &mut Store| {
+        reached = true;
+        assert!(
+            store.conn.is_autocommit(),
+            "SQL must end before observation I/O"
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE checkouts SET owner='external-change' WHERE id=?1",
+                [checkout.to_string()],
+            )
+            .unwrap();
+    };
+    let observation = inspect_inner(&mut f.store, checkout, &policies, Some(&mut change)).unwrap();
+    assert!(reached);
+    assert_eq!(observation.reasons(), [IncompleteReason::ContextConflict]);
+    assert_eq!(events, f.store.pending_events(100).unwrap());
+    let owner: String = f
+        .store
+        .conn
+        .query_row(
+            "SELECT owner FROM checkouts WHERE id=?1",
+            [checkout.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        owner, "external-change",
+        "inspection must not repair external context"
+    );
+    let writers: i64 = f
+        .store
+        .conn
+        .query_row("SELECT count(*) FROM writers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(writers, 0);
+}
+
+#[test]
+fn active_sql_or_transaction_is_refused_before_io() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    let policies = crate::disposal::validate(crate::disposal::PolicyDocument {
+        format: 1,
+        policies: vec![],
+    })
+    .unwrap();
+    let phase = f.store.sql_phase();
+    let o = f.inspect(&policies);
+    assert_eq!(o.reasons(), [IncompleteReason::ContextUnavailable]);
+    assert_eq!(o.counters().child_launches, 0);
+    drop(phase);
+    f.store.conn.execute_batch("BEGIN;").unwrap();
+    let o = f.inspect(&policies);
+    assert_eq!(o.reasons(), [IncompleteReason::ContextUnavailable]);
+    assert_eq!(o.counters().observed_file_bytes, 0);
+    assert!(!f.store.conn.is_autocommit());
+    f.store.conn.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn byte_identical_registration_replacement_invalidates_observation() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    let policies = crate::disposal::validate(crate::disposal::PolicyDocument {
+        format: 1,
+        policies: vec![],
+    })
+    .unwrap();
+    let path = f.private().join("gitdir");
+    let bytes = fs::read(&path).unwrap();
+    let mut reached = false;
+    let mut replace = |_: &mut Store| {
+        reached = true;
+        fs::rename(&path, path.with_extension("old")).unwrap();
+        fs::write(&path, &bytes).unwrap();
+    };
+    let o = inspect_inner(
+        &mut f.store,
+        f.allocation.checkout,
+        &policies,
+        Some(&mut replace),
+    )
+    .unwrap();
+    assert!(reached);
+    assert_eq!(o.coverage(), Coverage::Incomplete);
+    assert!(o.reasons().contains(&IncompleteReason::Changed));
+}
 
 #[test]
 fn descriptor_reopen_never_opens_a_replacement() {
