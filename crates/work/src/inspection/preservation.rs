@@ -847,11 +847,10 @@ fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
     let frames = take_frames(bytes)?;
     let mut paths = BTreeMap::new();
     let mut absent = BTreeSet::new();
-    let mut i = 0;
-    match frames.first() {
-        Some((0, value)) if value == b"work.recovery.manifest.v1" => i = 1,
+    let mut i = match frames.first() {
+        Some((0, value)) if value == b"work.recovery.manifest.v1" => 1,
         _ => return Err("census_changed"),
-    }
+    };
     while i < frames.len() {
         match frames[i].0 {
             1 => {
@@ -1129,7 +1128,7 @@ fn provenance_kind(bytes: &[u8]) -> Held<&'static str> {
 }
 
 fn hex_text(text: &str) -> bool {
-    text.len() % 2 == 0 && text.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    text.len().is_multiple_of(2) && text.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn encode_provenance(set: &BTreeSet<Provenance>) -> Held<Vec<u8>> {

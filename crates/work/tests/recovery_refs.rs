@@ -244,20 +244,37 @@ fn already_present_packed_and_loose_targets_are_verified_not_rewritten() {
     let name = recovery_ref(f.allocation.checkout, "sha1", &head);
     let loose = loose_ref(&f, &name);
     let before = fs::read(&loose).unwrap();
+    let before_meta = fs::metadata(&loose).unwrap();
+    let (out, verified_loose) = prepare(&config, f.allocation.checkout, Uuid::now_v7());
+    assert!(out.status.success(), "{verified_loose}");
+    assert_eq!(verified_loose["outcome"], "prepared");
+    assert_eq!(verified_loose["created_refs"], serde_json::json!([]));
+    assert!(verified_loose["verified_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == &name));
+    assert_eq!(fs::read(&loose).unwrap(), before);
+    let after_meta = fs::metadata(&loose).unwrap();
+    assert_eq!(after_meta.ino(), before_meta.ino());
+    assert_eq!(after_meta.mtime(), before_meta.mtime());
+    assert_eq!(after_meta.mtime_nsec(), before_meta.mtime_nsec());
     f.git(&["pack-refs".as_ref(), "--all".as_ref()]);
     if loose.exists() {
         fs::remove_file(&loose).unwrap();
     }
     let packed = fs::read(f.common().join("packed-refs")).unwrap();
     assert!(String::from_utf8_lossy(&packed).contains(&head));
+    // Packing is an unrelated physical change, not a planned ref addition.
+    // The old immutable operation must hold; a fresh operation can verify it.
     let (out, report) = prepare(&config, f.allocation.checkout, operation);
-    assert!(out.status.success(), "{report}");
-    assert_eq!(report["outcome"], "historical", "{report}");
-    assert_eq!(report["durability"], "historical");
+    assert_eq!(out.status.code(), Some(1), "{report}");
+    assert_eq!(report["outcome"], "held", "{report}");
+    assert_eq!(report["reason"], "census_changed");
+    assert_eq!(report["durability"], "not_attempted");
+    assert_eq!(report["created_refs"], serde_json::json!([]));
     assert_eq!(fs::read(f.common().join("packed-refs")).unwrap(), packed);
-    if loose.exists() {
-        assert_eq!(fs::read(&loose).unwrap(), before);
-    }
+    assert!(!loose.exists());
     let other = Uuid::now_v7();
     let (out, second) = prepare(&config, f.allocation.checkout, other);
     assert!(out.status.success(), "{second}");
@@ -272,9 +289,11 @@ fn already_present_packed_and_loose_targets_are_verified_not_rewritten() {
         .unwrap()
         .iter()
         .any(|v| v == &name));
-    if loose.exists() {
-        assert_eq!(fs::read(&loose).unwrap(), before);
-    }
+    assert!(
+        !loose.exists(),
+        "existing packed target must not gain a loose shadow"
+    );
+    assert_eq!(fs::read(f.common().join("packed-refs")).unwrap(), packed);
 }
 
 #[test]
