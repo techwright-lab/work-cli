@@ -1,0 +1,1326 @@
+//! Private append-only receipt protocol. Tests authored before implementation;
+//! no local execution or RED/GREEN claim.
+use super::{frame, hex, Captured, Coverage, InspectionError, Observation, Store};
+use crate::disposal::ValidatedPolicies;
+use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir, RenameFlags, ResolveFlags};
+use sha2::{Digest, Sha256};
+use std::{
+    fs::File,
+    io::{Read, Write},
+    mem::MaybeUninit,
+    os::unix::ffi::OsStrExt,
+};
+use uuid::Uuid;
+
+const DIRECTORY: &str = "inspection-receipts-v1";
+const MAX_RECEIPT: u64 = 2 * 1024 * 1024;
+const MAX_TOTAL: u64 = 16 * 1024 * 1024;
+const MAX_NAMES: usize = 4096;
+const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+    .union(ResolveFlags::NO_SYMLINKS)
+    .union(ResolveFlags::NO_MAGICLINKS)
+    .union(ResolveFlags::NO_XDEV);
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReceiptError {
+    #[error("inspection context changed or unavailable")]
+    Conflict,
+    #[error("inspection receipt capacity full")]
+    CapacityFull,
+    #[error("unsafe inspection receipt store")]
+    UnsafeReceiptStore,
+    #[error("inspection authority busy or unavailable")]
+    Busy,
+    #[error("inspection receipt encoding limit")]
+    EncodingLimit,
+    #[error("inspection receipt I/O failure")]
+    Io,
+    #[error("inspection receipt missing")]
+    Missing,
+    #[error("inspection receipt corrupt")]
+    Corrupt,
+    #[error("inspection receipt publication durability unknown")]
+    DurabilityUnknown { id: Uuid, digest: [u8; 32] },
+}
+impl ReceiptError {
+    pub(super) fn label(&self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::CapacityFull => "capacity_full",
+            Self::UnsafeReceiptStore => "unsafe_receipt_store",
+            Self::Busy => "busy",
+            Self::EncodingLimit => "encoding_limit",
+            Self::Io => "io_failure",
+            Self::Missing => "missing",
+            Self::Corrupt => "corrupt",
+            Self::DurabilityUnknown { .. } => "durability_unknown",
+        }
+    }
+}
+type Result<T> = std::result::Result<T, ReceiptError>;
+/// Acknowledges file sync, no-replace publication and directory sync in this
+/// invocation. Never a live filesystem, writer or retirement capability.
+#[derive(Debug)]
+pub struct PersistedReceipt {
+    id: Uuid,
+    digest: [u8; 32],
+}
+impl PersistedReceipt {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+}
+#[derive(Debug)]
+pub struct RecordOutcome {
+    pub observation: Observation,
+    pub receipt: Result<PersistedReceipt>,
+}
+/// Passive historical bytes only. No constructor, Deserialize, freshness or
+/// conversion into Captured/PersistedReceipt. A read is not an original ack.
+#[derive(Debug)]
+pub struct ReceiptData {
+    id: Uuid,
+    checkout: Uuid,
+    digest: [u8; 32],
+    coverage: Coverage,
+    body: Vec<u8>,
+    policy_digest: [u8; 32],
+    findings: Vec<super::Finding>,
+}
+impl ReceiptData {
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+    pub fn checkout(&self) -> Uuid {
+        self.checkout
+    }
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+    pub fn coverage(&self) -> Coverage {
+        self.coverage
+    }
+    pub fn canonical_observation(&self) -> &[u8] {
+        &self.body
+    }
+    pub fn policy_digest(&self) -> [u8; 32] {
+        self.policy_digest
+    }
+    pub fn findings(&self) -> &[super::Finding] {
+        &self.findings
+    }
+}
+/// Fresh capture only; callers cannot append arbitrary or previously decoded
+/// observations. Incomplete provenance can persist only with retained inputs.
+pub fn inspect_and_record(
+    store: &mut Store,
+    checkout: Uuid,
+    policies: &ValidatedPolicies,
+) -> std::result::Result<RecordOutcome, InspectionError> {
+    let mut captured = super::collect(
+        store,
+        checkout,
+        policies,
+        #[cfg(test)]
+        None,
+    )?;
+    let receipt = persist(store, &mut captured, Fault::None);
+    Ok(RecordOutcome {
+        observation: captured.observation,
+        receipt,
+    })
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    None,
+    #[cfg(test)]
+    Write,
+    #[cfg(test)]
+    FileSync,
+    #[cfg(test)]
+    Rename,
+    #[cfg(test)]
+    DirectorySync,
+}
+fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<PersistedReceipt> {
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    let context = captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
+    let physical = captured.physical.as_ref().ok_or(ReceiptError::Conflict)?;
+    if captured.started > captured.ended
+        || captured.observation.reasons().iter().any(|r| {
+            matches!(
+                r,
+                super::IncompleteReason::Changed | super::IncompleteReason::ContextConflict
+            )
+        })
+    {
+        return Err(ReceiptError::Conflict);
+    }
+    captured
+        .budget
+        .check()
+        .map_err(|_| ReceiptError::Conflict)?;
+    let id = Uuid::now_v7();
+    // Encode before any lease or SQL. The immutable body includes its original
+    // policy/version/context digest; later checks never rewrite it or its clock.
+    let bytes = encode(store, id, captured)?;
+    let mut reservation = reserve(store, id, bytes.len() as u64)?;
+    #[cfg(test)]
+    if fault == Fault::Write {
+        // A failure-only seam: a real partial write, never synthetic evidence.
+        reservation
+            .file
+            .write_all(&bytes[..bytes.len() / 2])
+            .map_err(|_| ReceiptError::Io)?;
+        return Err(ReceiptError::Io);
+    }
+    reservation
+        .file
+        .write_all(&bytes)
+        .map_err(|_| ReceiptError::Io)?;
+    #[cfg(test)]
+    if fault == Fault::FileSync {
+        return Err(ReceiptError::Io);
+    }
+    reservation.file.sync_all().map_err(|_| ReceiptError::Io)?;
+    // Retained descriptor/Git evidence and ORIGINAL Budget: outside both guards.
+    physical
+        .recheck(&mut captured.budget)
+        .map_err(|_| ReceiptError::Conflict)?;
+    let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
+    lease.check(store).map_err(|_| ReceiptError::Conflict)?;
+    reservation.check(store, true)?;
+    let authority = std::sync::Arc::clone(store.authority_identity());
+    {
+        let phase = store.sql_phase();
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|_| ReceiptError::Conflict)?;
+        let current = super::snapshot_in_transaction(
+            &tx,
+            &authority,
+            context.allocation.checkout,
+            &mut captured.budget,
+        )
+        .map_err(|_| ReceiptError::Conflict)?;
+        if current.canonical != context.canonical {
+            return Err(ReceiptError::Conflict);
+        }
+        tx.rollback().map_err(|_| ReceiptError::Conflict)?;
+        drop(phase);
+    }
+    captured
+        .budget
+        .check()
+        .map_err(|_| ReceiptError::Conflict)?;
+    // Lease stays held across SQL-off metadata publication. No payload I/O.
+    reservation.check(store, true)?;
+    captured
+        .budget
+        .check()
+        .map_err(|_| ReceiptError::Conflict)?;
+    #[cfg(test)]
+    if fault == Fault::Rename {
+        return Err(ReceiptError::Io);
+    }
+    let final_name = format!("{id}.receipt");
+    rename_noreplace(&reservation.location.dir, &reservation.pending, &final_name)?;
+    let unknown = || ReceiptError::DurabilityUnknown {
+        id,
+        digest: captured.observation.digest(),
+    };
+    #[cfg(test)]
+    if fault == Fault::DirectorySync {
+        return Err(unknown());
+    }
+    let _ = fault;
+    reservation.location.dir.sync_all().map_err(|_| unknown())?;
+    // A rebind observed after rename cannot truthfully be reported not stored.
+    reservation.location.check(store).map_err(|_| unknown())?;
+    check_named(
+        &reservation.location.dir,
+        &final_name,
+        &reservation.file,
+        reservation.length,
+        true,
+    )
+    .map_err(|_| unknown())?;
+    drop(lease);
+    Ok(PersistedReceipt {
+        id,
+        digest: captured.observation.digest(),
+    })
+}
+fn rename_noreplace(dir: &File, from: &str, to: &str) -> Result<()> {
+    fs::renameat_with(dir, from, dir, to, RenameFlags::NOREPLACE).map_err(|error| {
+        if error == rustix::io::Errno::EXIST {
+            ReceiptError::Conflict
+        } else {
+            ReceiptError::Io
+        }
+    })
+}
+fn stat(file: &File) -> Result<fs::Stat> {
+    fs::fstat(file).map_err(|_| ReceiptError::UnsafeReceiptStore)
+}
+fn identity(stat: &fs::Stat) -> (u64, u64) {
+    (stat.st_dev, stat.st_ino)
+}
+fn validate_directory(stat: &fs::Stat) -> Result<()> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory
+        || stat.st_mode & 0o7777 != 0o700
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+    {
+        return Err(ReceiptError::UnsafeReceiptStore);
+    }
+    Ok(())
+}
+fn validate_file(stat: &fs::Stat) -> Result<()> {
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+        || stat.st_mode & 0o7777 != 0o600
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_nlink != 1
+        || stat.st_size < 0
+        || stat.st_size as u64 > MAX_RECEIPT
+    {
+        return Err(ReceiptError::UnsafeReceiptStore);
+    }
+    Ok(())
+}
+fn open_relative(parent: &File, name: &str, flags: OFlags) -> Result<File> {
+    fs::openat2(
+        parent,
+        name,
+        flags | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        RESOLVE,
+    )
+    .map(File::from)
+    .map_err(|e| {
+        if e == rustix::io::Errno::NOENT {
+            ReceiptError::Missing
+        } else {
+            ReceiptError::UnsafeReceiptStore
+        }
+    })
+}
+fn open_authority(store: &Store) -> Result<File> {
+    let authority = store.authority_identity();
+    let directory = fs::openat2(
+        fs::CWD,
+        authority.directory.as_path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map(File::from)
+    .map_err(|_| ReceiptError::UnsafeReceiptStore)?;
+    let metadata = stat(&directory)?;
+    validate_directory(&metadata)?;
+    if identity(&metadata) != authority.directory_id {
+        return Err(ReceiptError::UnsafeReceiptStore);
+    }
+    // O_PATH checks names/types without reading SQLite or lock payloads.
+    for (name, expected) in [
+        ("store.sqlite", Some(authority.database_id())),
+        ("allocation.lock", authority.lock_id),
+    ] {
+        let file = open_relative(&directory, name, OFlags::PATH)?;
+        let metadata = stat(&file)?;
+        if FileType::from_raw_mode(metadata.st_mode) != FileType::RegularFile
+            || metadata.st_uid != rustix::process::geteuid().as_raw()
+            || metadata.st_mode & 0o7777 != 0o600
+            || metadata.st_nlink != 1
+            || Some(identity(&metadata)) != expected
+        {
+            return Err(ReceiptError::UnsafeReceiptStore);
+        }
+    }
+    Ok(directory)
+}
+struct Location {
+    parent: File,
+    dir: File,
+}
+impl Location {
+    fn open(store: &Store, create: bool) -> Result<Self> {
+        let parent = open_authority(store)?;
+        if create {
+            match fs::mkdirat(&parent, DIRECTORY, Mode::from_raw_mode(0o700)) {
+                Ok(()) => (),
+                Err(rustix::io::Errno::EXIST) => (),
+                Err(_) => return Err(ReceiptError::Io),
+            }
+        }
+        let dir = open_relative(&parent, DIRECTORY, OFlags::RDONLY | OFlags::DIRECTORY)?;
+        validate_directory(&stat(&dir)?)?;
+        let location = Self { parent, dir };
+        location.check(store)?;
+        // Also sync an EXISTING directory entry: its first creation may have
+        // been interrupted. Passive reads deliberately never do this.
+        if create {
+            location.parent.sync_all().map_err(|_| ReceiptError::Io)?;
+        }
+        Ok(location)
+    }
+    fn check(&self, store: &Store) -> Result<()> {
+        let parent = open_authority(store)?;
+        if identity(&stat(&parent)?) != identity(&stat(&self.parent)?) {
+            return Err(ReceiptError::UnsafeReceiptStore);
+        }
+        let named = open_relative(&self.parent, DIRECTORY, OFlags::PATH | OFlags::DIRECTORY)?;
+        let held = stat(&self.dir)?;
+        validate_directory(&held)?;
+        validate_directory(&stat(&named)?)?;
+        if identity(&held) != identity(&stat(&named)?) {
+            return Err(ReceiptError::UnsafeReceiptStore);
+        }
+        Ok(())
+    }
+}
+struct Reservation {
+    location: Location,
+    file: File,
+    pending: String,
+    length: u64,
+}
+impl Reservation {
+    fn check(&self, store: &Store, filled: bool) -> Result<()> {
+        self.location.check(store)?;
+        check_named(
+            &self.location.dir,
+            &self.pending,
+            &self.file,
+            self.length,
+            filled,
+        )
+    }
+}
+fn check_named(dir: &File, name: &str, file: &File, length: u64, filled: bool) -> Result<()> {
+    let held = stat(file)?;
+    validate_file(&held)?;
+    let named_file = open_relative(dir, name, OFlags::PATH)?;
+    let named = stat(&named_file)?;
+    validate_file(&named)?;
+    if identity(&held) != identity(&named)
+        || held.st_size != named.st_size
+        || held.st_size as u64 > length
+        || (filled && held.st_size as u64 != length)
+    {
+        return Err(ReceiptError::UnsafeReceiptStore);
+    }
+    Ok(())
+}
+fn uuid(bytes: &[u8]) -> Result<Uuid> {
+    let text = std::str::from_utf8(bytes).map_err(|_| ReceiptError::Corrupt)?;
+    let id = Uuid::parse_str(text).map_err(|_| ReceiptError::Corrupt)?;
+    if id.get_version_num() != 7
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.to_string() != text
+    {
+        return Err(ReceiptError::Corrupt);
+    }
+    Ok(id)
+}
+fn name_charge(name: &[u8], size: u64) -> Result<(Uuid, u64)> {
+    let invalid = || ReceiptError::UnsafeReceiptStore;
+    if let Some(text) = name.strip_suffix(b".receipt") {
+        let id = uuid(text).map_err(|_| invalid())?;
+        if size == 0 || size > MAX_RECEIPT {
+            return Err(invalid());
+        }
+        return Ok((id, size));
+    }
+    let pending = name.strip_prefix(b"pending-").ok_or_else(invalid)?;
+    if pending.len() < 38 || pending[36] != b'-' {
+        return Err(invalid());
+    }
+    let id = uuid(&pending[..36]).map_err(|_| invalid())?;
+    let wire = std::str::from_utf8(&pending[37..]).map_err(|_| invalid())?;
+    let length: u64 = wire.parse().map_err(|_| invalid())?;
+    if length == 0 || length > MAX_RECEIPT || length.to_string() != wire || size > length {
+        return Err(invalid());
+    }
+    Ok((id, length))
+}
+fn admit(count: usize, total: u64, length: u64) -> Result<()> {
+    if count >= MAX_NAMES || total.checked_add(length).is_none_or(|n| n > MAX_TOTAL) {
+        return Err(ReceiptError::CapacityFull);
+    }
+    Ok(())
+}
+fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservation> {
+    if length == 0 || length > MAX_RECEIPT {
+        return Err(ReceiptError::EncodingLimit);
+    }
+    uuid(id.to_string().as_bytes())?;
+    let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
+    lease.check(store).map_err(|_| ReceiptError::Conflict)?;
+    let location = Location::open(store, true)?;
+    let cursor = open_relative(&location.dir, ".", OFlags::RDONLY | OFlags::DIRECTORY)?;
+    let mut buffer = [MaybeUninit::<u8>::uninit(); 8192];
+    let mut entries = RawDir::new(&cursor, &mut buffer);
+    let mut count = 0usize;
+    let mut total = 0u64;
+    let mut ids = std::collections::BTreeSet::new();
+    let mut duplicate = false;
+    while let Some(entry) = entries.next() {
+        let entry = entry.map_err(|_| ReceiptError::UnsafeReceiptStore)?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        count += 1;
+        if count > MAX_NAMES {
+            return Err(ReceiptError::CapacityFull);
+        }
+        let metadata = fs::statat(&location.dir, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(|_| ReceiptError::UnsafeReceiptStore)?;
+        validate_file(&metadata)?;
+        // O_PATH + NO_XDEV also refuses same-device bind mounts.
+        let text =
+            std::str::from_utf8(name.to_bytes()).map_err(|_| ReceiptError::UnsafeReceiptStore)?;
+        let held = open_relative(&location.dir, text, OFlags::PATH)?;
+        if identity(&stat(&held)?) != identity(&metadata) {
+            return Err(ReceiptError::UnsafeReceiptStore);
+        }
+        let (existing, charge) = name_charge(name.to_bytes(), metadata.st_size as u64)?;
+        if !ids.insert(existing) {
+            return Err(ReceiptError::UnsafeReceiptStore);
+        }
+        duplicate |= existing == id;
+        total = total
+            .checked_add(charge)
+            .ok_or(ReceiptError::CapacityFull)?;
+    }
+    // Finish discovery even when enough charged bytes were seen earlier: junk
+    // and duplicates must never become available capacity.
+    if duplicate {
+        return Err(ReceiptError::Conflict);
+    }
+    admit(count, total, length)?;
+    location.check(store)?;
+    let pending = format!("pending-{id}-{length}");
+    let file = fs::openat2(
+        &location.dir,
+        pending.as_str(),
+        OFlags::WRONLY
+            | OFlags::CREATE
+            | OFlags::EXCL
+            | OFlags::CLOEXEC
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK,
+        Mode::from_raw_mode(0o600),
+        RESOLVE,
+    )
+    .map(File::from)
+    .map_err(|e| {
+        if e == rustix::io::Errno::EXIST {
+            ReceiptError::Conflict
+        } else {
+            ReceiptError::Io
+        }
+    })?;
+    let reservation = Reservation {
+        location,
+        file,
+        pending,
+        length,
+    };
+    reservation.check(store, false)?;
+    // Make the declared reservation visible durably before payload work. No
+    // automatic unlink on any subsequent error; a zero-byte pending is charged.
+    reservation
+        .location
+        .dir
+        .sync_all()
+        .map_err(|_| ReceiptError::Io)?;
+    drop(lease);
+    Ok(reservation)
+}
+fn authority_bytes(store: &Store) -> Vec<u8> {
+    let authority = store.authority_identity();
+    let mut bytes = Vec::new();
+    frame(&mut bytes, 0, authority.registry().as_os_str().as_bytes());
+    frame(&mut bytes, 1, authority.directory.as_os_str().as_bytes());
+    for n in [
+        authority.directory_id.0,
+        authority.directory_id.1,
+        authority.database_id().0,
+        authority.database_id().1,
+    ] {
+        frame(&mut bytes, 2, &n.to_be_bytes());
+    }
+    if let Some((dev, ino)) = authority.lock_id {
+        frame(&mut bytes, 3, &dev.to_be_bytes());
+        frame(&mut bytes, 3, &ino.to_be_bytes());
+    }
+    bytes
+}
+fn encode(store: &Store, id: Uuid, captured: &Captured) -> Result<Vec<u8>> {
+    let context = captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
+    uuid(id.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
+    uuid(context.allocation.checkout.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
+    let mut bytes = Vec::new();
+    frame(&mut bytes, 0, b"work.inspection.receipt.v1");
+    frame(&mut bytes, 1, id.to_string().as_bytes());
+    frame(
+        &mut bytes,
+        2,
+        context.allocation.checkout.to_string().as_bytes(),
+    );
+    frame(&mut bytes, 3, &authority_bytes(store));
+    frame(&mut bytes, 4, &Sha256::digest(&context.canonical));
+    frame(&mut bytes, 5, &captured.started.to_be_bytes());
+    frame(&mut bytes, 6, &captured.ended.to_be_bytes());
+    frame(
+        &mut bytes,
+        7,
+        &[u8::from(
+            captured.observation.coverage() == Coverage::Complete,
+        )],
+    );
+    frame(&mut bytes, 8, &captured.observation.digest());
+    frame(&mut bytes, 9, captured.observation.canonical_bytes());
+    let checksum = Sha256::digest(&bytes);
+    frame(&mut bytes, 10, &checksum);
+    if bytes.len() as u64 > MAX_RECEIPT {
+        return Err(ReceiptError::EncodingLimit);
+    }
+    Ok(bytes)
+}
+/// Targeted passive read through an existing mutable-open Store (the inspector's
+/// current-authority handle). No lease, SQL, creation, sync, repair or freshness.
+pub fn read_receipt(store: &Store, id: Uuid) -> Result<ReceiptData> {
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    uuid(id.to_string().as_bytes())?;
+    let location = Location::open(store, false)?;
+    let name = format!("{id}.receipt");
+    let before = open_relative(&location.dir, &name, OFlags::PATH)?;
+    let expected = stat(&before)?;
+    validate_file(&expected)?;
+    if expected.st_size == 0 {
+        return Err(ReceiptError::Corrupt);
+    }
+    let file = open_relative(&location.dir, &name, OFlags::RDONLY)?;
+    check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
+    if identity(&stat(&file)?) != identity(&expected) {
+        return Err(ReceiptError::UnsafeReceiptStore);
+    }
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_RECEIPT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReceiptError::Io)?;
+    if bytes.len() != expected.st_size as usize {
+        return Err(ReceiptError::Corrupt);
+    }
+    let result = decode(store, id, &bytes)?;
+    check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
+    let after = stat(&file)?;
+    if expected.st_mtime != after.st_mtime
+        || expected.st_mtime_nsec != after.st_mtime_nsec
+        || expected.st_ctime != after.st_ctime
+        || expected.st_ctime_nsec != after.st_ctime_nsec
+    {
+        return Err(ReceiptError::Corrupt);
+    }
+    location.check(store)?;
+    Ok(result)
+}
+
+// Strict tagged/length-framed decoding, never an Observation/Captured decoder.
+// Re-encode each consumed frame and validate the entire grammar; policy bytes
+// additionally round-trip through the existing strict policy validator.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    canonical: Vec<u8>,
+}
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            at: 0,
+            canonical: Vec::new(),
+        }
+    }
+    fn done(&self) -> bool {
+        self.at == self.bytes.len()
+    }
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.at).copied()
+    }
+    fn any(&mut self) -> Result<(u8, &'a [u8])> {
+        let header = self
+            .bytes
+            .get(self.at..self.at.saturating_add(9))
+            .ok_or(ReceiptError::Corrupt)?;
+        let length = u64::from_be_bytes(header[1..].try_into().map_err(|_| ReceiptError::Corrupt)?);
+        let length = usize::try_from(length).map_err(|_| ReceiptError::Corrupt)?;
+        let start = self.at + 9;
+        let end = start.checked_add(length).ok_or(ReceiptError::Corrupt)?;
+        let value = self.bytes.get(start..end).ok_or(ReceiptError::Corrupt)?;
+        let tag = header[0];
+        self.at = end;
+        frame(&mut self.canonical, tag, value);
+        Ok((tag, value))
+    }
+    fn field(&mut self, expected: u8) -> Result<&'a [u8]> {
+        let (tag, value) = self.any()?;
+        if tag != expected {
+            return Err(ReceiptError::Corrupt);
+        }
+        Ok(value)
+    }
+    fn number(&mut self, tag: u8) -> Result<u64> {
+        Ok(u64::from_be_bytes(
+            self.field(tag)?
+                .try_into()
+                .map_err(|_| ReceiptError::Corrupt)?,
+        ))
+    }
+    fn end(self) -> Result<()> {
+        if !self.done() || self.canonical != self.bytes {
+            return Err(ReceiptError::Corrupt);
+        }
+        Ok(())
+    }
+}
+fn hash(bytes: &[u8]) -> Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| ReceiptError::Corrupt)
+}
+fn text(bytes: &[u8]) -> Result<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| ReceiptError::Corrupt)
+}
+fn policy(wire: &[u8]) -> Result<(ValidatedPolicies, std::collections::BTreeSet<String>)> {
+    use crate::disposal::{Policy, PolicyDocument, PolicyFile};
+    let mut c = Cursor::new(wire);
+    if c.field(0)? != b"work.disposal.policy.v1" || c.number(1)? != 1 || c.number(2)? != 1 {
+        return Err(ReceiptError::Corrupt);
+    }
+    let count = c.number(3)?;
+    if count > 64 {
+        return Err(ReceiptError::Corrupt);
+    }
+    let mut policies = Vec::new();
+    let mut entry_count = 0u64;
+    for _ in 0..count {
+        let scope = hex(c.field(4)?);
+        let id = text(c.field(5)?)?;
+        let version = text(c.field(6)?)?;
+        let max_files = c.number(7)?;
+        let max_file_bytes = c.number(8)?;
+        let max_total_bytes = c.number(9)?;
+        let count = c.number(10)?;
+        entry_count = entry_count
+            .checked_add(count)
+            .ok_or(ReceiptError::Corrupt)?;
+        if entry_count > 4096 {
+            return Err(ReceiptError::Corrupt);
+        }
+        let mut directories = Vec::new();
+        for _ in 0..count {
+            directories.push(hex(c.field(11)?));
+        }
+        let count = c.number(12)?;
+        entry_count = entry_count
+            .checked_add(count)
+            .ok_or(ReceiptError::Corrupt)?;
+        if entry_count > 4096 {
+            return Err(ReceiptError::Corrupt);
+        }
+        let mut files = Vec::new();
+        for _ in 0..count {
+            files.push(PolicyFile {
+                path: hex(c.field(13)?),
+                sha256: hex(c.field(14)?),
+                length: c.number(15)?,
+                mode: u32::try_from(c.number(16)?).map_err(|_| ReceiptError::Corrupt)?,
+            });
+        }
+        policies.push(Policy {
+            id,
+            version,
+            scope,
+            max_files,
+            max_file_bytes,
+            max_total_bytes,
+            files,
+            directories,
+        });
+    }
+    c.end()?;
+    let ids = policies.iter().map(|p| p.id.clone()).collect();
+    let validated = crate::disposal::validate(PolicyDocument {
+        format: 1,
+        policies,
+    })
+    .map_err(|_| ReceiptError::Corrupt)?;
+    if validated.canonical_bytes() != wire {
+        return Err(ReceiptError::Corrupt);
+    }
+    Ok((validated, ids))
+}
+fn body_metadata(
+    body: &[u8],
+    coverage: Coverage,
+    context: [u8; 32],
+) -> Result<([u8; 32], Vec<super::Finding>)> {
+    let mut c = Cursor::new(body);
+    let domain: &[u8] = if coverage == Coverage::Complete {
+        b"work.inspection.complete.v1"
+    } else {
+        b"work.inspection.incomplete.v1"
+    };
+    if c.field(0)? != domain {
+        return Err(ReceiptError::Corrupt);
+    }
+    let (policy, policy_ids) = policy(c.field(1)?)?;
+    if hash(c.field(2)?)? != context {
+        return Err(ReceiptError::Corrupt);
+    }
+    hash(c.field(3)?)?;
+    hash(c.field(14)?)?;
+    let version = c.field(16)?;
+    if version.len() > 96
+        || (!version.is_empty()
+            && (!version.starts_with(b"git version ")
+                || !version
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || b" .-()".contains(b))))
+    {
+        return Err(ReceiptError::Corrupt);
+    }
+    let reason = c.field(4)?;
+    if reason.len() != 1
+        || reason[0] > super::IncompleteReason::ContextConflict as u8 + 1
+        || (reason[0] == 0) != (coverage == Coverage::Complete)
+    {
+        return Err(ReceiptError::Corrupt);
+    }
+    for n in [
+        30,
+        super::MAX_ENTRIES,
+        super::MAX_DEPTH as u64,
+        super::MAX_PATH_BYTES as u64,
+        super::MAX_FILE_BYTES,
+        super::MAX_CHARGED_BYTES,
+        super::MAX_OUTPUT_BYTES,
+        96,
+        1024 * 1024,
+        8 * 1024 * 1024,
+        32 * 1024,
+        2,
+        256,
+        256 * 1024,
+        128,
+        super::TERMINAL_RESERVE,
+        super::DIRECTORY_BUFFER_BYTES as u64,
+        super::MAX_FILE_BYTES + 65536,
+    ] {
+        if c.number(5)? != n {
+            return Err(ReceiptError::Corrupt);
+        }
+    }
+    for _ in 0..15 {
+        c.number(6)?;
+    }
+    let mut paths = std::collections::BTreeSet::new();
+    while c.peek() == Some(15) {
+        let flags = c.field(15)?;
+        if flags.len() != 3 || flags.iter().any(|b| *b > 1) {
+            return Err(ReceiptError::Corrupt);
+        }
+        let path =
+            crate::disposal::RawPath::from_bytes(c.field(7)?).map_err(|_| ReceiptError::Corrupt)?;
+        if !paths.insert(path) || paths.len() > super::MAX_ENTRIES as usize {
+            return Err(ReceiptError::Corrupt);
+        }
+        let mode = u32::from_be_bytes(c.field(8)?.try_into().map_err(|_| ReceiptError::Corrupt)?);
+        if !matches!(
+            FileType::from_raw_mode(mode),
+            FileType::RegularFile | FileType::Directory
+        ) {
+            return Err(ReceiptError::Corrupt);
+        }
+        c.number(9)?;
+        let content = c.field(10)?;
+        if !(content.is_empty() || content.len() == 32) {
+            return Err(ReceiptError::Corrupt);
+        }
+        let matched = c.field(11)?;
+        if !matched.is_empty()
+            && (coverage == Coverage::Incomplete
+                || matched.len() > 128
+                || !policy_ids.contains(&text(matched)?))
+        {
+            return Err(ReceiptError::Corrupt);
+        }
+    }
+    let mut previous = None;
+    let mut findings = Vec::new();
+    let mut count = 0usize;
+    while c.peek() == Some(12) {
+        let path = crate::disposal::RawPath::from_bytes(c.field(12)?)
+            .map_err(|_| ReceiptError::Corrupt)?;
+        let kind = c.field(13)?;
+        if kind.len() != 1 || kind[0] > super::FindingKind::PolicyMismatch as u8 {
+            return Err(ReceiptError::Corrupt);
+        }
+        let finding_kind = match kind[0] {
+            0 => super::FindingKind::TrackedContent,
+            1 => super::FindingKind::StagedChange,
+            2 => super::FindingKind::Untracked,
+            3 => super::FindingKind::IgnoredUnclassified,
+            4 => super::FindingKind::PolicyMismatch,
+            _ => return Err(ReceiptError::Corrupt),
+        };
+        findings.push(super::Finding {
+            path: path.clone(),
+            kind: finding_kind,
+        });
+        let key = (path, kind[0]);
+        if previous.as_ref().is_some_and(|p| p >= &key) {
+            return Err(ReceiptError::Corrupt);
+        }
+        previous = Some(key);
+        count += 1;
+        if count > 3 * super::MAX_ENTRIES as usize + 64 {
+            return Err(ReceiptError::Corrupt);
+        }
+    }
+    c.end()?;
+    Ok((policy.digest(), findings))
+}
+fn decode(store: &Store, expected_id: Uuid, bytes: &[u8]) -> Result<ReceiptData> {
+    if bytes.len() as u64 > MAX_RECEIPT {
+        return Err(ReceiptError::Corrupt);
+    }
+    let mut c = Cursor::new(bytes);
+    if c.field(0)? != b"work.inspection.receipt.v1" {
+        return Err(ReceiptError::Corrupt);
+    }
+    let id = uuid(c.field(1)?)?;
+    if id != expected_id {
+        return Err(ReceiptError::Corrupt);
+    }
+    let checkout = uuid(c.field(2)?)?;
+    if c.field(3)? != authority_bytes(store) {
+        return Err(ReceiptError::Corrupt);
+    }
+    let context = hash(c.field(4)?)?;
+    let started = c.number(5)?;
+    let ended = c.number(6)?;
+    if started == 0 || ended < started {
+        return Err(ReceiptError::Corrupt);
+    }
+    let coverage = match c.field(7)? {
+        [1] => Coverage::Complete,
+        [0] => Coverage::Incomplete,
+        _ => return Err(ReceiptError::Corrupt),
+    };
+    let digest = hash(c.field(8)?)?;
+    let body = c.field(9)?;
+    if hash(&Sha256::digest(body))? != digest {
+        return Err(ReceiptError::Corrupt);
+    }
+    let checksum_at = c.at;
+    if hash(c.field(10)?)? != hash(&Sha256::digest(&bytes[..checksum_at]))? {
+        return Err(ReceiptError::Corrupt);
+    }
+    c.end()?;
+    let (policy_digest, findings) = body_metadata(body, coverage, context)?;
+    Ok(ReceiptData {
+        id,
+        checkout,
+        digest,
+        coverage,
+        body: body.to_vec(),
+        policy_digest,
+        findings,
+    })
+}
+
+#[cfg(test)]
+use crate as work_cli_api;
+#[cfg(test)]
+#[path = "../../tests/support/inspection_fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    fn empty() -> crate::disposal::ValidatedPolicies {
+        crate::disposal::validate(crate::disposal::PolicyDocument {
+            format: 1,
+            policies: vec![],
+        })
+        .unwrap()
+    }
+    fn directory(f: &fixture::ManagedFixture) -> std::path::PathBuf {
+        f.temp.path().join("authority/inspection-receipts-v1")
+    }
+    fn finals(f: &fixture::ManagedFixture) -> usize {
+        std::fs::read_dir(directory(f))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .ends_with(b".receipt")
+            })
+            .count()
+    }
+    #[test]
+    fn original_context_conflict_leaves_charged_pending_no_final() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let mut captured =
+            super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
+        assert_eq!(captured.observation.coverage(), Coverage::Complete);
+        f.store
+            .conn
+            .execute(
+                "UPDATE checkouts SET owner='changed' WHERE id=?1",
+                [f.allocation.checkout.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            persist(&mut f.store, &mut captured, Fault::None),
+            Err(ReceiptError::Conflict)
+        ));
+        assert_eq!(finals(&f), 0);
+        assert_eq!(std::fs::read_dir(directory(&f)).unwrap().count(), 1);
+    }
+    #[test]
+    fn physical_change_is_not_reinspected_until_match() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let mut captured =
+            super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
+        std::fs::write(f.path(b"tracked"), b"changed").unwrap();
+        assert!(matches!(
+            persist(&mut f.store, &mut captured, Fault::None),
+            Err(ReceiptError::Conflict)
+        ));
+        assert_eq!(finals(&f), 0);
+    }
+    #[test]
+    fn failures_before_and_after_rename_report_truthful_durability() {
+        for fault in [
+            Fault::Write,
+            Fault::FileSync,
+            Fault::Rename,
+            Fault::DirectorySync,
+        ] {
+            let mut f = fixture::ManagedFixture::new("sha1", "2");
+            let mut captured =
+                super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
+            let result = persist(&mut f.store, &mut captured, fault);
+            if fault == Fault::DirectorySync {
+                let Err(ReceiptError::DurabilityUnknown { id, digest }) = result else {
+                    panic!("must report uncertain publication")
+                };
+                assert_eq!(digest, captured.observation.digest());
+                assert_eq!(read_receipt(&f.store, id).unwrap().digest(), digest);
+                assert_eq!(finals(&f), 1);
+            } else {
+                assert!(matches!(result, Err(ReceiptError::Io)));
+                assert_eq!(finals(&f), 0);
+                assert_eq!(std::fs::read_dir(directory(&f)).unwrap().count(), 1);
+            }
+        }
+    }
+    #[test]
+    fn pending_declared_bytes_not_empty_length_and_atomic_contention() {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        // Seven real zero-length exclusive reservations leave exactly one slot
+        // of bytes. Two contenders cannot both reserve it. No stress/timing gate.
+        for _ in 0..7 {
+            reserve(&f.store, Uuid::now_v7(), MAX_RECEIPT).unwrap();
+        }
+        let root = f.root.clone();
+        let base = f.temp.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (root, base, barrier) = (root.clone(), base.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let store = Store::open_existing_registered_mut(
+                        &base.join("registry"),
+                        &base.join("authority"),
+                        &[root],
+                    )
+                    .unwrap();
+                    barrier.wait();
+                    reserve(&store, Uuid::now_v7(), MAX_RECEIPT).map(|_| ())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, Err(ReceiptError::CapacityFull)))
+                .count(),
+            1
+        );
+        assert_eq!(std::fs::read_dir(directory(&f)).unwrap().count(), 8);
+        assert!(matches!(
+            reserve(&f.store, Uuid::now_v7(), 1),
+            Err(ReceiptError::CapacityFull)
+        ));
+    }
+    #[test]
+    fn unsafe_names_modes_links_lengths_and_duplicate_ids_refuse() {
+        for shape in [
+            "unknown",
+            "mode",
+            "symlink",
+            "hardlink",
+            "oversize",
+            "zero",
+            "noncanonical",
+            "directory",
+            "owner",
+        ] {
+            let f = fixture::ManagedFixture::new("sha1", "2");
+            let reservation = reserve(&f.store, Uuid::now_v7(), 20).unwrap();
+            let path = directory(&f).join(&reservation.pending);
+            match shape {
+                "unknown" => {
+                    std::fs::write(directory(&f).join("junk"), b"").unwrap();
+                }
+                "mode" => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "symlink" => {
+                    symlink(
+                        &path,
+                        directory(&f).join(format!("{}.receipt", Uuid::now_v7())),
+                    )
+                    .unwrap();
+                }
+                "hardlink" => {
+                    std::fs::hard_link(
+                        &path,
+                        directory(&f).join(format!("{}.receipt", Uuid::now_v7())),
+                    )
+                    .unwrap();
+                }
+                "oversize" => reservation.file.set_len(21).unwrap(),
+                "zero" => {
+                    std::fs::rename(
+                        &path,
+                        directory(&f).join(format!("pending-{}-0", Uuid::now_v7())),
+                    )
+                    .unwrap();
+                }
+                "noncanonical" => {
+                    std::fs::rename(
+                        &path,
+                        directory(&f).join(format!("pending-{}-020", Uuid::now_v7())),
+                    )
+                    .unwrap();
+                }
+                "directory" => {
+                    std::fs::create_dir(directory(&f).join(format!("{}.receipt", Uuid::now_v7())))
+                        .unwrap();
+                }
+                "owner" => {
+                    // Pure validation of the observed owner field, never host chown.
+                    let mut stat = rustix::fs::fstat(&reservation.file).unwrap();
+                    stat.st_uid = stat.st_uid.wrapping_add(1);
+                    assert!(validate_file(&stat).is_err());
+                    continue;
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                reserve(&f.store, Uuid::now_v7(), 20),
+                Err(ReceiptError::UnsafeReceiptStore)
+            ));
+        }
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let id = Uuid::now_v7();
+        let r = reserve(&f.store, id, 20).unwrap();
+        assert!(matches!(
+            reserve(&f.store, id, 21),
+            Err(ReceiptError::Conflict)
+        ));
+        std::fs::rename(
+            directory(&f).join(&r.pending),
+            directory(&f).join(format!("{id}.receipt")),
+        )
+        .unwrap();
+        // A zero-length final is unsafe, not available capacity.
+        assert!(reserve(&f.store, id, 20).is_err());
+    }
+    #[test]
+    fn replaced_reservation_or_directory_and_no_replace_publication_refuse() {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let r = reserve(&f.store, Uuid::now_v7(), 20).unwrap();
+        let path = directory(&f).join(&r.pending);
+        std::fs::rename(&path, directory(&f).join("displaced")).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(r.check(&f.store, false).is_err());
+        let old = directory(&f).with_extension("old");
+        std::fs::rename(directory(&f), &old).unwrap();
+        std::fs::create_dir(directory(&f)).unwrap();
+        std::fs::set_permissions(directory(&f), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(r.location.check(&f.store).is_err());
+        // Exercise the actual kernel NOREPLACE, with two exclusively created
+        // reservations, not a preflight-only duplicate test.
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let a = reserve(&f.store, Uuid::now_v7(), 20).unwrap();
+        let b = reserve(&f.store, Uuid::now_v7(), 20).unwrap();
+        let before = b.file.metadata().unwrap().ino();
+        assert!(rename_noreplace(&a.location.dir, &a.pending, &b.pending).is_err());
+        assert_eq!(
+            before,
+            std::fs::metadata(directory(&f).join(&b.pending))
+                .unwrap()
+                .ino()
+        );
+    }
+    #[test]
+    fn strict_envelope_rejects_rechecksummed_header_policy_and_body_changes() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let captured =
+            super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
+        let id = Uuid::now_v7();
+        let bytes = encode(&f.store, id, &captured).unwrap();
+        assert!(decode(&f.store, id, &bytes).is_ok());
+        for tag in [4, 7, 8, 9] {
+            let mut damaged = bytes.clone();
+            let mut cursor = Cursor::new(&bytes);
+            let mut changed = false;
+            while !cursor.done() {
+                let start = cursor.at;
+                let (current, value) = cursor.any().unwrap();
+                if current == tag {
+                    damaged[start + 9 + value.len() - 1] ^= 1;
+                    changed = true;
+                    break;
+                }
+            }
+            assert!(changed);
+            let checksum_at = damaged.len() - 41;
+            let checksum = Sha256::digest(&damaged[..checksum_at]);
+            damaged[checksum_at + 9..].copy_from_slice(&checksum);
+            assert!(decode(&f.store, id, &damaged).is_err());
+        }
+        assert!(decode(&f.store, Uuid::now_v7(), &bytes).is_err());
+        assert!(decode(&f.store, id, &bytes[..bytes.len() - 1]).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode(&f.store, id, &trailing).is_err());
+    }
+    #[test]
+    fn passive_policy_decoder_checks_versions_and_canonical_order() {
+        let validated = crate::disposal::validate(crate::disposal::PolicyDocument {
+            format: 1,
+            policies: vec![crate::disposal::Policy {
+                id: "cache".into(),
+                version: "v1".into(),
+                scope: "6361636865".into(),
+                max_files: 0,
+                max_file_bytes: 0,
+                max_total_bytes: 0,
+                files: vec![],
+                directories: vec!["6361636865".into()],
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            policy(validated.canonical_bytes()).unwrap().0.digest(),
+            validated.digest()
+        );
+        for target in [1, 2, 6] {
+            let mut bytes = validated.canonical_bytes().to_vec();
+            let mut cursor = Cursor::new(validated.canonical_bytes());
+            while !cursor.done() {
+                let start = cursor.at;
+                let (tag, value) = cursor.any().unwrap();
+                if tag == target {
+                    bytes[start + 9 + value.len() - 1] = b'+';
+                    break;
+                }
+            }
+            assert!(policy(&bytes).is_err());
+        }
+        let mut trailing = validated.canonical_bytes().to_vec();
+        frame(&mut trailing, 99, b"unknown");
+        assert!(policy(&trailing).is_err());
+    }
+    #[test]
+    fn finite_admission_edges_and_final_bytes_are_charged() {
+        assert!(admit(4095, MAX_TOTAL - 1, 1).is_ok());
+        assert!(matches!(admit(4096, 0, 1), Err(ReceiptError::CapacityFull)));
+        assert!(matches!(
+            admit(0, MAX_TOTAL, 1),
+            Err(ReceiptError::CapacityFull)
+        ));
+        assert!(matches!(
+            admit(0, u64::MAX, 1),
+            Err(ReceiptError::CapacityFull)
+        ));
+        let id = Uuid::now_v7();
+        assert_eq!(
+            name_charge(format!("{id}.receipt").as_bytes(), 321)
+                .unwrap()
+                .1,
+            321
+        );
+        assert_eq!(
+            name_charge(format!("pending-{id}-321").as_bytes(), 0)
+                .unwrap()
+                .1,
+            321
+        );
+        assert_eq!(
+            name_charge(format!("pending-{id}-321").as_bytes(), 320)
+                .unwrap()
+                .1,
+            321
+        );
+        assert!(name_charge(format!("pending-{id}-321").as_bytes(), 322).is_err());
+    }
+    #[test]
+    fn original_deadline_is_not_reset_for_recording() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let mut captured =
+            super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
+        captured.budget.test_elapsed = Some(std::time::Duration::from_secs(31));
+        assert!(matches!(
+            persist(&mut f.store, &mut captured, Fault::None),
+            Err(ReceiptError::Conflict)
+        ));
+        assert!(!directory(&f).exists());
+    }
+    #[test]
+    fn active_sql_refused_before_receipt_io() {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let _phase = f.store.sql_phase();
+        assert!(reserve(&f.store, Uuid::now_v7(), 20).is_err());
+        assert!(!directory(&f).exists());
+        assert!(matches!(
+            read_receipt(&f.store, Uuid::now_v7()),
+            Err(ReceiptError::Busy)
+        ));
+        drop(_phase);
+        let transaction = f.store.conn.unchecked_transaction().unwrap();
+        assert!(reserve(&f.store, Uuid::now_v7(), 20).is_err());
+        assert!(!directory(&f).exists());
+        transaction.rollback().unwrap();
+    }
+}

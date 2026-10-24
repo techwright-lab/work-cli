@@ -84,6 +84,19 @@ impl ConfigDocument {
             ..Config::default()
         })
     }
+    /// Decode only the inspection subtree of this same bounded snapshot.
+    /// Unrelated execution/capture declarations never confer or block policy.
+    pub(crate) fn inspection_policies(&self) -> Result<crate::disposal::ValidatedPolicies, Error> {
+        let invalid = || Error::Config("invalid inspection policy".into());
+        let document = match self.value.get("inspection") {
+            None => crate::disposal::PolicyDocument {
+                format: 1,
+                policies: vec![],
+            },
+            Some(value) => value.clone().try_into().map_err(|_| invalid())?,
+        };
+        crate::disposal::validate(document).map_err(|_| invalid())
+    }
     pub(crate) fn execution(&self) -> Result<Config, Error> {
         Config::from_value(&self.value)
     }
@@ -342,4 +355,31 @@ pub fn validate_path(path: &std::path::Path, required: bool) -> Result<PathBuf, 
         return Err(invalid_path());
     }
     Ok(path.to_owned())
+}
+
+#[cfg(test)]
+mod inspection_policy_tests {
+    use super::*;
+    #[test]
+    fn lazy_inspection_policy_isolation_and_strictness() {
+        let document = ConfigDocument::from_text("[capture]\nexecutable = 42\n[supervisor]\nactors = false\n[allocation]\ncapture_sink = false\n").unwrap();
+        assert!(document.authority().is_ok());
+        assert_eq!(document.inspection_policies().unwrap().policy_count(), 0);
+        assert!(document.execution().is_err());
+        let document =
+            ConfigDocument::from_text("[inspection]\nformat = 1\npolicies = []\n").unwrap();
+        assert_eq!(document.inspection_policies().unwrap().policy_count(), 0);
+        for text in [
+            "inspection = false",
+            "[inspection]\nformat=2\npolicies=[]",
+            "[inspection]\nformat=1\npolicies=[]\nsecret='DO_NOT_ECHO'",
+            "[inspection]\nformat=1",
+        ] {
+            let error = ConfigDocument::from_text(text)
+                .unwrap()
+                .inspection_policies()
+                .unwrap_err();
+            assert!(!error.to_string().contains("DO_NOT_ECHO"));
+        }
+    }
 }

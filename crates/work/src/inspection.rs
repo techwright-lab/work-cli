@@ -1,5 +1,6 @@
 //! Bounded cooperative inspection. Complete means coverage, never deletion safety.
-//! Observations are nondurable; no lifecycle mutation or receipt persistence.
+//! Observations are nondurable; explicit file receipts preserve provenance only.
+//! Receipt publication never mutates lifecycle metadata or grants deletion authority.
 //! Inspector reads are descriptor anchored. Native Git reopens pathnames and is
 //! NOT descriptor-race-contained: postchecks cannot prevent raced device opens.
 //! Operation deadlines cannot interrupt a syscall stuck in the kernel.
@@ -13,6 +14,11 @@ use std::{
     time::{Duration, Instant},
 };
 use uuid::Uuid;
+
+mod receipts;
+pub use receipts::{
+    inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,
+};
 
 #[cfg(test)]
 #[path = "inspection_tests.rs"]
@@ -174,6 +180,117 @@ impl Observation {
         self.git_version.as_deref()
     }
 }
+/// Argument validation is value-free; Clap diagnostics for inspect are also
+/// routed through the existing sanitized public dispatcher.
+pub(crate) fn parse_checkout(value: &str) -> Result<Uuid, &'static str> {
+    let id = Uuid::parse_str(value).map_err(|_| "expected UUIDv7 checkout")?;
+    if id.get_version_num() != 7
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.to_string() != value
+    {
+        return Err("expected canonical UUIDv7 checkout");
+    }
+    Ok(id)
+}
+#[derive(serde::Serialize)]
+pub(crate) struct InspectionReport {
+    coverage: &'static str,
+    counts: SummaryCounts,
+    findings: FindingCounts,
+    digest: String,
+    recorded: bool,
+    recording: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_id: Option<Uuid>,
+}
+#[derive(serde::Serialize)]
+struct SummaryCounts {
+    entries: usize,
+    incomplete_reasons: usize,
+    observed_file_bytes: u64,
+    charged_read_bytes: u64,
+    child_launches: u64,
+}
+#[derive(Default, serde::Serialize)]
+struct FindingCounts {
+    tracked_content: u64,
+    staged_change: u64,
+    untracked: u64,
+    ignored_unclassified: u64,
+    policy_mismatch: u64,
+}
+impl InspectionReport {
+    pub(crate) fn is_held(&self) -> bool {
+        self.coverage != "complete"
+            || self.findings.tracked_content
+                + self.findings.staged_change
+                + self.findings.untracked
+                + self.findings.ignored_unclassified
+                + self.findings.policy_mismatch
+                != 0
+            || !matches!(self.recording, "not_requested" | "stored")
+    }
+}
+pub(crate) fn configured_report(
+    checkout: Uuid,
+    record: bool,
+) -> Result<InspectionReport, InspectionError> {
+    let document = crate::config::ConfigDocument::load().map_err(|_| InspectionError)?;
+    let config = document.authority().map_err(|_| InspectionError)?;
+    let policies = document
+        .inspection_policies()
+        .map_err(|_| InspectionError)?;
+    let mut store = Store::open_existing_registered_mut(
+        config.trusted_registry.as_deref().ok_or(InspectionError)?,
+        config.store_dir.as_deref().ok_or(InspectionError)?,
+        &config.roots,
+    )
+    .map_err(|_| InspectionError)?;
+    let (observation, receipt) = if record {
+        let result = inspect_and_record(&mut store, checkout, &policies)?;
+        (result.observation, Some(result.receipt))
+    } else {
+        (inspect(&mut store, checkout, &policies)?, None)
+    };
+    let (recorded, recording, receipt_id) = match receipt {
+        None => (false, "not_requested", None),
+        Some(Ok(receipt)) => (true, "stored", Some(receipt.id())),
+        Some(Err(ReceiptError::DurabilityUnknown { id, .. })) => {
+            (false, "durability_unknown", Some(id))
+        }
+        Some(Err(error)) => (false, error.label(), None),
+    };
+    let mut findings = FindingCounts::default();
+    for finding in observation.findings() {
+        match finding.kind() {
+            FindingKind::TrackedContent => findings.tracked_content += 1,
+            FindingKind::StagedChange => findings.staged_change += 1,
+            FindingKind::Untracked => findings.untracked += 1,
+            FindingKind::IgnoredUnclassified => findings.ignored_unclassified += 1,
+            FindingKind::PolicyMismatch => findings.policy_mismatch += 1,
+        }
+    }
+    Ok(InspectionReport {
+        coverage: if observation.coverage() == Coverage::Complete {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        counts: SummaryCounts {
+            entries: observation.entries().len(),
+            incomplete_reasons: observation.reasons().len(),
+            observed_file_bytes: observation.counters().observed_file_bytes,
+            charged_read_bytes: observation.counters().charged_read_bytes,
+            child_launches: observation.counters().child_launches,
+        },
+        findings,
+        digest: hex(&observation.digest()),
+        recorded,
+        recording,
+        receipt_id,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("inspection encoding unavailable")]
 pub struct InspectionError;
@@ -200,13 +317,67 @@ fn inspect_inner(
     policies: &ValidatedPolicies,
     #[cfg(test)] before_repeat: Option<&mut dyn FnMut(&mut Store)>,
 ) -> Result<Observation, InspectionError> {
+    collect(
+        store,
+        checkout,
+        policies,
+        #[cfg(test)]
+        before_repeat,
+    )
+    .map(|captured| captured.observation)
+}
+
+// Only this actual collector can retain context/descriptor evidence. Neither
+// Observation nor passive decoded receipt data can be promoted into Captured.
+struct Captured {
+    observation: Observation,
+    context: Option<Context>,
+    physical: Option<Physical>,
+    budget: Budget,
+    started: u64,
+    ended: u64,
+}
+struct Physical {
+    first: filesystem::Census,
+    before: GitInputs,
+    last: Option<(filesystem::Census, GitInputs)>,
+}
+impl Physical {
+    fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
+        self.first.recheck(b)?;
+        self.before.recheck(b)?;
+        if let Some((census, inputs)) = &self.last {
+            census.recheck(b)?;
+            inputs.recheck(b)?;
+        }
+        b.check()
+    }
+}
+fn wall_time() -> Result<u64, InspectionError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| InspectionError)?
+        .as_millis()
+        .try_into()
+        .map_err(|_| InspectionError)
+}
+fn collect(
+    store: &mut Store,
+    checkout: Uuid,
+    policies: &ValidatedPolicies,
+    #[cfg(test)] before_repeat: Option<&mut dyn FnMut(&mut Store)>,
+) -> Result<Captured, InspectionError> {
     let mut b = Budget::new();
+    let started = wall_time()?;
+    let mut retained_context = None;
+    let mut physical = None;
     let mut context_bytes = checkout.as_bytes().to_vec();
     let mut evidence = Vec::new();
     let mut entries = Vec::new();
     let mut findings = Vec::new();
     let result = (|| {
-        let context = snapshot(store, checkout, &mut b)?;
+        retained_context = Some(snapshot(store, checkout, &mut b)?);
+        let context = retained_context.as_ref().expect("just captured context");
         context_bytes = context.canonical.clone();
         let identity = context
             .allocation
@@ -222,27 +393,32 @@ fn inspect_inner(
         }
         let first = filesystem::walk(&identity.path, &mut b, &mut filesystem::SystemBoundary)?;
         frame(&mut evidence, 1, &first.fingerprint());
-        let before = GitInputs::capture(&context, &first, &mut b)?;
+        let before = GitInputs::capture(context, &first, &mut b)?;
         frame(&mut evidence, 2, &before.fingerprint());
-        let proof = GitProof::observe(&context, &first, &before, &mut b)?;
+        physical = Some(Physical {
+            first,
+            before,
+            last: None,
+        });
+        let retained = physical.as_mut().expect("just captured physical inputs");
+        let proof = GitProof::observe(context, &retained.first, &retained.before, &mut b)?;
         frame(&mut evidence, 3, &proof.canonical);
-        (entries, findings) = classify(&first, &proof, policies);
+        (entries, findings) = classify(&retained.first, &proof, policies);
         #[cfg(test)]
         if let Some(hook) = before_repeat {
             hook(store);
         }
         let second = filesystem::walk(&identity.path, &mut b, &mut filesystem::SystemBoundary)?;
-        let after = GitInputs::capture(&context, &second, &mut b)?;
-        let repeated = GitProof::observe(&context, &second, &after, &mut b)?;
+        let after = GitInputs::capture(context, &second, &mut b)?;
+        retained.last = Some((second, after));
+        let (second, after) = retained.last.as_ref().expect("just captured final inputs");
+        let repeated = GitProof::observe(context, second, after, &mut b)?;
         frame(&mut evidence, 4, &second.fingerprint());
         frame(&mut evidence, 5, &after.fingerprint());
         frame(&mut evidence, 6, &repeated.canonical);
-        first.recheck(&mut b)?;
-        before.recheck(&mut b)?;
-        second.recheck(&mut b)?;
-        after.recheck(&mut b)?;
-        if first.fingerprint() != second.fingerprint()
-            || before.fingerprint() != after.fingerprint()
+        retained.recheck(&mut b)?;
+        if retained.first.fingerprint() != second.fingerprint()
+            || retained.before.fingerprint() != after.fingerprint()
             || proof.canonical != repeated.canonical
         {
             return Err(IncompleteReason::Changed);
@@ -253,7 +429,7 @@ fn inspect_inner(
         }
         b.check()
     })();
-    finish_observation(
+    let observation = finish_observation(
         policies,
         &context_bytes,
         &evidence,
@@ -261,7 +437,15 @@ fn inspect_inner(
         findings,
         result.err(),
         &b,
-    )
+    )?;
+    Ok(Captured {
+        observation,
+        context: retained_context,
+        physical,
+        budget: b,
+        started,
+        ended: wall_time()?,
+    })
 }
 
 fn frame(out: &mut Vec<u8>, tag: u8, value: &[u8]) {
@@ -409,17 +593,37 @@ fn snapshot(
     checkout: Uuid,
     b: &mut Budget,
 ) -> Result<Context, IncompleteReason> {
+    b.check()?;
+    // Reject external SQL/TX before I/O; never reset an active phase budget.
+    store
+        .may_acquire_lease()
+        .map_err(|_| IncompleteReason::ContextUnavailable)?;
+    let authority = std::sync::Arc::clone(store.authority_identity());
+    let phase = store.sql_phase();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|_| IncompleteReason::ContextUnavailable)?;
+    let context = snapshot_in_transaction(&tx, &authority, checkout, b)?;
+    tx.rollback()
+        .map_err(|_| IncompleteReason::ContextUnavailable)?;
+    drop(phase);
+    Ok(context)
+}
+// Caller owns one bounded SQL phase and READ transaction. No lease guard or
+// nested phase acquisition here, and no filesystem/config/Git I/O.
+fn snapshot_in_transaction(
+    tx: &rusqlite::Transaction<'_>,
+    authority: &crate::store::AuthorityIdentity,
+    checkout: Uuid,
+    b: &mut Budget,
+) -> Result<Context, IncompleteReason> {
     use rusqlite::types::ValueRef;
     fn unavailable<E>(_: E) -> IncompleteReason {
         IncompleteReason::ContextUnavailable
     }
     b.check()?;
-    // This existing metadata-only guard rejects externally active SQL phases
-    // as well as transactions. It does NOT acquire a lease or touch its file.
-    // Read-only Store handles are conservatively unsupported by this API.
-    store.may_acquire_lease().map_err(unavailable)?;
     let mut canonical = Vec::new();
-    let authority = store.authority_identity();
     frame(
         &mut canonical,
         0,
@@ -442,11 +646,6 @@ fn snapshot(
         frame(&mut canonical, 3, &dev.to_be_bytes());
         frame(&mut canonical, 3, &ino.to_be_bytes());
     }
-    let _phase = store.sql_phase();
-    let tx = store
-        .conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-        .map_err(unavailable)?;
     let version: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(unavailable)?;
@@ -559,8 +758,6 @@ fn snapshot(
     {
         return Err(IncompleteReason::ContextUnavailable);
     }
-    tx.rollback().map_err(unavailable)?;
-    drop(_phase);
     Ok(Context {
         allocation,
         canonical,

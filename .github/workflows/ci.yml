@@ -20,13 +20,15 @@ jobs:
       - name: Inspection unit tests
         run: |
           cargo test -p work-cli --locked --lib inspection::tests::
+          cargo test -p work-cli --locked --lib inspection::receipts::tests::
+          cargo test -p work-cli --locked --lib config::inspection_policy_tests::
       - name: Disposal unit tests
         run: |
           cargo test -p work-cli --locked --lib disposal::tests::
       - name: Inspection and disposal integration tests
-        run: cargo test -p work-cli --locked --test inspection --test disposal
+        run: cargo test -p work-cli --locked --test inspection --test disposal --test inspection_receipts --test inspection_cli
       - name: Library and inspection Clippy
-        run: cargo clippy -p work-cli --locked --lib --test inspection --test disposal -- -D warnings
+        run: cargo clippy -p work-cli --locked --lib --test inspection --test disposal --test inspection_receipts --test inspection_cli -- -D warnings
   ci:
     runs-on: ubuntu-latest
     steps:

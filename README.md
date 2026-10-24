@@ -459,6 +459,73 @@ remain deferred. The bounded initial Off/local-queue increment below does not co
 not a claim that those later reviews are complete. No installation, host-policy changes,
 live manager/receiver test or production activation is implied by this implementation.
 
+## Checkout inspection (Task 9 functional pilot)
+
+```sh
+work inspect CHECKOUT_UUIDV7
+work inspect CHECKOUT_UUIDV7 --record
+```
+
+Inspection uses one bounded configuration snapshot: `store_dir`, `trusted_registry`,
+`roots` and only the optional `[inspection]` policy subtree. It requires an existing
+registered schema-15 authority; it never initializes or migrates one. Unrelated
+malformed execution/capture declarations do not block inspection. An absent policy
+section means zero exemptions. An explicit empty section is:
+
+```toml
+[inspection]
+format = 1
+policies = []
+```
+
+Nonempty `[[inspection.policies]]` use the strict `disposal::PolicyDocument` format:
+explicit ID/version, lowercase-hex relative scope, finite file/byte maxima, exact
+file hashes/lengths/modes and complete directory coverage. No glob or extension
+exemptions exist. Unknown policy fields and invalid policies are refused.
+
+Plain inspection is nondurable and creates no receipt directory. `--record` freshly
+captures context and retained filesystem/Git evidence internally, then explicitly
+records provenance in `<store>/inspection-receipts-v1/`. It does not append a caller's
+old Observation. The private directory is 0700; immutable single-link files are 0600.
+Receipts retain unchanged canonical observation bytes, policy versions, context and
+observation digests, authority binding, observation times and an envelope checksum.
+No raw SQL rows, file contents, config values, credentials or Git stderr are included.
+
+Receipt envelopes are bounded to 2 MiB, with an independent 16 MiB aggregate and
+4096-entry receipt-directory limit. The existing SQLite 16 MiB preflight remains
+unchanged. Exclusive `pending-<uuidv7>-<reserved-length>` names charge the entire
+declared reservation even when empty; final names are `<uuidv7>.receipt`. Unknown
+names, unsafe metadata, links and over-capacity stores refuse append. There is no
+pruning, automatic orphan cleanup, adoption or recovery command. Failures before
+publication can retain charged pending files. After rename but before confirmed
+directory sync, recording reports `durability_unknown` with the ID/digest, not
+success or definitely-not-stored. Only file sync, no-replace rename and directory
+sync acknowledge a `PersistedReceipt`.
+
+The existing Store-instance exclusive lease covers reservation metadata and the
+final exact-context read transaction, followed by SQL-off rename/directory sync.
+Payload writes and all checkout/Git/config I/O remain outside SQL and that lease.
+The original inspection budget is never renewed. Cooperative filesystem writers
+are not stopped: these are observations, not atomic snapshots or quiescence proofs.
+The inspector still requires source-qualified Git **2.55.0**; unsupported inputs
+remain incomplete. Native Git pathname races and kernel D-state limitations remain.
+
+JSON is a bounded allowlist of coverage, finding counts, observation counts/digest,
+`recorded`, `recording`, and an optional `receipt_id`; raw paths/payloads are not
+printed. Incomplete coverage, preservation findings or any requested recording
+failure exit 1. Exit 0 means only a complete, clear observation, **never deletion
+permission**. Valid incomplete provenance may be recorded when its retained context
+and inputs still match; recording does not turn it complete. Help and sanitized
+argument failures are read-only.
+
+Library `inspection::read_receipt(&Store, id)` is passive and targeted, using an
+existing mutable-open current-authority Store handle. It checks bounds, canonical
+encoding, checksum, body/header agreement and authority binding, not today's
+checkout context. Historical reads cannot reconstruct freshness, original delivery
+acknowledgement, writer permission or retirement authority. Inspection and recording
+never alter lifecycle, readiness, writers, charges or outbox rows. Task 8 remains
+parked; Task 9 acceptance and production qualification are not implied by this pilot.
+
 ## Read-only inventory
 
 ```sh

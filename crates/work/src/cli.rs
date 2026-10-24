@@ -36,6 +36,13 @@ enum Command {
     },
     /// Reserve and create a configured checkout; does not launch a writer
     Start(crate::allocate::Start),
+    /// Observe checkout content; no deletion permission. Only --record writes provenance
+    Inspect {
+        #[arg(value_name = "checkout-id", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+        #[arg(long)]
+        record: bool,
+    },
     /// Explicit task completion; retirement disabled, tree and charge retained
     Finish {
         #[arg(value_name = "checkout-id")]
@@ -88,6 +95,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
     let argv = std::iter::once(std::ffi::OsString::from("work")).chain(args.iter().cloned());
     let cli = if args.first().is_some_and(|a| {
         a == "capture"
+            || a == "inspect"
             || a == "finish"
             || a == "run"
             || a == "recover"
@@ -187,6 +195,24 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 ),
                 Err(e) => {
                     eprintln!("start refused: {e}; inspect WORK_CONFIG and held allocations; retry with the same --operation UUID");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Command::Inspect { checkout, record } => {
+            let result = crate::inspection::configured_report(checkout, record);
+            match result {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("inspection summary serialization")
+                    );
+                    if report.is_held() {
+                        std::process::exit(1);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("inspection unavailable: invalid policy or existing authority; no deletion permission");
                     std::process::exit(1);
                 }
             }
