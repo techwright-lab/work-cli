@@ -1495,7 +1495,9 @@ mod tests {
                 "escaped" => "missing_enrollment",
                 "reused" => "missing_enrollment",
                 "reboot" => "boot_mismatch",
-                "missing" => "observation_incomplete",
+                // Missing stat aborts collection before unit identity is assigned;
+                // verification reports that unknown identity before coverage.
+                "missing" => "unknown_manager",
                 _ => unreachable!(),
             };
             assert_eq!(report.reason(), expected, "{case}");
