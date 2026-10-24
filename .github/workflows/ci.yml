@@ -18,9 +18,11 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Inspection unit tests
-        run: cargo test -p work-cli --locked --lib inspection::tests::
+        run: |
+          cargo test -p work-cli --locked --lib inspection::tests::
       - name: Disposal unit tests
-        run: cargo test -p work-cli --locked --lib disposal::tests::
+        run: |
+          cargo test -p work-cli --locked --lib disposal::tests::
       - name: Inspection and disposal integration tests
         run: cargo test -p work-cli --locked --test inspection --test disposal
       - name: Library and inspection Clippy
