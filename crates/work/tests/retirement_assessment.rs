@@ -148,7 +148,8 @@ fn missing_allocation_lock_holds() {
 
 #[test]
 fn missing_recovery_lock_holds_without_prepare() {
-    let f = fixture::ManagedFixture::new("sha1", "2");
+    // Reach the missing-lock gate on persistent storage, not the tmpfs guard.
+    let f = fixture::ManagedFixture::recovery("sha1", "2");
     let (config, _) = f.approval();
     let assertion = confirm_assertion(&config, f.allocation.checkout);
     let before_sql = sql_bytes(&f);
