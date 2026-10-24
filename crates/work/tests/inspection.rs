@@ -102,6 +102,77 @@ fn raw_names_and_ignored_descendants_are_all_observed() {
 }
 
 #[test]
+fn ignore_lookup_treats_magic_and_wildcard_filenames_as_literal_paths() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    fs::write(f.path(b".gitignore"), b"cache/\n:(literal)cache/\n").unwrap();
+    let names = [
+        b":(".as_slice(),
+        b":(glob)tracked",
+        b":(exclude)tracked",
+        b"track?d",
+        b"*",
+        b"[t]racked",
+        b"[",
+    ];
+    let scopes = [b"".as_slice(), b"cache", b":(literal)cache"];
+    let mut expected = Vec::new();
+    for scope in scopes {
+        if !scope.is_empty() {
+            fs::create_dir(f.path(scope)).unwrap();
+            expected.push((scope.to_vec(), FindingKind::IgnoredUnclassified));
+        }
+        for name in names {
+            let mut path = scope.to_vec();
+            if !path.is_empty() {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+            fs::write(f.path(&path), b"literal payload\n").unwrap();
+            expected.push((
+                path,
+                if scope.is_empty() {
+                    FindingKind::Untracked
+                } else {
+                    FindingKind::IgnoredUnclassified
+                },
+            ));
+        }
+    }
+    let before = fs::read(f.private().join("index")).unwrap();
+    let o = f.inspect(&empty());
+    assert_eq!(
+        o.coverage(),
+        Coverage::Complete,
+        "reasons={:?}, counters={:?}",
+        o.reasons(),
+        o.counters()
+    );
+    for (path, kind) in expected {
+        let entry = o
+            .entries()
+            .iter()
+            .find(|e| e.path().as_bytes() == path)
+            .unwrap();
+        assert!(!entry.tracked());
+        assert!(entry.policy_match().is_none());
+        assert!(o
+            .findings()
+            .iter()
+            .any(|finding| finding.path().as_bytes() == path && finding.kind() == kind));
+    }
+    // Names such as '*' and 'track?d' must not select the real tracked file.
+    assert!(o
+        .entries()
+        .iter()
+        .any(|e| e.path().as_bytes() == b"tracked" && e.tracked()));
+    assert!(!o
+        .findings()
+        .iter()
+        .any(|finding| finding.path().as_bytes() == b"tracked"));
+    assert_eq!(before, fs::read(f.private().join("index")).unwrap());
+}
+
+#[test]
 fn hidden_index_flags_do_not_hide_changed_bytes() {
     for flag in ["--assume-unchanged", "--skip-worktree"] {
         let mut f = fixture::ManagedFixture::new("sha1", "3");

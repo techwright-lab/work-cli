@@ -1004,7 +1004,13 @@ fn parse_ignored(
     }
     let mut result = BTreeMap::new();
     for (fields, path) in rows.chunks_exact(4).zip(requested) {
-        if fields[3] != path.as_bytes() {
+        // Git echoes the original stdin path, including our deliberate prefix.
+        // Strip exactly that prefix; accept no normalization or alternate alias.
+        let echoed = fields[3]
+            .strip_prefix(b"./")
+            .ok_or(IncompleteReason::InvalidProtocol)?;
+        let echoed = RawPath::from_bytes(echoed).map_err(|_| IncompleteReason::InvalidProtocol)?;
+        if &echoed != path {
             return Err(IncompleteReason::InvalidProtocol);
         }
         let ignored = if fields[..3].iter().all(|v| v.is_empty()) {
@@ -2048,14 +2054,22 @@ impl GitProof {
             let start = offset;
             while offset < paths.len()
                 && offset - start < 256
-                && input.len() + paths[offset].as_bytes().len() + 1 <= 256 * 1024
+                && input.len() + paths[offset].as_bytes().len() + 3 <= 256 * 1024
             {
+                // check-ignore rejects literal pathspec magic. Shield leading
+                // colons with './'; --no-index leaves no index to glob-select,
+                // and ignore matching treats each pathname as the lookup value.
+                input.extend_from_slice(b"./");
                 input.extend(paths[offset].as_bytes());
                 input.push(0);
                 offset += 1;
             }
             let output = command(
                 &[
+                    // Override only this fixed invocation; other commands retain
+                    // the runner's --literal-pathspecs. env_clear forbids inherited
+                    // pathspec settings, and every stdin path is prefixed above.
+                    "--no-literal-pathspecs",
                     "check-ignore",
                     "--no-index",
                     "--stdin",

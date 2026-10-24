@@ -205,7 +205,7 @@ fn git_byte_protocols_reject_ambiguity() {
             b".gitignore\0"
                 .iter()
                 .copied()
-                .chain(b"1\0cache/\0cache/a\n\0".iter().copied())
+                .chain(b"1\0cache/\0./cache/a\n\0".iter().copied())
                 .collect::<Vec<_>>()
                 .as_slice(),
             &requested
@@ -214,6 +214,7 @@ fn git_byte_protocols_reject_ambiguity() {
     );
     assert!(parse_ignored(b"\0\0\0other\0", &requested).is_err());
     assert!(parse_ignored(b"\0\0\0cache/a\n\0extra\0", &requested).is_err());
+    assert!(parse_ignored(b"\0\0\0./cache/a\n\0extra\0", &requested).is_err());
     let payload = b"binary\0\n123 blob 9\n";
     for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
         let oid = hex(&object_digest(format, b"blob", payload));
@@ -228,6 +229,67 @@ fn git_byte_protocols_reject_ambiguity() {
         wire.push(b'\n');
         assert!(parse_blobs(&wire, &expected, format).is_err());
     }
+}
+
+#[test]
+fn ignored_protocol_requires_exact_prefixed_raw_echoes() {
+    let paths = [
+        b":(glob)tracked".as_slice(),
+        b"cache/track?d",
+        b"cache/*",
+        b"cache/[t]racked",
+        b"cache/\xff\n\t",
+        b"cache/empty",
+    ];
+    let requested: Vec<_> = paths
+        .iter()
+        .map(|p| RawPath::from_bytes(p).unwrap())
+        .collect();
+    let mut wire = Vec::new();
+    for (i, path) in paths.iter().enumerate() {
+        wire.extend_from_slice(if i == 0 { b"\0\0\0" } else { b".gitignore\0" });
+        if i != 0 {
+            wire.extend_from_slice(b"1\0cache/\0");
+        }
+        wire.extend_from_slice(b"./");
+        wire.extend_from_slice(path);
+        wire.push(0);
+    }
+    let parsed = parse_ignored(&wire, &requested).unwrap();
+    for (i, path) in requested.iter().enumerate() {
+        assert_eq!(parsed[path], i != 0);
+    }
+    let requested = [RawPath::from_bytes(b"cache/a").unwrap()];
+    for echo in [
+        b"cache/a".as_slice(), // missing deliberate prefix
+        b"././cache/a",
+        b"./cache/../cache/a",
+        b"./cache//a",
+        b"./cache/a/",
+        b"./other",
+        b"/cache/a",
+        b"./",
+    ] {
+        let mut wire = b"\0\0\0".to_vec();
+        wire.extend_from_slice(echo);
+        wire.push(0);
+        assert!(parse_ignored(&wire, &requested).is_err());
+    }
+    let record = b"\0\0\0./cache/a\0";
+    let duplicate = [record.as_slice(), record.as_slice()].concat();
+    assert!(parse_ignored(&duplicate, &requested).is_err()); // extra response
+    let two = [
+        requested[0].clone(),
+        RawPath::from_bytes(b"cache/b").unwrap(),
+    ];
+    assert!(parse_ignored(&duplicate, &two).is_err()); // wrong second response
+    assert!(parse_ignored(record, &two).is_err()); // missing response
+    let duplicate_requests = [requested[0].clone(), requested[0].clone()];
+    assert!(parse_ignored(&duplicate, &duplicate_requests).is_err());
+    assert!(
+        !parse_ignored(b".gitignore\x001\0!cache/a\0./cache/a\0", &requested).unwrap()
+            [&requested[0]]
+    );
 }
 
 #[test]
