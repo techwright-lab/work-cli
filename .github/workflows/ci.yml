@@ -7,6 +7,24 @@ on:
   pull_request:
 
 jobs:
+  # Task10 is independent: neither parked Task8 nor Task9 results are suppressed.
+  task10-preservation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Remote observation and lazy policy unit tests
+        run: |
+          cargo test -p work-cli --locked --lib inspection::remote_proof::tests::
+          cargo test -p work-cli --locked --lib config::remote_policy_tests::
+      - name: Owned local remote integration tests
+        run: cargo test -p work-cli --locked --test remote_proof
+      - name: Library and remote observation Clippy
+        run: cargo clippy -p work-cli --locked --lib --test remote_proof -- -D warnings
   # Independent qualification: full-suite failures remain visible in `ci` below.
   task9-inspection:
     runs-on: ubuntu-latest

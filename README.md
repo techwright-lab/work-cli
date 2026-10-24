@@ -20,6 +20,87 @@ production qualification/activation and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor
 for read-only accounting. Historical run bindings cannot be restored.
 
+### Remote preservation observation pilot (Task10 source, not retirement acceptance)
+
+```sh
+work verify-remote <checkout-uuidv7>
+```
+
+This observational command uses existing registered Work authority and the checkout's
+**actual current HEAD**, not its allocation-time HEAD or a historical inspection receipt.
+It does not initialize/repair authority, acquire a writer lease, change original Git
+refs/index/objects, push, record a receipt, finish, retire, delete a checkout or release quota.
+Its public library entrypoint is `inspection::verify_remote(checkout)`; `RemoteReport`
+has private fields, read-only accessors and serialization, not Deserialize or a freshness API.
+
+Configure an explicit policy in the same `WORK_CONFIG` document as `store_dir`,
+`trusted_registry` and `roots` (no default target, upstream inference or CLI URL/ref override):
+
+```toml
+[remote_preservation]
+format = 1
+version = "operator-policy-v1"
+
+[[remote_preservation.targets]]
+common_dir = "/absolute/canonical/repository/.git"
+remote = "backup"
+url = "https://example.invalid/repository.git"
+branch = "refs/heads/main"
+```
+
+This subtree is decoded lazily and strictly. Unknown fields, duplicate declarations,
+unsupported format/version, ambiguous repository targets and duplicate URLs hold.
+There must be exactly one target for the canonical actual common Git directory and
+one effective URL for that named remote, exactly equal to policy. Fetch refspecs,
+push URLs and implicit remote HEAD never establish the target. At most 32 targets;
+policy version is a 1–128-character ASCII identifier, remote name 1–64, branch at most
+256 and absolute paths/URLs at most 4096 bytes. Paths and refs use a deliberately
+restricted ASCII grammar; unsupported layouts or values hold, never guess.
+
+Transport is anonymous HTTPS with certificate checking and no redirects, credentials,
+userinfo, ports, escapes, query or fragment. SSH/scp, HTTP, git and helper transports
+are refused. Explicit `file:///absolute/canonical/owned/backup.git` is also supported
+for ordinary owned bare repositories under the restricted input envelope; it reports
+`LOCAL`, **not off-host backup**. No host HOME credentials, SSH agent, proxy variables,
+Git system/global configuration, hooks, submodules, replacements or lazy fetch are inherited.
+Authenticated remotes are deferred. Only an operator-approved endpoint is contacted.
+
+The command advertises the exact branch, fetches that **named branch** into an isolated
+bare verification repository, requires its OID to equal the advertisement and validates
+the remote commit/objects with native fsck **before importing local objects**. It then
+fetches the verified checkout's HEAD using fixed local upload-pack, validates the exact
+OID and objects, and tests ancestry. One closing advertisement must match; actual local
+HEAD, filesystem/Git input evidence, boot, config and SQL authority context are rechecked.
+No remote-stage retry (the shared helper retains bounded ETXTBSY pre-exec retries).
+Network errors, missing objects, movement, non-ancestry and unknowns hold. Two matching advertisements cannot detect an away-and-back change or promise future
+preservation. Reachability is not acceptance or merge, and timestamps are not live authority.
+
+Exit 0 means consistently observed ancestry **during this invocation**, with complete
+scratch cleanup. Held/unknown outcomes exit 1; invalid CLI arguments exit 2, sanitized.
+JSON contains allowlisted IDs/OIDs/ref, commitments, start/end times, transport, outcome
+and cleanup status, never raw URLs, config, payloads or child stderr. `recorded` and
+`retirement_authority` are always false. The UUID `observation_id` also names this
+invocation's `/tmp/work-verify-<UUID>` scratch. It is created privately (0700), outside
+the checkout/store, with retained directory identity. Only that scratch is eligible for
+bounded descriptor-relative, no-follow/no-mount cleanup after children are reaped.
+Replacement, unsupported layout, timeout, ambiguous process-helper/reaping failure or
+cleanup failure leaves a remainder and reports `cleanup=incomplete`; there is no old-prefix sweeper or automatic cleanup of prior runs.
+
+Linux and source-qualified Git **2.55.0** are required. Task9's restricted linked-worktree,
+files-ref and index-v2/v3 input envelope is retained. All children share one 30-second
+invocation deadline and an aggregate 1 MiB stdout+stderr allowance; existing metadata/input
+bounds remain. Scratch objects are **not subject to a formal hard disk quota**. Fetch may
+consume space within the deadline; operator endpoint/free-space policy still matters.
+Native Git pathname operations remain cooperative, not hostile-same-UID race containment;
+kernel uninterruptible I/O can delay kill/reap. Cleanup is not checkout deletion authority.
+
+Tests are source-authored for the independent `task10-preservation` GitHub job using owned
+local bare remotes, without live network credentials. Local execution and performance gates
+remain opt-in; no test pass or rollout is claimed by this source pilot. Task8 remains parked.
+Full Task10 still requires preservation of dirty/untracked/ignored, local-branch and
+reflog-only work, verified local recovery refs, fresh quiescence, operator approval and
+separately reviewed retirement transactions. None is waived by HEAD ancestry.
+
 ### Capture construction (Tasks 8.1–8.4b; implementation, not acceptance)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and

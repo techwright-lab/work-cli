@@ -43,6 +43,11 @@ enum Command {
         #[arg(long)]
         record: bool,
     },
+    /// Observe configured remote ancestry once; no recording or retirement authority
+    VerifyRemote {
+        #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+    },
     /// Explicit task completion; retirement disabled, tree and charge retained
     Finish {
         #[arg(value_name = "checkout-id")]
@@ -96,6 +101,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
     let cli = if args.first().is_some_and(|a| {
         a == "capture"
             || a == "inspect"
+            || a == "verify-remote"
             || a == "finish"
             || a == "run"
             || a == "recover"
@@ -215,6 +221,16 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     eprintln!("inspection unavailable: invalid policy or existing authority; no deletion permission");
                     std::process::exit(1);
                 }
+            }
+        }
+        Command::VerifyRemote { checkout } => {
+            let report = crate::inspection::verify_remote(checkout);
+            println!(
+                "{}",
+                serde_json::to_string(&report).expect("remote observation serialization")
+            );
+            if !report.observed() {
+                std::process::exit(1);
             }
         }
         Command::Finish { checkout } => {

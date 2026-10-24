@@ -15,6 +15,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod remote_proof;
+pub use remote_proof::{verify_remote, RemoteReport};
+
 mod receipts;
 pub use receipts::{
     inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,
@@ -657,7 +660,7 @@ fn snapshot(
 // Caller owns one bounded SQL phase and READ transaction. No lease guard or
 // nested phase acquisition here, and no filesystem/config/Git I/O.
 fn snapshot_in_transaction(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     authority: &crate::store::AuthorityIdentity,
     checkout: Uuid,
     b: &mut Budget,
@@ -1317,6 +1320,11 @@ fn run_command(
     b: &mut Budget,
     repository: bool,
 ) -> Result<ProcessOutput, IncompleteReason> {
+    // Task10 opts into the same input proof with owned HOME and a single
+    // invocation deadline. Ordinary inspection keeps its existing runner.
+    if b.remote_home.is_some() {
+        return remote_proof::run_inspection_command(command, input, b, repository);
+    }
     use std::{
         io::{ErrorKind, Read, Write},
         os::unix::process::CommandExt,
@@ -2541,6 +2549,8 @@ const DIRECTORY_BUFFER_BYTES: usize = 8192;
 // Private operation budget. No caller-supplied path/census/membership bypass.
 struct Budget {
     start: Instant,
+    remote_home: Option<PathBuf>,
+    remote_reap_unknown: bool,
     counters: Counters,
     stopped: Option<IncompleteReason>,
     evidence: Sha256,
@@ -2554,6 +2564,8 @@ impl Budget {
     fn new() -> Self {
         Self {
             start: Instant::now(),
+            remote_home: None,
+            remote_reap_unknown: false,
             counters: Counters::default(),
             stopped: None,
             evidence: Sha256::new(),
@@ -3259,6 +3271,22 @@ mod filesystem {
                 .node(path, b)?
                 .ok_or(IncompleteReason::UnsupportedGit)?;
             Ok(self.held[i].identity.kind() == FileType::Directory)
+        }
+        // Optional stricter input cap for the remote pilot's config document;
+        // required() still performs retained identity and growth rechecks.
+        pub(super) fn required_limited(
+            &mut self,
+            path: &[u8],
+            maximum: u64,
+            b: &mut Budget,
+        ) -> Result<Vec<u8>, IncompleteReason> {
+            let i = self
+                .node(path, b)?
+                .ok_or(IncompleteReason::UnsupportedGit)?;
+            if self.held[i].identity.size < 0 || self.held[i].identity.size as u64 > maximum {
+                return Err(IncompleteReason::FileBudget);
+            }
+            self.required(path, b)
         }
         pub(super) fn metadata(
             &mut self,

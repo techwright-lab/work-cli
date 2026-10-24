@@ -97,6 +97,19 @@ impl ConfigDocument {
         };
         crate::disposal::validate(document).map_err(|_| invalid())
     }
+    /// Remote verification alone decodes this strict subtree. Absence is a hold.
+    pub(crate) fn remote_preservation(&self) -> Result<RemotePolicy, Error> {
+        let invalid = || Error::Config("invalid remote preservation policy".into());
+        let policy: RemotePolicy = self
+            .value
+            .get("remote_preservation")
+            .ok_or_else(invalid)?
+            .clone()
+            .try_into()
+            .map_err(|_| invalid())?;
+        policy.validate().map_err(|_| invalid())?;
+        Ok(policy)
+    }
     pub(crate) fn execution(&self) -> Result<Config, Error> {
         Config::from_value(&self.value)
     }
@@ -219,7 +232,7 @@ impl Config {
         Ok(Some(text))
     }
 
-    fn discover_path() -> Option<PathBuf> {
+    pub(crate) fn discover_path() -> Option<PathBuf> {
         if let Some(explicit) = std::env::var_os("WORK_CONFIG") {
             let path = PathBuf::from(explicit);
             if path.as_os_str().is_empty() {
@@ -355,6 +368,242 @@ pub fn validate_path(path: &std::path::Path, required: bool) -> Result<PathBuf, 
         return Err(invalid_path());
     }
     Ok(path.to_owned())
+}
+
+/// Operator declarations, not remote evidence. Never exposed as proof constructors.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemotePolicy {
+    pub(crate) format: u32,
+    pub(crate) version: String,
+    pub(crate) targets: Vec<RemoteTarget>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoteTarget {
+    pub(crate) common_dir: PathBuf,
+    pub(crate) remote: String,
+    pub(crate) url: String,
+    pub(crate) branch: String,
+}
+impl RemotePolicy {
+    fn validate(&self) -> Result<(), ()> {
+        let mut repositories = std::collections::BTreeSet::new();
+        let mut urls = std::collections::BTreeSet::new();
+        if self.format != 1
+            || !remote_token(&self.version, 128)
+            || self.targets.is_empty()
+            || self.targets.len() > 32
+        {
+            return Err(());
+        }
+        for target in &self.targets {
+            let common = target.common_dir.to_str().ok_or(())?;
+            if !remote_absolute_path(common)
+                || !remote_token(&target.remote, 64)
+                || !remote_branch(&target.branch)
+                || remote_transport(&target.url).is_none()
+                || !repositories.insert(common)
+                || !urls.insert(&target.url)
+            {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+}
+fn remote_token(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+pub(crate) fn remote_branch(value: &str) -> bool {
+    value.len() <= 256
+        && value.starts_with("refs/heads/")
+        && value.is_ascii()
+        && !value.contains("..")
+        && !value.contains("@{")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+        && value.split('/').all(|p| {
+            !p.is_empty() && !p.starts_with('.') && !p.ends_with('.') && !p.ends_with(".lock")
+        })
+}
+fn remote_absolute_path(value: &str) -> bool {
+    value.len() <= 4096
+        && value.starts_with('/')
+        && value.len() > 1
+        && value[1..]
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != "..")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.".contains(&b))
+}
+/// No userinfo, ports, escapes, queries, fragments or transport helper syntax.
+/// LOCAL means same-host transport; it is expressly not an off-host backup.
+pub(crate) fn remote_transport(url: &str) -> Option<&'static str> {
+    if url.len() > 4096 {
+        return None;
+    }
+    if let Some(path) = url.strip_prefix("file://") {
+        return remote_absolute_path(path).then_some("LOCAL");
+    }
+    let (host, path) = url.strip_prefix("https://")?.split_once('/')?;
+    if host.is_empty()
+        || host.len() > 253
+        || path.is_empty()
+        || !host.split('.').all(|p| {
+            !p.is_empty()
+                && p.len() <= 63
+                && p.as_bytes()[0].is_ascii_alphanumeric()
+                && p.as_bytes()[p.len() - 1].is_ascii_alphanumeric()
+                && p.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        || !path
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != "..")
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/_-.~".contains(&b))
+    {
+        return None;
+    }
+    Some("HTTPS")
+}
+
+#[cfg(test)]
+mod remote_policy_tests {
+    use super::*;
+    fn text(url: &str, branch: &str) -> String {
+        format!("[remote_preservation]\nformat=1\nversion='v1'\n[[remote_preservation.targets]]\ncommon_dir='/owned/repository/.git'\nremote='backup'\nurl={url:?}\nbranch={branch:?}\n")
+    }
+    #[test]
+    fn strict_lazy_remote_policy_isolation() {
+        let valid = text("https://example.invalid/repo.git", "refs/heads/main");
+        let d = ConfigDocument::from_text(&format!(
+            "{valid}\n[capture]\nexecutable=false\n[inspection]\nformat=false\n"
+        ))
+        .unwrap();
+        assert!(d.remote_preservation().is_ok());
+        assert!(d.authority().is_ok());
+        assert!(d.inspection_policies().is_err());
+        assert!(ConfigDocument::from_text("")
+            .unwrap()
+            .remote_preservation()
+            .is_err());
+        for value in [
+            valid.replace("format=1", "format=2"),
+            valid.replace("version='v1'", "version=''"),
+            valid.replace("remote='backup'", "remote='backup'\nsecret='DO_NOT_ECHO'"),
+            valid.replace(
+                "common_dir='/owned/repository/.git'",
+                "common_dir='/owned/../repository'",
+            ),
+            "remote_preservation=false".into(),
+        ] {
+            let d = ConfigDocument::from_text(&value).unwrap();
+            assert!(d.authority().is_ok());
+            assert!(d.execution().is_ok());
+            assert!(d.inspection_policies().is_ok());
+            assert!(!d
+                .remote_preservation()
+                .unwrap_err()
+                .to_string()
+                .contains("DO_NOT_ECHO"));
+        }
+    }
+    #[test]
+    fn remote_url_and_branch_grammar_is_narrow() {
+        for url in [
+            "ssh://example.invalid/a",
+            "git@example.invalid:a",
+            "http://example.invalid/a",
+            "git://example.invalid/a",
+            "ext::helper",
+            "https://user@example.invalid/a",
+            "https://example.invalid/a?secret",
+            "https://example.invalid/a#fragment",
+            "https://example.invalid/%61",
+            "https://example.invalid/a/../b",
+            "file://host/owned/remote",
+            "file:///owned/../remote",
+            "file:///owned/space name",
+            "https://example.invalid:443/a",
+        ] {
+            assert!(
+                ConfigDocument::from_text(&text(url, "refs/heads/main"))
+                    .unwrap()
+                    .remote_preservation()
+                    .is_err(),
+                "{url}"
+            );
+        }
+        for branch in [
+            "main",
+            "HEAD",
+            "refs/tags/v1",
+            "refs/heads/*",
+            "refs/heads/a..b",
+            "refs/heads/a.lock",
+            "refs/heads/.hidden",
+            "refs/heads/x@{y",
+            "refs/heads/x\ny",
+        ] {
+            assert!(
+                ConfigDocument::from_text(&text("file:///owned/backup.git", branch))
+                    .unwrap()
+                    .remote_preservation()
+                    .is_err()
+            );
+        }
+        assert!(
+            ConfigDocument::from_text(&text("file:///owned/backup.git", "refs/heads/main"))
+                .unwrap()
+                .remote_preservation()
+                .is_ok()
+        );
+    }
+    #[test]
+    fn remote_policy_collisions_unknown_fields_and_bounds_hold() {
+        let valid = text("file:///owned/backup.git", "refs/heads/main");
+        let target = valid
+            .split("[[remote_preservation.targets]]")
+            .nth(1)
+            .unwrap();
+        for other in [
+            target.to_string(),
+            target.replace("/owned/repository/.git", "/another/.git"),
+            target.replace("backup.git", "other.git"),
+        ] {
+            assert!(ConfigDocument::from_text(&format!(
+                "{valid}\n[[remote_preservation.targets]]{other}"
+            ))
+            .unwrap()
+            .remote_preservation()
+            .is_err());
+        }
+        assert!(ConfigDocument::from_text(
+            &valid.replace("version='v1'", "version='v1'\nunknown=1")
+        )
+        .unwrap()
+        .remote_preservation()
+        .is_err());
+        assert!(ConfigDocument::from_text(
+            &valid.replace("version='v1'", &format!("version='{}'", "a".repeat(129)))
+        )
+        .unwrap()
+        .remote_preservation()
+        .is_err());
+        assert!(
+            ConfigDocument::from_text(&valid.replace("format=1", "format=1\nformat=1")).is_err()
+        );
+    }
 }
 
 #[cfg(test)]
