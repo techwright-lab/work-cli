@@ -916,6 +916,13 @@ fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
                 if i < frames.len() && matches!(frames[i].0, 2 | 3 | 5) {
                     return Err("census_changed");
                 }
+                if identity.len() != 88
+                    || content.as_ref().is_some_and(|hash| hash.len() != 32)
+                    || (directory && content.is_some())
+                    || (!directory && !names.is_empty())
+                {
+                    return Err("census_changed");
+                }
                 last_path = Some(path.clone());
                 paths.insert(
                     path,

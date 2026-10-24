@@ -1667,31 +1667,31 @@ mod tests {
 
     #[test]
     fn lock_special_mode_bits_fail_revalidate() {
-        let (f, config) = setup("sha1");
-        let lock = lock_file(&f);
-        AFTER_CAS.with(|hook| {
-            let path = lock.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o4600));
-            }));
-        });
-        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
-        assert_eq!(report.reason, "lock_unknown", "{report:?}");
-        assert_ne!(report.outcome, "prepared");
-        let (f, config) = setup("sha1");
-        let dir = f
-            .temp
-            .path()
-            .join("authority/recovery-preparation-locks-v1");
-        AFTER_CAS.with(|hook| {
-            let path = dir.clone();
-            *hook.borrow_mut() = Some(Box::new(move || {
-                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o2700));
-            }));
-        });
-        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
-        assert_eq!(report.reason, "lock_unknown", "{report:?}");
-        assert_ne!(report.outcome, "prepared");
+        for (directory, mode) in [(false, 0o4600), (true, 0o2700)] {
+            let (f, config) = setup("sha1");
+            let path = if directory {
+                f.temp
+                    .path()
+                    .join("authority/recovery-preparation-locks-v1")
+            } else {
+                lock_file(&f)
+            };
+            AFTER_CAS.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    let before = fs::metadata(&path).unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+                    let after = fs::metadata(&path).unwrap();
+                    assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+                    assert_eq!(after.mode() & 0o7777, mode);
+                }));
+            });
+            let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+            AFTER_CAS.with(|hook| assert!(hook.borrow().is_none(), "{report:?}"));
+            assert_eq!(report.reason, "lock_unknown", "{report:?}");
+            assert_eq!(report.durability, "unknown", "{report:?}");
+            assert!(!report.created_refs.is_empty(), "{report:?}");
+            assert_ne!(report.outcome, "prepared");
+        }
     }
 
     #[test]
@@ -1785,6 +1785,7 @@ mod tests {
         assert_ne!(report.outcome, "prepared", "{report:?}");
         assert_eq!(report.durability, "unknown", "{report:?}");
         assert!(!report.created_refs.is_empty(), "{report:?}");
+        AFTER_CLOSING_CAPTURE.with(|hook| assert!(hook.borrow().is_none(), "{report:?}"));
     }
 
     #[test]
@@ -1849,6 +1850,70 @@ mod tests {
         assert!(published.exists(), "{resume:?}");
         assert_eq!(fs::metadata(&published).unwrap().ino(), ino);
         assert!(!pending.exists());
+    }
+
+    fn malformed_manifest_shape(manifest: &[u8], case: u8) -> Vec<u8> {
+        let mut frames = framed(manifest);
+        match case {
+            0 => {
+                let start = frames
+                    .iter()
+                    .position(|(tag, value)| *tag == 3 && value == &[1])
+                    .unwrap();
+                let end = (start + 1..frames.len())
+                    .find(|i| matches!(frames[*i].0, 1 | 6))
+                    .unwrap_or(frames.len());
+                frames.insert(end, (5, vec![7; 32]));
+            }
+            1 => {
+                let start = frames
+                    .iter()
+                    .position(|(tag, value)| *tag == 3 && value == &[0])
+                    .unwrap();
+                frames.insert(start + 1, (4, b"impossible-child".to_vec()));
+            }
+            2 => {
+                let identity = &mut frames.iter_mut().find(|(tag, _)| *tag == 2).unwrap().1;
+                assert_eq!(identity.len(), 88);
+                identity.truncate(87);
+            }
+            3 => {
+                let content = &mut frames.iter_mut().find(|(tag, _)| *tag == 5).unwrap().1;
+                assert_eq!(content.len(), 32);
+                content.truncate(31);
+            }
+            _ => unreachable!(),
+        }
+        encode_framed(&frames)
+    }
+
+    #[test]
+    fn rechecksummed_malformed_manifest_shapes_are_rejected_on_resume() {
+        for case in 0..4 {
+            let (f, config) = setup("sha1");
+            let operation = Uuid::now_v7();
+            let first = prepare_path(&config, f.allocation.checkout, operation, Fault::BeforeCas);
+            assert_eq!(take_fault_hit(), Fault::BeforeCas, "{first:?}");
+            let path = f.temp.path().join(format!(
+                "authority/inspection-receipts-v1/{operation}.receipt"
+            ));
+            let mut intent = match storage::decode(&fs::read(&path).unwrap()).unwrap() {
+                storage::Record::Intent(intent) => *intent,
+                storage::Record::Result(_) => panic!("kind"),
+            };
+            let mut source = framed(&intent.source_witness);
+            let admin = source.iter_mut().find(|(tag, _)| *tag == 3).unwrap();
+            admin.1 = malformed_manifest_shape(&admin.1, case);
+            intent.source_witness = encode_framed(&source);
+            intent.source_commitment = hash32(&Sha256::digest(&intent.source_witness));
+            fs::write(&path, storage::encode_intent(&intent).unwrap()).unwrap();
+            let _ = take_witness_delta();
+            let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+            assert!(take_witness_delta(), "case {case}: {resume:?}");
+            assert_eq!(resume.reason, "census_changed", "case {case}: {resume:?}");
+            assert_ne!(resume.outcome, "prepared");
+            assert!(!f.common().join("refs/work-recovery").exists());
+        }
     }
 
     #[test]

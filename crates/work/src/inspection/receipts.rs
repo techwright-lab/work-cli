@@ -916,10 +916,7 @@ pub(super) fn reserve_with_budget(
     let mut total = 0u64;
     let mut ids = std::collections::BTreeSet::new();
     let mut duplicate = false;
-    loop {
-        let Some(name) = next_receipt_name(&mut entries, budget.as_deref_mut())? else {
-            break;
-        };
+    while let Some(name) = next_receipt_name(&mut entries, budget.as_deref_mut())? {
         if name == b"." || name == b".." {
             continue;
         }
