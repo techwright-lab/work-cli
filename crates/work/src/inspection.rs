@@ -585,8 +585,8 @@ impl Sha1 {
     }
     fn compress(&mut self) {
         let mut w = [0u32; 80];
-        for (i, bytes) in self.block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(bytes.try_into().expect("four bytes"));
+        for (i, bytes) in self.block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*bytes);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -636,7 +636,7 @@ impl Sha1 {
         }
         self.update(&bits.to_be_bytes());
         let mut out = [0u8; 20];
-        for (dst, n) in out.chunks_exact_mut(4).zip(self.state) {
+        for (dst, n) in out.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             dst.copy_from_slice(&n.to_be_bytes());
         }
         out
@@ -1003,7 +1003,7 @@ fn parse_ignored(
         return Err(IncompleteReason::InvalidProtocol);
     }
     let mut result = BTreeMap::new();
-    for (fields, path) in rows.chunks_exact(4).zip(requested) {
+    for (fields, path) in rows.as_chunks::<4>().0.iter().zip(requested) {
         // Git echoes the original stdin path, including our deliberate prefix.
         // Strip exactly that prefix; accept no normalization or alternate alias.
         let echoed = fields[3]
@@ -1195,10 +1195,7 @@ fn run_command(
                         progressed = true;
                     }
                     Err(e)
-                        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
-                    {
-                        ()
-                    }
+                        if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
                     Err(_) => return b.fail(IncompleteReason::Io),
                 }
                 if written == input.len() {
