@@ -15,26 +15,48 @@ fn checked<T>(value: Result<T, IncompleteReason>) -> Held<T> {
     value.map_err(|_| "sync_unknown")
 }
 
-pub(super) fn sync_objects(common: &filesystem::Manifest, b: &mut Budget) -> Held<()> {
-    checked(common.sync_prefix(b"objects", b))?;
+pub(super) fn sync_objects(objects: &filesystem::Manifest, b: &mut Budget) -> Held<()> {
+    if !objects.contains(b"objects") {
+        return Err("object_storage_missing");
+    }
+    let files = objects.object_files();
+    if files.is_empty() {
+        return Err("object_handles_missing");
+    }
+    for path in &files {
+        checked(objects.sync_path(path, false, b))?;
+    }
+    checked(objects.sync_prefix(b"objects", b))?;
+    checked(objects.sync_path(b"", true, b))?;
     Ok(())
 }
 
 pub(super) fn sync_refs(
     common: &filesystem::Manifest,
-    created: &[String],
+    targets: &[String],
     packed: bool,
     b: &mut Budget,
 ) -> Held<()> {
     if packed {
         checked(common.sync_path(b"packed-refs", false, b))?;
     }
-    for name in created {
-        checked(common.sync_path(name.as_bytes(), false, b))?;
+    let mut dirs = BTreeSet::new();
+    for name in targets {
+        if common.contains(name.as_bytes()) {
+            checked(common.sync_path(name.as_bytes(), false, b))?;
+            for ancestor in ancestor_dirs(name) {
+                dirs.insert(ancestor);
+            }
+        } else if !packed {
+            return Err("recovery_target_unknown");
+        }
     }
-    for ancestor in created.iter().flat_map(|name| ancestor_dirs(name)) {
+    let mut dirs: Vec<_> = dirs.into_iter().collect();
+    dirs.sort_by_key(|path| std::cmp::Reverse(path.len()));
+    for ancestor in dirs {
         checked(common.sync_path(&ancestor, true, b))?;
     }
+    checked(common.sync_path(b"", true, b))?;
     Ok(())
 }
 

@@ -4,7 +4,9 @@
 use super::*;
 use crate::config::{Config, ConfigDocument, RemoteTarget};
 use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags};
-use std::{ffi::CString, mem::MaybeUninit, os::fd::OwnedFd, process::Command};
+use std::{
+    ffi::CString, mem::MaybeUninit, os::fd::OwnedFd, os::unix::ffi::OsStrExt, process::Command,
+};
 
 type Held<T> = Result<T, &'static str>;
 const PROCESS_OUTPUT: usize = 1024 * 1024;
@@ -324,7 +326,10 @@ fn verify_with_audit(
         ))?;
         let inputs = input(GitInputs::capture(&context, &census, &mut b))?;
         if let Some(collector) = recovery.as_deref_mut() {
-            collector.confirm_common(&inputs.common)?;
+            collector.confirm_common(
+                &inputs.common,
+                identity.common_git_dir.as_os_str().as_bytes(),
+            )?;
         }
         let proof = input(GitProof::observe(&context, &census, &inputs, &mut b))?;
         report.git_version = b.git_version.clone();
@@ -605,6 +610,7 @@ fn verify_with_audit(
                     last: Some((last_census, last_inputs)),
                 },
                 document_policy: policy_bytes,
+                config: current_config_manifest,
             });
         }
         input(b.check())

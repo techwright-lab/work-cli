@@ -597,30 +597,49 @@ impl RecoveryCensus {
     pub(super) fn object_format(&self) -> &'static str {
         format_name(self.local.format)
     }
-    pub(super) fn source_commitment(&self) -> [u8; 32] {
+    pub(super) fn source_witness(
+        &self,
+        checkout: &filesystem::Census,
+        inputs: &GitInputs,
+        config: Option<&filesystem::Manifest>,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         frame(&mut out, 0, b"work.recovery.source.v1");
-        frame(&mut out, 1, self.object_format().as_bytes());
+        frame(&mut out, 1, checkout.fingerprint().as_slice());
+        frame(&mut out, 2, &inputs.source_witness());
+        frame(&mut out, 3, &self.local.admin.source_witness());
         for (id, object) in &self.local.objects {
-            frame(&mut out, 2, id);
-            frame(&mut out, 3, object.kind.as_bytes());
-            frame(&mut out, 4, &object.size.to_be_bytes());
+            frame(&mut out, 4, id);
+            frame(&mut out, 5, object.kind.as_bytes());
+            frame(&mut out, 6, &object.size.to_be_bytes());
         }
         for (id, provenance) in &self.local.roots {
-            frame(&mut out, 5, id);
+            frame(&mut out, 7, id);
             frame(
                 &mut out,
-                6,
+                8,
                 &serde_json::to_vec(provenance).unwrap_or_default(),
             );
         }
         for id in &self.local.unclassified {
-            frame(&mut out, 7, id);
+            frame(&mut out, 9, id);
         }
         for id in &self.local.head_graph {
-            frame(&mut out, 8, id);
+            frame(&mut out, 10, id);
         }
-        let digest = Sha256::digest(out);
+        frame(&mut out, 11, &Sha256::digest(&self.local.native_digest));
+        if let Some(config) = config {
+            frame(&mut out, 12, &config.fingerprint());
+        }
+        out
+    }
+    pub(super) fn source_commitment(
+        &self,
+        checkout: &filesystem::Census,
+        inputs: &GitInputs,
+        config: Option<&filesystem::Manifest>,
+    ) -> [u8; 32] {
+        let digest = Sha256::digest(self.source_witness(checkout, inputs, config));
         let mut out = [0u8; 32];
         out.copy_from_slice(&digest);
         out
@@ -657,7 +676,10 @@ impl RecoveryCensus {
     pub(super) fn recheck(&self, b: &mut Budget) -> Held<()> {
         checked(self.local.admin.recheck(b))
     }
-    pub(super) fn recapture(context: &Context, b: &mut Budget) -> Held<Self> {
+    pub(super) fn recapture(
+        context: &Context,
+        b: &mut Budget,
+    ) -> Held<(Self, filesystem::Census, GitInputs)> {
         let identity = context
             .allocation
             .identity
@@ -669,11 +691,53 @@ impl RecoveryCensus {
             &mut filesystem::SystemBoundary,
         ))?;
         let inputs = checked(GitInputs::capture(context, &census, b))?;
-        Ok(Self {
-            local: Local::capture(context, &inputs, b)?,
-        })
+        Ok((
+            Self {
+                local: Local::capture(context, &inputs, b)?,
+            },
+            census,
+            inputs,
+        ))
     }
-    pub(super) fn expected_delta(&self, before: &Self, planned: &BTreeSet<Vec<u8>>) -> Held<()> {
+    pub(super) fn expected_delta(
+        &self,
+        before: &Self,
+        before_checkout: &filesystem::Census,
+        before_inputs: &GitInputs,
+        after_checkout: &filesystem::Census,
+        after_inputs: &GitInputs,
+        planned_new: &BTreeSet<Vec<u8>>,
+    ) -> Held<()> {
+        if after_checkout.fingerprint() != before_checkout.fingerprint() {
+            return Err("census_changed");
+        }
+        if after_inputs.private.source_witness() != before_inputs.private.source_witness()
+            || after_inputs.checkout.source_witness() != before_inputs.checkout.source_witness()
+            || after_inputs.boot != before_inputs.boot
+            || after_inputs.version != before_inputs.version
+            || after_inputs.endpoints.len() != before_inputs.endpoints.len()
+        {
+            return Err("census_changed");
+        }
+        for (after, original) in after_inputs
+            .endpoints
+            .iter()
+            .zip(before_inputs.endpoints.iter())
+        {
+            if after.fingerprint() != original.fingerprint() {
+                return Err("census_changed");
+            }
+        }
+        checked(
+            after_inputs
+                .common
+                .recovery_delta(&before_inputs.common, planned_new),
+        )?;
+        checked(
+            self.local
+                .admin
+                .recovery_delta(&before.local.admin, planned_new),
+        )?;
         if self.local.objects != before.local.objects
             || self.local.roots != before.local.roots
             || self.local.unclassified != before.local.unclassified
@@ -681,11 +745,7 @@ impl RecoveryCensus {
         {
             return Err("census_changed");
         }
-        checked(
-            self.local
-                .admin
-                .recovery_delta(&before.local.admin, planned),
-        )
+        Ok(())
     }
     pub(super) fn verify_named(&self, targets: &[(String, String)]) -> Held<()> {
         for (reference, oid) in targets {
@@ -699,9 +759,272 @@ impl RecoveryCensus {
         }
         Ok(())
     }
-    pub(super) fn closure_digest(&self) -> [u8; 32] {
-        self.source_commitment()
+    pub(super) fn verify_closure(&self, original: &Self, targets: &[(String, String)]) -> Held<()> {
+        self.verify_named(targets)?;
+        if self.local.objects != original.local.objects {
+            return Err("object_census_inconsistent");
+        }
+        for (id, object) in &original.local.objects {
+            let Some((_, oid)) = targets
+                .iter()
+                .find(|(_, oid)| oid.as_bytes() == id.as_slice())
+            else {
+                if !original.local.roots.contains_key(id) {
+                    continue;
+                }
+                return Err("incomplete_closure");
+            };
+            let Some(current) = self.local.objects.get(oid.as_bytes()) else {
+                return Err("missing_root_object");
+            };
+            if current.kind != object.kind || current.size != object.size {
+                return Err("object_type_unknown");
+            }
+        }
+        for id in original.local.roots.keys() {
+            if !targets
+                .iter()
+                .any(|(_, oid)| oid.as_bytes() == id.as_slice())
+            {
+                return Err("incomplete_closure");
+            }
+        }
+        Ok(())
     }
+    pub(super) fn closure_digest(
+        &self,
+        checkout: &filesystem::Census,
+        inputs: &GitInputs,
+        config: Option<&filesystem::Manifest>,
+    ) -> [u8; 32] {
+        self.source_commitment(checkout, inputs, config)
+    }
+    pub(super) fn planned_new(&self, plan: &BTreeSet<Vec<u8>>) -> BTreeSet<Vec<u8>> {
+        plan.iter()
+            .filter(|name| {
+                self.existing_target(std::str::from_utf8(name).unwrap_or(""))
+                    .is_none()
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn take_frames(bytes: &[u8]) -> Held<Vec<(u8, Vec<u8>)>> {
+    let mut at = 0;
+    let mut out = Vec::new();
+    while at < bytes.len() {
+        let tag = *bytes.get(at).ok_or("census_changed")?;
+        at += 1;
+        let raw = bytes
+            .get(at..at.saturating_add(8))
+            .ok_or("census_changed")?;
+        let len = u64::from_be_bytes(raw.try_into().map_err(|_| "census_changed")?);
+        at += 8;
+        let n = usize::try_from(len).map_err(|_| "census_changed")?;
+        let end = at.checked_add(n).ok_or("census_changed")?;
+        let value = bytes.get(at..end).ok_or("census_changed")?.to_vec();
+        at = end;
+        out.push((tag, value));
+    }
+    Ok(out)
+}
+
+struct WitnessPath {
+    identity: Vec<u8>,
+    directory: bool,
+    names: Vec<Vec<u8>>,
+    content: Option<Vec<u8>>,
+}
+
+fn parse_manifest_witness(
+    bytes: &[u8],
+) -> Held<(BTreeMap<Vec<u8>, WitnessPath>, BTreeSet<Vec<u8>>)> {
+    let frames = take_frames(bytes)?;
+    let mut paths = BTreeMap::new();
+    let mut absent = BTreeSet::new();
+    let mut current: Option<Vec<u8>> = None;
+    for (tag, value) in frames {
+        match tag {
+            0 if value == b"work.recovery.manifest.v1" => (),
+            1 => {
+                current = Some(value.clone());
+                paths.insert(
+                    value,
+                    WitnessPath {
+                        identity: Vec::new(),
+                        directory: false,
+                        names: Vec::new(),
+                        content: None,
+                    },
+                );
+            }
+            2 => {
+                let path = current.as_ref().ok_or("census_changed")?;
+                paths.get_mut(path).ok_or("census_changed")?.identity = value;
+            }
+            3 => {
+                let path = current.as_ref().ok_or("census_changed")?;
+                paths.get_mut(path).ok_or("census_changed")?.directory = value == [1];
+            }
+            4 => {
+                let path = current.as_ref().ok_or("census_changed")?;
+                paths
+                    .get_mut(path)
+                    .ok_or("census_changed")?
+                    .names
+                    .push(value);
+            }
+            5 => {
+                let path = current.as_ref().ok_or("census_changed")?;
+                paths.get_mut(path).ok_or("census_changed")?.content = Some(value);
+            }
+            6 => {
+                absent.insert(value);
+            }
+            _ => return Err("census_changed"),
+        }
+    }
+    Ok((paths, absent))
+}
+
+fn binding_blob(identity: &[u8]) -> Held<([u8; 24], [u8; 16])> {
+    if identity.len() != 88 {
+        return Err("census_changed");
+    }
+    let mut head = [0u8; 24];
+    head.copy_from_slice(&identity[..24]);
+    let mut ids = [0u8; 16];
+    ids.copy_from_slice(&identity[32..48]);
+    Ok((head, ids))
+}
+
+fn manifest_witness_delta(
+    before: &[u8],
+    after: &[u8],
+    planned_new: &BTreeSet<Vec<u8>>,
+) -> Held<()> {
+    let (before_paths, before_absent) = parse_manifest_witness(before)?;
+    let (after_paths, after_absent) = parse_manifest_witness(after)?;
+    let mut allowed_dirs = BTreeSet::new();
+    for path in planned_new {
+        let mut i = 0;
+        while let Some(rel) = path[i..].iter().position(|c| *c == b'/') {
+            i += rel;
+            allowed_dirs.insert(path[..i].to_vec());
+            i += 1;
+        }
+    }
+    for (path, was) in &before_paths {
+        let now = after_paths.get(path).ok_or("census_changed")?;
+        if was.directory {
+            if allowed_dirs.contains(path) {
+                if binding_blob(&was.identity)? != binding_blob(&now.identity)? || !now.directory {
+                    return Err("census_changed");
+                }
+            } else if was.identity != now.identity || was.names != now.names || !now.directory {
+                return Err("census_changed");
+            }
+        } else if was.identity != now.identity || was.content != now.content || now.directory {
+            return Err("census_changed");
+        }
+    }
+    for (path, now) in &after_paths {
+        if before_paths.contains_key(path) {
+            continue;
+        }
+        if now.directory {
+            if !allowed_dirs.contains(path) {
+                return Err("census_changed");
+            }
+        } else if !planned_new.contains(path) {
+            return Err("census_changed");
+        }
+    }
+    for path in &before_absent {
+        if planned_new.contains(path) {
+            continue;
+        }
+        if !after_absent.contains(path) {
+            return Err("census_changed");
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn planned_new_from_witness(
+    original: &[u8],
+    plan: &BTreeSet<Vec<u8>>,
+) -> BTreeSet<Vec<u8>> {
+    let mut present = BTreeSet::new();
+    let Ok(frames) = take_frames(original) else {
+        return plan.clone();
+    };
+    for (tag, value) in frames {
+        if tag == 3 {
+            if let Ok((paths, _)) = parse_manifest_witness(&value) {
+                present.extend(paths.into_keys());
+            }
+        }
+        if tag == 2 {
+            let Ok(inner) = take_frames(&value) else {
+                continue;
+            };
+            for (inner_tag, inner_value) in inner {
+                if inner_tag == 1 {
+                    if let Ok((paths, _)) = parse_manifest_witness(&inner_value) {
+                        present.extend(paths.into_keys());
+                    }
+                }
+            }
+        }
+    }
+    plan.difference(&present).cloned().collect()
+}
+
+pub(super) fn source_witness_delta(
+    original: &[u8],
+    current: &[u8],
+    planned_new: &BTreeSet<Vec<u8>>,
+) -> Held<()> {
+    let original = take_frames(original)?;
+    let current = take_frames(current)?;
+    if original.len() != current.len() {
+        return Err("census_changed");
+    }
+    for (before, after) in original.iter().zip(current.iter()) {
+        if before.0 != after.0 {
+            return Err("census_changed");
+        }
+        match before.0 {
+            0 => {
+                if before.1 != b"work.recovery.source.v1" || after.1 != before.1 {
+                    return Err("census_changed");
+                }
+            }
+            2 => {
+                let before_inputs = take_frames(&before.1)?;
+                let after_inputs = take_frames(&after.1)?;
+                if before_inputs.len() != after_inputs.len() {
+                    return Err("census_changed");
+                }
+                for (left, right) in before_inputs.iter().zip(after_inputs.iter()) {
+                    if left.0 != right.0 {
+                        return Err("census_changed");
+                    }
+                    if left.0 == 1 {
+                        manifest_witness_delta(&left.1, &right.1, planned_new)?;
+                    } else if left.1 != right.1 {
+                        return Err("census_changed");
+                    }
+                }
+            }
+            3 => manifest_witness_delta(&before.1, &after.1, planned_new)?,
+            _ if before.1 != after.1 => return Err("census_changed"),
+            _ => (),
+        }
+    }
+    Ok(())
 }
 
 enum RecoveryNs {

@@ -6,7 +6,7 @@ use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir, RenameFlags, Res
 use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     mem::MaybeUninit,
     os::unix::ffi::OsStrExt,
 };
@@ -469,6 +469,7 @@ pub(super) struct Reservation {
     file: File,
     pending: String,
     length: u64,
+    id: Uuid,
 }
 impl Reservation {
     fn check(&self, store: &Store, filled: bool) -> Result<()> {
@@ -577,6 +578,72 @@ pub(super) fn resync_published(store: &Store, id: Uuid) -> Result<()> {
     location.check(store)?;
     Ok(())
 }
+fn reject_volatile(file: &File) -> Result<()> {
+    let fs = fs::fstatfs(file).map_err(|_| ReceiptError::Io)?;
+    let magic = fs.f_type as u64;
+    if magic == 0x0102_1994 || magic == 0x8584_58f6 {
+        return Err(ReceiptError::UnsafeReceiptStore);
+    }
+    Ok(())
+}
+pub(super) fn recovery_storage_persistent(store: &Store) -> Result<()> {
+    let location = Location::open(store, false).or_else(|_| Location::open(store, true))?;
+    reject_volatile(&location.dir)?;
+    reject_volatile(&location.parent)?;
+    Ok(())
+}
+pub(super) fn resync_recovery_published(store: &Store, id: Uuid) -> Result<()> {
+    recovery_storage_persistent(store)?;
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    let location = Location::open(store, false)?;
+    reject_volatile(&location.dir)?;
+    reject_volatile(&location.parent)?;
+    let name = format!("{id}.receipt");
+    let file = open_relative(&location.dir, &name, OFlags::RDONLY)?;
+    let expected = stat(&file)?;
+    validate_file(&expected)?;
+    file.sync_all().map_err(|_| ReceiptError::Io)?;
+    location.dir.sync_all().map_err(|_| ReceiptError::Io)?;
+    location.parent.sync_all().map_err(|_| ReceiptError::Io)?;
+    check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
+    location.check(store)?;
+    Ok(())
+}
+pub(super) fn publish_recovery_reserved(
+    store: &mut Store,
+    id: Uuid,
+    length: u64,
+    context: &super::Context,
+    budget: &mut super::Budget,
+) -> Result<PersistedReceipt> {
+    recovery_storage_persistent(store)?;
+    let published = publish_reserved(store, id, length, context, budget)?;
+    let unknown = || ReceiptError::DurabilityUnknown {
+        id: published.id,
+        digest: published.digest,
+    };
+    let location = Location::open(store, false).map_err(|_| unknown())?;
+    location.parent.sync_all().map_err(|_| unknown())?;
+    location.check(store).map_err(|_| unknown())?;
+    Ok(published)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RecoveryResultBinding {
+    pub id: Uuid,
+    pub length: u64,
+    pub dev: u64,
+    pub ino: u64,
+}
+pub(super) fn reservation_binding(reservation: &Reservation) -> Result<RecoveryResultBinding> {
+    let held = stat(&reservation.file)?;
+    validate_file(&held)?;
+    Ok(RecoveryResultBinding {
+        id: reservation.id,
+        length: reservation.length,
+        dev: held.st_dev,
+        ino: held.st_ino,
+    })
+}
 
 pub(super) fn write_reserved(mut reservation: Reservation, bytes: &[u8]) -> Result<()> {
     if bytes.len() as u64 != reservation.length {
@@ -638,44 +705,56 @@ pub(super) fn publish_reserved(
     Ok(PersistedReceipt { id, digest })
 }
 
-pub(super) fn restart_or_write(store: &Store, id: Uuid, bytes: &[u8]) -> Result<()> {
-    let length = bytes.len() as u64;
-    if length == 0 || length > MAX_RECEIPT {
+pub(super) fn restart_recovery_result(
+    store: &Store,
+    bound: &RecoveryResultBinding,
+    bytes: &[u8],
+) -> Result<()> {
+    recovery_storage_persistent(store)?;
+    if bytes.len() as u64 != bound.length || bound.length == 0 || bound.length > MAX_RECEIPT {
         return Err(ReceiptError::EncodingLimit);
     }
-    uuid(id.to_string().as_bytes())?;
+    uuid(bound.id.to_string().as_bytes())?;
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     let location = Location::open(store, false)?;
-    let final_name = format!("{id}.receipt");
+    let final_name = format!("{}.receipt", bound.id);
     if open_relative(&location.dir, &final_name, OFlags::PATH).is_ok() {
         return Err(ReceiptError::Conflict);
     }
-    let pending = format!("pending-{id}-{length}");
-    let file = match open_relative(&location.dir, &pending, OFlags::RDWR) {
+    let pending = format!("pending-{}-{}", bound.id, bound.length);
+    let mut file = match open_relative(&location.dir, &pending, OFlags::RDWR) {
         Ok(file) => file,
         Err(ReceiptError::Missing) => return Err(ReceiptError::Missing),
         Err(error) => return Err(error),
     };
     let held = stat(&file)?;
     validate_file(&held)?;
-    if held.st_size != 0 && held.st_size as u64 != length {
+    if identity(&held) != (bound.dev, bound.ino) {
+        return Err(ReceiptError::Conflict);
+    }
+    check_named(&location.dir, &pending, &file, bound.length, false)?;
+    let size = held.st_size as u64;
+    if size > bound.length {
         return Err(ReceiptError::Corrupt);
     }
-    check_named(&location.dir, &pending, &file, length, false)?;
-    if held.st_size as u64 == length {
-        let mut existing = Vec::new();
-        (&file)
-            .take(MAX_RECEIPT + 1)
-            .read_to_end(&mut existing)
-            .map_err(|_| ReceiptError::Io)?;
-        if existing != bytes {
-            return Err(ReceiptError::Corrupt);
-        }
-        return Ok(());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ReceiptError::Io)?;
+    let mut existing = Vec::new();
+    (&file)
+        .take(MAX_RECEIPT + 1)
+        .read_to_end(&mut existing)
+        .map_err(|_| ReceiptError::Io)?;
+    if existing.len() as u64 != size || !bytes.starts_with(&existing) {
+        return Err(ReceiptError::Corrupt);
     }
-    let mut writer = file;
-    writer.write_all(bytes).map_err(|_| ReceiptError::Io)?;
-    writer.sync_all().map_err(|_| ReceiptError::Io)?;
+    if size < bound.length {
+        file.seek(SeekFrom::Start(size))
+            .map_err(|_| ReceiptError::Io)?;
+        file.write_all(&bytes[existing.len()..])
+            .map_err(|_| ReceiptError::Io)?;
+    }
+    file.sync_all().map_err(|_| ReceiptError::Io)?;
+    check_named(&location.dir, &pending, &file, bound.length, true)?;
     Ok(())
 }
 
@@ -756,6 +835,7 @@ pub(super) fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservatio
         file,
         pending,
         length,
+        id,
     };
     reservation.check(store, false)?;
     // Make the declared reservation visible durably before payload work. No

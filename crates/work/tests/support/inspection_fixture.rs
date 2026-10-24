@@ -29,6 +29,7 @@ impl ManagedFixture {
     pub fn recovery(format: &str, version: &str) -> Self {
         let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/recovery-fixtures");
         fs::create_dir_all(&base).unwrap();
+        let base = fs::canonicalize(&base).expect("owned recovery fixture base");
         let temp = tempfile::Builder::new()
             .prefix("work-recovery-")
             .tempdir_in(&base)

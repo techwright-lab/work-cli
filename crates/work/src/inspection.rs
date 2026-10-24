@@ -2094,6 +2094,18 @@ impl GitInputs {
         frame(&mut out, 4, &self.version);
         Sha256::digest(out).to_vec()
     }
+    pub(super) fn source_witness(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        frame(&mut out, 1, &self.common.source_witness());
+        frame(&mut out, 2, &self.private.source_witness());
+        frame(&mut out, 3, &self.checkout.source_witness());
+        for endpoint in &self.endpoints {
+            frame(&mut out, 4, &endpoint.fingerprint());
+        }
+        frame(&mut out, 5, &self.boot);
+        frame(&mut out, 6, &self.version);
+        out
+    }
     fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
         self.common.recheck(b)?;
         self.private.recheck(b)?;
@@ -2843,6 +2855,26 @@ mod filesystem {
                 frame(out, 1, &n.to_be_bytes());
             }
         }
+        fn witness_blob(&self) -> [u8; 88] {
+            let nums = [
+                self.device,
+                self.inode,
+                u64::from(self.mode),
+                self.links,
+                u64::from(self.uid),
+                u64::from(self.gid),
+                self.size as u64,
+                self.mtime as u64,
+                self.mtime_ns,
+                self.ctime as u64,
+                self.ctime_ns,
+            ];
+            let mut out = [0u8; 88];
+            for (i, n) in nums.iter().enumerate() {
+                out[i * 8..(i + 1) * 8].copy_from_slice(&n.to_be_bytes());
+            }
+            out
+        }
     }
     fn stat(fd: &OwnedFd, b: &mut Budget) -> Result<Identity, IncompleteReason> {
         b.check()?;
@@ -3558,8 +3590,41 @@ mod filesystem {
         pub(super) fn contains(&self, path: &[u8]) -> bool {
             self.paths.contains_key(path)
         }
-        pub(super) fn has_path(&self, path: &[u8]) -> Result<bool, IncompleteReason> {
-            Ok(self.paths.contains_key(path))
+        pub(super) fn source_witness(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            frame(&mut out, 0, b"work.recovery.manifest.v1");
+            for (path, i) in &self.paths {
+                let held = &self.held[*i];
+                frame(&mut out, 1, path);
+                frame(&mut out, 2, &held.identity.witness_blob());
+                frame(
+                    &mut out,
+                    3,
+                    &[u8::from(held.identity.kind() == FileType::Directory)],
+                );
+                if let Some(names) = &held.names {
+                    for name in names {
+                        frame(&mut out, 4, name);
+                    }
+                }
+                if let Some(data) = self.data.get(path) {
+                    frame(&mut out, 5, &Sha256::digest(data));
+                }
+            }
+            for path in self.absent.keys() {
+                frame(&mut out, 6, path);
+            }
+            out
+        }
+        pub(super) fn object_files(&self) -> Vec<Vec<u8>> {
+            let mut files = Vec::new();
+            for (path, i) in &self.paths {
+                let under = path.as_slice() == b"objects" || path.starts_with(b"objects/");
+                if under && self.held[*i].identity.kind() != FileType::Directory {
+                    files.push(path.clone());
+                }
+            }
+            files
         }
         pub(super) fn sync_path(
             &self,
@@ -3641,10 +3706,10 @@ mod filesystem {
         pub(super) fn recovery_delta(
             &self,
             before: &Self,
-            planned: &BTreeSet<Vec<u8>>,
+            planned_new: &BTreeSet<Vec<u8>>,
         ) -> Result<(), IncompleteReason> {
             let mut allowed_dirs = BTreeSet::new();
-            for path in planned {
+            for path in planned_new {
                 let mut i = 0;
                 while let Some(rel) = path[i..].iter().position(|c| *c == b'/') {
                     i += rel;
@@ -3659,9 +3724,21 @@ mod filesystem {
                 let was = &before.held[*i].identity;
                 let now = &self.held[after].identity;
                 if was.kind() == FileType::Directory {
-                    binding_equal(was, now)?;
+                    if allowed_dirs.contains(path) {
+                        binding_equal(was, now)?;
+                    } else {
+                        equal(was, now)?;
+                        if before.held[*i].names != self.held[after].names {
+                            return Err(IncompleteReason::Changed);
+                        }
+                    }
                 } else {
                     equal(was, now)?;
+                    match (before.data.get(path), self.data.get(path)) {
+                        (Some(a), Some(b)) if a == b => (),
+                        (None, None) => (),
+                        _ => return Err(IncompleteReason::Changed),
+                    }
                 }
             }
             for (path, i) in &self.paths {
@@ -3673,12 +3750,12 @@ mod filesystem {
                     if !allowed_dirs.contains(path) {
                         return Err(IncompleteReason::Changed);
                     }
-                } else if !planned.contains(path) {
+                } else if !planned_new.contains(path) {
                     return Err(IncompleteReason::Changed);
                 }
             }
-            for (path, _) in &before.absent {
-                if planned.contains(path) {
+            for path in before.absent.keys() {
+                if planned_new.contains(path) {
                     continue;
                 }
                 if !self.absent.contains_key(path) {

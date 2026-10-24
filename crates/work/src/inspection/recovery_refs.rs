@@ -2,11 +2,11 @@
 //! Tests were authored before this logic; no local RED/GREEN claim.
 use super::*;
 use crate::config::{Config, ConfigDocument};
-use rustix::fs::{self as rfs, OFlags};
+use rustix::fs::{self as rfs, Mode, OFlags, ResolveFlags};
 use serde::Serialize;
 use std::{
-    fs::{File, OpenOptions},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    fs::File,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::Path,
 };
 
@@ -88,23 +88,33 @@ pub fn prepare_recovery(checkout: Uuid, operation: Uuid) -> RecoveryReport {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Fault {
     None,
-    #[cfg(test)]
     IntentWrite,
-    #[cfg(test)]
     IntentSync,
-    #[cfg(test)]
     BeforeCas,
-    #[cfg(test)]
     AfterFirstCas,
-    #[cfg(test)]
     ObjectSync,
-    #[cfg(test)]
     RefSync,
-    #[cfg(test)]
     ResultWrite,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT_HIT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    static AFTER_CAS: std::cell::RefCell<Option<fn()>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn fault_hit(fault: Fault) {
+    FAULT_HIT.with(|hit| hit.set(fault));
+}
+
+#[cfg(test)]
+fn take_fault_hit() -> Fault {
+    FAULT_HIT.with(|hit| hit.replace(Fault::None))
 }
 
 struct CommonKey {
@@ -114,13 +124,41 @@ struct CommonKey {
 }
 
 struct OperationLock {
-    _file: File,
+    authority: File,
+    directory: File,
+    file: File,
+    authority_id: (u64, u64),
+    directory_id: (u64, u64),
+    file_id: (u64, u64),
+    name: String,
+}
+impl OperationLock {
+    fn revalidate(&self, store: &Store, key: &CommonKey, common_path: &[u8]) -> Held<()> {
+        let identity = store.authority_identity();
+        if key.path != common_path {
+            return Err("common_identity_changed");
+        }
+        let authority = open_lock_authority(store)?;
+        let named_dir = open_lock_child(&authority, LOCK_DIR, OFlags::RDONLY | OFlags::DIRECTORY)?;
+        let named_file = open_lock_child(&named_dir, &self.name, OFlags::RDONLY)?;
+        if lock_identity(&authority)? != self.authority_id
+            || lock_identity(&named_dir)? != self.directory_id
+            || lock_identity(&self.directory)? != self.directory_id
+            || lock_identity(&named_file)? != self.file_id
+            || lock_identity(&self.file)? != self.file_id
+            || identity.directory_id != self.authority_id
+        {
+            return Err("lock_unknown");
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct Retained {
     pub(super) context: Context,
     pub(super) physical: Physical,
     pub(super) document_policy: Vec<u8>,
+    pub(super) config: filesystem::Manifest,
 }
 
 pub(super) struct Collector {
@@ -194,12 +232,15 @@ impl Collector {
         self.key = Some(key);
         Ok(())
     }
-    pub(super) fn confirm_common(&self, common: &filesystem::Manifest) -> Held<()> {
+    pub(super) fn confirm_common(&self, common: &filesystem::Manifest, path: &[u8]) -> Held<()> {
         let key = self.key.as_ref().ok_or("identity_unknown")?;
+        let lock = self.lock.as_ref().ok_or("lock_unknown")?;
         let (dev, ino) = common.root_dev_ino();
-        if (dev, ino) != (key.dev, key.ino) {
+        if (dev, ino) != (key.dev, key.ino) || key.path != path {
             return Err("common_identity_changed");
         }
+        let store = self.store.as_ref().ok_or("authority_unknown")?;
+        lock.revalidate(store, key, path)?;
         sync::persistent_manifest(common)?;
         Ok(())
     }
@@ -227,7 +268,21 @@ impl Collector {
                 provenance: row.provenance,
             })
             .collect();
-        let source_commitment = census.source_commitment();
+        let lock = self.lock.take().ok_or("lock_unknown")?;
+        let key = self.key.take().ok_or("identity_unknown")?;
+        let source_witness = census.source_witness(
+            &retained.physical.first,
+            &retained.physical.before,
+            Some(&retained.config),
+        );
+        if source_witness.len() as u64 > 2 * 1024 * 1024 {
+            return Err("encoding_limit");
+        }
+        let source_commitment = census.source_commitment(
+            &retained.physical.first,
+            &retained.physical.before,
+            Some(&retained.config),
+        );
         self.plan = Some(FreshRecoveryPlan {
             checkout: self.checkout,
             operation: self.operation,
@@ -236,8 +291,11 @@ impl Collector {
             census,
             plan,
             source_commitment,
+            source_witness,
             budget,
             remote_cleanup: remote.cleanup() == "complete",
+            lock,
+            key,
         });
         Ok(())
     }
@@ -251,8 +309,11 @@ struct FreshRecoveryPlan {
     census: preservation::RecoveryCensus,
     plan: Vec<storage::PlanEntry>,
     source_commitment: [u8; 32],
+    source_witness: Vec<u8>,
     budget: Budget,
     remote_cleanup: bool,
+    lock: OperationLock,
+    key: CommonKey,
 }
 
 fn prepare_path(
@@ -380,34 +441,75 @@ fn resume_published(
         storage::Record::Intent(intent) => intent,
         storage::Record::Result(_) => return Err("result_without_intent"),
     };
+    let identity = plan
+        .retained
+        .context
+        .allocation
+        .identity
+        .as_ref()
+        .ok_or("identity_unknown")?;
+    plan.lock.revalidate(
+        store,
+        &plan.key,
+        identity.common_git_dir.as_os_str().as_bytes(),
+    )?;
+    let planned_names = sync::planned_names(&plan.plan);
+    let planned_new =
+        preservation::planned_new_from_witness(&intent.source_witness, &planned_names);
+    let current_witness = plan.census.source_witness(
+        &plan.retained.physical.first,
+        &plan.retained.physical.before,
+        Some(&plan.retained.config),
+    );
     if intent.operation != plan.operation
         || intent.checkout != plan.checkout
         || intent.authority != storage::authority_bytes(store)
         || intent.common_dev != plan.census.common_dev_ino().0
         || intent.common_ino != plan.census.common_dev_ino().1
+        || intent.common_path != plan.key.path
         || intent.context_digest != hash32(&Sha256::digest(&plan.retained.context.canonical))
         || intent.policy_digest != hash32(&Sha256::digest(&plan.retained.document_policy))
-        || intent.source_commitment != plan.source_commitment
         || intent.plan != plan.plan
     {
         return Err("intent_binding_changed");
     }
-    receipts::resync_published(store, plan.operation).map_err(receipt_reason)?;
+    preservation::source_witness_delta(&intent.source_witness, &current_witness, &planned_new)?;
+    receipts::resync_recovery_published(store, plan.operation).map_err(|error| {
+        if matches!(error, ReceiptError::UnsafeReceiptStore) {
+            "nonpersistent_filesystem"
+        } else {
+            receipt_reason(error)
+        }
+    })?;
     report.intent_id = Some(plan.operation);
     report.intent_checksum = Some(hex(&storage::intent_checksum(&bytes)?));
     report.result_id = Some(intent.result_id);
     plan.result_id = intent.result_id;
     match receipts::read_raw(store, intent.result_id) {
-        Ok(result_bytes) => historical_result(&result_bytes, &intent, report),
-        Err(ReceiptError::Missing) => execute_cas(
-            store,
-            &mut plan,
+        Ok(result_bytes) => historical_result(
+            &result_bytes,
+            &intent,
+            storage::intent_checksum(&bytes)?,
             report,
-            mutating_git,
-            Some(bytes),
-            #[cfg(test)]
-            fault,
         ),
+        Err(ReceiptError::Missing) => {
+            let bound = receipts::RecoveryResultBinding {
+                id: intent.result_id,
+                length: intent.result_length,
+                dev: intent.result_dev,
+                ino: intent.result_ino,
+            };
+            execute_cas(
+                store,
+                &mut plan,
+                report,
+                mutating_git,
+                Some(bytes),
+                Some(bound),
+                #[cfg(test)]
+                fault,
+            )
+        }
         Err(_) => Err("result_unknown"),
     }
 }
@@ -415,13 +517,24 @@ fn resume_published(
 fn historical_result(
     bytes: &[u8],
     intent: &storage::Intent,
+    intent_checksum: [u8; 32],
     report: &mut RecoveryReport,
 ) -> Held<()> {
     match storage::decode(bytes)? {
         storage::Record::Result(result) => {
+            let expected: Vec<_> = intent
+                .plan
+                .iter()
+                .map(|entry| (entry.reference.clone(), entry.oid.clone()))
+                .collect();
             if result.operation != intent.operation
                 || result.result_id != intent.result_id
+                || result.checkout != intent.checkout
+                || result.intent_checksum != intent_checksum
+                || result.target_count != intent.plan.len() as u64
+                || result.targets != expected
                 || result.retirement_authority
+                || !result.sync_ack
             {
                 return Err("result_binding_changed");
             }
@@ -443,30 +556,59 @@ fn execute_fresh(
     mutating_git: &mut u64,
     #[cfg(test)] fault: Fault,
 ) -> Held<()> {
-    let intent = current_intent(store, plan)?;
+    receipts::recovery_storage_persistent(store).map_err(|error| {
+        if matches!(error, ReceiptError::UnsafeReceiptStore) {
+            "nonpersistent_filesystem"
+        } else {
+            receipt_reason(error)
+        }
+    })?;
+    let identity = plan
+        .retained
+        .context
+        .allocation
+        .identity
+        .as_ref()
+        .ok_or("identity_unknown")?;
+    plan.lock.revalidate(
+        store,
+        &plan.key,
+        identity.common_git_dir.as_os_str().as_bytes(),
+    )?;
+    let result_len = storage::encode_result(&empty_result_stub(plan))?.len() as u64;
+    let result_res =
+        receipts::reserve(store, plan.result_id, result_len).map_err(receipt_reason)?;
+    let bound = receipts::reservation_binding(&result_res).map_err(receipt_reason)?;
+    drop(result_res);
+    let intent = current_intent(store, plan, &bound)?;
     let intent_bytes = storage::encode_intent(&intent)?;
-    let result_len = storage::encode_result(&empty_result(&intent, plan))?.len() as u64;
     let intent_res = receipts::reserve(store, plan.operation, intent_bytes.len() as u64)
         .map_err(receipt_reason)?;
-    let _result_res =
-        receipts::reserve(store, plan.result_id, result_len).map_err(receipt_reason)?;
     #[cfg(test)]
     if fault == Fault::IntentWrite {
+        fault_hit(Fault::IntentWrite);
         return Err("intent_io");
     }
     receipts::write_reserved(intent_res, &intent_bytes).map_err(receipt_reason)?;
     #[cfg(test)]
     if fault == Fault::IntentSync {
+        fault_hit(Fault::IntentSync);
         return Err("intent_io");
     }
-    let published = receipts::publish_reserved(
+    let published = receipts::publish_recovery_reserved(
         store,
         plan.operation,
         intent_bytes.len() as u64,
         &plan.retained.context,
         &mut plan.budget,
     )
-    .map_err(receipt_reason)?;
+    .map_err(|error| {
+        if matches!(error, ReceiptError::UnsafeReceiptStore) {
+            "nonpersistent_filesystem"
+        } else {
+            receipt_reason(error)
+        }
+    })?;
     report.intent_id = Some(published.id());
     report.intent_checksum = Some(hex(&storage::intent_checksum(&intent_bytes)?));
     report.result_id = Some(plan.result_id);
@@ -476,17 +618,18 @@ fn execute_fresh(
         report,
         mutating_git,
         Some(intent_bytes),
+        Some(bound),
         #[cfg(test)]
         fault,
     )
 }
 
-fn empty_result(intent: &storage::Intent, plan: &FreshRecoveryPlan) -> storage::ResultRecord {
+fn empty_result_stub(plan: &FreshRecoveryPlan) -> storage::ResultRecord {
     storage::ResultRecord {
-        operation: intent.operation,
+        operation: plan.operation,
         intent_checksum: [0; 32],
-        result_id: intent.result_id,
-        checkout: intent.checkout,
+        result_id: plan.result_id,
+        checkout: plan.checkout,
         target_count: plan.plan.len() as u64,
         targets: plan
             .plan
@@ -499,7 +642,11 @@ fn empty_result(intent: &storage::Intent, plan: &FreshRecoveryPlan) -> storage::
     }
 }
 
-fn current_intent(store: &Store, plan: &FreshRecoveryPlan) -> Held<storage::Intent> {
+fn current_intent(
+    store: &Store,
+    plan: &FreshRecoveryPlan,
+    bound: &receipts::RecoveryResultBinding,
+) -> Held<storage::Intent> {
     let identity = plan
         .retained
         .context
@@ -508,6 +655,9 @@ fn current_intent(store: &Store, plan: &FreshRecoveryPlan) -> Held<storage::Inte
         .as_ref()
         .ok_or("identity_unknown")?;
     let (dev, ino) = plan.census.common_dev_ino();
+    if bound.id != plan.result_id {
+        return Err("result_binding_changed");
+    }
     Ok(storage::Intent {
         operation: plan.operation,
         result_id: plan.result_id,
@@ -521,10 +671,30 @@ fn current_intent(store: &Store, plan: &FreshRecoveryPlan) -> Held<storage::Inte
         context_digest: hash32(&Sha256::digest(&plan.retained.context.canonical)),
         policy_digest: hash32(&Sha256::digest(&plan.retained.document_policy)),
         source_commitment: plan.source_commitment,
+        source_witness: plan.source_witness.clone(),
         object_format: plan.census.object_format().into(),
         plan: plan.plan.clone(),
         create_only: true,
+        result_length: bound.length,
+        result_dev: bound.dev,
+        result_ino: bound.ino,
     })
+}
+
+fn fail_after(
+    report: &mut RecoveryReport,
+    created: Vec<String>,
+    verified: Vec<String>,
+    launched: bool,
+    reason: &'static str,
+) -> Held<()> {
+    report.created_refs = created;
+    report.verified_refs = verified;
+    if launched {
+        report.outcome = "unknown";
+        report.durability = "unknown";
+    }
+    Err(reason)
 }
 
 fn execute_cas(
@@ -533,24 +703,32 @@ fn execute_cas(
     report: &mut RecoveryReport,
     mutating_git: &mut u64,
     intent_bytes: Option<Vec<u8>>,
+    bound: Option<receipts::RecoveryResultBinding>,
     #[cfg(test)] fault: Fault,
 ) -> Held<()> {
     #[cfg(test)]
     if fault == Fault::BeforeCas {
+        fault_hit(Fault::BeforeCas);
         return Err("cas_not_started");
     }
-    let git_path = plan
-        .retained
-        .context
-        .allocation
-        .identity
-        .as_ref()
-        .ok_or("identity_unknown")?
-        .path
-        .clone();
+    let (git_path, common_path) = {
+        let identity = plan
+            .retained
+            .context
+            .allocation
+            .identity
+            .as_ref()
+            .ok_or("identity_unknown")?;
+        (
+            identity.path.clone(),
+            identity.common_git_dir.as_os_str().as_bytes().to_vec(),
+        )
+    };
+    plan.lock.revalidate(store, &plan.key, &common_path)?;
     let format = plan.census.format();
     let mut created = Vec::new();
     let mut verified = Vec::new();
+    let mut launched = false;
     plan.retained
         .physical
         .recheck(&mut plan.budget)
@@ -558,65 +736,106 @@ fn execute_cas(
     plan.census.recheck(&mut plan.budget)?;
     #[cfg(test)]
     if fault == Fault::ObjectSync {
+        fault_hit(Fault::ObjectSync);
         return Err("object_sync_failed");
     }
-    sync::sync_objects(plan.census.common(), &mut plan.budget)?;
+    sync::sync_objects(&plan.retained.physical.before.common, &mut plan.budget)?;
     for entry in &plan.plan {
         sync::recovery_log_absent(plan.census.common_mut(), &entry.reference, &mut plan.budget)?;
         match plan.census.existing_target(&entry.reference) {
             Some(existing) if existing == entry.oid.as_bytes() => {
                 verified.push(entry.reference.clone());
+                report.verified_refs = verified.clone();
             }
             Some(_) => return Err("recovery_ref_conflict"),
             None => {
+                if !launched {
+                    launched = true;
+                    report.outcome = "unknown";
+                    report.durability = "unknown";
+                }
                 *mutating_git += 1;
                 match sync::create_missing(&git_path, entry, format, &mut plan.budget) {
-                    Ok(_) => created.push(entry.reference.clone()),
+                    Ok(_) => {
+                        created.push(entry.reference.clone());
+                        report.created_refs = created.clone();
+                    }
                     Err(reason) => {
-                        report.outcome = "unknown";
-                        report.created_refs = created;
-                        report.verified_refs = verified;
-                        report.durability = "unknown";
-                        return Err(reason);
+                        return fail_after(report, created, verified, true, reason);
                     }
                 }
                 #[cfg(test)]
                 if fault == Fault::AfterFirstCas {
-                    report.outcome = "unknown";
-                    report.created_refs = created;
-                    report.verified_refs = verified;
-                    report.durability = "unknown";
-                    return Err("cas_partial");
+                    fault_hit(Fault::AfterFirstCas);
+                    return fail_after(report, created, verified, true, "cas_partial");
                 }
             }
         }
     }
+    let fail = |report: &mut RecoveryReport, reason: &'static str| {
+        fail_after(report, created.clone(), verified.clone(), launched, reason)
+    };
     #[cfg(test)]
     if fault == Fault::RefSync {
-        report.outcome = "unknown";
-        report.created_refs = created.clone();
-        report.verified_refs = verified.clone();
-        report.durability = "unknown";
-        return Err("ref_sync_failed");
+        fault_hit(Fault::RefSync);
+        return fail(report, "ref_sync_failed");
     }
-    let mut later =
-        preservation::RecoveryCensus::recapture(&plan.retained.context, &mut plan.budget)?;
+    #[cfg(test)]
+    AFTER_CAS.with(|hook| {
+        if let Some(call) = hook.borrow_mut().take() {
+            call();
+        }
+    });
+    let (mut later, after_checkout, after_inputs) =
+        match preservation::RecoveryCensus::recapture(&plan.retained.context, &mut plan.budget) {
+            Ok(value) => value,
+            Err(reason) => return fail(report, reason),
+        };
     let packed = later.packed_recovery();
-    sync::sync_refs(later.common(), &created, packed, &mut plan.budget)?;
-    for entry in &plan.plan {
-        sync::recovery_log_absent(later.common_mut(), &entry.reference, &mut plan.budget)?;
+    let mut targets = created.clone();
+    targets.extend(verified.iter().cloned());
+    if let Err(reason) = sync::sync_refs(later.common(), &targets, packed, &mut plan.budget) {
+        return fail(report, reason);
     }
-    later.expected_delta(&plan.census, &sync::planned_names(&plan.plan))?;
+    for entry in &plan.plan {
+        if let Err(reason) =
+            sync::recovery_log_absent(later.common_mut(), &entry.reference, &mut plan.budget)
+        {
+            return fail(report, reason);
+        }
+    }
+    let planned_names = sync::planned_names(&plan.plan);
+    let planned_new = plan.census.planned_new(&planned_names);
+    if let Err(reason) = later.expected_delta(
+        &plan.census,
+        &plan.retained.physical.first,
+        &plan.retained.physical.before,
+        &after_checkout,
+        &after_inputs,
+        &planned_new,
+    ) {
+        return fail(report, reason);
+    }
     let named: Vec<_> = plan
         .plan
         .iter()
         .map(|e| (e.reference.clone(), e.oid.clone()))
         .collect();
-    later.verify_named(&named)?;
-    short_context_matches(store, &plan.retained.context, &mut plan.budget)?;
+    if let Err(reason) = later.verify_closure(&plan.census, &named) {
+        return fail(report, reason);
+    }
+    if let Err(reason) = plan.lock.revalidate(store, &plan.key, &common_path) {
+        return fail(report, reason);
+    }
+    if let Err(reason) = short_context_matches(store, &plan.retained.context, &mut plan.budget) {
+        return fail(report, reason);
+    }
     let intent_checksum = match &intent_bytes {
-        Some(bytes) => storage::intent_checksum(bytes)?,
-        None => return Err("intent_missing"),
+        Some(bytes) => match storage::intent_checksum(bytes) {
+            Ok(value) => value,
+            Err(reason) => return fail(report, reason),
+        },
+        None => return fail(report, "intent_missing"),
     };
     let result = storage::ResultRecord {
         operation: plan.operation,
@@ -624,46 +843,54 @@ fn execute_cas(
         result_id: plan.result_id,
         checkout: plan.checkout,
         target_count: plan.plan.len() as u64,
-        targets: plan
-            .plan
-            .iter()
-            .map(|e| (e.reference.clone(), e.oid.clone()))
-            .collect(),
-        closure_digest: later.closure_digest(),
+        targets: named,
+        closure_digest: later.closure_digest(
+            &after_checkout,
+            &after_inputs,
+            Some(&plan.retained.config),
+        ),
         sync_ack: true,
         retirement_authority: false,
     };
-    let result_bytes = storage::encode_result(&result)?;
+    let result_bytes = match storage::encode_result(&result) {
+        Ok(bytes) => bytes,
+        Err(reason) => return fail(report, reason),
+    };
     #[cfg(test)]
     if fault == Fault::ResultWrite {
-        report.outcome = "unknown";
-        report.created_refs = created;
-        report.verified_refs = verified;
-        report.durability = "unknown";
-        return Err("result_io");
+        fault_hit(Fault::ResultWrite);
+        return fail(report, "result_io");
     }
-    match receipts::restart_or_write(store, plan.result_id, &result_bytes) {
+    let bound = match bound {
+        Some(value) => value,
+        None => return fail(report, "result_binding_changed"),
+    };
+    match receipts::restart_recovery_result(store, &bound, &result_bytes) {
         Ok(()) => (),
         Err(error) => {
-            report.outcome = "unknown";
-            report.created_refs = created;
-            report.verified_refs = verified;
-            report.durability = "unknown";
-            return Err(receipt_reason(error));
+            let reason = if matches!(error, ReceiptError::UnsafeReceiptStore) {
+                "nonpersistent_filesystem"
+            } else {
+                receipt_reason(error)
+            };
+            return fail(report, reason);
         }
     }
-    receipts::publish_reserved(
+    if let Err(error) = receipts::publish_recovery_reserved(
         store,
         plan.result_id,
         result_bytes.len() as u64,
         &plan.retained.context,
         &mut plan.budget,
-    )
-    .map_err(|error| {
-        report.outcome = "unknown";
-        report.durability = "unknown";
-        receipt_reason(error)
-    })?;
+    ) {
+        let reason = if matches!(error, ReceiptError::UnsafeReceiptStore) {
+            "nonpersistent_filesystem"
+        } else {
+            receipt_reason(error)
+        };
+        return fail(report, reason);
+    }
+    drop(fail);
     report.outcome = "prepared";
     report.reason = "local_protection";
     report.durability = "acknowledged";
@@ -716,33 +943,86 @@ fn hash32(digest: &sha2::digest::Output<Sha256>) -> [u8; 32] {
     out
 }
 
-fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
-    let authority = store.authority_identity();
-    let directory = &authority.directory;
-    let locks = directory.join("recovery-preparation-locks-v1");
-    match std::fs::create_dir(&locks) {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-        Err(_) => return Err("lock_unknown"),
-    }
-    let metadata = std::fs::symlink_metadata(&locks).map_err(|_| "lock_unknown")?;
-    if !metadata.is_dir()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o777 != 0o700
+const LOCK_DIR: &str = "recovery-preparation-locks-v1";
+const LOCK_RESOLVE: ResolveFlags = ResolveFlags::BENEATH
+    .union(ResolveFlags::NO_SYMLINKS)
+    .union(ResolveFlags::NO_MAGICLINKS)
+    .union(ResolveFlags::NO_XDEV);
+
+fn lock_identity(file: &File) -> Held<(u64, u64)> {
+    let meta = file.metadata().map_err(|_| "lock_unknown")?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+fn open_lock_authority(store: &Store) -> Held<File> {
+    let identity = store.authority_identity();
+    let directory = rfs::openat2(
+        rfs::CWD,
+        identity.directory.as_path(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .map(File::from)
+    .map_err(|_| "lock_unknown")?;
+    let meta = directory.metadata().map_err(|_| "lock_unknown")?;
+    if !meta.is_dir()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o777 != 0o700
+        || (meta.dev(), meta.ino()) != identity.directory_id
     {
         return Err("lock_unknown");
     }
+    Ok(directory)
+}
+
+fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
+    let additional = if flags.contains(OFlags::PATH) {
+        OFlags::empty()
+    } else {
+        OFlags::NONBLOCK
+    };
+    rfs::openat2(
+        parent,
+        name,
+        flags | OFlags::CLOEXEC | OFlags::NOFOLLOW | additional,
+        Mode::empty(),
+        LOCK_RESOLVE,
+    )
+    .map(File::from)
+    .map_err(|_| "lock_unknown")
+}
+
+fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    let authority = open_lock_authority(store)?;
+    let authority_id = lock_identity(&authority)?;
+    match rfs::mkdirat(&authority, LOCK_DIR, Mode::from_raw_mode(0o700)) {
+        Ok(()) => (),
+        Err(error) if error == rustix::io::Errno::EXIST => (),
+        Err(_) => return Err("lock_unknown"),
+    }
+    let directory = open_lock_child(&authority, LOCK_DIR, OFlags::RDONLY | OFlags::DIRECTORY)?;
+    let dir_meta = directory.metadata().map_err(|_| "lock_unknown")?;
+    if !dir_meta.is_dir()
+        || dir_meta.uid() != rustix::process::geteuid().as_raw()
+        || dir_meta.mode() & 0o777 != 0o700
+    {
+        return Err("lock_unknown");
+    }
+    let named_dir = open_lock_child(&authority, LOCK_DIR, OFlags::PATH | OFlags::DIRECTORY)?;
+    if lock_identity(&named_dir)? != lock_identity(&directory)? {
+        return Err("lock_unknown");
+    }
     let name = format!("{:016x}-{:016x}.lock", key.dev, key.ino);
-    let path = locks.join(name);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags((OFlags::NOFOLLOW | OFlags::NONBLOCK).bits() as i32)
-        .open(&path)
-        .map_err(|_| "lock_unknown")?;
+    let file = rfs::openat2(
+        &directory,
+        name.as_str(),
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::from_raw_mode(0o600),
+        LOCK_RESOLVE,
+    )
+    .map(File::from)
+    .map_err(|_| "lock_unknown")?;
     let meta = file.metadata().map_err(|_| "lock_unknown")?;
     if !meta.is_file()
         || meta.nlink() != 1
@@ -751,8 +1031,20 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     {
         return Err("lock_unknown");
     }
+    let named_file = open_lock_child(&directory, &name, OFlags::PATH)?;
+    if lock_identity(&named_file)? != lock_identity(&file)? {
+        return Err("lock_unknown");
+    }
     match rfs::flock(&file, rfs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(OperationLock { _file: file }),
+        Ok(()) => Ok(OperationLock {
+            authority,
+            directory,
+            file,
+            authority_id,
+            directory_id: lock_identity(&named_dir)?,
+            file_id: lock_identity(&named_file)?,
+            name,
+        }),
         Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err("preparation_busy"),
         Err(_) => Err("lock_unknown"),
     }
@@ -767,7 +1059,7 @@ mod fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::{fs, os::unix::fs::MetadataExt};
 
     fn setup(format: &str) -> (fixture::ManagedFixture, std::path::PathBuf) {
         let f = fixture::ManagedFixture::recovery(format, "2");
@@ -806,7 +1098,10 @@ mod tests {
             let (f, config) = setup("sha1");
             let before = f.common().join("refs/work-recovery").exists();
             let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), fault);
+            assert_eq!(take_fault_hit(), fault, "{report:?}");
+            assert_eq!(report.reason, "intent_io", "{report:?}");
             assert_ne!(report.outcome, "prepared", "{report:?}");
+            assert_eq!(report.durability, "not_attempted");
             assert_eq!(f.common().join("refs/work-recovery").exists(), before);
             assert_eq!(report.created_refs.len(), 0);
         }
@@ -814,15 +1109,24 @@ mod tests {
 
     #[test]
     fn bounded_faults_never_report_prepared() {
-        for fault in [
-            Fault::AfterFirstCas,
-            Fault::ObjectSync,
-            Fault::RefSync,
-            Fault::ResultWrite,
+        for (fault, reason, launched) in [
+            (Fault::AfterFirstCas, "cas_partial", true),
+            (Fault::ObjectSync, "object_sync_failed", false),
+            (Fault::RefSync, "ref_sync_failed", true),
+            (Fault::ResultWrite, "result_io", true),
         ] {
             let (f, config) = setup("sha1");
             let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), fault);
+            assert_eq!(take_fault_hit(), fault, "{fault:?} {report:?}");
+            assert_eq!(report.reason, reason, "{fault:?} {report:?}");
             assert_ne!(report.outcome, "prepared", "{fault:?} {report:?}");
+            if launched {
+                assert_eq!(report.durability, "unknown", "{fault:?} {report:?}");
+                assert_eq!(report.outcome, "unknown", "{fault:?} {report:?}");
+            } else {
+                assert_eq!(report.durability, "not_attempted", "{fault:?} {report:?}");
+                assert!(report.created_refs.is_empty(), "{fault:?} {report:?}");
+            }
         }
     }
     #[test]
@@ -834,6 +1138,9 @@ mod tests {
             Uuid::now_v7(),
             Fault::BeforeCas,
         );
+        assert_eq!(take_fault_hit(), Fault::BeforeCas, "{report:?}");
+        assert_eq!(report.reason, "cas_not_started");
+        assert_eq!(report.durability, "not_attempted");
         assert_ne!(report.outcome, "prepared");
         assert!(!f.common().join("refs/work-recovery").exists() || report.created_refs.is_empty());
     }
@@ -847,8 +1154,23 @@ mod tests {
         let pending = dir.join(format!("pending-{id}-32"));
         fs::write(&pending, b"partial-not-matching-bytes").unwrap();
         let before = fs::read(&pending).unwrap();
-        assert!(receipts::restart_or_write(&f.store, id, &[0u8; 32]).is_err());
+        let meta = fs::metadata(&pending).unwrap();
+        let bound = receipts::RecoveryResultBinding {
+            id,
+            length: 32,
+            dev: meta.dev(),
+            ino: meta.ino(),
+        };
+        assert!(receipts::restart_recovery_result(&f.store, &bound, &[0u8; 32]).is_err());
         assert_eq!(fs::read(&pending).unwrap(), before);
+        let replaced = dir.join(format!("pending-{id}-32"));
+        fs::remove_file(&replaced).unwrap();
+        fs::write(&replaced, b"").unwrap();
+        let other = fs::read(&replaced).unwrap();
+        let replaced_meta = fs::metadata(&replaced).unwrap();
+        assert!(replaced_meta.ino() != bound.ino || other != before);
+        assert!(receipts::restart_recovery_result(&f.store, &bound, &[0u8; 32]).is_err());
+        assert_eq!(fs::read(&replaced).unwrap(), other);
     }
 
     #[test]
@@ -866,9 +1188,13 @@ mod tests {
             context_digest: [0; 32],
             policy_digest: [0; 32],
             source_commitment: [0; 32],
+            source_witness: vec![],
             object_format: "sha1".into(),
             plan: vec![],
             create_only: true,
+            result_length: 32,
+            result_dev: 1,
+            result_ino: 1,
         };
         intent.authority = vec![0; 3 * 1024 * 1024];
         assert!(storage::encode_intent(&intent).is_err());
@@ -880,5 +1206,22 @@ mod tests {
         assert_eq!(report.outcome, "held");
         assert_eq!(report.retirement_authority, false);
         assert!(report.limitation.contains("audit-preservation"));
+    }
+
+    #[test]
+    fn resume_holds_ordinary_reflog_and_payload_mutations() {
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(&config, f.allocation.checkout, operation, Fault::BeforeCas);
+        assert_eq!(take_fault_hit(), Fault::BeforeCas, "{first:?}");
+        assert_eq!(first.reason, "cas_not_started");
+        assert_eq!(first.durability, "not_attempted");
+        let log = f.private().join("logs/HEAD");
+        let mut bytes = fs::read(&log).unwrap();
+        bytes.extend(b"message-only change\n");
+        fs::write(&log, bytes).unwrap();
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_ne!(resume.outcome, "prepared", "{resume:?}");
+        assert_ne!(resume.durability, "acknowledged");
     }
 }

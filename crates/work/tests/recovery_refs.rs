@@ -5,10 +5,9 @@ mod fixture;
 use std::{
     fs,
     io::Write,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::Arc,
-    thread,
 };
 use uuid::Uuid;
 use work_cli as work_cli_api;
@@ -21,14 +20,16 @@ fn command(config: &Path, args: &[&str]) -> Output {
         .output()
         .unwrap()
 }
-fn configured(f: &fixture::ManagedFixture) -> PathBuf {
+fn configured(f: &fixture::ManagedFixture, format: &str) -> PathBuf {
     let remote = f.temp.path().join("backup.git");
+    let object_format = format!("--object-format={format}");
     fixture::git(
         f.temp.path(),
         &[
             "init".as_ref(),
             "--bare".as_ref(),
             "--template=".as_ref(),
+            object_format.as_ref(),
             remote.as_os_str(),
         ],
     );
@@ -130,7 +131,7 @@ fn assert_truth(report: &serde_json::Value) {
 #[test]
 fn missing_create_flag_does_not_mutate_and_directs_audit() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let before = original(f.common());
     let authority = sql_bytes(&f);
     let checkout = f.allocation.checkout.to_string();
@@ -162,7 +163,7 @@ fn missing_create_flag_does_not_mutate_and_directs_audit() {
 #[test]
 fn sha1_create_protects_exact_oids_and_preserves_ordinary_git() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let head = object_git(&f, &["rev-parse", "HEAD"], b"");
     let branch = fs::read(f.common().join("HEAD")).unwrap();
     let index = fs::read(f.private().join("index")).unwrap();
@@ -193,7 +194,7 @@ fn sha1_create_protects_exact_oids_and_preserves_ordinary_git() {
 #[test]
 fn sha256_create_uses_exact_format_in_generated_names() {
     let f = fixture::ManagedFixture::recovery("sha256", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha256");
     let head = object_git(&f, &["rev-parse", "HEAD"], b"");
     let operation = Uuid::now_v7();
     let (out, report) = prepare(&config, f.allocation.checkout, operation);
@@ -213,7 +214,7 @@ fn sha256_create_uses_exact_format_in_generated_names() {
 #[test]
 fn exact_retry_is_historical_and_does_not_rewrite() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let operation = Uuid::now_v7();
     let (first_out, first) = prepare(&config, f.allocation.checkout, operation);
     assert!(first_out.status.success(), "{first}");
@@ -235,7 +236,7 @@ fn exact_retry_is_historical_and_does_not_rewrite() {
 #[test]
 fn packed_and_loose_unreachable_and_standalone_objects_are_protected() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let tree = object_git(&f, &["rev-parse", "HEAD^{tree}"], b"");
     let packed = object_git(&f, &["commit-tree", &tree, "-m", "packed unreachable"], b"");
     let prefix = f.common().join("objects/pack/pack");
@@ -292,7 +293,7 @@ fn packed_and_loose_unreachable_and_standalone_objects_are_protected() {
 #[test]
 fn reflog_only_work_is_protected_while_remote_and_additional_holds_remain() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let head = object_git(&f, &["rev-parse", "HEAD"], b"");
     let tree = object_git(&f, &["rev-parse", "HEAD^{tree}"], b"");
     let old = object_git(&f, &["commit-tree", &tree, "-m", "deleted work"], b"");
@@ -334,7 +335,7 @@ fn reflog_only_work_is_protected_while_remote_and_additional_holds_remain() {
 #[test]
 fn ordinary_branch_index_payload_and_logs_are_invariant() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let before_common = original(f.common());
     let before_private_logs = original(&f.private().join("logs"));
     let tracked = fs::read(f.path(b"tracked")).unwrap();
@@ -362,7 +363,7 @@ fn ordinary_branch_index_payload_and_logs_are_invariant() {
 #[test]
 fn conflicts_symrefs_and_stale_locks_hold_without_overwrite() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     let head = object_git(&f, &["rev-parse", "HEAD"], b"");
     let name = recovery_ref(f.allocation.checkout, "sha1", &head);
     fs::create_dir_all(loose_ref(&f, &name).parent().unwrap()).unwrap();
@@ -372,12 +373,20 @@ fn conflicts_symrefs_and_stale_locks_hold_without_overwrite() {
     assert_eq!(out.status.code(), Some(1), "{report}");
     assert_ne!(report["outcome"], "prepared");
     assert_eq!(fs::read(loose_ref(&f, &name)).unwrap(), before);
+    fs::remove_file(loose_ref(&f, &name)).unwrap();
+    let stale = PathBuf::from(format!("{}.lock", loose_ref(&f, &name).display()));
+    fs::write(&stale, b"stale").unwrap();
+    let (out, report) = prepare(&config, f.allocation.checkout, Uuid::now_v7());
+    assert_eq!(out.status.code(), Some(1), "{report}");
+    assert_ne!(report["outcome"], "prepared");
+    assert_eq!(fs::read(&stale).unwrap(), b"stale");
+    assert!(!loose_ref(&f, &name).exists());
 }
 
 #[test]
 fn missing_and_corrupt_inputs_hold_without_git_mutation() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
+    let config = configured(&f, "sha1");
     fs::write(f.private().join("logs/HEAD"), b"DO_NOT_ECHO\n").unwrap();
     let before = original(f.common());
     let (out, report) = prepare(&config, f.allocation.checkout, Uuid::now_v7());
@@ -388,33 +397,33 @@ fn missing_and_corrupt_inputs_hold_without_git_mutation() {
 }
 
 #[test]
-fn concurrent_preparers_serialize_on_the_same_store() {
+fn operation_lock_excludes_while_held() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
-    let config = configured(&f);
-    let checkout = f.allocation.checkout;
-    let a = Uuid::now_v7();
-    let b = Uuid::now_v7();
-    let config = Arc::new(config);
-    let left = {
-        let config = Arc::clone(&config);
-        thread::spawn(move || prepare(&config, checkout, a))
-    };
-    let right = {
-        let config = Arc::clone(&config);
-        thread::spawn(move || prepare(&config, checkout, b))
-    };
-    let (_, first) = left.join().unwrap();
-    let (_, second) = right.join().unwrap();
-    let prepared = [&first, &second]
-        .iter()
-        .filter(|r| r["outcome"] == "prepared")
-        .count();
-    let held = [&first, &second]
-        .iter()
-        .filter(|r| r["outcome"] != "prepared" && r["outcome"] != "historical")
-        .count();
-    assert_eq!(prepared + held, 2, "{first} {second}");
-    assert!(prepared >= 1, "{first} {second}");
+    let config = configured(&f, "sha1");
+    let common = fs::metadata(f.common()).unwrap();
+    let locks = f
+        .temp
+        .path()
+        .join("authority/recovery-preparation-locks-v1");
+    fs::create_dir_all(&locks).unwrap();
+    fs::set_permissions(&locks, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock_path = locks.join(format!("{:016x}-{:016x}.lock", common.dev(), common.ino()));
+    fs::write(&lock_path, b"").unwrap();
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut holder = Command::new("flock")
+        .arg("-x")
+        .arg(&lock_path)
+        .arg("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let (out, report) = prepare(&config, f.allocation.checkout, Uuid::now_v7());
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert_eq!(out.status.code(), Some(1), "{report}");
+    assert_eq!(report["reason"], "preparation_busy", "{report}");
+    assert_ne!(report["outcome"], "prepared");
+    assert_eq!(report["durability"], "not_attempted");
 }
 
 #[test]

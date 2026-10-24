@@ -2,7 +2,7 @@
 //! never become a fresh plan. Tests authored with the protocol cases.
 #[cfg(test)]
 use super::super::hex;
-use super::super::{frame, Store};
+use super::super::{frame, valid_ref, Store};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -32,9 +32,13 @@ pub(super) struct Intent {
     pub context_digest: [u8; 32],
     pub policy_digest: [u8; 32],
     pub source_commitment: [u8; 32],
+    pub source_witness: Vec<u8>,
     pub object_format: String,
     pub plan: Vec<PlanEntry>,
     pub create_only: bool,
+    pub result_length: u64,
+    pub result_dev: u64,
+    pub result_ino: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,9 +60,47 @@ pub(super) enum Record {
     Result(ResultRecord),
 }
 
+pub(super) fn valid_plan_entry(
+    checkout: Uuid,
+    format: &str,
+    entry: &PlanEntry,
+) -> Result<(), &'static str> {
+    if entry.provenance.len() > 65_536 {
+        return Err("record_corrupt");
+    }
+    if !matches!(
+        entry.object_type.as_str(),
+        "commit" | "tree" | "blob" | "tag"
+    ) {
+        return Err("record_corrupt");
+    }
+    let width = match format {
+        "sha1" => 40,
+        "sha256" => 64,
+        _ => return Err("record_corrupt"),
+    };
+    if entry.oid.len() != width
+        || !entry
+            .oid
+            .bytes()
+            .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+        || entry.oid.bytes().all(|c| c == b'0')
+    {
+        return Err("record_corrupt");
+    }
+    let expected = format!("refs/work-recovery/{checkout}/{format}/{}", entry.oid);
+    if entry.reference != expected || !valid_ref(entry.reference.as_bytes()) {
+        return Err("record_corrupt");
+    }
+    Ok(())
+}
+
 pub(super) fn encode_intent(intent: &Intent) -> Result<Vec<u8>, &'static str> {
     if !intent.create_only {
         return Err("create_only_required");
+    }
+    if intent.operation == intent.result_id {
+        return Err("record_corrupt");
     }
     let mut bytes = Vec::new();
     frame(&mut bytes, 0, MAGIC);
@@ -83,6 +125,7 @@ pub(super) fn encode_intent(intent: &Intent) -> Result<Vec<u8>, &'static str> {
         if previous.as_ref().is_some_and(|p| p >= &entry.reference) {
             return Err("plan_order");
         }
+        valid_plan_entry(intent.checkout, &intent.object_format, entry)?;
         previous = Some(entry.reference.clone());
         frame(&mut bytes, 17, entry.reference.as_bytes());
         frame(&mut bytes, 18, entry.oid.as_bytes());
@@ -90,8 +133,12 @@ pub(super) fn encode_intent(intent: &Intent) -> Result<Vec<u8>, &'static str> {
         frame(&mut bytes, 20, &entry.provenance);
     }
     frame(&mut bytes, 21, &[1]);
+    frame(&mut bytes, 22, &intent.source_witness);
+    frame(&mut bytes, 23, &intent.result_length.to_be_bytes());
+    frame(&mut bytes, 24, &intent.result_dev.to_be_bytes());
+    frame(&mut bytes, 25, &intent.result_ino.to_be_bytes());
     let checksum = Sha256::digest(&bytes);
-    frame(&mut bytes, 22, &checksum);
+    frame(&mut bytes, 26, &checksum);
     if bytes.len() as u64 > 2 * 1024 * 1024 {
         return Err("encoding_limit");
     }
@@ -138,7 +185,7 @@ pub(super) fn intent_checksum(bytes: &[u8]) -> Result<[u8; 32], &'static str> {
     match decode(bytes)? {
         Record::Intent(_) => {
             let mut c = Cursor::new(bytes);
-            while c.peek() != Some(22) {
+            while c.peek() != Some(26) {
                 c.any().map_err(|_| "record_corrupt")?;
             }
             Ok(Sha256::digest(&bytes[..c.at]).into())
@@ -277,24 +324,31 @@ fn decode_intent<'a>(bytes: &'a [u8], mut c: Cursor<'a>) -> Result<Record, &'sta
             .map_err(|_| "record_corrupt")?
             .to_owned();
         let provenance = c.field(20)?.to_vec();
-        if previous.as_ref().is_some_and(|p| p >= &reference)
-            || !matches!(object_type.as_str(), "commit" | "tree" | "blob" | "tag")
-        {
+        if previous.as_ref().is_some_and(|p| p >= &reference) {
             return Err("record_corrupt");
         }
         previous = Some(reference.clone());
-        plan.push(PlanEntry {
+        let entry = PlanEntry {
             reference,
             oid,
             object_type,
             provenance,
-        });
+        };
+        valid_plan_entry(checkout, &object_format, &entry)?;
+        plan.push(entry);
     }
     if c.field(21)? != [1] {
         return Err("record_corrupt");
     }
+    let source_witness = c.field(22)?.to_vec();
+    let result_length = c.u64(23)?;
+    let result_dev = c.u64(24)?;
+    let result_ino = c.u64(25)?;
+    if result_length == 0 || result_length > 2 * 1024 * 1024 {
+        return Err("record_corrupt");
+    }
     let checksum_at = c.at;
-    if c.hash(22)? != hash32(&Sha256::digest(&bytes[..checksum_at])) {
+    if c.hash(26)? != hash32(&Sha256::digest(&bytes[..checksum_at])) {
         return Err("record_corrupt");
     }
     c.end()?;
@@ -311,9 +365,13 @@ fn decode_intent<'a>(bytes: &'a [u8], mut c: Cursor<'a>) -> Result<Record, &'sta
         context_digest,
         policy_digest,
         source_commitment,
+        source_witness,
         object_format,
         plan,
         create_only: true,
+        result_length,
+        result_dev,
+        result_ino,
     }))
 }
 
@@ -389,10 +447,12 @@ mod tests {
     fn sample_intent() -> Intent {
         let operation = Uuid::now_v7();
         let result_id = Uuid::now_v7();
+        let checkout = Uuid::now_v7();
+        let oid = "a".repeat(40);
         Intent {
             operation,
             result_id,
-            checkout: Uuid::now_v7(),
+            checkout,
             authority: b"authority".to_vec(),
             common_path: b"/abs/common.git".to_vec(),
             common_dev: 1,
@@ -402,14 +462,18 @@ mod tests {
             context_digest: [3; 32],
             policy_digest: [4; 32],
             source_commitment: [5; 32],
+            source_witness: b"work.recovery.source.v1".to_vec(),
             object_format: "sha1".into(),
             plan: vec![PlanEntry {
-                reference: "refs/work-recovery/x/sha1/aa".into(),
-                oid: "aa".into(),
+                reference: format!("refs/work-recovery/{checkout}/sha1/{oid}"),
+                oid,
                 object_type: "commit".into(),
                 provenance: b"prov".to_vec(),
             }],
             create_only: true,
+            result_length: 128,
+            result_dev: 8,
+            result_ino: 9,
         }
     }
 
@@ -428,13 +492,40 @@ mod tests {
         swapped[0] = 9;
         assert_eq!(decode(&swapped), Err("record_corrupt"));
         let mut unordered = intent;
+        let oid_b = "9".repeat(40);
         unordered.plan.push(PlanEntry {
-            reference: "refs/work-recovery/a/sha1/bb".into(),
-            oid: "bb".into(),
+            reference: format!("refs/work-recovery/{}/sha1/{oid_b}", unordered.checkout),
+            oid: oid_b,
             object_type: "blob".into(),
             provenance: vec![],
         });
         assert!(encode_intent(&unordered).is_err());
+    }
+
+    #[test]
+    fn generated_ref_rejects_noncanonical_names_and_zero_oids() {
+        let mut intent = sample_intent();
+        intent.plan[0].reference = "refs/work-recovery/x/sha1/aa".into();
+        intent.plan[0].oid = "aa".into();
+        assert_eq!(encode_intent(&intent), Err("record_corrupt"));
+        let mut intent = sample_intent();
+        intent.plan[0].oid = "0".repeat(40);
+        intent.plan[0].reference = format!(
+            "refs/work-recovery/{}/sha1/{}",
+            intent.checkout, intent.plan[0].oid
+        );
+        assert_eq!(encode_intent(&intent), Err("record_corrupt"));
+        let mut intent = sample_intent();
+        intent.plan[0].oid = intent.plan[0].oid.to_uppercase();
+        intent.plan[0].reference = format!(
+            "refs/work-recovery/{}/sha1/{}",
+            intent.checkout, intent.plan[0].oid
+        );
+        assert_eq!(encode_intent(&intent), Err("record_corrupt"));
+        let mut intent = sample_intent();
+        assert!(intent.operation != intent.result_id);
+        intent.result_id = intent.operation;
+        assert_eq!(encode_intent(&intent), Err("record_corrupt"));
     }
 
     #[test]
@@ -448,7 +539,7 @@ mod tests {
             result_id: intent.result_id,
             checkout: intent.checkout,
             target_count: 1,
-            targets: vec![("refs/work-recovery/x/sha1/aa".into(), "aa".into())],
+            targets: vec![(intent.plan[0].reference.clone(), intent.plan[0].oid.clone())],
             closure_digest: [9; 32],
             sync_ack: true,
             retirement_authority: false,
@@ -461,6 +552,28 @@ mod tests {
         let mut forged = result;
         forged.retirement_authority = true;
         assert!(encode_result(&forged).is_err());
+        let mut mismatched = ResultRecord {
+            operation: intent.operation,
+            intent_checksum: checksum,
+            result_id: intent.result_id,
+            checkout: Uuid::now_v7(),
+            target_count: 1,
+            targets: vec![(intent.plan[0].reference.clone(), intent.plan[0].oid.clone())],
+            closure_digest: [9; 32],
+            sync_ack: true,
+            retirement_authority: false,
+        };
+        let mismatched_bytes = encode_result(&mismatched).unwrap();
+        match decode(&mismatched_bytes).unwrap() {
+            Record::Result(decoded) => {
+                assert_ne!(decoded.checkout, intent.checkout);
+                assert_eq!(decoded.intent_checksum, checksum);
+            }
+            Record::Intent(_) => panic!("kind"),
+        }
+        mismatched.checkout = intent.checkout;
+        mismatched.targets = vec![(intent.plan[0].reference.clone(), "b".repeat(40))];
+        assert!(encode_result(&mismatched).is_ok());
     }
 
     #[test]
