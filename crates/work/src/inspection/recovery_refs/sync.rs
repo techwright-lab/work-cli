@@ -24,10 +24,14 @@ pub(super) fn sync_objects(objects: &filesystem::Manifest, b: &mut Budget) -> He
         return Err("object_handles_missing");
     }
     for path in &files {
+        if !objects.contains(path) {
+            return Err("object_handles_missing");
+        }
         checked(objects.sync_path(path, false, b))?;
     }
-    checked(objects.sync_prefix(b"objects", b))?;
+    checked(objects.sync_dirs_under(b"objects", b))?;
     checked(objects.sync_path(b"", true, b))?;
+    checked(objects.sync_root_attachment(b))?;
     Ok(())
 }
 
@@ -54,9 +58,13 @@ pub(super) fn sync_refs(
     let mut dirs: Vec<_> = dirs.into_iter().collect();
     dirs.sort_by_key(|path| std::cmp::Reverse(path.len()));
     for ancestor in dirs {
+        if !common.contains(&ancestor) {
+            return Err("recovery_target_unknown");
+        }
         checked(common.sync_path(&ancestor, true, b))?;
     }
     checked(common.sync_path(b"", true, b))?;
+    checked(common.sync_root_attachment(b))?;
     Ok(())
 }
 

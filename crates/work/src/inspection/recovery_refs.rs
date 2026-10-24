@@ -66,6 +66,44 @@ impl RecoveryReport {
     }
 }
 
+pub(super) struct RecoveryIntentPublication {
+    id: Uuid,
+    length: u64,
+    bytes: Vec<u8>,
+}
+impl RecoveryIntentPublication {
+    pub(super) fn id(&self) -> Uuid {
+        self.id
+    }
+    pub(super) fn length(&self) -> u64 {
+        self.length
+    }
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(super) struct RecoveryResultPublication {
+    id: Uuid,
+    length: u64,
+    bytes: Vec<u8>,
+    binding: receipts::RecoveryResultBinding,
+}
+impl RecoveryResultPublication {
+    pub(super) fn id(&self) -> Uuid {
+        self.id
+    }
+    pub(super) fn length(&self) -> u64 {
+        self.length
+    }
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+    pub(super) fn binding(&self) -> receipts::RecoveryResultBinding {
+        self.binding
+    }
+}
+
 /// Refuse mutation unless the caller supplied both required flags.
 pub fn prepare_recovery_refused(checkout: Uuid) -> RecoveryReport {
     RecoveryReport::held(checkout, None)
@@ -94,17 +132,24 @@ enum Fault {
     None,
     IntentWrite,
     IntentSync,
+    IntentDurability,
     BeforeCas,
     AfterFirstCas,
     ObjectSync,
     RefSync,
+    AttachmentSync,
     ResultWrite,
+    ResultFsync,
+    PublishReopen,
+    PublishDeadline,
 }
 
 #[cfg(test)]
 thread_local! {
     static FAULT_HIT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
-    static AFTER_CAS: std::cell::RefCell<Option<fn()>> = const { std::cell::RefCell::new(None) };
+    static ACTIVE_FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
+    static AFTER_CAS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -115,6 +160,36 @@ fn fault_hit(fault: Fault) {
 #[cfg(test)]
 fn take_fault_hit() -> Fault {
     FAULT_HIT.with(|hit| hit.replace(Fault::None))
+}
+
+#[cfg(test)]
+fn set_active_fault(fault: Fault) {
+    ACTIVE_FAULT.with(|active| active.set(fault));
+}
+
+#[cfg(test)]
+pub(super) fn active_fault_is_result_fsync() -> bool {
+    ACTIVE_FAULT.with(|active| active.get() == Fault::ResultFsync)
+}
+
+#[cfg(test)]
+pub(super) fn active_fault_is_intent_durability() -> bool {
+    ACTIVE_FAULT.with(|active| active.get() == Fault::IntentDurability)
+}
+
+#[cfg(test)]
+pub(super) fn active_fault_is_publish_reopen() -> bool {
+    ACTIVE_FAULT.with(|active| active.get() == Fault::PublishReopen)
+}
+
+#[cfg(test)]
+pub(super) fn active_fault_is_publish_deadline() -> bool {
+    ACTIVE_FAULT.with(|active| active.get() == Fault::PublishDeadline)
+}
+
+#[cfg(test)]
+pub(super) fn note_active_fault() {
+    ACTIVE_FAULT.with(|active| fault_hit(active.get()));
 }
 
 struct CommonKey {
@@ -139,14 +214,24 @@ impl OperationLock {
             return Err("common_identity_changed");
         }
         let authority = open_lock_authority(store)?;
+        lock_directory_meta(&self.authority)?;
+        lock_directory_meta(&authority)?;
+        if lock_identity(&self.authority)? != self.authority_id
+            || lock_identity(&authority)? != self.authority_id
+            || identity.directory_id != self.authority_id
+        {
+            return Err("lock_unknown");
+        }
         let named_dir = open_lock_child(&authority, LOCK_DIR, OFlags::RDONLY | OFlags::DIRECTORY)?;
+        lock_directory_meta(&self.directory)?;
+        lock_directory_meta(&named_dir)?;
         let named_file = open_lock_child(&named_dir, &self.name, OFlags::RDONLY)?;
-        if lock_identity(&authority)? != self.authority_id
-            || lock_identity(&named_dir)? != self.directory_id
+        lock_file_meta(&self.file)?;
+        lock_file_meta(&named_file)?;
+        if lock_identity(&named_dir)? != self.directory_id
             || lock_identity(&self.directory)? != self.directory_id
             || lock_identity(&named_file)? != self.file_id
             || lock_identity(&self.file)? != self.file_id
-            || identity.directory_id != self.authority_id
         {
             return Err("lock_unknown");
         }
@@ -331,6 +416,8 @@ fn prepare_path(
         report.reason = "invalid_checkout";
         return report;
     }
+    #[cfg(test)]
+    set_active_fault(fault);
     let mut collector = Collector::new(
         checkout,
         operation,
@@ -453,9 +540,10 @@ fn resume_published(
         &plan.key,
         identity.common_git_dir.as_os_str().as_bytes(),
     )?;
+    intent_redundant_bindings(&intent, &plan)?;
     let planned_names = sync::planned_names(&plan.plan);
     let planned_new =
-        preservation::planned_new_from_witness(&intent.source_witness, &planned_names);
+        preservation::planned_new_from_witness(&intent.source_witness, &planned_names)?;
     let current_witness = plan.census.source_witness(
         &plan.retained.physical.first,
         &plan.retained.physical.before,
@@ -474,13 +562,15 @@ fn resume_published(
         return Err("intent_binding_changed");
     }
     preservation::source_witness_delta(&intent.source_witness, &current_witness, &planned_new)?;
-    receipts::resync_recovery_published(store, plan.operation).map_err(|error| {
-        if matches!(error, ReceiptError::UnsafeReceiptStore) {
-            "nonpersistent_filesystem"
-        } else {
-            receipt_reason(error)
-        }
-    })?;
+    receipts::resync_recovery_published(store, plan.operation, &mut plan.budget).map_err(
+        |error| {
+            if matches!(error, ReceiptError::UnsafeReceiptStore) {
+                "nonpersistent_filesystem"
+            } else {
+                receipt_reason(error)
+            }
+        },
+    )?;
     report.intent_id = Some(plan.operation);
     report.intent_checksum = Some(hex(&storage::intent_checksum(&bytes)?));
     report.result_id = Some(intent.result_id);
@@ -584,40 +674,45 @@ fn execute_fresh(
     let intent_bytes = storage::encode_intent(&intent)?;
     let intent_res = receipts::reserve(store, plan.operation, intent_bytes.len() as u64)
         .map_err(receipt_reason)?;
+    let publication = mint_intent_publication(plan, intent_bytes, &bound, plan.operation)?;
     #[cfg(test)]
     if fault == Fault::IntentWrite {
         fault_hit(Fault::IntentWrite);
         return Err("intent_io");
     }
-    receipts::write_reserved(intent_res, &intent_bytes).map_err(receipt_reason)?;
     #[cfg(test)]
     if fault == Fault::IntentSync {
         fault_hit(Fault::IntentSync);
         return Err("intent_io");
     }
-    let published = receipts::publish_recovery_reserved(
+    let published = match receipts::publish_recovery_intent(
         store,
-        plan.operation,
-        intent_bytes.len() as u64,
+        &publication,
+        intent_res,
         &plan.retained.context,
         &mut plan.budget,
-    )
-    .map_err(|error| {
-        if matches!(error, ReceiptError::UnsafeReceiptStore) {
-            "nonpersistent_filesystem"
-        } else {
-            receipt_reason(error)
+    ) {
+        Ok(published) => published,
+        Err(error) => {
+            if matches!(error, ReceiptError::DurabilityUnknown { .. }) {
+                report.durability = "unknown";
+            }
+            return Err(if matches!(error, ReceiptError::UnsafeReceiptStore) {
+                "nonpersistent_filesystem"
+            } else {
+                receipt_reason(error)
+            });
         }
-    })?;
+    };
     report.intent_id = Some(published.id());
-    report.intent_checksum = Some(hex(&storage::intent_checksum(&intent_bytes)?));
+    report.intent_checksum = Some(hex(&storage::intent_checksum(publication.bytes())?));
     report.result_id = Some(plan.result_id);
     execute_cas(
         store,
         plan,
         report,
         mutating_git,
-        Some(intent_bytes),
+        Some(publication.bytes().to_vec()),
         Some(bound),
         #[cfg(test)]
         fault,
@@ -678,6 +773,92 @@ fn current_intent(
         result_length: bound.length,
         result_dev: bound.dev,
         result_ino: bound.ino,
+    })
+}
+
+fn intent_redundant_bindings(intent: &storage::Intent, plan: &FreshRecoveryPlan) -> Held<()> {
+    let identity = plan
+        .retained
+        .context
+        .allocation
+        .identity
+        .as_ref()
+        .ok_or("identity_unknown")?;
+    if intent.source_commitment != hash32(&Sha256::digest(&intent.source_witness)) {
+        return Err("source_commitment_changed");
+    }
+    if intent.private_path != identity.private_git_dir.as_os_str().as_bytes() {
+        return Err("identity_unknown");
+    }
+    if intent.boot != identity.boot_id.as_bytes() {
+        return Err("identity_unknown");
+    }
+    Ok(())
+}
+
+fn mint_intent_publication(
+    plan: &FreshRecoveryPlan,
+    intent_bytes: Vec<u8>,
+    bound: &receipts::RecoveryResultBinding,
+    intent_id: Uuid,
+) -> Held<RecoveryIntentPublication> {
+    if intent_id != plan.operation
+        || bound.id != plan.result_id
+        || intent_bytes.len() as u64 > 2 * 1024 * 1024
+    {
+        return Err("result_binding_changed");
+    }
+    match storage::decode(&intent_bytes)? {
+        storage::Record::Intent(intent) => {
+            if intent.operation != plan.operation
+                || intent.result_id != plan.result_id
+                || intent.result_dev != bound.dev
+                || intent.result_ino != bound.ino
+                || intent.result_length != bound.length
+            {
+                return Err("result_binding_changed");
+            }
+        }
+        storage::Record::Result(_) => return Err("record_kind"),
+    }
+    Ok(RecoveryIntentPublication {
+        id: plan.operation,
+        length: intent_bytes.len() as u64,
+        bytes: intent_bytes,
+    })
+}
+
+fn mint_result_publication(
+    intent: &storage::Intent,
+    intent_checksum: [u8; 32],
+    bound: receipts::RecoveryResultBinding,
+    result_bytes: Vec<u8>,
+) -> Held<RecoveryResultPublication> {
+    if bound.id != intent.result_id
+        || bound.length != result_bytes.len() as u64
+        || bound.length != intent.result_length
+        || bound.dev != intent.result_dev
+        || bound.ino != intent.result_ino
+    {
+        return Err("result_binding_changed");
+    }
+    match storage::decode(&result_bytes)? {
+        storage::Record::Result(result) => {
+            if result.operation != intent.operation
+                || result.result_id != intent.result_id
+                || result.checkout != intent.checkout
+                || result.intent_checksum != intent_checksum
+            {
+                return Err("result_binding_changed");
+            }
+        }
+        storage::Record::Intent(_) => return Err("record_kind"),
+    }
+    Ok(RecoveryResultPublication {
+        id: intent.result_id,
+        length: result_bytes.len() as u64,
+        bytes: result_bytes,
+        binding: bound,
     })
 }
 
@@ -797,6 +978,11 @@ fn execute_cas(
     if let Err(reason) = sync::sync_refs(later.common(), &targets, packed, &mut plan.budget) {
         return fail(report, reason);
     }
+    #[cfg(test)]
+    if fault == Fault::AttachmentSync {
+        fault_hit(Fault::AttachmentSync);
+        return fail(report, "attachment_sync_failed");
+    }
     for entry in &plan.plan {
         if let Err(reason) =
             sync::recovery_log_absent(later.common_mut(), &entry.reference, &mut plan.budget)
@@ -830,11 +1016,23 @@ fn execute_cas(
     if let Err(reason) = short_context_matches(store, &plan.retained.context, &mut plan.budget) {
         return fail(report, reason);
     }
+    if plan.retained.config.recheck(&mut plan.budget).is_err() {
+        return fail(report, "census_changed");
+    }
+    if later.recheck(&mut plan.budget).is_err() {
+        return fail(report, "census_changed");
+    }
     let intent_checksum = match &intent_bytes {
         Some(bytes) => match storage::intent_checksum(bytes) {
             Ok(value) => value,
             Err(reason) => return fail(report, reason),
         },
+        None => return fail(report, "intent_missing"),
+    };
+    let decoded_intent = match intent_bytes.as_deref().map(storage::decode) {
+        Some(Ok(storage::Record::Intent(intent))) => intent,
+        Some(Ok(_)) => return fail(report, "record_kind"),
+        Some(Err(reason)) => return fail(report, reason),
         None => return fail(report, "intent_missing"),
     };
     let result = storage::ResultRecord {
@@ -865,21 +1063,14 @@ fn execute_cas(
         Some(value) => value,
         None => return fail(report, "result_binding_changed"),
     };
-    match receipts::restart_recovery_result(store, &bound, &result_bytes) {
-        Ok(()) => (),
-        Err(error) => {
-            let reason = if matches!(error, ReceiptError::UnsafeReceiptStore) {
-                "nonpersistent_filesystem"
-            } else {
-                receipt_reason(error)
-            };
-            return fail(report, reason);
-        }
-    }
-    if let Err(error) = receipts::publish_recovery_reserved(
+    let publication =
+        match mint_result_publication(&decoded_intent, intent_checksum, bound, result_bytes) {
+            Ok(value) => value,
+            Err(reason) => return fail(report, reason),
+        };
+    if let Err(error) = receipts::publish_recovery_result(
         store,
-        plan.result_id,
-        result_bytes.len() as u64,
+        &publication,
         &plan.retained.context,
         &mut plan.budget,
     ) {
@@ -890,7 +1081,6 @@ fn execute_cas(
         };
         return fail(report, reason);
     }
-    drop(fail);
     report.outcome = "prepared";
     report.reason = "local_protection";
     report.durability = "acknowledged";
@@ -954,6 +1144,29 @@ fn lock_identity(file: &File) -> Held<(u64, u64)> {
     Ok((meta.dev(), meta.ino()))
 }
 
+fn lock_directory_meta(file: &File) -> Held<()> {
+    let meta = file.metadata().map_err(|_| "lock_unknown")?;
+    if !meta.is_dir()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o777 != 0o700
+    {
+        return Err("lock_unknown");
+    }
+    Ok(())
+}
+
+fn lock_file_meta(file: &File) -> Held<()> {
+    let meta = file.metadata().map_err(|_| "lock_unknown")?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o777 != 0o600
+    {
+        return Err("lock_unknown");
+    }
+    Ok(())
+}
+
 fn open_lock_authority(store: &Store) -> Held<File> {
     let identity = store.authority_identity();
     let directory = rfs::openat2(
@@ -1002,13 +1215,7 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
         Err(_) => return Err("lock_unknown"),
     }
     let directory = open_lock_child(&authority, LOCK_DIR, OFlags::RDONLY | OFlags::DIRECTORY)?;
-    let dir_meta = directory.metadata().map_err(|_| "lock_unknown")?;
-    if !dir_meta.is_dir()
-        || dir_meta.uid() != rustix::process::geteuid().as_raw()
-        || dir_meta.mode() & 0o777 != 0o700
-    {
-        return Err("lock_unknown");
-    }
+    lock_directory_meta(&directory)?;
     let named_dir = open_lock_child(&authority, LOCK_DIR, OFlags::PATH | OFlags::DIRECTORY)?;
     if lock_identity(&named_dir)? != lock_identity(&directory)? {
         return Err("lock_unknown");
@@ -1023,14 +1230,7 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     )
     .map(File::from)
     .map_err(|_| "lock_unknown")?;
-    let meta = file.metadata().map_err(|_| "lock_unknown")?;
-    if !meta.is_file()
-        || meta.nlink() != 1
-        || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o777 != 0o600
-    {
-        return Err("lock_unknown");
-    }
+    lock_file_meta(&file)?;
     let named_file = open_lock_child(&directory, &name, OFlags::PATH)?;
     if lock_identity(&named_file)? != lock_identity(&file)? {
         return Err("lock_unknown");
@@ -1059,7 +1259,10 @@ mod fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::MetadataExt};
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+    };
 
     fn setup(format: &str) -> (fixture::ManagedFixture, std::path::PathBuf) {
         let f = fixture::ManagedFixture::recovery(format, "2");
@@ -1113,7 +1316,11 @@ mod tests {
             (Fault::AfterFirstCas, "cas_partial", true),
             (Fault::ObjectSync, "object_sync_failed", false),
             (Fault::RefSync, "ref_sync_failed", true),
+            (Fault::AttachmentSync, "attachment_sync_failed", true),
             (Fault::ResultWrite, "result_io", true),
+            (Fault::ResultFsync, "receipt_io", true),
+            (Fault::PublishReopen, "durability_unknown", true),
+            (Fault::PublishDeadline, "durability_unknown", true),
         ] {
             let (f, config) = setup("sha1");
             let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), fault);
@@ -1145,32 +1352,76 @@ mod tests {
         assert!(!f.common().join("refs/work-recovery").exists() || report.created_refs.is_empty());
     }
 
+    fn pending_result_path(
+        f: &fixture::ManagedFixture,
+        report: &RecoveryReport,
+    ) -> std::path::PathBuf {
+        let id = report.result_id.expect("result reservation");
+        let dir = f.temp.path().join("authority/inspection-receipts-v1");
+        for entry in fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let text = name.to_string_lossy();
+            if text.starts_with(&format!("pending-{id}-")) {
+                return dir.join(name);
+            }
+        }
+        panic!("missing pending result for {id}");
+    }
+
+    fn lock_file(f: &fixture::ManagedFixture) -> std::path::PathBuf {
+        let common = fs::metadata(f.common()).unwrap();
+        f.temp
+            .path()
+            .join("authority/recovery-preparation-locks-v1")
+            .join(format!("{:016x}-{:016x}.lock", common.dev(), common.ino()))
+    }
+
+    fn mutate_reflog_message_only(f: &fixture::ManagedFixture) {
+        let log = f.private().join("logs/HEAD");
+        let bytes = fs::read(&log).unwrap();
+        let mut lines: Vec<Vec<u8>> = bytes.split(|c| *c == b'\n').map(|l| l.to_vec()).collect();
+        if lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let last = lines.last_mut().expect("reflog");
+        if let Some(tab) = last.iter().position(|c| *c == b'\t') {
+            last.truncate(tab + 1);
+            last.extend(b"message-only");
+        } else {
+            last.extend(b"\tmessage-only");
+        }
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            out.extend(line);
+        }
+        out.push(b'\n');
+        fs::write(&log, out).unwrap();
+    }
+
     #[test]
     fn mismatched_pending_result_is_not_truncated() {
-        let f = fixture::ManagedFixture::recovery("sha1", "2");
-        let dir = f.temp.path().join("authority/inspection-receipts-v1");
-        fs::create_dir_all(&dir).unwrap();
-        let id = Uuid::now_v7();
-        let pending = dir.join(format!("pending-{id}-32"));
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(
+            &config,
+            f.allocation.checkout,
+            operation,
+            Fault::ResultWrite,
+        );
+        assert_eq!(take_fault_hit(), Fault::ResultWrite, "{first:?}");
+        assert_eq!(first.reason, "result_io", "{first:?}");
+        assert_eq!(first.durability, "unknown");
+        assert!(!first.created_refs.is_empty(), "{first:?}");
+        let pending = pending_result_path(&f, &first);
         fs::write(&pending, b"partial-not-matching-bytes").unwrap();
         let before = fs::read(&pending).unwrap();
-        let meta = fs::metadata(&pending).unwrap();
-        let bound = receipts::RecoveryResultBinding {
-            id,
-            length: 32,
-            dev: meta.dev(),
-            ino: meta.ino(),
-        };
-        assert!(receipts::restart_recovery_result(&f.store, &bound, &[0u8; 32]).is_err());
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_ne!(resume.outcome, "prepared", "{resume:?}");
         assert_eq!(fs::read(&pending).unwrap(), before);
-        let replaced = dir.join(format!("pending-{id}-32"));
-        fs::remove_file(&replaced).unwrap();
-        fs::write(&replaced, b"").unwrap();
-        let other = fs::read(&replaced).unwrap();
-        let replaced_meta = fs::metadata(&replaced).unwrap();
-        assert!(replaced_meta.ino() != bound.ino || other != before);
-        assert!(receipts::restart_recovery_result(&f.store, &bound, &[0u8; 32]).is_err());
-        assert_eq!(fs::read(&replaced).unwrap(), other);
+        assert!(f.common().join("refs/work-recovery").exists());
     }
 
     #[test]
@@ -1216,12 +1467,188 @@ mod tests {
         assert_eq!(take_fault_hit(), Fault::BeforeCas, "{first:?}");
         assert_eq!(first.reason, "cas_not_started");
         assert_eq!(first.durability, "not_attempted");
-        let log = f.private().join("logs/HEAD");
-        let mut bytes = fs::read(&log).unwrap();
-        bytes.extend(b"message-only change\n");
-        fs::write(&log, bytes).unwrap();
+        mutate_reflog_message_only(&f);
         let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_eq!(resume.reason, "census_changed", "{resume:?}");
         assert_ne!(resume.outcome, "prepared", "{resume:?}");
         assert_ne!(resume.durability, "acknowledged");
+        assert!(!f.common().join("refs/work-recovery").exists());
+    }
+
+    #[test]
+    fn resume_holds_payload_index_config_and_identity_mutations() {
+        for case in ["payload", "index", "config", "identity"] {
+            let (f, config) = setup("sha1");
+            let operation = Uuid::now_v7();
+            let first = prepare_path(&config, f.allocation.checkout, operation, Fault::BeforeCas);
+            assert_eq!(take_fault_hit(), Fault::BeforeCas, "{case} {first:?}");
+            match case {
+                "payload" => fs::write(f.path(b"tracked"), b"mutated payload\n").unwrap(),
+                "index" => {
+                    let path = f.private().join("index");
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes.push(0);
+                    fs::write(&path, bytes).unwrap();
+                }
+                "config" => {
+                    let path = f.common().join("config");
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes.extend(b"\n[work]\nextra=1\n");
+                    fs::write(&path, bytes).unwrap();
+                }
+                _ => fs::write(f.private().join("work-lease.json"), b"{}").unwrap(),
+            }
+            let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+            assert_ne!(resume.outcome, "prepared", "{case} {resume:?}");
+            assert_ne!(resume.durability, "acknowledged", "{case}");
+            assert_ne!(resume.reason, "lock_unknown", "{case} {resume:?}");
+            assert!(!f.common().join("refs/work-recovery").exists(), "{case}");
+        }
+    }
+
+    #[test]
+    fn intent_durability_unknown_does_not_call_git() {
+        let (f, config) = setup("sha1");
+        let before = f.common().join("refs/work-recovery").exists();
+        let report = prepare_path(
+            &config,
+            f.allocation.checkout,
+            Uuid::now_v7(),
+            Fault::IntentDurability,
+        );
+        assert_eq!(take_fault_hit(), Fault::IntentDurability, "{report:?}");
+        assert_eq!(report.reason, "durability_unknown", "{report:?}");
+        assert_eq!(report.durability, "unknown", "{report:?}");
+        assert_ne!(report.outcome, "prepared");
+        assert_ne!(report.outcome, "unknown");
+        assert_eq!(f.common().join("refs/work-recovery").exists(), before);
+        assert!(report.created_refs.is_empty());
+    }
+
+    #[test]
+    fn same_id_continues_after_first_cas_and_retries_matching_pending() {
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(
+            &config,
+            f.allocation.checkout,
+            operation,
+            Fault::AfterFirstCas,
+        );
+        assert_eq!(take_fault_hit(), Fault::AfterFirstCas, "{first:?}");
+        assert_eq!(first.durability, "unknown");
+        assert!(!first.created_refs.is_empty(), "{first:?}");
+        let created = first.created_refs.clone();
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_eq!(resume.outcome, "prepared", "{resume:?}");
+        assert_eq!(resume.durability, "acknowledged", "{resume:?}");
+        assert_eq!(resume.resume, true);
+        for name in &created {
+            assert!(
+                resume.verified_refs.iter().any(|r| r == name)
+                    || resume.created_refs.iter().any(|r| r == name),
+                "{name} {resume:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_pending_fsync_fault_retries_same_artifact() {
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(
+            &config,
+            f.allocation.checkout,
+            operation,
+            Fault::ResultFsync,
+        );
+        assert_eq!(take_fault_hit(), Fault::ResultFsync, "{first:?}");
+        assert_eq!(first.reason, "receipt_io", "{first:?}");
+        assert_eq!(first.durability, "unknown");
+        let pending = pending_result_path(&f, &first);
+        let before = fs::metadata(&pending).unwrap();
+        let ino = before.ino();
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_eq!(resume.outcome, "prepared", "{resume:?}");
+        assert_eq!(resume.durability, "acknowledged");
+        let published = f.temp.path().join(format!(
+            "authority/inspection-receipts-v1/{}.receipt",
+            first.result_id.unwrap()
+        ));
+        assert!(published.exists(), "{resume:?}");
+        assert_eq!(fs::metadata(&published).unwrap().ino(), ino);
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn lock_chmod_and_hardlink_fail_revalidate() {
+        let (f, config) = setup("sha1");
+        let lock = lock_file(&f);
+        AFTER_CAS.with(|hook| {
+            let path = lock.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o644));
+            }));
+        });
+        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(report.reason, "lock_unknown", "{report:?}");
+        assert_eq!(report.durability, "unknown", "{report:?}");
+        let (f, config) = setup("sha1");
+        let lock = lock_file(&f);
+        AFTER_CAS.with(|hook| {
+            let path = lock.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let extra = path.with_extension("link");
+                let _ = fs::hard_link(&path, &extra);
+            }));
+        });
+        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(report.reason, "lock_unknown", "{report:?}");
+        assert_ne!(report.outcome, "prepared");
+    }
+
+    #[test]
+    fn lock_namespace_replacement_fails_revalidate() {
+        let (f, config) = setup("sha1");
+        let dir = f
+            .temp
+            .path()
+            .join("authority/recovery-preparation-locks-v1");
+        AFTER_CAS.with(|hook| {
+            let path = dir.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let replaced = path.with_extension("old");
+                let _ = fs::rename(&path, &replaced);
+                let _ = fs::create_dir(&path);
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+            }));
+        });
+        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(report.reason, "lock_unknown", "{report:?}");
+        assert_ne!(report.outcome, "prepared");
+    }
+
+    #[test]
+    fn rechecksummed_source_commitment_contradiction_is_rejected_on_resume() {
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(&config, f.allocation.checkout, operation, Fault::BeforeCas);
+        assert_eq!(take_fault_hit(), Fault::BeforeCas, "{first:?}");
+        let path = f.temp.path().join(format!(
+            "authority/inspection-receipts-v1/{}.receipt",
+            operation
+        ));
+        let bytes = fs::read(&path).unwrap();
+        let mut intent = match storage::decode(&bytes).unwrap() {
+            storage::Record::Intent(intent) => *intent,
+            storage::Record::Result(_) => panic!("kind"),
+        };
+        intent.source_commitment = [9; 32];
+        let forged = storage::encode_intent(&intent).unwrap();
+        fs::write(&path, forged).unwrap();
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_eq!(resume.reason, "source_commitment_changed", "{resume:?}");
+        assert_ne!(resume.outcome, "prepared");
+        assert!(!f.common().join("refs/work-recovery").exists());
     }
 }

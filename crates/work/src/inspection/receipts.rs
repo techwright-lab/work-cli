@@ -565,18 +565,9 @@ pub(super) fn read_raw(store: &Store, id: Uuid) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn resync_published(store: &Store, id: Uuid) -> Result<()> {
-    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
-    let location = Location::open(store, false)?;
-    let name = format!("{id}.receipt");
-    let file = open_relative(&location.dir, &name, OFlags::RDONLY)?;
-    let expected = stat(&file)?;
-    validate_file(&expected)?;
-    file.sync_all().map_err(|_| ReceiptError::Io)?;
-    location.dir.sync_all().map_err(|_| ReceiptError::Io)?;
-    check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
-    location.check(store)?;
-    Ok(())
+#[cfg(test)]
+thread_local! {
+    static RESULT_PUBLISH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 fn reject_volatile(file: &File) -> Result<()> {
     let fs = fs::fstatfs(file).map_err(|_| ReceiptError::Io)?;
@@ -592,9 +583,14 @@ pub(super) fn recovery_storage_persistent(store: &Store) -> Result<()> {
     reject_volatile(&location.parent)?;
     Ok(())
 }
-pub(super) fn resync_recovery_published(store: &Store, id: Uuid) -> Result<()> {
+pub(super) fn resync_recovery_published(
+    store: &Store,
+    id: Uuid,
+    budget: &mut super::Budget,
+) -> Result<()> {
     recovery_storage_persistent(store)?;
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
     let location = Location::open(store, false)?;
     reject_volatile(&location.dir)?;
     reject_volatile(&location.parent)?;
@@ -605,11 +601,51 @@ pub(super) fn resync_recovery_published(store: &Store, id: Uuid) -> Result<()> {
     file.sync_all().map_err(|_| ReceiptError::Io)?;
     location.dir.sync_all().map_err(|_| ReceiptError::Io)?;
     location.parent.sync_all().map_err(|_| ReceiptError::Io)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
     check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
     location.check(store)?;
     Ok(())
 }
-pub(super) fn publish_recovery_reserved(
+pub(super) fn publish_recovery_intent(
+    store: &mut Store,
+    publication: &super::recovery_refs::RecoveryIntentPublication,
+    reservation: Reservation,
+    context: &super::Context,
+    budget: &mut super::Budget,
+) -> Result<PersistedReceipt> {
+    if reservation.id != publication.id() || reservation.length != publication.length() {
+        return Err(ReceiptError::Conflict);
+    }
+    write_reserved(reservation, publication.bytes())?;
+    publish_recovery_record(
+        store,
+        publication.id(),
+        publication.length(),
+        context,
+        budget,
+    )
+}
+pub(super) fn publish_recovery_result(
+    store: &mut Store,
+    publication: &super::recovery_refs::RecoveryResultPublication,
+    context: &super::Context,
+    budget: &mut super::Budget,
+) -> Result<PersistedReceipt> {
+    restart_recovery_result(store, publication, budget)?;
+    #[cfg(test)]
+    RESULT_PUBLISH.with(|flag| flag.set(true));
+    let published = publish_recovery_record(
+        store,
+        publication.id(),
+        publication.length(),
+        context,
+        budget,
+    );
+    #[cfg(test)]
+    RESULT_PUBLISH.with(|flag| flag.set(false));
+    published
+}
+fn publish_recovery_record(
     store: &mut Store,
     id: Uuid,
     length: u64,
@@ -617,15 +653,7 @@ pub(super) fn publish_recovery_reserved(
     budget: &mut super::Budget,
 ) -> Result<PersistedReceipt> {
     recovery_storage_persistent(store)?;
-    let published = publish_reserved(store, id, length, context, budget)?;
-    let unknown = || ReceiptError::DurabilityUnknown {
-        id: published.id,
-        digest: published.digest,
-    };
-    let location = Location::open(store, false).map_err(|_| unknown())?;
-    location.parent.sync_all().map_err(|_| unknown())?;
-    location.check(store).map_err(|_| unknown())?;
-    Ok(published)
+    publish_reserved(store, id, length, context, budget)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RecoveryResultBinding {
@@ -699,23 +727,51 @@ pub(super) fn publish_reserved(
     let unknown = || ReceiptError::DurabilityUnknown { id, digest };
     location.dir.sync_all().map_err(|_| unknown())?;
     location.check(store).map_err(|_| unknown())?;
-    let published = open_relative(&location.dir, &final_name, OFlags::RDONLY)?;
+    let published =
+        open_relative(&location.dir, &final_name, OFlags::RDONLY).map_err(|_| unknown())?;
     check_named(&location.dir, &final_name, &published, length, true).map_err(|_| unknown())?;
+    location.parent.sync_all().map_err(|_| unknown())?;
+    location.check(store).map_err(|_| unknown())?;
+    budget.check().map_err(|_| unknown())?;
+    lease.check(store).map_err(|_| unknown())?;
+    #[cfg(test)]
+    if RESULT_PUBLISH.with(|flag| flag.get())
+        && (super::recovery_refs::active_fault_is_publish_reopen()
+            || super::recovery_refs::active_fault_is_publish_deadline())
+    {
+        super::recovery_refs::note_active_fault();
+        return Err(unknown());
+    }
+    #[cfg(test)]
+    if !RESULT_PUBLISH.with(|flag| flag.get())
+        && super::recovery_refs::active_fault_is_intent_durability()
+    {
+        super::recovery_refs::note_active_fault();
+        return Err(unknown());
+    }
     drop(lease);
     Ok(PersistedReceipt { id, digest })
 }
 
 pub(super) fn restart_recovery_result(
     store: &Store,
-    bound: &RecoveryResultBinding,
-    bytes: &[u8],
+    publication: &super::recovery_refs::RecoveryResultPublication,
+    budget: &mut super::Budget,
 ) -> Result<()> {
     recovery_storage_persistent(store)?;
-    if bytes.len() as u64 != bound.length || bound.length == 0 || bound.length > MAX_RECEIPT {
+    let bound = publication.binding();
+    let bytes = publication.bytes();
+    if publication.id() != bound.id
+        || publication.length() != bound.length
+        || bytes.len() as u64 != bound.length
+        || bound.length == 0
+        || bound.length > MAX_RECEIPT
+    {
         return Err(ReceiptError::EncodingLimit);
     }
     uuid(bound.id.to_string().as_bytes())?;
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
     let location = Location::open(store, false)?;
     let final_name = format!("{}.receipt", bound.id);
     if open_relative(&location.dir, &final_name, OFlags::PATH).is_ok() {
@@ -753,7 +809,13 @@ pub(super) fn restart_recovery_result(
         file.write_all(&bytes[existing.len()..])
             .map_err(|_| ReceiptError::Io)?;
     }
+    #[cfg(test)]
+    if super::recovery_refs::active_fault_is_result_fsync() {
+        super::recovery_refs::note_active_fault();
+        return Err(ReceiptError::Io);
+    }
     file.sync_all().map_err(|_| ReceiptError::Io)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
     check_named(&location.dir, &pending, &file, bound.length, true)?;
     Ok(())
 }

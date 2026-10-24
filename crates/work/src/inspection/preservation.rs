@@ -627,10 +627,11 @@ impl RecoveryCensus {
         for id in &self.local.head_graph {
             frame(&mut out, 10, id);
         }
-        frame(&mut out, 11, &Sha256::digest(&self.local.native_digest));
+        frame(&mut out, 11, &Sha256::digest(&self.local.native_nonref));
         if let Some(config) = config {
             frame(&mut out, 12, &config.fingerprint());
         }
+        frame(&mut out, 13, &encode_native_refs(&self.local.native_refs));
         out
     }
     pub(super) fn source_commitment(
@@ -667,7 +668,7 @@ impl RecoveryCensus {
                 reference,
                 oid,
                 object_type: object.kind,
-                provenance: serde_json::to_vec(provenance).map_err(|_| "census_unknown")?,
+                provenance: encode_provenance(provenance)?,
             });
         }
         plan.sort_by(|a, b| a.reference.cmp(&b.reference));
@@ -837,55 +838,84 @@ struct WitnessPath {
     content: Option<Vec<u8>>,
 }
 
-fn parse_manifest_witness(
-    bytes: &[u8],
-) -> Held<(BTreeMap<Vec<u8>, WitnessPath>, BTreeSet<Vec<u8>>)> {
+struct ManifestWitness {
+    paths: BTreeMap<Vec<u8>, WitnessPath>,
+    absent: BTreeSet<Vec<u8>>,
+}
+
+fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
     let frames = take_frames(bytes)?;
     let mut paths = BTreeMap::new();
     let mut absent = BTreeSet::new();
-    let mut current: Option<Vec<u8>> = None;
-    for (tag, value) in frames {
-        match tag {
-            0 if value == b"work.recovery.manifest.v1" => (),
+    let mut i = 0;
+    match frames.first() {
+        Some((0, value)) if value == b"work.recovery.manifest.v1" => i = 1,
+        _ => return Err("census_changed"),
+    }
+    while i < frames.len() {
+        match frames[i].0 {
             1 => {
-                current = Some(value.clone());
+                let path = frames[i].1.clone();
+                i += 1;
+                if paths.contains_key(&path) || absent.contains(&path) {
+                    return Err("census_changed");
+                }
+                if i >= frames.len() || frames[i].0 != 2 {
+                    return Err("census_changed");
+                }
+                let identity = frames[i].1.clone();
+                i += 1;
+                if i >= frames.len() || frames[i].0 != 3 {
+                    return Err("census_changed");
+                }
+                let directory = match frames[i].1.as_slice() {
+                    [1] => true,
+                    [0] => false,
+                    _ => return Err("census_changed"),
+                };
+                i += 1;
+                let mut names = Vec::new();
+                let mut seen_names = BTreeSet::new();
+                while i < frames.len() && frames[i].0 == 4 {
+                    if !seen_names.insert(frames[i].1.clone()) {
+                        return Err("census_changed");
+                    }
+                    names.push(frames[i].1.clone());
+                    i += 1;
+                }
+                let mut content = None;
+                if i < frames.len() && frames[i].0 == 5 {
+                    content = Some(frames[i].1.clone());
+                    i += 1;
+                }
+                if i < frames.len() && matches!(frames[i].0, 2 | 3 | 5) {
+                    return Err("census_changed");
+                }
                 paths.insert(
-                    value,
+                    path,
                     WitnessPath {
-                        identity: Vec::new(),
-                        directory: false,
-                        names: Vec::new(),
-                        content: None,
+                        identity,
+                        directory,
+                        names,
+                        content,
                     },
                 );
             }
-            2 => {
-                let path = current.as_ref().ok_or("census_changed")?;
-                paths.get_mut(path).ok_or("census_changed")?.identity = value;
-            }
-            3 => {
-                let path = current.as_ref().ok_or("census_changed")?;
-                paths.get_mut(path).ok_or("census_changed")?.directory = value == [1];
-            }
-            4 => {
-                let path = current.as_ref().ok_or("census_changed")?;
-                paths
-                    .get_mut(path)
-                    .ok_or("census_changed")?
-                    .names
-                    .push(value);
-            }
-            5 => {
-                let path = current.as_ref().ok_or("census_changed")?;
-                paths.get_mut(path).ok_or("census_changed")?.content = Some(value);
-            }
-            6 => {
-                absent.insert(value);
-            }
+            6 => break,
             _ => return Err("census_changed"),
         }
     }
-    Ok((paths, absent))
+    while i < frames.len() {
+        if frames[i].0 != 6 {
+            return Err("census_changed");
+        }
+        let path = frames[i].1.clone();
+        if paths.contains_key(&path) || !absent.insert(path) {
+            return Err("census_changed");
+        }
+        i += 1;
+    }
+    Ok(ManifestWitness { paths, absent })
 }
 
 fn binding_blob(identity: &[u8]) -> Held<([u8; 24], [u8; 16])> {
@@ -904,8 +934,14 @@ fn manifest_witness_delta(
     after: &[u8],
     planned_new: &BTreeSet<Vec<u8>>,
 ) -> Held<()> {
-    let (before_paths, before_absent) = parse_manifest_witness(before)?;
-    let (after_paths, after_absent) = parse_manifest_witness(after)?;
+    let ManifestWitness {
+        paths: before_paths,
+        absent: before_absent,
+    } = parse_manifest_witness(before)?;
+    let ManifestWitness {
+        paths: after_paths,
+        absent: after_absent,
+    } = parse_manifest_witness(after)?;
     let mut allowed_dirs = BTreeSet::new();
     for path in planned_new {
         let mut i = 0;
@@ -955,31 +991,23 @@ fn manifest_witness_delta(
 pub(super) fn planned_new_from_witness(
     original: &[u8],
     plan: &BTreeSet<Vec<u8>>,
-) -> BTreeSet<Vec<u8>> {
+) -> Held<BTreeSet<Vec<u8>>> {
+    let frames = take_frames(original)?;
     let mut present = BTreeSet::new();
-    let Ok(frames) = take_frames(original) else {
-        return plan.clone();
-    };
+    let mut found = false;
     for (tag, value) in frames {
-        if tag == 3 {
-            if let Ok((paths, _)) = parse_manifest_witness(&value) {
-                present.extend(paths.into_keys());
+        if tag == 13 {
+            if found {
+                return Err("census_changed");
             }
-        }
-        if tag == 2 {
-            let Ok(inner) = take_frames(&value) else {
-                continue;
-            };
-            for (inner_tag, inner_value) in inner {
-                if inner_tag == 1 {
-                    if let Ok((paths, _)) = parse_manifest_witness(&inner_value) {
-                        present.extend(paths.into_keys());
-                    }
-                }
-            }
+            found = true;
+            present.extend(parse_native_refs(&value)?.into_keys());
         }
     }
-    plan.difference(&present).cloned().collect()
+    if !found {
+        return Err("census_changed");
+    }
+    Ok(plan.difference(&present).cloned().collect())
 }
 
 pub(super) fn source_witness_delta(
@@ -1020,9 +1048,145 @@ pub(super) fn source_witness_delta(
                 }
             }
             3 => manifest_witness_delta(&before.1, &after.1, planned_new)?,
+            13 => native_ref_delta(&before.1, &after.1, planned_new)?,
             _ if before.1 != after.1 => return Err("census_changed"),
             _ => (),
         }
+    }
+    Ok(())
+}
+
+fn encode_native_refs(refs: &BTreeMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, id) in refs {
+        frame(&mut out, 1, name);
+        frame(&mut out, 2, id);
+    }
+    out
+}
+
+fn parse_native_refs(bytes: &[u8]) -> Held<BTreeMap<Vec<u8>, Vec<u8>>> {
+    let frames = take_frames(bytes)?;
+    if frames.len() % 2 != 0 {
+        return Err("census_changed");
+    }
+    let mut refs = BTreeMap::new();
+    let mut previous: Option<Vec<u8>> = None;
+    let mut i = 0;
+    while i < frames.len() {
+        if frames[i].0 != 1 || frames[i + 1].0 != 2 {
+            return Err("census_changed");
+        }
+        let name = frames[i].1.clone();
+        let id = frames[i + 1].1.clone();
+        if previous.as_ref().is_some_and(|p| p >= &name) || refs.insert(name.clone(), id).is_some()
+        {
+            return Err("census_changed");
+        }
+        previous = Some(name);
+        i += 2;
+    }
+    Ok(refs)
+}
+
+fn native_ref_delta(before: &[u8], after: &[u8], planned_new: &BTreeSet<Vec<u8>>) -> Held<()> {
+    let original = parse_native_refs(before)?;
+    let current = parse_native_refs(after)?;
+    for (name, oid) in &original {
+        match current.get(name) {
+            Some(now) if now == oid => (),
+            _ => return Err("census_changed"),
+        }
+    }
+    for name in current.keys() {
+        if original.contains_key(name) {
+            continue;
+        }
+        if !planned_new.contains(name) {
+            return Err("census_changed");
+        }
+    }
+    Ok(())
+}
+
+const PROVENANCE_KINDS: &[&str] = &[
+    "named_ref",
+    "HEAD",
+    "reflog_old",
+    "reflog_new",
+    "unreachable_census",
+    "unclassified_census",
+    "administrative_HEAD",
+    "pseudoref",
+];
+
+fn provenance_kind(bytes: &[u8]) -> Held<&'static str> {
+    PROVENANCE_KINDS
+        .iter()
+        .copied()
+        .find(|kind| kind.as_bytes() == bytes)
+        .ok_or("record_corrupt")
+}
+
+fn hex_text(text: &str) -> bool {
+    text.len() % 2 == 0 && text.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn encode_provenance(set: &BTreeSet<Provenance>) -> Held<Vec<u8>> {
+    let mut out = Vec::new();
+    for provenance in set {
+        provenance_kind(provenance.kind.as_bytes())?;
+        if !hex_text(&provenance.path_hex) {
+            return Err("record_corrupt");
+        }
+        frame(&mut out, 1, provenance.kind.as_bytes());
+        frame(&mut out, 2, provenance.path_hex.as_bytes());
+        match provenance.record_ordinal {
+            Some(n) => frame(&mut out, 3, &n.to_be_bytes()),
+            None => frame(&mut out, 3, &[]),
+        }
+    }
+    Ok(out)
+}
+
+fn decode_provenance(bytes: &[u8]) -> Held<BTreeSet<Provenance>> {
+    let frames = take_frames(bytes).map_err(|_| "record_corrupt")?;
+    if frames.len() % 3 != 0 {
+        return Err("record_corrupt");
+    }
+    let mut set = BTreeSet::new();
+    let mut i = 0;
+    while i < frames.len() {
+        if frames[i].0 != 1 || frames[i + 1].0 != 2 || frames[i + 2].0 != 3 {
+            return Err("record_corrupt");
+        }
+        let kind = provenance_kind(&frames[i].1)?;
+        let path_hex = std::str::from_utf8(&frames[i + 1].1).map_err(|_| "record_corrupt")?;
+        if !hex_text(path_hex) {
+            return Err("record_corrupt");
+        }
+        let record_ordinal = match frames[i + 2].1.as_slice() {
+            [] => None,
+            raw => Some(u64::from_be_bytes(
+                raw.try_into().map_err(|_| "record_corrupt")?,
+            )),
+        };
+        if !set.insert(Provenance {
+            kind,
+            path_hex: path_hex.to_owned(),
+            record_ordinal,
+        }) {
+            return Err("record_corrupt");
+        }
+        i += 3;
+    }
+    Ok(set)
+}
+
+pub(super) fn validate_provenance(bytes: &[u8]) -> Held<()> {
+    let encoded = encode_provenance(&decode_provenance(bytes)?)?;
+    if encoded != bytes {
+        return Err("record_corrupt");
     }
     Ok(())
 }
@@ -1076,6 +1240,8 @@ struct Local {
     head_graph: BTreeSet<Vec<u8>>,
     unclassified: BTreeSet<Vec<u8>>,
     native_digest: Vec<u8>,
+    native_nonref: Vec<u8>,
+    native_refs: BTreeMap<Vec<u8>, Vec<u8>>,
     recovery_refs: BTreeMap<Vec<u8>, Vec<u8>>,
     reserved_held: bool,
     format: ObjectFormat,
@@ -1166,21 +1332,31 @@ impl Local {
             .checked_add(admin.read_size())
             .ok_or("census_budget")?;
         let mut native_digest = Vec::new();
-        let mut command = |args: &[&str], stdin: &[u8], b: &mut Budget| -> Held<Vec<u8>> {
-            checked(b.reserve(charge))?;
-            b.counters.native_input_reserved_bytes += charge;
-            let bytes = checked(git_success(Some(&identity.path), args, stdin, b))?;
-            for arg in args {
-                frame(&mut native_digest, 1, arg.as_bytes());
-            }
-            frame(&mut native_digest, 2, &Sha256::digest(stdin));
-            frame(&mut native_digest, 3, &Sha256::digest(&bytes));
-            Ok(bytes)
-        };
+        let mut native_nonref = Vec::new();
+        let mut command =
+            |args: &[&str], stdin: &[u8], b: &mut Budget, bind_nonref: bool| -> Held<Vec<u8>> {
+                checked(b.reserve(charge))?;
+                b.counters.native_input_reserved_bytes += charge;
+                let bytes = checked(git_success(Some(&identity.path), args, stdin, b))?;
+                for arg in args {
+                    frame(&mut native_digest, 1, arg.as_bytes());
+                    if bind_nonref {
+                        frame(&mut native_nonref, 1, arg.as_bytes());
+                    }
+                }
+                frame(&mut native_digest, 2, &Sha256::digest(stdin));
+                frame(&mut native_digest, 3, &Sha256::digest(&bytes));
+                if bind_nonref {
+                    frame(&mut native_nonref, 2, &Sha256::digest(stdin));
+                    frame(&mut native_nonref, 3, &Sha256::digest(&bytes));
+                }
+                Ok(bytes)
+            };
         let effective = command(
             &["for-each-ref", "--format=%(objectname)%00%(refname)"],
             b"",
             b,
+            false,
         )?;
         let mut native_refs = BTreeMap::new();
         for row in rows(&effective)? {
@@ -1209,7 +1385,12 @@ impl Local {
                 .join(std::ffi::OsStr::from_bytes(&prefix));
             let dir = dir.to_str().ok_or("admin_path_unknown")?;
             let name = std::str::from_utf8(&name).map_err(|_| "admin_path_unknown")?;
-            let bytes = command(&["--git-dir", dir, "rev-parse", "--verify", name], b"", b)?;
+            let bytes = command(
+                &["--git-dir", dir, "rev-parse", "--verify", name],
+                b"",
+                b,
+                true,
+            )?;
             if checked(oid(checked(line(&bytes))?, inputs.format))? != expected {
                 return Err("refs_changed");
             }
@@ -1222,6 +1403,7 @@ impl Local {
             ],
             b"",
             b,
+            true,
         )?;
         let objects = parse_objects(&bytes, inputs.format, b)?;
         let head = ascii_oid(&inputs.head)?;
@@ -1239,6 +1421,7 @@ impl Local {
             ],
             b"",
             b,
+            true,
         )?;
         if !validation.is_empty() {
             return Err("object_validation_unknown");
@@ -1253,6 +1436,7 @@ impl Local {
                 &["rev-list", "--objects", "--no-object-names", &head],
                 b"",
                 b,
+                true,
             )?,
             inputs.format,
         )?;
@@ -1266,6 +1450,7 @@ impl Local {
                 &["rev-list", "--objects", "--no-object-names", "--stdin"],
                 &root_input,
                 b,
+                true,
             )?,
             inputs.format,
         )?;
@@ -1295,6 +1480,7 @@ impl Local {
                 &["rev-list", "--objects", "--no-object-names", "--stdin"],
                 &input,
                 b,
+                true,
             )?,
             inputs.format,
         )?;
@@ -1322,6 +1508,8 @@ impl Local {
             head_graph,
             unclassified,
             native_digest,
+            native_nonref,
+            native_refs,
             recovery_refs,
             reserved_held,
             format: inputs.format,
@@ -1716,5 +1904,57 @@ mod tests {
             &mut b
         )
         .is_err());
+    }
+    #[test]
+    fn manifest_witness_rejects_duplicate_paths_and_malformed_field_order() {
+        let mut ok = Vec::new();
+        frame(&mut ok, 0, b"work.recovery.manifest.v1");
+        frame(&mut ok, 1, b"HEAD");
+        frame(&mut ok, 2, &[0u8; 88]);
+        frame(&mut ok, 3, &[0]);
+        frame(&mut ok, 5, &[1; 32]);
+        assert!(parse_manifest_witness(&ok).is_ok());
+        let mut duplicate = ok.clone();
+        frame(&mut duplicate, 1, b"HEAD");
+        frame(&mut duplicate, 2, &[0u8; 88]);
+        frame(&mut duplicate, 3, &[0]);
+        assert!(parse_manifest_witness(&duplicate).is_err());
+        let mut overwritten = Vec::new();
+        frame(&mut overwritten, 0, b"work.recovery.manifest.v1");
+        frame(&mut overwritten, 1, b"HEAD");
+        frame(&mut overwritten, 2, &[0u8; 88]);
+        frame(&mut overwritten, 2, &[1u8; 88]);
+        frame(&mut overwritten, 3, &[0]);
+        assert!(parse_manifest_witness(&overwritten).is_err());
+        let mut bad_kind = Vec::new();
+        frame(&mut bad_kind, 0, b"work.recovery.manifest.v1");
+        frame(&mut bad_kind, 1, b"HEAD");
+        frame(&mut bad_kind, 2, &[0u8; 88]);
+        frame(&mut bad_kind, 3, &[2]);
+        assert!(parse_manifest_witness(&bad_kind).is_err());
+        let mut absent_and_present = ok.clone();
+        frame(&mut absent_and_present, 6, b"HEAD");
+        assert!(parse_manifest_witness(&absent_and_present).is_err());
+    }
+    #[test]
+    fn provenance_round_trip_rejects_unknown_kind_and_noncanonical_order() {
+        let mut set = BTreeSet::new();
+        set.insert(Provenance {
+            kind: "named_ref",
+            path_hex: hex(b"refs/heads/main"),
+            record_ordinal: None,
+        });
+        let bytes = encode_provenance(&set).unwrap();
+        validate_provenance(&bytes).unwrap();
+        let mut swapped = Vec::new();
+        frame(&mut swapped, 2, hex(b"refs/heads/main").as_bytes());
+        frame(&mut swapped, 1, b"named_ref");
+        frame(&mut swapped, 3, &[]);
+        assert!(validate_provenance(&swapped).is_err());
+        let mut unknown = Vec::new();
+        frame(&mut unknown, 1, b"guessed_author");
+        frame(&mut unknown, 2, b"");
+        frame(&mut unknown, 3, &[]);
+        assert!(validate_provenance(&unknown).is_err());
     }
 }

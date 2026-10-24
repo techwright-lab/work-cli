@@ -3674,34 +3674,57 @@ mod filesystem {
             }
             b.check()
         }
-        pub(super) fn sync_prefix(
+        pub(super) fn sync_dirs_under(
             &self,
             prefix: &[u8],
             b: &mut Budget,
         ) -> Result<(), IncompleteReason> {
-            let mut files = Vec::new();
             let mut dirs = Vec::new();
             for (path, i) in &self.paths {
                 let under = prefix.is_empty()
                     || path == prefix
                     || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'));
-                if !under {
-                    continue;
-                }
-                if self.held[*i].identity.kind() == FileType::Directory {
+                if under && self.held[*i].identity.kind() == FileType::Directory {
                     dirs.push(path.clone());
-                } else {
-                    files.push(path.clone());
                 }
-            }
-            for path in files {
-                self.sync_path(&path, false, b)?;
             }
             dirs.sort_by_key(|p| std::cmp::Reverse(p.len()));
             for path in dirs {
                 self.sync_path(&path, true, b)?;
             }
-            Ok(())
+            b.check()
+        }
+        pub(super) fn sync_root_attachment(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
+            b.check()?;
+            if self.anchor.route.is_empty() {
+                return Err(IncompleteReason::UnsupportedGit);
+            }
+            let last = self.anchor.route.len() - 1;
+            for i in (0..last).rev() {
+                let link = &self.anchor.route[i];
+                if link.identity.kind() != FileType::Directory {
+                    return Err(IncompleteReason::Changed);
+                }
+                let fd = self.proc.reopen_syncable(
+                    &link.fd,
+                    &link.identity,
+                    &link.name,
+                    true,
+                    b,
+                    &mut SystemBoundary,
+                )?;
+                File::from(fd)
+                    .sync_all()
+                    .map_err(|_| IncompleteReason::Io)?;
+                binding_equal(&link.identity, &stat(&link.fd, b)?)?;
+                if i > 0 {
+                    binding_equal(
+                        &link.identity,
+                        &named(&self.anchor.route[i - 1].fd, &link.name, b)?,
+                    )?;
+                }
+            }
+            b.check()
         }
         pub(super) fn recovery_delta(
             &self,

@@ -234,6 +234,50 @@ fn exact_retry_is_historical_and_does_not_rewrite() {
 }
 
 #[test]
+fn already_present_packed_and_loose_targets_are_verified_not_rewritten() {
+    let f = fixture::ManagedFixture::recovery("sha1", "2");
+    let config = configured(&f, "sha1");
+    let operation = Uuid::now_v7();
+    let (out, first) = prepare(&config, f.allocation.checkout, operation);
+    assert!(out.status.success(), "{first}");
+    let head = object_git(&f, &["rev-parse", "HEAD"], b"");
+    let name = recovery_ref(f.allocation.checkout, "sha1", &head);
+    let loose = loose_ref(&f, &name);
+    let before = fs::read(&loose).unwrap();
+    f.git(&["pack-refs".as_ref(), "--all".as_ref()]);
+    if loose.exists() {
+        fs::remove_file(&loose).unwrap();
+    }
+    let packed = fs::read(f.common().join("packed-refs")).unwrap();
+    assert!(String::from_utf8_lossy(&packed).contains(&head));
+    let (out, report) = prepare(&config, f.allocation.checkout, operation);
+    assert!(out.status.success(), "{report}");
+    assert_eq!(report["outcome"], "historical", "{report}");
+    assert_eq!(report["durability"], "historical");
+    assert_eq!(fs::read(f.common().join("packed-refs")).unwrap(), packed);
+    if loose.exists() {
+        assert_eq!(fs::read(&loose).unwrap(), before);
+    }
+    let other = Uuid::now_v7();
+    let (out, second) = prepare(&config, f.allocation.checkout, other);
+    assert!(out.status.success(), "{second}");
+    assert_eq!(second["outcome"], "prepared", "{second}");
+    assert!(second["verified_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == &name));
+    assert!(!second["created_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == &name));
+    if loose.exists() {
+        assert_eq!(fs::read(&loose).unwrap(), before);
+    }
+}
+
+#[test]
 fn packed_and_loose_unreachable_and_standalone_objects_are_protected() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
     let config = configured(&f, "sha1");
@@ -410,13 +454,23 @@ fn operation_lock_excludes_while_held() {
     let lock_path = locks.join(format!("{:016x}-{:016x}.lock", common.dev(), common.ino()));
     fs::write(&lock_path, b"").unwrap();
     fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let ready = f.temp.path().join("lock-ready");
     let mut holder = Command::new("flock")
         .arg("-x")
         .arg(&lock_path)
-        .arg("sleep")
-        .arg("30")
+        .arg("sh")
+        .arg("-c")
+        .arg(format!("printf ready > {:?} && sleep 30", ready))
         .spawn()
         .unwrap();
+    let started = std::time::Instant::now();
+    while !ready.exists() {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "lock holder never published readiness"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let (out, report) = prepare(&config, f.allocation.checkout, Uuid::now_v7());
     let _ = holder.kill();
     let _ = holder.wait();
