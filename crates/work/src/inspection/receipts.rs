@@ -421,7 +421,7 @@ fn read_charged(file: &File, limit: u64, budget: &mut super::Budget) -> Result<V
     Ok(bytes)
 }
 fn next_receipt_name(
-    entries: &mut RawDir<'_>,
+    entries: &mut RawDir<'_, &File>,
     budget: Option<&mut super::Budget>,
 ) -> Result<Option<Vec<u8>>> {
     match budget {
