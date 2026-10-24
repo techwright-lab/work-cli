@@ -100,7 +100,6 @@ struct Assessment {
     adopted: Option<approval::AdoptedMode>,
     terminals: Vec<TerminalCandidate>,
     task_completed: bool,
-    policy_digest: String,
     approval_policy_digest: Option<String>,
     policies: ValidatedPolicies,
     lock: recovery_refs::ExistingLock,
@@ -118,7 +117,6 @@ pub(super) struct Collector {
     adopted: Option<approval::AdoptedMode>,
     terminals: Option<Vec<TerminalCandidate>>,
     task_completed: Option<bool>,
-    policy_digest: Option<String>,
     approval_policy_digest: Option<String>,
     policies: Option<ValidatedPolicies>,
     runtime: Option<(std::path::PathBuf, String)>,
@@ -136,7 +134,6 @@ impl Collector {
             adopted: None,
             terminals: None,
             task_completed: None,
-            policy_digest: None,
             approval_policy_digest: None,
             policies: None,
             runtime: None,
@@ -156,19 +153,6 @@ impl Collector {
         let policies = document
             .inspection_policies()
             .map_err(|_| "inspection_policy_unknown")?;
-        let mut all = Vec::new();
-        frame(&mut all, 0, b"work.retirement.policy.v1");
-        frame(&mut all, 1, policies.canonical_bytes());
-        frame(
-            &mut all,
-            2,
-            &serde_json::to_vec(
-                &document
-                    .remote_preservation()
-                    .map_err(|_| "policy_unknown")?,
-            )
-            .map_err(|_| "policy_unknown")?,
-        );
         let approval_policy_digest = match document.approval() {
             Ok(policy) => {
                 let mut approval = Vec::new();
@@ -189,11 +173,6 @@ impl Collector {
                     )
                     .map_err(|_| "policy_unknown")?,
                 );
-                frame(
-                    &mut all,
-                    3,
-                    &serde_json::to_vec(&policy).map_err(|_| "approval_policy_unknown")?,
-                );
                 Some(hex(&Sha256::digest(approval)))
             }
             Err(_) => None,
@@ -203,7 +182,6 @@ impl Collector {
             .recovery_runtime()
             .ok()
             .map(|runtime| (runtime.runtime_directory, runtime.bus_address));
-        self.policy_digest = Some(hex(&Sha256::digest(all)));
         self.approval_policy_digest = approval_policy_digest;
         self.policies = Some(policies);
         self.store = Some(store);
@@ -325,7 +303,6 @@ impl Collector {
             adopted: self.adopted.take(),
             terminals: self.terminals.take().unwrap_or_default(),
             task_completed: self.task_completed.take().unwrap_or(false),
-            policy_digest: self.policy_digest.take().ok_or("policy_unknown")?,
             approval_policy_digest: self.approval_policy_digest.take(),
             policies: self.policies.take().ok_or("inspection_policy_unknown")?,
             lock,
@@ -473,7 +450,7 @@ fn decide(
             .approval_policy_digest
             .as_deref()
             .ok_or("approval_policy_unknown")?;
-        let mut validated = approval::consume_operator_assertion(
+        let validated = approval::consume_operator_assertion(
             &assessment.store,
             assessment.context.allocation.checkout,
             id,
@@ -489,6 +466,8 @@ fn decide(
         )?;
         report.quiescence = "operator_assertion";
         report.task_completion = "declaration_required";
+        #[cfg(test)]
+        let mut validated = validated;
         #[cfg(test)]
         if take_expire_after_io() {
             validated.expire_for_test();
@@ -510,12 +489,20 @@ fn decide(
         .revalidate(&assessment.store, &common_path)?;
     let (fresh, census, inputs) =
         preservation::RecoveryCensus::recapture(&assessment.context, &mut assessment.budget)?;
-    fresh.verify_closure(&assessment.census, &targets)?;
     assessment
         .physical
-        .first
         .recheck(&mut assessment.budget)
         .map_err(|_| "census_changed")?;
+    assessment.census.recheck(&mut assessment.budget)?;
+    let current_plan = fresh.plan(assessment.context.allocation.checkout)?;
+    let current_targets: Vec<(String, String)> = current_plan
+        .into_iter()
+        .map(|row| (row.reference, row.oid))
+        .collect();
+    if current_targets != targets {
+        return Err("census_changed");
+    }
+    fresh.verify_closure(&assessment.census, &targets)?;
     fresh.recheck(&mut assessment.budget)?;
     census
         .recheck(&mut assessment.budget)
@@ -528,6 +515,7 @@ fn decide(
             .recheck(&mut assessment.budget)
             .map_err(|_| "configuration_changed")?;
     }
+    let mut observations = Vec::new();
     if assessment.mode == ModeKind::Supervised {
         if !assessment.task_completed {
             return Err("task_completion_missing");
@@ -535,7 +523,6 @@ fn decide(
         if assessment.terminals.is_empty() {
             return Err("terminal_candidate_unknown");
         }
-        assessment.budget.check().map_err(|_| "deadline")?;
         let owned;
         let driver = {
             #[cfg(test)]
@@ -551,37 +538,32 @@ fn decide(
                 &owned
             }
         };
-        let mut observations = Vec::new();
         for candidate in &assessment.terminals {
+            assessment.budget.check().map_err(|_| "deadline")?;
             observations.push(
                 candidate
                     .observe(driver)
                     .map_err(|_| "observation_incomplete")?,
             );
+            assessment.budget.check().map_err(|_| "deadline")?;
         }
-        let now = Instant::now();
-        let oldest = observations
-            .iter()
-            .map(TerminalObservation::observed_at)
-            .min()
-            .ok_or("observation_incomplete")?;
-        if now.saturating_duration_since(oldest) >= Duration::from_secs(2) {
-            return Err("observation_stale");
-        }
-        for observed in &observations {
-            if !observed.completed() {
-                return Err("terminal_outcome_incomplete");
-            }
-            observed.verify_empty(now).map_err(hold_reason)?;
-        }
-        report.quiescence = "supervised_observed_empty";
         report.task_completion = "recorded";
     }
     assessment.budget.check().map_err(|_| "deadline")?;
+    #[cfg(test)]
+    if let Some(hook) = take_before_final() {
+        hook();
+    }
+    assessment
+        .lock
+        .revalidate(&assessment.store, &common_path)?;
     let current = {
-        assessment
+        let lease = assessment
             .store
-            .may_acquire_lease()
+            .authority_lease()
+            .map_err(|_| "authority_unknown")?;
+        lease
+            .check(&assessment.store)
             .map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(assessment.store.authority_identity());
         let phase = assessment.store.sql_phase();
@@ -615,8 +597,15 @@ fn decide(
                 }
             }
         }
+        #[cfg(test)]
+        if take_age_first_observation() {
+            if let Some(first) = observations.first_mut() {
+                first.age_for_test();
+            }
+        }
         tx.rollback().map_err(|_| "context_changed")?;
         drop(phase);
+        drop(lease);
         current
     };
     if current.canonical != assessment.context.canonical {
@@ -625,7 +614,29 @@ fn decide(
     if let Some(mut assertion) = assertion {
         assertion.recheck_expiry(&mut assessment.budget)?;
     }
+    if assessment.mode == ModeKind::Supervised {
+        seal_terminal_observations(&observations, Instant::now())?;
+        report.quiescence = "supervised_observed_empty";
+    }
     assessment.budget.check().map_err(|_| "deadline")?;
+    Ok(())
+}
+
+fn seal_terminal_observations(observations: &[TerminalObservation], now: Instant) -> Held<()> {
+    let oldest = observations
+        .iter()
+        .map(TerminalObservation::observed_at)
+        .min()
+        .ok_or("observation_incomplete")?;
+    if now.saturating_duration_since(oldest) >= Duration::from_secs(2) {
+        return Err("observation_stale");
+    }
+    for observed in observations {
+        if !observed.completed() {
+            return Err("terminal_outcome_incomplete");
+        }
+        observed.verify_empty(now).map_err(hold_reason)?;
+    }
     Ok(())
 }
 
@@ -660,7 +671,10 @@ fn hold_reason(reason: HoldReason) -> &'static str {
 thread_local! {
     static AFTER_PROTECTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static BEFORE_FINAL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
     static EXPIRE_AFTER_IO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static AGE_FIRST_OBSERVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -669,8 +683,18 @@ fn take_after_protection() -> Option<Box<dyn FnOnce()>> {
 }
 
 #[cfg(test)]
+fn take_before_final() -> Option<Box<dyn FnOnce()>> {
+    BEFORE_FINAL.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
 fn take_expire_after_io() -> bool {
     EXPIRE_AFTER_IO.with(|hit| hit.replace(false))
+}
+
+#[cfg(test)]
+fn take_age_first_observation() -> bool {
+    AGE_FIRST_OBSERVATION.with(|hit| hit.replace(false))
 }
 
 #[cfg(test)]
@@ -679,8 +703,18 @@ pub(super) fn set_after_protection<F: FnOnce() + 'static>(hook: F) {
 }
 
 #[cfg(test)]
+pub(super) fn set_before_final<F: FnOnce() + 'static>(hook: F) {
+    BEFORE_FINAL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(test)]
 pub(super) fn set_expire_after_io() {
     EXPIRE_AFTER_IO.with(|hit| hit.set(true));
+}
+
+#[cfg(test)]
+pub(super) fn set_age_first_observation() {
+    AGE_FIRST_OBSERVATION.with(|hit| hit.set(true));
 }
 
 #[cfg(test)]
@@ -692,15 +726,17 @@ mod fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run_journal::{RootOutcome, RootRunRequest};
+    use crate::run_journal::{RootOutcome, RootRunRequest, TerminalObservation};
+    use crate::run_participants::{ChildOutcome, ChildRequest, ExpectedHost};
     use crate::runtime_scope::Binding;
     use crate::scope_driver::{LibraryIo, Limits};
     use std::{
-        ffi::OsStr,
         fs,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        process::Command,
     };
+    use work_contract::{RunId, RunRef};
 
     const BOOT: &str = "550e8400-e29b-41d4-a716-446655440000";
 
@@ -764,7 +800,18 @@ mod tests {
                 driver,
             }
         }
+        fn process_pid(&self, pid: u32, ticks: u64, group: &str) {
+            let p = self.tmp.path().join("proc").join(pid.to_string());
+            fs::create_dir_all(&p).unwrap();
+            fs::write(
+                p.join("stat"),
+                format!("{pid} (root) S {} {ticks} 0\n", vec!["0"; 18].join(" ")),
+            )
+            .unwrap();
+            fs::write(p.join("cgroup"), format!("0::{group}\n")).unwrap();
+        }
         fn populate(&self, b: &Binding) {
+            self.process_pid(4242, 12, &b.identity().cgroup);
             fs::write(
                 self.tmp
                     .path()
@@ -774,14 +821,31 @@ mod tests {
                 "4242\n",
             )
             .unwrap();
-            let p = self.tmp.path().join("proc/4242");
-            fs::create_dir_all(&p).unwrap();
+        }
+        fn clear_members(&self, b: &Binding) {
             fs::write(
-                p.join("stat"),
-                "4242 (leak) S 0 10 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                self.tmp
+                    .path()
+                    .join("cg")
+                    .join(b.identity().cgroup.trim_start_matches('/'))
+                    .join("cgroup.procs"),
+                "",
             )
             .unwrap();
-            fs::write(p.join("cgroup"), format!("0::{}\n", b.identity().cgroup)).unwrap();
+        }
+        fn activate(&self) {
+            let properties = self.tmp.path().join("properties");
+            let text = fs::read_to_string(&properties)
+                .unwrap()
+                .replace("ActiveState=inactive", "ActiveState=active");
+            fs::write(properties, text).unwrap();
+        }
+        fn deactivate(&self) {
+            let properties = self.tmp.path().join("properties");
+            let text = fs::read_to_string(&properties)
+                .unwrap()
+                .replace("ActiveState=active", "ActiveState=inactive");
+            fs::write(properties, text).unwrap();
         }
     }
 
@@ -911,6 +975,108 @@ mod tests {
         };
         crate::finish::finish(&config, f.allocation.checkout).unwrap();
     }
+    fn git_text(f: &fixture::ManagedFixture, args: &[&str]) -> String {
+        let out = Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args)
+            .current_dir(&f.allocation.destination)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    fn enroll(
+        f: &mut fixture::ManagedFixture,
+        r: &RootRunRequest,
+        b: &Binding,
+        os: &Manager,
+        pid: u32,
+        ticks: u64,
+    ) -> ChildRequest {
+        let c = ChildRequest {
+            checkout: r.identity().checkout.clone(),
+            group: r.identity().group.clone(),
+            run: RunId::generate(),
+            run_ref: RunRef::parse(&format!("child:{}", Uuid::now_v7())).unwrap(),
+            parent_run: r.identity().run.clone(),
+            parent_run_ref: r.identity().run_ref.clone(),
+            execution_chain: r.identity().execution_chain.clone(),
+            source: None,
+            session: None,
+            agent: None,
+            actor: None,
+            expected_host: Some(ExpectedHost {
+                boot: BOOT.into(),
+                pid,
+                start_ticks: ticks,
+            }),
+        };
+        f.store.register_child(r, &c).unwrap();
+        os.process_pid(pid, ticks, &b.identity().cgroup);
+        os.activate();
+        fs::write(
+            os.tmp
+                .path()
+                .join("cg")
+                .join(b.identity().cgroup.trim_start_matches('/'))
+                .join("cgroup.procs"),
+            format!("{pid}\n"),
+        )
+        .unwrap();
+        let proof = f
+            .store
+            .group_snapshot(&r.identity().run)
+            .unwrap()
+            .certify_child_enrollment(&os.driver, &c.run, Some(b))
+            .unwrap();
+        f.store.record_child_enrollment(r, &c, &proof).unwrap();
+        fs::remove_dir_all(os.tmp.path().join(format!("proc/{pid}"))).unwrap();
+        os.clear_members(b);
+        os.deactivate();
+        c
+    }
+    fn pack_recovery_refs(f: &fixture::ManagedFixture) {
+        f.git(&["pack-refs".as_ref(), "--all".as_ref()]);
+        let root = f.common().join("refs/work-recovery");
+        if !root.exists() {
+            return;
+        }
+        fn walk(dir: &Path) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path);
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+        walk(&root);
+    }
+    fn first_recovery_ref(f: &fixture::ManagedFixture) -> String {
+        git_text(
+            f,
+            &["for-each-ref", "--format=%(refname)", "refs/work-recovery"],
+        )
+        .lines()
+        .next()
+        .expect("recovery ref")
+        .to_owned()
+    }
+    fn prepared_supervised(
+        f: &mut fixture::ManagedFixture,
+    ) -> (RootRunRequest, Binding, Manager, PathBuf) {
+        let (r, b, os) = close_completed(f);
+        finish_task(f);
+        let config = remote_config(f, &os.tmp.path().join("runtime"));
+        let prepared = recovery_refs::prepare_for_assessment(&config, f.allocation.checkout);
+        assert!(prepared.prepared(), "{prepared:?}");
+        (r, b, os, config)
+    }
 
     #[test]
     fn closed_ordinary_supervised_success_from_public_journal_and_finish() {
@@ -1020,5 +1186,242 @@ mod tests {
         let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
         assert_eq!(report.outcome(), "held");
         assert_eq!(report.reason(), "approval_expired");
+    }
+
+    #[test]
+    fn ordinary_ref_to_existing_head_tree_after_protection_holds() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let dest = f.allocation.destination.clone();
+        let tree = git_text(&f, &["rev-parse", "HEAD^{tree}"]);
+        set_after_protection(move || {
+            fixture::git(
+                &dest,
+                &[
+                    "update-ref".as_ref(),
+                    "refs/heads/extra-tree".as_ref(),
+                    tree.as_ref(),
+                ],
+            );
+        });
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert_ne!(report.reason(), "prerequisites_complete");
+    }
+
+    #[test]
+    fn config_mutation_after_protection_holds_for_supervised_and_adopted() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let path = config.clone();
+        set_after_protection(move || {
+            let text = fs::read_to_string(&path)
+                .unwrap()
+                .replace("fixture-v1", "fixture-v2");
+            fs::write(&path, text).unwrap();
+        });
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "configuration_changed");
+        let f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (config, _) = f.approval();
+        let prepared = recovery_refs::prepare_for_assessment(&config, f.allocation.checkout);
+        assert!(prepared.prepared(), "{prepared:?}");
+        let begin = approval::begin_path(&config, f.allocation.checkout);
+        std::thread::sleep(Duration::from_millis(1100));
+        let confirm = approval::confirm_path(
+            &config,
+            f.allocation.checkout,
+            begin.test_receipt_id().expect("baseline"),
+        );
+        let assertion = confirm.test_receipt_id().expect("assertion");
+        let path = config.clone();
+        set_after_protection(move || {
+            let text = fs::read_to_string(&path)
+                .unwrap()
+                .replace("fixture-v1", "fixture-v2");
+            fs::write(&path, text).unwrap();
+        });
+        let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "configuration_changed");
+    }
+
+    #[test]
+    fn first_of_two_observations_stale_at_final_sql_holds() {
+        let now = Instant::now();
+        let mut first = TerminalObservation::timed_for_test(now);
+        let second = TerminalObservation::timed_for_test(now);
+        first.age_for_test();
+        assert_eq!(
+            seal_terminal_observations(&[first, second], Instant::now()),
+            Err("observation_stale")
+        );
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        set_age_first_observation();
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "observation_stale");
+        assert_ne!(report.quiescence(), "supervised_observed_empty");
+    }
+
+    #[test]
+    fn allocation_lock_replacement_and_recovery_namespace_change_hold() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let lock = f.temp.path().join("authority/allocation.lock");
+        set_before_final(move || {
+            let bytes = fs::read(&lock).unwrap();
+            let tmp = lock.with_extension("lock.replaced");
+            fs::write(&tmp, bytes).unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(&tmp, &lock).unwrap();
+        });
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "authority_unknown");
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let ns = f
+            .temp
+            .path()
+            .join("authority/recovery-preparation-locks-v1");
+        set_before_final(move || {
+            fs::rename(&ns, ns.with_extension("moved")).unwrap();
+        });
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert_ne!(report.reason(), "prerequisites_complete");
+    }
+
+    #[test]
+    fn packed_mixed_and_conflicting_recovery_refs() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        pack_recovery_refs(&f);
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(
+            report.outcome(),
+            "prerequisites_complete",
+            "{}",
+            report.reason()
+        );
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        pack_recovery_refs(&f);
+        let name = first_recovery_ref(&f);
+        let oid = git_text(&f, &["rev-parse", &name]);
+        f.git(&["update-ref".as_ref(), name.as_ref(), oid.as_ref()]);
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(
+            report.outcome(),
+            "prerequisites_complete",
+            "{}",
+            report.reason()
+        );
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let name = first_recovery_ref(&f);
+        let tree = git_text(&f, &["rev-parse", "HEAD^{tree}"]);
+        f.git(&["update-ref".as_ref(), name.as_ref(), tree.as_ref()]);
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert!(
+            report.reason() == "recovery_ref_conflict"
+                || report.reason() == "recovery_namespace_unknown",
+            "{}",
+            report.reason()
+        );
+    }
+
+    #[test]
+    fn enrolled_child_still_present_escaped_reused_reboot_and_missing() {
+        for case in ["present", "escaped", "reused", "reboot"] {
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+            let r = request(f.allocation.checkout);
+            f.store.begin_run(&r).unwrap();
+            let b = binding(&r);
+            f.store.record_bound(&r, &b).unwrap();
+            f.store.record_permit_attempt(&r, &b).unwrap();
+            f.store
+                .record_root_outcome(&r, RootOutcome::Completed)
+                .unwrap();
+            let os = Manager::empty(&r, &b);
+            let child = enroll(&mut f, &r, &b, &os, 43, 20);
+            f.store
+                .record_child_outcome(&r, &child, ChildOutcome::Completed)
+                .unwrap();
+            let snap = f.store.group_snapshot(&r.identity().run).unwrap();
+            let proof = snap.certify_empty(&os.driver, &b).unwrap();
+            f.store.close_supervised_group(&snap, &proof).unwrap();
+            finish_task(&f);
+            let config = remote_config(&f, &os.tmp.path().join("runtime"));
+            let prepared = recovery_refs::prepare_for_assessment(&config, f.allocation.checkout);
+            assert!(prepared.prepared(), "{prepared:?}");
+            match case {
+                "present" => {
+                    os.process_pid(43, 20, &b.identity().cgroup);
+                    fs::write(
+                        os.tmp
+                            .path()
+                            .join("cg")
+                            .join(b.identity().cgroup.trim_start_matches('/'))
+                            .join("cgroup.procs"),
+                        "43\n",
+                    )
+                    .unwrap();
+                }
+                "escaped" => os.process_pid(43, 20, "/escaped"),
+                "reused" => os.process_pid(43, 21, &b.identity().cgroup),
+                "reboot" => fs::write(
+                    os.tmp.path().join("proc/sys/kernel/random/boot_id"),
+                    "650e8400-e29b-41d4-a716-446655440000",
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+            let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+            assert_eq!(report.outcome(), "held", "{case}");
+            let expected = match case {
+                "present" => "missing_enrollment",
+                "escaped" => "missing_enrollment",
+                "reused" => "missing_enrollment",
+                "reboot" => "boot_mismatch",
+                _ => unreachable!(),
+            };
+            assert_eq!(report.reason(), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn shared_remote_change_before_cleanup_holds() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let dest = f.allocation.destination.clone();
+        super::super::remote_proof::set_retirement_observer(move |phase, scratch| {
+            if phase != super::super::remote_proof::Phase::BeforeCleanup {
+                return;
+            }
+            fs::write(dest.join("tracked"), b"shared remote change\n").unwrap();
+            fixture::git(
+                &dest,
+                &["commit".as_ref(), "-am".as_ref(), "shared tip".as_ref()],
+            );
+            fixture::git(
+                &dest,
+                &[
+                    "-c".as_ref(),
+                    "protocol.file.allow=always".as_ref(),
+                    "push".as_ref(),
+                    "backup".as_ref(),
+                    "HEAD:refs/heads/preserved".as_ref(),
+                ],
+            );
+            std::os::unix::fs::symlink(&dest, scratch.path().join("unexpected-link")).unwrap();
+        });
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(report.outcome(), "held");
+        assert_ne!(report.reason(), "prerequisites_complete");
     }
 }

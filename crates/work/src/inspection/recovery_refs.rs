@@ -1387,9 +1387,6 @@ pub(super) fn verify_existing_protection(
     if census.reserved_namespace_held() {
         return Err("recovery_namespace_unknown");
     }
-    if census.packed_recovery() {
-        return Err("packed_recovery");
-    }
     let plan = census.plan(checkout)?;
     if plan.is_empty() {
         return Err("recovery_target_unknown");
@@ -1398,6 +1395,13 @@ pub(super) fn verify_existing_protection(
         .into_iter()
         .map(|row| (row.reference, row.oid))
         .collect::<Vec<_>>();
+    for (reference, oid) in &targets {
+        match census.existing_target(reference) {
+            Some(existing) if existing == oid.as_bytes() => {}
+            Some(_) => return Err("recovery_ref_conflict"),
+            None => return Err("recovery_target_unknown"),
+        }
+    }
     census.verify_named(&targets)?;
     Ok(targets)
 }
@@ -1414,7 +1418,8 @@ pub(super) fn sync_existing_protection(
         .iter()
         .map(|(reference, _)| reference.clone())
         .collect::<Vec<_>>();
-    sync::sync_refs(census.common(), &names, false, b)?;
+    let packed = census.packed_recovery();
+    sync::sync_refs(census.common(), &names, packed, b)?;
     for (reference, _) in targets {
         sync::recovery_log_absent(census.common_mut(), reference, b)?;
     }

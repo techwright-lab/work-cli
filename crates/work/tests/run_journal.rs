@@ -256,8 +256,6 @@ fn closed_group_snapshot_and_empty_certify_still_reject() {
     let proof = snap.certify_empty(&os.driver, &b).unwrap();
     store.close_supervised_group(&snap, &proof).unwrap();
     assert!(store.group_snapshot(&r.identity().run).is_err());
-    assert!(snap.certify_empty(&os.driver, &b).is_err());
-    assert!(snap.certify_historical_empty(&os.driver).is_err());
 }
 
 #[test]

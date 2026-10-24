@@ -147,7 +147,7 @@ fn readonly_context(config: &Config, checkout: Uuid, b: &mut Budget) -> Held<Con
 }
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase {
+pub(crate) enum Phase {
     AfterAdvertisement,
     BeforeFinalAdvertisement,
     BeforeRecheck,
@@ -155,6 +155,27 @@ enum Phase {
 }
 #[cfg(test)]
 type Observer<'a> = Option<&'a mut dyn FnMut(Phase, &Scratch)>;
+#[cfg(test)]
+thread_local! {
+    static RETIREMENT_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(Phase, &Scratch)>>> =
+        std::cell::RefCell::new(None);
+}
+#[cfg(test)]
+pub(crate) fn set_retirement_observer<F: FnMut(Phase, &Scratch) + 'static>(hook: F) {
+    RETIREMENT_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+fn notify(observer: &mut Observer<'_>, phase: Phase, scratch: &Scratch) {
+    if let Some(hook) = observer.as_deref_mut() {
+        hook(phase, scratch);
+        return;
+    }
+    RETIREMENT_OBSERVER.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(phase, scratch);
+        }
+    });
+}
 
 fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>) -> RemoteReport {
     verify_with_audit(
@@ -420,9 +441,7 @@ fn verify_with_audit(
         let first = advertisement(&verification, target, inputs.format, &mut b)?;
         report.initial_remote_oid = Some(first.clone());
         #[cfg(test)]
-        if let Some(hook) = observer.as_deref_mut() {
-            hook(Phase::AfterAdvertisement, scratch);
-        }
+        notify(&mut observer, Phase::AfterAdvertisement, scratch);
         fetch(
             &verification,
             &target.url,
@@ -501,18 +520,14 @@ fn verify_with_audit(
             return Err("protocol_unknown");
         }
         #[cfg(test)]
-        if let Some(hook) = observer.as_deref_mut() {
-            hook(Phase::BeforeFinalAdvertisement, scratch);
-        }
+        notify(&mut observer, Phase::BeforeFinalAdvertisement, scratch);
         let final_oid = advertisement(&verification, target, inputs.format, &mut b)?;
         report.final_remote_oid = Some(final_oid.clone());
         if final_oid != first {
             return Err("remote_changed");
         }
         #[cfg(test)]
-        if let Some(hook) = observer.as_deref_mut() {
-            hook(Phase::BeforeRecheck, scratch);
-        }
+        notify(&mut observer, Phase::BeforeRecheck, scratch);
         #[cfg(test)]
         if let Some(hook) = before_recheck {
             hook();
@@ -681,9 +696,7 @@ fn verify_with_audit(
     report.reason = result.err().unwrap_or("consistent_observation");
     if let Some(scratch) = scratch {
         #[cfg(test)]
-        if let Some(hook) = observer {
-            hook(Phase::BeforeCleanup, &scratch);
-        }
+        notify(&mut observer, Phase::BeforeCleanup, &scratch);
         // Removal requires successful helper returns; an ambiguous helper
         // error (including unknown wait outcome) leaves scratch untouched.
         report.cleanup = if scratch.cleanup(&mut b).is_ok() {
@@ -770,6 +783,10 @@ fn verify_with_audit(
             collector.failed(reason);
         }
     }
+    #[cfg(test)]
+    RETIREMENT_OBSERVER.with(|slot| {
+        slot.borrow_mut().take();
+    });
     report
 }
 
@@ -1132,6 +1149,12 @@ struct Scratch {
     path: PathBuf,
     identity: (u64, u64),
     parent_identity: (u64, u64),
+}
+#[cfg(test)]
+impl Scratch {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
 }
 fn stat_id(stat: &rfs::Stat) -> (u64, u64) {
     (stat.st_dev, stat.st_ino)

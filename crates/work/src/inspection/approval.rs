@@ -880,7 +880,6 @@ impl SealedApproval {
 /// Fresh validation of a named v2 operator assertion. Never publishes, renews,
 /// reconfirms, or treats the decoded receipt as a transaction capability.
 pub(super) struct AssertionAssessment {
-    id: Uuid,
     record: ApprovalRecord,
     latest_trusted: ApprovalStamp,
     clock: Clock,
@@ -991,7 +990,6 @@ pub(super) fn consume_operator_assertion(
         record.claim_expiry.as_ref().ok_or("assertion_ineligible")?,
     )?;
     Ok(AssertionAssessment {
-        id: assertion,
         record,
         latest_trusted: now,
         clock,

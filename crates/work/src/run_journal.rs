@@ -475,6 +475,35 @@ impl TerminalObservation {
             EMPTY_MAX_AGE,
         )
     }
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&mut self) {
+        self.observed_at = Instant::now()
+            .checked_sub(EMPTY_MAX_AGE)
+            .expect("monotonic clock must predate the two-second observation limit");
+    }
+    #[cfg(test)]
+    pub(crate) fn timed_for_test(observed_at: Instant) -> Self {
+        use crate::runtime_scope::{Coverage, Membership, Observation, UnitPresence};
+        Self {
+            observed_at,
+            identity: ScopeIdentity {
+                unit: "work-test.scope".into(),
+                invocation: "550e8400e29b41d4a716446655440000".into(),
+                cgroup: "/test/work-test.scope".into(),
+            },
+            boot: "550e8400-e29b-41d4-a716-446655440000".into(),
+            observation: Observation {
+                boot: String::new(),
+                observed_at,
+                unit: UnitPresence::Unknown,
+                membership: Membership::Unknown,
+                recursive_coverage: Coverage::Unknown,
+                participant_coverage: Coverage::Unknown,
+                participants: vec![],
+            },
+            completed: true,
+        }
+    }
 }
 use crate::{events::Event, store::emit};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -1483,4 +1512,183 @@ enum Change {
     Permit(BoundSnapshot),
     Outcome(RootOutcome),
     Hold,
+}
+
+#[cfg(test)]
+mod closed_snapshot_guards {
+    use super::*;
+    use crate::admission::{Limits, Reservation};
+    use crate::runtime_scope::{
+        ActiveStatus, ChildIdentity, Coverage, LoadStatus, Membership, Observation, UnitPresence,
+    };
+    use crate::scope_driver::{Driver, LibraryIo, Limits as DriverLimits, RuntimeContext};
+    use rusqlite::Connection;
+    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+    use uuid::Uuid;
+
+    const BOOT: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    fn request(checkout: Uuid) -> RootRunRequest {
+        serde_json::from_value(serde_json::json!({
+            "identity": {
+                "checkout": checkout,
+                "group": Uuid::now_v7(),
+                "run": Uuid::now_v7(),
+                "run_ref": format!("run:{}", Uuid::now_v7()),
+                "actor": "reviewer-not-owner",
+                "parent_run_ref": "external:parent",
+                "execution_chain": [{"kind":"executor","system":"test"}]
+            },
+            "input": {
+                "command_digest": vec![1; 32],
+                "input_digest": vec![2; 32],
+                "context_ref": "context",
+                "intent_ref": "intent",
+                "boot": BOOT
+            }
+        }))
+        .unwrap()
+    }
+
+    fn binding(r: &RootRunRequest) -> Binding {
+        let intent = LaunchIntent::new(r.identity().run.clone(), &r.input().boot).unwrap();
+        let identity = ScopeIdentity {
+            unit: intent.unit_name().into(),
+            invocation: "550e8400e29b41d4a716446655440000".into(),
+            cgroup: format!("/test/{}", intent.unit_name()),
+        };
+        let child = ChildIdentity {
+            pid: 42,
+            start_ticks: 10,
+            boot: r.input().boot.clone(),
+            cgroup: identity.cgroup.clone(),
+        };
+        let now = Instant::now();
+        crate::runtime_scope::bind(
+            &intent,
+            &child,
+            &Observation {
+                boot: child.boot.clone(),
+                observed_at: now,
+                unit: UnitPresence::Present {
+                    identity,
+                    load: LoadStatus::Loaded,
+                    active: ActiveStatus::Active,
+                },
+                membership: Membership::Present(vec![child.clone()]),
+                recursive_coverage: Coverage::Complete,
+                participant_coverage: Coverage::Unknown,
+                participants: vec![],
+            },
+            now,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+    }
+
+    fn driver(
+        r: &RootRunRequest,
+        b: &Binding,
+    ) -> (tempfile::TempDir, std::os::unix::net::UnixListener, Driver) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("runtime")).unwrap();
+        fs::set_permissions(root.join("runtime"), fs::Permissions::from_mode(0o700)).unwrap();
+        let bus = std::os::unix::net::UnixListener::bind(root.join("runtime/bus")).unwrap();
+        fs::create_dir_all(root.join("proc/sys/kernel/random")).unwrap();
+        fs::write(root.join("proc/sys/kernel/random/boot_id"), &r.input().boot).unwrap();
+        let cg = root
+            .join("cg")
+            .join(b.identity().cgroup.trim_start_matches('/'));
+        fs::create_dir_all(&cg).unwrap();
+        fs::write(cg.join("cgroup.procs"), "").unwrap();
+        fs::write(cg.join("cgroup.type"), "domain\n").unwrap();
+        fs::write(
+            root.join("properties"),
+            format!(
+                "Id={}\nInvocationID={}\nControlGroup={}\nLoadState=loaded\nActiveState=inactive\n",
+                b.identity().unit,
+                b.identity().invocation,
+                b.identity().cgroup
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("manager"),
+            format!(
+                "#!/bin/sh\nexec /usr/bin/cat '{}'\n",
+                root.join("properties").display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(root.join("manager"), fs::Permissions::from_mode(0o700)).unwrap();
+        let driver = Driver::with_io(
+            RuntimeContext::new(
+                root.join("runtime"),
+                format!("unix:path={}/runtime/bus", root.display()),
+            )
+            .unwrap(),
+            LibraryIo {
+                systemctl: root.join("manager"),
+                proc_root: root.join("proc"),
+                cgroup_root: root.join("cg"),
+                between_censuses: None,
+            },
+            DriverLimits::default(),
+        )
+        .unwrap();
+        (tmp, bus, driver)
+    }
+
+    #[test]
+    fn closed_record_group_snapshot_rejects_both_certify_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).unwrap();
+        let mut store =
+            Store::open(&dir.path().join("private"), std::slice::from_ref(&root)).unwrap();
+        let checkout = store
+            .reserve(
+                &Reservation {
+                    operation: Uuid::now_v7(),
+                    repository: root,
+                    actor: "allocator".into(),
+                    owner: "owner".into(),
+                    task: "task".into(),
+                },
+                Limits {
+                    repository: 10,
+                    owner: 10,
+                    available_bytes: Some(100),
+                    floor_bytes: 0,
+                    warn_bytes: 0,
+                },
+            )
+            .unwrap();
+        let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        sql.execute(
+            "UPDATE checkouts SET state='active',ready=1 WHERE id=?1",
+            [checkout.to_string()],
+        )
+        .unwrap();
+        drop(sql);
+        let r = request(checkout);
+        store.begin_run(&r).unwrap();
+        let b = binding(&r);
+        store.record_bound(&r, &b).unwrap();
+        store.record_permit_attempt(&r, &b).unwrap();
+        store
+            .record_root_outcome(&r, RootOutcome::Completed)
+            .unwrap();
+        let (_tmp, _bus, driver) = driver(&r, &b);
+        let snap = store.group_snapshot(&r.identity().run).unwrap();
+        let proof = snap.certify_empty(&driver, &b).unwrap();
+        store.close_supervised_group(&snap, &proof).unwrap();
+        let closed = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+        assert!(closed.closed);
+        let closed_snap = GroupSnapshot { record: closed };
+        assert!(closed_snap.certify_empty(&driver, &b).is_err());
+        assert!(closed_snap.certify_historical_empty(&driver).is_err());
+        assert!(store.group_snapshot(&r.identity().run).is_err());
+    }
 }

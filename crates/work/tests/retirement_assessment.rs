@@ -79,6 +79,41 @@ fn assert_disabled(report: &RetirementAssessmentReport) {
     assert!(!report.retirement_authority());
     assert!(report.writer_charges_retained());
 }
+fn confirm_assertion(config: &Path, checkout: Uuid) -> Uuid {
+    let (out, begin) = report(config, &["approve", "begin", &checkout.to_string()]);
+    assert!(out.status.success(), "{begin}");
+    std::thread::sleep(Duration::from_millis(1100));
+    let (out, confirm) = report(
+        config,
+        &[
+            "approve",
+            "confirm",
+            &checkout.to_string(),
+            "--observation",
+            begin["receipt_id"].as_str().unwrap(),
+            "--assert-quiescent",
+        ],
+    );
+    assert!(out.status.success(), "{confirm}");
+    Uuid::parse_str(confirm["receipt_id"].as_str().unwrap()).unwrap()
+}
+fn pack_recovery_refs(f: &fixture::ManagedFixture) {
+    f.git(&["pack-refs".as_ref(), "--all".as_ref()]);
+    let root = f.common().join("refs/work-recovery");
+    if root.exists() {
+        fn walk(dir: &Path) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path);
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+        }
+        walk(&root);
+    }
+}
 
 #[test]
 fn public_wrapper_holds_unknown_configuration_without_driver() {
@@ -103,9 +138,11 @@ fn invalid_checkout_holds() {
 fn missing_allocation_lock_holds() {
     let f = fixture::ManagedFixture::new("sha1", "2");
     let (config, _) = f.approval();
+    let assertion = confirm_assertion(&config, f.allocation.checkout);
     fs::remove_file(f.temp.path().join("authority/allocation.lock")).unwrap();
-    let report = assess_retirement(&config, f.allocation.checkout, None);
+    let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
     assert_eq!(report.outcome(), "held");
+    assert_eq!(report.reason(), "authority_unknown");
     assert_disabled(&report);
 }
 
@@ -113,10 +150,11 @@ fn missing_allocation_lock_holds() {
 fn missing_recovery_lock_holds_without_prepare() {
     let f = fixture::ManagedFixture::new("sha1", "2");
     let (config, _) = f.approval();
+    let assertion = confirm_assertion(&config, f.allocation.checkout);
     let before_sql = sql_bytes(&f);
     let before_writers = writer_count(&f);
     let before_refs = recovery_refs(&f);
-    let report = assess_retirement(&config, f.allocation.checkout, None);
+    let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
     assert_eq!(report.outcome(), "held");
     assert_eq!(report.reason(), "preparation_required");
     assert_disabled(&report);
@@ -213,12 +251,15 @@ fn adopted_baseline_observation_is_ineligible() {
 fn dirty_work_holds_and_does_not_mutate() {
     let f = fixture::ManagedFixture::recovery("sha1", "2");
     let (config, _) = f.approval();
-    let _ = prepare(&config, f.allocation.checkout);
+    let prepared = prepare(&config, f.allocation.checkout);
+    assert_ne!(prepared["outcome"], "held", "{prepared}");
+    let assertion = confirm_assertion(&config, f.allocation.checkout);
     fs::write(f.allocation.destination.join("untracked"), b"dirty").unwrap();
     let before_sql = sql_bytes(&f);
     let before_refs = recovery_refs(&f);
-    let report = assess_retirement(&config, f.allocation.checkout, None);
+    let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
     assert_eq!(report.outcome(), "held");
+    assert_eq!(report.reason(), "inspection_held");
     assert_disabled(&report);
     assert_eq!(sql_bytes(&f), before_sql);
     assert_eq!(recovery_refs(&f), before_refs);
@@ -251,5 +292,37 @@ fn pre_prepare_assertion_is_invalidated_by_recovery_creation() {
     let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
     assert_eq!(report.outcome(), "held");
     assert_eq!(report.reason(), "assertion_invalidated");
+    assert_disabled(&report);
+}
+
+#[test]
+fn packed_recovery_after_fresh_begin_confirm_is_eligible() {
+    let f = fixture::ManagedFixture::recovery("sha1", "2");
+    let (config, request) = f.approval();
+    let prepared = prepare(&config, f.allocation.checkout);
+    assert_ne!(prepared["outcome"], "held", "{prepared}");
+    let stale = confirm_assertion(&config, f.allocation.checkout);
+    pack_recovery_refs(&f);
+    let report = assess_retirement(&config, f.allocation.checkout, Some(stale));
+    assert_eq!(report.outcome(), "held");
+    assert_eq!(report.reason(), "assertion_invalidated");
+    assert_disabled(&report);
+    let assertion = confirm_assertion(&config, f.allocation.checkout);
+    let before_writers = writer_count(&f);
+    let before_status = f.store.adopted_status(&request.identity.run).unwrap();
+    let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
+    assert_eq!(
+        report.outcome(),
+        "prerequisites_complete",
+        "{}",
+        report.reason()
+    );
+    assert_eq!(report.mode(), "adopted");
+    assert_eq!(report.task_completion(), "declaration_required");
+    assert_eq!(writer_count(&f), before_writers);
+    assert_eq!(
+        f.store.adopted_status(&request.identity.run).unwrap(),
+        before_status
+    );
     assert_disabled(&report);
 }
