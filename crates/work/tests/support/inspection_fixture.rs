@@ -22,7 +22,20 @@ pub struct ManagedFixture {
 }
 impl ManagedFixture {
     pub fn new(format: &str, version: &str) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        Self::create(tempfile::tempdir().unwrap(), format, version)
+    }
+    /// Recovery-preparation fixtures prefer the workspace target filesystem so
+    /// tmpfs `/tmp` cannot be mistaken for persistent success.
+    pub fn recovery(format: &str, version: &str) -> Self {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/recovery-fixtures");
+        fs::create_dir_all(&base).unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("work-recovery-")
+            .tempdir_in(&base)
+            .unwrap();
+        Self::create(temp, format, version)
+    }
+    fn create(temp: tempfile::TempDir, format: &str, version: &str) -> Self {
         let repo = temp.path().join("repository");
         let root = temp.path().join("managed");
         fs::create_dir(&repo).unwrap();

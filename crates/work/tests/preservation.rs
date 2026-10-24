@@ -446,3 +446,20 @@ fn cli_help_uuid_policy_and_old_report_are_sanitized() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
 }
+#[test]
+fn existing_recovery_ref_does_not_classify_or_clear_unclassified_holds() {
+    let f = fixture::ManagedFixture::new("sha1", "2");
+    let config = configured(&f);
+    let blob = object_git(
+        &f,
+        &["hash-object", "-w", "--stdin"],
+        b"unclassified payload",
+    );
+    let name = format!("refs/work-recovery/{}/sha1/{}", f.allocation.checkout, blob);
+    f.git(&["update-ref".as_ref(), name.as_ref(), blob.as_ref()]);
+    let (out, report) = audit(&f, &config);
+    assert_eq!(out.status.code(), Some(1), "{report}");
+    assert!(holds(&report, "unclassified_local_work"));
+    assert!(provenance(&report, &blob, "unclassified_census"));
+    assert!(!provenance(&report, &blob, "named_ref"));
+}

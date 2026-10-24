@@ -165,6 +165,16 @@ impl Audit {
             invalidation,
         })
     }
+    pub(super) fn take_recovery_plan(&mut self) -> Held<RecoveryCensus> {
+        if !self.sealed {
+            return Err("audit_sequence_unknown");
+        }
+        let local = self.local.take().ok_or("census_unknown")?;
+        if self.graph.is_none() || !self.rechecked {
+            return Err("census_unknown");
+        }
+        Ok(RecoveryCensus { local })
+    }
     pub(super) fn begin(
         &mut self,
         document: &ConfigDocument,
@@ -557,6 +567,185 @@ impl ApprovalLocal {
         checked(self.local.admin.recheck(b))
     }
 }
+
+pub(super) struct RecoveryPlanRow {
+    pub reference: String,
+    pub oid: String,
+    pub object_type: &'static str,
+    pub provenance: Vec<u8>,
+}
+
+pub(super) struct RecoveryCensus {
+    local: Local,
+}
+impl RecoveryCensus {
+    pub(super) fn reserved_namespace_held(&self) -> bool {
+        self.local.reserved_held
+    }
+    pub(super) fn common_dev_ino(&self) -> (u64, u64) {
+        self.local.admin.root_dev_ino()
+    }
+    pub(super) fn common(&self) -> &filesystem::Manifest {
+        &self.local.admin
+    }
+    pub(super) fn common_mut(&mut self) -> &mut filesystem::Manifest {
+        &mut self.local.admin
+    }
+    pub(super) fn format(&self) -> ObjectFormat {
+        self.local.format
+    }
+    pub(super) fn object_format(&self) -> &'static str {
+        format_name(self.local.format)
+    }
+    pub(super) fn source_commitment(&self) -> [u8; 32] {
+        let mut out = Vec::new();
+        frame(&mut out, 0, b"work.recovery.source.v1");
+        frame(&mut out, 1, self.object_format().as_bytes());
+        for (id, object) in &self.local.objects {
+            frame(&mut out, 2, id);
+            frame(&mut out, 3, object.kind.as_bytes());
+            frame(&mut out, 4, &object.size.to_be_bytes());
+        }
+        for (id, provenance) in &self.local.roots {
+            frame(&mut out, 5, id);
+            frame(
+                &mut out,
+                6,
+                &serde_json::to_vec(provenance).unwrap_or_default(),
+            );
+        }
+        for id in &self.local.unclassified {
+            frame(&mut out, 7, id);
+        }
+        for id in &self.local.head_graph {
+            frame(&mut out, 8, id);
+        }
+        let digest = Sha256::digest(out);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest);
+        out
+    }
+    pub(super) fn packed_recovery(&self) -> bool {
+        self.local
+            .recovery_refs
+            .keys()
+            .any(|path| !self.local.admin.contains(path))
+    }
+    pub(super) fn existing_target(&self, reference: &str) -> Option<&[u8]> {
+        self.local
+            .recovery_refs
+            .get(reference.as_bytes())
+            .map(|v| v.as_slice())
+    }
+    pub(super) fn plan(&self, checkout: Uuid) -> Held<Vec<RecoveryPlanRow>> {
+        let object_format = format_name(self.local.format);
+        let mut plan = Vec::new();
+        for (id, provenance) in &self.local.roots {
+            let object = self.local.objects.get(id).ok_or("missing_root_object")?;
+            let oid = ascii_oid(id)?;
+            let reference = format!("refs/work-recovery/{checkout}/{object_format}/{oid}");
+            plan.push(RecoveryPlanRow {
+                reference,
+                oid,
+                object_type: object.kind,
+                provenance: serde_json::to_vec(provenance).map_err(|_| "census_unknown")?,
+            });
+        }
+        plan.sort_by(|a, b| a.reference.cmp(&b.reference));
+        Ok(plan)
+    }
+    pub(super) fn recheck(&self, b: &mut Budget) -> Held<()> {
+        checked(self.local.admin.recheck(b))
+    }
+    pub(super) fn recapture(context: &Context, b: &mut Budget) -> Held<Self> {
+        let identity = context
+            .allocation
+            .identity
+            .as_ref()
+            .ok_or("identity_unknown")?;
+        let census = checked(filesystem::walk(
+            &identity.path,
+            b,
+            &mut filesystem::SystemBoundary,
+        ))?;
+        let inputs = checked(GitInputs::capture(context, &census, b))?;
+        Ok(Self {
+            local: Local::capture(context, &inputs, b)?,
+        })
+    }
+    pub(super) fn expected_delta(&self, before: &Self, planned: &BTreeSet<Vec<u8>>) -> Held<()> {
+        if self.local.objects != before.local.objects
+            || self.local.roots != before.local.roots
+            || self.local.unclassified != before.local.unclassified
+            || self.local.head_graph != before.local.head_graph
+        {
+            return Err("census_changed");
+        }
+        checked(
+            self.local
+                .admin
+                .recovery_delta(&before.local.admin, planned),
+        )
+    }
+    pub(super) fn verify_named(&self, targets: &[(String, String)]) -> Held<()> {
+        for (reference, oid) in targets {
+            match self.existing_target(reference) {
+                Some(existing) if existing == oid.as_bytes() => (),
+                _ => return Err("recovery_target_unknown"),
+            }
+            if !self.local.objects.contains_key(oid.as_bytes()) {
+                return Err("missing_root_object");
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn closure_digest(&self) -> [u8; 32] {
+        self.source_commitment()
+    }
+}
+
+enum RecoveryNs {
+    Ordinary,
+    Valid,
+    Invalid,
+}
+fn recovery_namespace(path: &[u8], target: &[u8], format: ObjectFormat) -> RecoveryNs {
+    let rest = match path.strip_prefix(b"refs/work-recovery") {
+        None => return RecoveryNs::Ordinary,
+        Some(b"") => return RecoveryNs::Invalid,
+        Some(rest) => match rest.strip_prefix(b"/") {
+            Some(rest) => rest,
+            None => return RecoveryNs::Invalid,
+        },
+    };
+    let parts: Vec<_> = rest.split(|c| *c == b'/').collect();
+    if parts.len() != 3 {
+        return RecoveryNs::Invalid;
+    }
+    let Ok(text) = std::str::from_utf8(parts[0]) else {
+        return RecoveryNs::Invalid;
+    };
+    let Ok(id) = Uuid::parse_str(text) else {
+        return RecoveryNs::Invalid;
+    };
+    if id.get_version_num() != 7
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.to_string() != text
+    {
+        return RecoveryNs::Invalid;
+    }
+    let expected = match format {
+        ObjectFormat::Sha1 => b"sha1".as_slice(),
+        ObjectFormat::Sha256 => b"sha256".as_slice(),
+    };
+    if parts[1] != expected {
+        return RecoveryNs::Invalid;
+    }
+    if parts[2] != target || oid(parts[2], format).is_err() {
+        return RecoveryNs::Invalid;
+    }
+    RecoveryNs::Valid
+}
 struct Local {
     admin: filesystem::Manifest,
     objects: Objects,
@@ -564,6 +753,9 @@ struct Local {
     head_graph: BTreeSet<Vec<u8>>,
     unclassified: BTreeSet<Vec<u8>>,
     native_digest: Vec<u8>,
+    recovery_refs: BTreeMap<Vec<u8>, Vec<u8>>,
+    reserved_held: bool,
+    format: ObjectFormat,
 }
 impl Local {
     fn fingerprint(&self) -> Vec<u8> {
@@ -608,8 +800,20 @@ impl Local {
             return Err("private_refs_unsupported");
         }
         let mut roots = Roots::new();
+        let mut recovery_refs = BTreeMap::new();
+        let mut reserved_held = false;
         for (path, id) in &refs {
-            add_root(&mut roots, id.clone(), "named_ref", path, None, b)?;
+            match recovery_namespace(path, id, inputs.format) {
+                RecoveryNs::Ordinary => {
+                    add_root(&mut roots, id.clone(), "named_ref", path, None, b)?;
+                }
+                RecoveryNs::Valid => {
+                    recovery_refs.insert(path.clone(), id.clone());
+                }
+                RecoveryNs::Invalid => {
+                    reserved_held = true;
+                }
+            }
         }
         let mut admin_heads = Vec::new();
         administrative(
@@ -795,6 +999,9 @@ impl Local {
             head_graph,
             unclassified,
             native_digest,
+            recovery_refs,
+            reserved_held,
+            format: inputs.format,
         })
     }
 }

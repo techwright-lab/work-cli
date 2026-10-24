@@ -25,6 +25,9 @@ mod approval;
 pub(crate) use approval::ApprovalCommand;
 pub use approval::{approve_begin, approve_confirm, ApprovalReport};
 
+mod recovery_refs;
+pub use recovery_refs::{prepare_recovery, prepare_recovery_refused, RecoveryReport};
+
 mod receipts;
 pub use receipts::{
     inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,
@@ -2777,7 +2780,7 @@ mod filesystem {
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct Identity {
-        device: u64,
+        pub(super) device: u64,
         pub(super) inode: u64,
         pub(super) mode: u32,
         links: u64,
@@ -3078,6 +3081,48 @@ mod filesystem {
             let reopened = stat(&fd, b)?;
             hooks.event(Event::DataOpened, path, Some(&reopened))?;
             equal(expected, &reopened)?;
+            Ok(fd)
+        }
+        fn reopen_syncable<H: Boundary>(
+            &self,
+            retained: &OwnedFd,
+            expected: &Identity,
+            path: &[u8],
+            directory: bool,
+            b: &mut Budget,
+            hooks: &mut H,
+        ) -> Result<OwnedFd, IncompleteReason> {
+            if directory {
+                if expected.kind() != FileType::Directory {
+                    return Err(IncompleteReason::Changed);
+                }
+                binding_equal(expected, &stat(retained, b)?)?;
+            } else {
+                regular(expected)?;
+                equal(expected, &stat(retained, b)?)?;
+            }
+            self.recheck(b)?;
+            let numeric = retained.as_raw_fd().to_string();
+            hooks.event(Event::BeforeDataOpen, path, Some(expected))?;
+            b.check()?;
+            let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
+            if directory {
+                flags |= OFlags::DIRECTORY;
+            }
+            let fd = fs::openat(
+                &self.anchor.last().fd,
+                numeric.as_str(),
+                flags,
+                Mode::empty(),
+            )
+            .map_err(os_error)?;
+            let reopened = stat(&fd, b)?;
+            hooks.event(Event::DataOpened, path, Some(&reopened))?;
+            if directory {
+                binding_equal(expected, &reopened)?;
+            } else {
+                equal(expected, &reopened)?;
+            }
             Ok(fd)
         }
     }
@@ -3498,6 +3543,149 @@ mod filesystem {
                 frame(&mut out, 5, &Sha256::digest(data));
             }
             Sha256::digest(out).to_vec()
+        }
+        pub(super) fn root_dev_ino(&self) -> (u64, u64) {
+            (self.held[0].identity.device, self.held[0].identity.inode)
+        }
+        pub(super) fn persistent_fs(&self) -> Result<(), IncompleteReason> {
+            let fs = fs::fstatfs(&self.held[0].fd).map_err(os_error)?;
+            let magic = fs.f_type as u64;
+            if magic == 0x01021994 || magic == 0x858458f6 {
+                return Err(IncompleteReason::UnsupportedGit);
+            }
+            Ok(())
+        }
+        pub(super) fn contains(&self, path: &[u8]) -> bool {
+            self.paths.contains_key(path)
+        }
+        pub(super) fn has_path(&self, path: &[u8]) -> Result<bool, IncompleteReason> {
+            Ok(self.paths.contains_key(path))
+        }
+        pub(super) fn sync_path(
+            &self,
+            path: &[u8],
+            directory: bool,
+            b: &mut Budget,
+        ) -> Result<(), IncompleteReason> {
+            let Some(i) = self.paths.get(path).copied() else {
+                return if directory {
+                    Ok(())
+                } else {
+                    Err(IncompleteReason::UnsupportedGit)
+                };
+            };
+            let held = &self.held[i];
+            if directory != (held.identity.kind() == FileType::Directory) {
+                return Err(IncompleteReason::Changed);
+            }
+            let fd = self.proc.reopen_syncable(
+                &held.fd,
+                &held.identity,
+                path,
+                directory,
+                b,
+                &mut SystemBoundary,
+            )?;
+            File::from(fd)
+                .sync_all()
+                .map_err(|_| IncompleteReason::Io)?;
+            if directory {
+                binding_equal(&held.identity, &stat(&held.fd, b)?)?;
+            } else {
+                equal(&held.identity, &stat(&held.fd, b)?)?;
+            }
+            if let Some(parent) = held.parent {
+                if directory {
+                    binding_equal(
+                        &held.identity,
+                        &named(&self.held[parent].fd, &held.name, b)?,
+                    )?;
+                } else {
+                    equal(
+                        &held.identity,
+                        &named(&self.held[parent].fd, &held.name, b)?,
+                    )?;
+                }
+            }
+            b.check()
+        }
+        pub(super) fn sync_prefix(
+            &self,
+            prefix: &[u8],
+            b: &mut Budget,
+        ) -> Result<(), IncompleteReason> {
+            let mut files = Vec::new();
+            let mut dirs = Vec::new();
+            for (path, i) in &self.paths {
+                let under = prefix.is_empty()
+                    || path == prefix
+                    || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'));
+                if !under {
+                    continue;
+                }
+                if self.held[*i].identity.kind() == FileType::Directory {
+                    dirs.push(path.clone());
+                } else {
+                    files.push(path.clone());
+                }
+            }
+            for path in files {
+                self.sync_path(&path, false, b)?;
+            }
+            dirs.sort_by_key(|p| std::cmp::Reverse(p.len()));
+            for path in dirs {
+                self.sync_path(&path, true, b)?;
+            }
+            Ok(())
+        }
+        pub(super) fn recovery_delta(
+            &self,
+            before: &Self,
+            planned: &BTreeSet<Vec<u8>>,
+        ) -> Result<(), IncompleteReason> {
+            let mut allowed_dirs = BTreeSet::new();
+            for path in planned {
+                let mut i = 0;
+                while let Some(rel) = path[i..].iter().position(|c| *c == b'/') {
+                    i += rel;
+                    allowed_dirs.insert(path[..i].to_vec());
+                    i += 1;
+                }
+            }
+            for (path, i) in &before.paths {
+                let Some(after) = self.paths.get(path).copied() else {
+                    return Err(IncompleteReason::Changed);
+                };
+                let was = &before.held[*i].identity;
+                let now = &self.held[after].identity;
+                if was.kind() == FileType::Directory {
+                    binding_equal(was, now)?;
+                } else {
+                    equal(was, now)?;
+                }
+            }
+            for (path, i) in &self.paths {
+                if before.paths.contains_key(path) {
+                    continue;
+                }
+                let identity = &self.held[*i].identity;
+                if identity.kind() == FileType::Directory {
+                    if !allowed_dirs.contains(path) {
+                        return Err(IncompleteReason::Changed);
+                    }
+                } else if !planned.contains(path) {
+                    return Err(IncompleteReason::Changed);
+                }
+            }
+            for (path, _) in &before.absent {
+                if planned.contains(path) {
+                    continue;
+                }
+                if !self.absent.contains_key(path) {
+                    return Err(IncompleteReason::Changed);
+                }
+            }
+            Ok(())
         }
     }
     pub(super) struct Endpoint {

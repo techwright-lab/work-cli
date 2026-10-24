@@ -157,10 +157,44 @@ not promise future remote availability, checkout ownership or quiescence.
 The independent existing Task10 GitHub job selects preservation unit/integration
 source alongside remote regression tests and scoped Clippy. No local test/build
 execution or passing claim accompanies this source change. Full Task10 still needs
-fresh, verified durable recovery-ref creation, preservation of held content,
-qualification of the adopted assertion pilot below, fresh physical writer quiescence,
-and separately reviewed crash-safe retirement/quarantine/removal and charge-release
-gates. No gate is waived; Task8 and performance qualification remain parked/opt-in.
+CI-qualified recovery-ref preparation below, qualification of the adopted assertion
+pilot, fresh physical writer quiescence, and separately reviewed crash-safe
+retirement/quarantine/removal and charge-release gates. No gate is waived; Task8
+and performance qualification remain parked/opt-in.
+
+### Recovery preparation pilot (Task10 source, not retirement acceptance)
+
+```sh
+work prepare-recovery <checkout-uuidv7> --create --operation <uuidv7>
+```
+
+Both `--create` and `--operation` are required before any mutation. The operation
+ID is caller-selected identity, never caller-supplied evidence, OID, ref, path or
+policy. Without the explicit create flag, the command refuses, does not write, and
+directs the operator to `work audit-preservation`. There is no implicit invocation
+from inspect, approve, finish or reap, and no new configuration subtree.
+
+Useful success is **local protection** of the enumerated object set via deterministic
+`refs/work-recovery/<checkout>/<sha1|sha256>/<oid>` create-only refs. It is not remote
+backup, ownership attribution, approval eligibility or retirement readiness.
+`retirement_authority` stays false. Content and additional-work holds remain visible;
+unknown coverage or failed remote proof prevents writes. Existing recovery refs are
+excluded as ordinary classification roots so adding protection cannot erase
+unclassified, remote-absence or shared-ownership holds.
+
+A closed `work.recovery-preparation.v1` intent is reserved, fsync'd and NOREPLACE-
+published under the existing inspection-receipt directory **before** any Git CAS.
+Intent publication uncertainty means no `update-ref`. Each missing ref is a single
+native argv `update-ref --no-deref` with exact OIDs and matching-width zeros; existing
+exact targets are verified and synced without rewrite. Conflicts, symrefs, stale locks
+and malformed reserved-namespace entries hold. Ordinary branches, HEAD, index, payload
+and reflogs are left unchanged. OS fsync acknowledgment is not hardware power-loss
+certification; tmpfs/ramfs cannot receive persistent success.
+
+The same operation ID resumes an unresolved published intent. A completed result is
+historical evidence, not a fresh ACK or removal permission. Preparation invalidates
+earlier approval observations without rewriting those receipts. Full Task10 remains
+open.
 
 ### Adopted assertion pilot (source-only; no retirement or OS proof)
 

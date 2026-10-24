@@ -26,10 +26,11 @@ jobs:
           cargo test -p work-cli --locked --lib config::approval_policy_tests::
           cargo test -p work-cli --locked --lib inspection::receipts::tests::approval_v2
           cargo test -p work-cli --locked --lib inspection::receipts::tests::v2_envelope
+          cargo test -p work-cli --locked --lib inspection::recovery_refs::
       - name: Owned local remote integration tests
-        run: cargo test -p work-cli --locked --test remote_proof --test preservation --test approval
+        run: cargo test -p work-cli --locked --test remote_proof --test preservation --test approval --test recovery_refs
       - name: Library and remote observation Clippy
-        run: cargo clippy -p work-cli --locked --lib --test remote_proof --test preservation --test approval -- -D warnings
+        run: cargo clippy -p work-cli --locked --lib --test remote_proof --test preservation --test approval --test recovery_refs -- -D warnings
   # Independent qualification: full-suite failures remain visible in `ci` below.
   task9-inspection:
     runs-on: ubuntu-latest

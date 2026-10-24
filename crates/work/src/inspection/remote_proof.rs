@@ -160,6 +160,7 @@ fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>)
         checkout,
         None,
         None,
+        None,
         #[cfg(test)]
         observer,
         #[cfg(test)]
@@ -192,6 +193,7 @@ pub(super) fn audit_path(
         checkout,
         Some(audit),
         None,
+        None,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -209,6 +211,25 @@ pub(super) fn approval_path(
         checkout,
         Some(audit),
         Some(collector),
+        None,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+pub(super) fn recovery_path(
+    path: &Path,
+    checkout: Uuid,
+    audit: &mut super::preservation::Audit,
+    collector: &mut super::recovery_refs::Collector,
+) -> RemoteReport {
+    verify_with_audit(
+        path,
+        checkout,
+        Some(audit),
+        None,
+        Some(collector),
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -220,12 +241,14 @@ fn verify_with_audit(
     checkout: Uuid,
     mut audit: Option<&mut super::preservation::Audit>,
     mut approval: Option<&mut super::approval::Collector>,
+    mut recovery: Option<&mut super::recovery_refs::Collector>,
     #[cfg(test)] mut observer: Observer<'_>,
     #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
 ) -> RemoteReport {
     let mut b = Budget::new();
     let mut audit_nonancestor = false;
     let mut approval_retained = None;
+    let mut recovery_retained = None;
     let mut report = RemoteReport::held(checkout);
     let mut scratch = None;
     let result = (|| -> Held<()> {
@@ -244,6 +267,9 @@ fn verify_with_audit(
         let context = if let Some(collector) = approval.as_deref_mut() {
             collector.configure(&document, &config)?;
             collector.context(&mut b)?
+        } else if let Some(collector) = recovery.as_deref_mut() {
+            collector.configure(&document, &config)?;
+            collector.context(&mut b)?
         } else {
             readonly_context(&config, checkout, &mut b)?
         };
@@ -258,6 +284,9 @@ fn verify_with_audit(
             &identity.private_git_dir,
         ] {
             input(native_anchor_path(path))?;
+        }
+        if let Some(collector) = recovery.as_deref_mut() {
+            collector.lock_common(&context, &mut b)?;
         }
         let targets: Vec<_> = policy
             .targets
@@ -294,6 +323,9 @@ fn verify_with_audit(
             &mut filesystem::SystemBoundary,
         ))?;
         let inputs = input(GitInputs::capture(&context, &census, &mut b))?;
+        if let Some(collector) = recovery.as_deref_mut() {
+            collector.confirm_common(&inputs.common)?;
+        }
         let proof = input(GitProof::observe(&context, &census, &inputs, &mut b))?;
         report.git_version = b.git_version.clone();
         let head = std::str::from_utf8(&inputs.head)
@@ -490,6 +522,8 @@ fn verify_with_audit(
         input(current_config_manifest.recheck(&mut b))?;
         let last_context = if let Some(collector) = approval.as_deref_mut() {
             collector.context(&mut b)?
+        } else if let Some(collector) = recovery.as_deref_mut() {
+            collector.context(&mut b)?
         } else {
             readonly_context(&config, checkout, &mut b)?
         };
@@ -551,6 +585,27 @@ fn verify_with_audit(
                 findings,
                 evidence,
             });
+        } else if recovery.is_some() {
+            let policies = document
+                .inspection_policies()
+                .map_err(|_| "inspection_policy_unknown")?;
+            let mut policy_bytes = Vec::new();
+            frame(&mut policy_bytes, 0, b"work.recovery.policy.v1");
+            frame(&mut policy_bytes, 1, policies.canonical_bytes());
+            frame(
+                &mut policy_bytes,
+                2,
+                &serde_json::to_vec(&policy).map_err(|_| "policy_unknown")?,
+            );
+            recovery_retained = Some(super::recovery_refs::Retained {
+                context,
+                physical: Physical {
+                    first: census,
+                    before: inputs,
+                    last: Some((last_census, last_inputs)),
+                },
+                document_policy: policy_bytes,
+            });
         }
         input(b.check())
     })();
@@ -610,6 +665,20 @@ fn verify_with_audit(
                     .take_approval_local()
                     .and_then(|local| collector.seal(retained, local, b)),
                 _ => Err("approval_sequence_unknown"),
+            }
+        } else {
+            Err(report.reason)
+        };
+        if let Err(reason) = seal {
+            collector.failed(reason);
+        }
+    } else if let Some(collector) = recovery {
+        let seal = if report.cleanup() == "complete" {
+            match (recovery_retained, audit) {
+                (Some(retained), Some(audit)) => audit
+                    .take_recovery_plan()
+                    .and_then(|census| collector.seal(retained, census, b, &report)),
+                _ => Err("recovery_sequence_unknown"),
             }
         } else {
             Err(report.reason)

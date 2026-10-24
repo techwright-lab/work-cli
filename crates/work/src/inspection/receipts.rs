@@ -464,7 +464,7 @@ impl Location {
         Ok(())
     }
 }
-struct Reservation {
+pub(super) struct Reservation {
     location: Location,
     file: File,
     pending: String,
@@ -535,7 +535,151 @@ fn admit(count: usize, total: u64, length: u64) -> Result<()> {
     }
     Ok(())
 }
-fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservation> {
+pub(super) fn authority_bytes_for_recovery(store: &Store) -> Vec<u8> {
+    authority_bytes(store)
+}
+
+pub(super) fn read_raw(store: &Store, id: Uuid) -> Result<Vec<u8>> {
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    uuid(id.to_string().as_bytes())?;
+    let location = Location::open(store, false)?;
+    let name = format!("{id}.receipt");
+    let before = open_relative(&location.dir, &name, OFlags::PATH)?;
+    let expected = stat(&before)?;
+    validate_file(&expected)?;
+    if expected.st_size == 0 {
+        return Err(ReceiptError::Corrupt);
+    }
+    let file = open_relative(&location.dir, &name, OFlags::RDONLY)?;
+    check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
+    let mut bytes = Vec::new();
+    (&file)
+        .take(MAX_RECEIPT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ReceiptError::Io)?;
+    if bytes.len() != expected.st_size as usize {
+        return Err(ReceiptError::Corrupt);
+    }
+    location.check(store)?;
+    Ok(bytes)
+}
+
+pub(super) fn resync_published(store: &Store, id: Uuid) -> Result<()> {
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    let location = Location::open(store, false)?;
+    let name = format!("{id}.receipt");
+    let file = open_relative(&location.dir, &name, OFlags::RDONLY)?;
+    let expected = stat(&file)?;
+    validate_file(&expected)?;
+    file.sync_all().map_err(|_| ReceiptError::Io)?;
+    location.dir.sync_all().map_err(|_| ReceiptError::Io)?;
+    check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
+    location.check(store)?;
+    Ok(())
+}
+
+pub(super) fn write_reserved(mut reservation: Reservation, bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 != reservation.length {
+        return Err(ReceiptError::EncodingLimit);
+    }
+    reservation
+        .file
+        .write_all(bytes)
+        .map_err(|_| ReceiptError::Io)?;
+    reservation.file.sync_all().map_err(|_| ReceiptError::Io)?;
+    Ok(())
+}
+
+pub(super) fn publish_reserved(
+    store: &mut Store,
+    id: Uuid,
+    length: u64,
+    context: &super::Context,
+    budget: &mut super::Budget,
+) -> Result<PersistedReceipt> {
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    uuid(id.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
+    let location = Location::open(store, false)?;
+    let pending = format!("pending-{id}-{length}");
+    let file = open_relative(&location.dir, &pending, OFlags::RDONLY)?;
+    check_named(&location.dir, &pending, &file, length, true)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
+    let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
+    lease.check(store).map_err(|_| ReceiptError::Conflict)?;
+    let authority = std::sync::Arc::clone(store.authority_identity());
+    {
+        let phase = store.sql_phase();
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|_| ReceiptError::Conflict)?;
+        let current =
+            super::snapshot_in_transaction(&tx, &authority, context.allocation.checkout, budget)
+                .map_err(|_| ReceiptError::Conflict)?;
+        if current.canonical != context.canonical {
+            return Err(ReceiptError::Conflict);
+        }
+        tx.rollback().map_err(|_| ReceiptError::Conflict)?;
+        drop(phase);
+    }
+    let final_name = format!("{id}.receipt");
+    rename_noreplace(&location.dir, &pending, &final_name)?;
+    let digest = {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&Sha256::digest(id.as_bytes()));
+        out
+    };
+    let unknown = || ReceiptError::DurabilityUnknown { id, digest };
+    location.dir.sync_all().map_err(|_| unknown())?;
+    location.check(store).map_err(|_| unknown())?;
+    let published = open_relative(&location.dir, &final_name, OFlags::RDONLY)?;
+    check_named(&location.dir, &final_name, &published, length, true).map_err(|_| unknown())?;
+    drop(lease);
+    Ok(PersistedReceipt { id, digest })
+}
+
+pub(super) fn restart_or_write(store: &Store, id: Uuid, bytes: &[u8]) -> Result<()> {
+    let length = bytes.len() as u64;
+    if length == 0 || length > MAX_RECEIPT {
+        return Err(ReceiptError::EncodingLimit);
+    }
+    uuid(id.to_string().as_bytes())?;
+    store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    let location = Location::open(store, false)?;
+    let final_name = format!("{id}.receipt");
+    if open_relative(&location.dir, &final_name, OFlags::PATH).is_ok() {
+        return Err(ReceiptError::Conflict);
+    }
+    let pending = format!("pending-{id}-{length}");
+    let file = match open_relative(&location.dir, &pending, OFlags::RDWR) {
+        Ok(file) => file,
+        Err(ReceiptError::Missing) => return Err(ReceiptError::Missing),
+        Err(error) => return Err(error),
+    };
+    let held = stat(&file)?;
+    validate_file(&held)?;
+    if held.st_size != 0 && held.st_size as u64 != length {
+        return Err(ReceiptError::Corrupt);
+    }
+    check_named(&location.dir, &pending, &file, length, false)?;
+    if held.st_size as u64 == length {
+        let mut existing = Vec::new();
+        (&file)
+            .take(MAX_RECEIPT + 1)
+            .read_to_end(&mut existing)
+            .map_err(|_| ReceiptError::Io)?;
+        if existing != bytes {
+            return Err(ReceiptError::Corrupt);
+        }
+        return Ok(());
+    }
+    let mut writer = file;
+    writer.write_all(bytes).map_err(|_| ReceiptError::Io)?;
+    writer.sync_all().map_err(|_| ReceiptError::Io)?;
+    Ok(())
+}
+
+pub(super) fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservation> {
     if length == 0 || length > MAX_RECEIPT {
         return Err(ReceiptError::EncodingLimit);
     }

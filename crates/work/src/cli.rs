@@ -58,6 +58,17 @@ enum Command {
         #[command(subcommand)]
         command: crate::inspection::ApprovalCommand,
     },
+    /// Create local recovery-ref protection; never remote backup or retirement authority
+    PrepareRecovery {
+        #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+        /// Required together with --operation before any ref or receipt mutation
+        #[arg(long)]
+        create: bool,
+        /// Caller-selected operation identity, never caller-supplied evidence
+        #[arg(long, value_parser = crate::inspection::parse_checkout)]
+        operation: Option<uuid::Uuid>,
+    },
     /// Explicit task completion; retirement disabled, tree and charge retained
     Finish {
         #[arg(value_name = "checkout-id")]
@@ -113,6 +124,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             || a == "inspect"
             || a == "verify-remote"
             || a == "audit-preservation"
+            || a == "prepare-recovery"
             || a == "approve"
             || a == "finish"
             || a == "run"
@@ -271,6 +283,23 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 serde_json::to_string(&report).expect("approval summary serialization")
             );
             if !report.recorded() {
+                std::process::exit(1);
+            }
+        }
+        Command::PrepareRecovery {
+            checkout,
+            create,
+            operation,
+        } => {
+            let report = match (create, operation) {
+                (true, Some(operation)) => crate::inspection::prepare_recovery(checkout, operation),
+                _ => crate::inspection::prepare_recovery_refused(checkout),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&report).expect("recovery preparation serialization")
+            );
+            if !report.prepared() {
                 std::process::exit(1);
             }
         }
