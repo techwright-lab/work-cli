@@ -292,7 +292,10 @@ fn context_change_is_incomplete_without_inspection_mutations() {
             .unwrap();
     };
     let observation = inspect_inner(&mut f.store, checkout, &policies, Some(&mut change)).unwrap();
-    assert!(reached);
+    assert!(
+        reached,
+        "initial inspection refused before context mutation: {observation:?}"
+    );
     assert_eq!(observation.reasons(), [IncompleteReason::ContextConflict]);
     assert_eq!(events, f.store.pending_events(100).unwrap());
     let owner: String = f
@@ -360,7 +363,10 @@ fn byte_identical_registration_replacement_invalidates_observation() {
         Some(&mut replace),
     )
     .unwrap();
-    assert!(reached);
+    assert!(
+        reached,
+        "initial inspection refused before registration replacement: {o:?}"
+    );
     assert_eq!(o.coverage(), Coverage::Incomplete);
     assert!(o.reasons().contains(&IncompleteReason::Changed));
 }
