@@ -121,6 +121,50 @@ impl Audit {
             sealed: false,
         }
     }
+    pub(super) fn take_approval_local(&mut self) -> Held<ApprovalLocal> {
+        if !self.sealed
+            || !self.report.inspection_findings.is_empty()
+            || !self.report.additional_work_holds.is_empty()
+        {
+            return Err("preservation_requirements_held");
+        }
+        let local = self.local.take().ok_or("census_unknown")?;
+        let graph = self.graph.as_ref().ok_or("census_unknown")?;
+        let mut semantic = Vec::new();
+        frame(&mut semantic, 0, b"work.approval.preservation.semantic.v1");
+        frame(&mut semantic, 1, &local.admin.approval_semantic_v1());
+        for (oid, object) in &local.objects {
+            frame(&mut semantic, 2, oid);
+            frame(&mut semantic, 3, object.kind.as_bytes());
+            frame(&mut semantic, 4, &object.size.to_be_bytes());
+            frame(
+                &mut semantic,
+                5,
+                &[
+                    u8::from(local.head_graph.contains(oid)),
+                    u8::from(graph.contains(oid)),
+                    u8::from(local.unclassified.contains(oid)),
+                ],
+            );
+        }
+        for (oid, provenance) in &local.roots {
+            frame(&mut semantic, 6, oid);
+            frame(
+                &mut semantic,
+                7,
+                &serde_json::to_vec(provenance).map_err(|_| "census_unknown")?,
+            );
+        }
+        for oid in graph {
+            frame(&mut semantic, 8, oid);
+        }
+        let invalidation = local.fingerprint();
+        Ok(ApprovalLocal {
+            local,
+            semantic: Sha256::digest(semantic).to_vec(),
+            invalidation,
+        })
+    }
     pub(super) fn begin(
         &mut self,
         document: &ConfigDocument,
@@ -496,6 +540,23 @@ fn parse_reflog(
     Ok(())
 }
 
+// Sealed retained admin census, not reconstructible from the public report.
+pub(super) struct ApprovalLocal {
+    local: Local,
+    semantic: Vec<u8>,
+    invalidation: Vec<u8>,
+}
+impl ApprovalLocal {
+    pub(super) fn semantic(&self) -> Vec<u8> {
+        self.semantic.clone()
+    }
+    pub(super) fn invalidation(&self) -> Vec<u8> {
+        self.invalidation.clone()
+    }
+    pub(super) fn recheck(&self, b: &mut Budget) -> Held<()> {
+        checked(self.local.admin.recheck(b))
+    }
+}
 struct Local {
     admin: filesystem::Manifest,
     objects: Objects,

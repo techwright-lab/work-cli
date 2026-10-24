@@ -159,6 +159,7 @@ fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>)
         path,
         checkout,
         None,
+        None,
         #[cfg(test)]
         observer,
         #[cfg(test)]
@@ -190,21 +191,41 @@ pub(super) fn audit_path(
         path,
         checkout,
         Some(audit),
+        None,
         #[cfg(test)]
         None,
         #[cfg(test)]
         before_recheck,
     )
 }
+pub(super) fn approval_path(
+    path: &Path,
+    checkout: Uuid,
+    audit: &mut super::preservation::Audit,
+    collector: &mut super::approval::Collector,
+) -> RemoteReport {
+    verify_with_audit(
+        path,
+        checkout,
+        Some(audit),
+        Some(collector),
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
 fn verify_with_audit(
     path: &Path,
     checkout: Uuid,
     mut audit: Option<&mut super::preservation::Audit>,
+    mut approval: Option<&mut super::approval::Collector>,
     #[cfg(test)] mut observer: Observer<'_>,
     #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
 ) -> RemoteReport {
     let mut b = Budget::new();
     let mut audit_nonancestor = false;
+    let mut approval_retained = None;
     let mut report = RemoteReport::held(checkout);
     let mut scratch = None;
     let result = (|| -> Held<()> {
@@ -212,12 +233,20 @@ fn verify_with_audit(
             return Err("invalid_checkout");
         }
         report.started_ms = wall_time().map_err(|_| "clock_unknown")?;
+        if let Some(collector) = approval.as_deref_mut() {
+            collector.start(&mut b)?;
+        }
         let (document, config_manifest) = load_document(path, &mut b)?;
         let config = document.authority().map_err(|_| "configuration_unknown")?;
         let policy = document
             .remote_preservation()
             .map_err(|_| "policy_unknown")?;
-        let context = readonly_context(&config, checkout, &mut b)?;
+        let context = if let Some(collector) = approval.as_deref_mut() {
+            collector.configure(&document, &config)?;
+            collector.context(&mut b)?
+        } else {
+            readonly_context(&config, checkout, &mut b)?
+        };
         let identity = context
             .allocation
             .identity
@@ -459,7 +488,11 @@ fn verify_with_audit(
         }
         input(config_manifest.recheck(&mut b))?;
         input(current_config_manifest.recheck(&mut b))?;
-        let last_context = readonly_context(&config, checkout, &mut b)?;
+        let last_context = if let Some(collector) = approval.as_deref_mut() {
+            collector.context(&mut b)?
+        } else {
+            readonly_context(&config, checkout, &mut b)?
+        };
         if context.canonical != last_context.canonical {
             return Err("context_changed");
         }
@@ -493,6 +526,32 @@ fn verify_with_audit(
         frame(&mut evidence, 3, report.observation_id.as_bytes());
         frame(&mut evidence, 4, &report.started_ms.to_be_bytes());
         report.evidence_digest = Some(hex(&Sha256::digest(evidence)));
+        if approval.is_some() {
+            // Retain THESE actual inputs; no disconnected inspector or report promotion.
+            let policies = document
+                .inspection_policies()
+                .map_err(|_| "inspection_policy_unknown")?;
+            let (entries, findings) = classify(&census, &proof, &policies);
+            let mut evidence = Vec::new();
+            frame(&mut evidence, 1, &census.fingerprint());
+            frame(&mut evidence, 2, &inputs.fingerprint());
+            frame(&mut evidence, 3, &proof.canonical);
+            frame(&mut evidence, 4, &last_census.fingerprint());
+            frame(&mut evidence, 5, &last_inputs.fingerprint());
+            frame(&mut evidence, 6, &last_proof.canonical);
+            approval_retained = Some(super::approval::Retained {
+                context,
+                physical: Physical {
+                    first: census,
+                    before: inputs,
+                    last: Some((last_census, last_inputs)),
+                },
+                manifests: [config_manifest, current_config_manifest],
+                entries,
+                findings,
+                evidence,
+            });
+        }
         input(b.check())
     })();
     report.reason = result.err().unwrap_or("consistent_observation");
@@ -525,7 +584,7 @@ fn verify_with_audit(
         report.outcome = "observed";
         // Only this actual completed invocation can seal audit coverage. Public
         // RemoteReport accessors/serialization cannot reconstruct this path.
-        if let Some(audit) = audit {
+        if let Some(audit) = audit.as_deref_mut() {
             if let Err(reason) = audit.complete(&mut b) {
                 report.outcome = "held";
                 report.reason = reason;
@@ -543,6 +602,21 @@ fn verify_with_audit(
         frame(&mut closing, 2, report.reason.as_bytes());
         frame(&mut closing, 3, report.cleanup.as_bytes());
         report.evidence_digest = Some(hex(&Sha256::digest(closing)));
+    }
+    if let Some(collector) = approval {
+        let seal = if report.observed() {
+            match (approval_retained, audit) {
+                (Some(retained), Some(audit)) => audit
+                    .take_approval_local()
+                    .and_then(|local| collector.seal(retained, local, b)),
+                _ => Err("approval_sequence_unknown"),
+            }
+        } else {
+            Err(report.reason)
+        };
+        if let Err(reason) = seal {
+            collector.failed(reason);
+        }
     }
     report
 }

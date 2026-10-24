@@ -211,6 +211,11 @@ impl Store {
         if let Some(actor) = &event.actor {
             Ref::new(actor.as_str().into())?;
         }
+        // Adopted metadata publication shares the existing authority fence.
+        // Production caller adopted::command(Event) is unleased; never recurse.
+        // Keep the lease through commit (and unchanged-event rollback on return).
+        let lease = self.authority_lease()?;
+        lease.check(self)?;
         let _phase = self.sql_phase();
         let tx = self
             .conn

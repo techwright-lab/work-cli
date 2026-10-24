@@ -110,6 +110,19 @@ impl ConfigDocument {
         policy.validate().map_err(|_| invalid())?;
         Ok(policy)
     }
+    /// Approval alone reads this strict subtree. No inferred operator or defaults.
+    pub(crate) fn approval(&self) -> Result<ApprovalPolicy, Error> {
+        let invalid = || Error::Config("invalid approval policy".into());
+        let policy: ApprovalPolicy = self
+            .value
+            .get("approval")
+            .ok_or_else(invalid)?
+            .clone()
+            .try_into()
+            .map_err(|_| invalid())?;
+        policy.validate().map_err(|_| invalid())?;
+        Ok(policy)
+    }
     pub(crate) fn execution(&self) -> Result<Config, Error> {
         Config::from_value(&self.value)
     }
@@ -370,6 +383,30 @@ pub fn validate_path(path: &std::path::Path, required: bool) -> Result<PathBuf, 
     Ok(path.to_owned())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ApprovalPolicy {
+    pub(crate) format: u32,
+    pub(crate) version: String,
+    pub(crate) operator_id: String,
+    pub(crate) quiet_window_seconds: u64,
+    pub(crate) expiry_seconds: u64,
+}
+impl ApprovalPolicy {
+    pub(crate) fn validate(&self) -> Result<(), ()> {
+        if self.format != 1
+            || [&self.version, &self.operator_id]
+                .iter()
+                .any(|s| s.trim().is_empty() || s.len() > 256 || s.chars().any(char::is_control))
+            || !(1..=1800).contains(&self.quiet_window_seconds)
+            || !(1..=1800).contains(&self.expiry_seconds)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
 /// Operator declarations, not remote evidence. Never exposed as proof constructors.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
@@ -475,6 +512,54 @@ pub(crate) fn remote_transport(url: &str) -> Option<&'static str> {
         return None;
     }
     Some("HTTPS")
+}
+
+#[cfg(test)]
+mod approval_policy_tests {
+    use super::*;
+    const VALID: &str = "[approval]\nformat=1\nversion='v1'\noperator_id='explicit operator'\nquiet_window_seconds=1\nexpiry_seconds=1800\n";
+    #[test]
+    fn strict_lazy_approval_policy_requires_every_explicit_bounded_field() {
+        assert!(ConfigDocument::from_text("").unwrap().approval().is_err());
+        let good = ConfigDocument::from_text(&format!(
+            "{VALID}[capture]\nexecutable=false\n[inspection]\nformat=false\n"
+        ))
+        .unwrap();
+        assert!(good.approval().is_ok());
+        assert!(good.authority().is_ok());
+        assert!(good.inspection_policies().is_err());
+        for (from, to) in [
+            ("format=1", "format=2"),
+            ("version='v1'", "version=''"),
+            ("operator_id='explicit operator'", "operator_id='  '"),
+            ("quiet_window_seconds=1", "quiet_window_seconds=0"),
+            ("quiet_window_seconds=1", "quiet_window_seconds=1801"),
+            ("expiry_seconds=1800", "expiry_seconds=1801"),
+            ("expiry_seconds=1800", "expiry_seconds=-1"),
+            ("format=1", "format=true"),
+            ("format=1", "format=1\nunknown=true"),
+        ] {
+            let text = VALID.replace(from, to);
+            let d = ConfigDocument::from_text(&text).unwrap();
+            assert!(d.approval().is_err(), "{from}");
+            assert!(d.authority().is_ok());
+            assert!(d.inspection_policies().is_ok());
+            assert!(Config::from_text(&text).is_ok());
+        }
+        for line in VALID.lines().skip(1) {
+            assert!(ConfigDocument::from_text(&VALID.replace(line, ""))
+                .unwrap()
+                .approval()
+                .is_err());
+        }
+        for key in ["version='v1'", "operator_id='explicit operator'"] {
+            let replacement = format!("{}='{}'", key.split('=').next().unwrap(), "x".repeat(257));
+            assert!(ConfigDocument::from_text(&VALID.replace(key, &replacement))
+                .unwrap()
+                .approval()
+                .is_err());
+        }
+    }
 }
 
 #[cfg(test)]

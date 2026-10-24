@@ -89,8 +89,12 @@ pub struct ReceiptData {
     body: Vec<u8>,
     policy_digest: [u8; 32],
     findings: Vec<super::Finding>,
+    approval: Option<super::approval::ApprovalRecord>,
 }
 impl ReceiptData {
+    pub(super) fn approval_record(&self) -> Option<&super::approval::ApprovalRecord> {
+        self.approval.as_ref()
+    }
     pub fn id(&self) -> Uuid {
         self.id
     }
@@ -145,10 +149,73 @@ enum Fault {
     #[cfg(test)]
     DirectorySync,
 }
+// Closed actual-evidence cases only, never a byte-append or public storage API.
+enum Publication<'a> {
+    CapturedInspection(&'a mut Captured),
+    SealedApproval(&'a mut super::approval::SealedApproval),
+}
+impl Publication<'_> {
+    fn captured(&mut self) -> &mut Captured {
+        match self {
+            Self::CapturedInspection(c) => c,
+            Self::SealedApproval(a) => a.captured(),
+        }
+    }
+    fn id(&self) -> Uuid {
+        match self {
+            Self::CapturedInspection(_) => Uuid::now_v7(),
+            Self::SealedApproval(a) => a.id(),
+        }
+    }
+    fn extension(&self) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::CapturedInspection(_) => Ok(None),
+            Self::SealedApproval(a) => a
+                .extension()
+                .map(Some)
+                .map_err(|_| ReceiptError::EncodingLimit),
+        }
+    }
+    fn recheck(&mut self) -> Result<()> {
+        if let Self::SealedApproval(a) = self {
+            a.recheck().map_err(|_| ReceiptError::Conflict)?;
+        }
+        Ok(())
+    }
+    fn context_matches(&self, tx: &rusqlite::Connection, context: &super::Context) -> Result<()> {
+        if let Self::SealedApproval(a) = self {
+            a.context_matches(tx, context)
+                .map_err(|_| ReceiptError::Conflict)?;
+        }
+        Ok(())
+    }
+    fn publication_time(&mut self) -> Result<()> {
+        if let Self::SealedApproval(a) = self {
+            a.publication_time().map_err(|_| ReceiptError::Conflict)?;
+        }
+        Ok(())
+    }
+}
+pub(super) fn publish_approval(
+    store: &mut Store,
+    sealed: &mut super::approval::SealedApproval,
+) -> Result<PersistedReceipt> {
+    publish(store, Publication::SealedApproval(sealed), Fault::None)
+}
 fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<PersistedReceipt> {
+    publish(store, Publication::CapturedInspection(captured), fault)
+}
+fn publish(
+    store: &mut Store,
+    mut publication: Publication<'_>,
+    fault: Fault,
+) -> Result<PersistedReceipt> {
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
-    let context = captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
-    let physical = captured.physical.as_ref().ok_or(ReceiptError::Conflict)?;
+    let id = publication.id();
+    let extension = publication.extension()?;
+    let captured = publication.captured();
+    captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
+    captured.physical.as_ref().ok_or(ReceiptError::Conflict)?;
     if captured.started > captured.ended
         || captured.observation.reasons().iter().any(|r| {
             matches!(
@@ -163,10 +230,12 @@ fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<P
         .budget
         .check()
         .map_err(|_| ReceiptError::Conflict)?;
-    let id = Uuid::now_v7();
     // Encode before any lease or SQL. The immutable body includes its original
     // policy/version/context digest; later checks never rewrite it or its clock.
-    let bytes = encode(store, id, captured)?;
+    let bytes = match extension.as_deref() {
+        None => encode(store, id, captured)?,
+        Some(extension) => encode_envelope(store, id, captured, Some(extension))?,
+    };
     let mut reservation = reserve(store, id, bytes.len() as u64)?;
     #[cfg(test)]
     if fault == Fault::Write {
@@ -187,9 +256,13 @@ fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<P
     }
     reservation.file.sync_all().map_err(|_| ReceiptError::Io)?;
     // Retained descriptor/Git evidence and ORIGINAL Budget: outside both guards.
-    physical
+    captured
+        .physical
+        .as_ref()
+        .ok_or(ReceiptError::Conflict)?
         .recheck(&mut captured.budget)
         .map_err(|_| ReceiptError::Conflict)?;
+    publication.recheck()?;
     let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     reservation.check(store, true)?;
@@ -200,6 +273,8 @@ fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<P
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| ReceiptError::Conflict)?;
+        let captured = publication.captured();
+        let context = captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
         let current = super::snapshot_in_transaction(
             &tx,
             &authority,
@@ -210,29 +285,31 @@ fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<P
         if current.canonical != context.canonical {
             return Err(ReceiptError::Conflict);
         }
+        publication.context_matches(&tx, &current)?;
         tx.rollback().map_err(|_| ReceiptError::Conflict)?;
         drop(phase);
     }
-    captured
+    publication
+        .captured()
         .budget
         .check()
         .map_err(|_| ReceiptError::Conflict)?;
     // Lease stays held across SQL-off metadata publication. No payload I/O.
     reservation.check(store, true)?;
-    captured
+    publication
+        .captured()
         .budget
         .check()
         .map_err(|_| ReceiptError::Conflict)?;
+    publication.publication_time()?;
     #[cfg(test)]
     if fault == Fault::Rename {
         return Err(ReceiptError::Io);
     }
     let final_name = format!("{id}.receipt");
     rename_noreplace(&reservation.location.dir, &reservation.pending, &final_name)?;
-    let unknown = || ReceiptError::DurabilityUnknown {
-        id,
-        digest: captured.observation.digest(),
-    };
+    let digest = publication.captured().observation.digest();
+    let unknown = || ReceiptError::DurabilityUnknown { id, digest };
     #[cfg(test)]
     if fault == Fault::DirectorySync {
         return Err(unknown());
@@ -249,11 +326,9 @@ fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<P
         true,
     )
     .map_err(|_| unknown())?;
+    publication.publication_time().map_err(|_| unknown())?;
     drop(lease);
-    Ok(PersistedReceipt {
-        id,
-        digest: captured.observation.digest(),
-    })
+    Ok(PersistedReceipt { id, digest })
 }
 fn rename_noreplace(dir: &File, from: &str, to: &str) -> Result<()> {
     fs::renameat_with(dir, from, dir, to, RenameFlags::NOREPLACE).map_err(|error| {
@@ -569,11 +644,27 @@ fn authority_bytes(store: &Store) -> Vec<u8> {
     bytes
 }
 fn encode(store: &Store, id: Uuid, captured: &Captured) -> Result<Vec<u8>> {
+    encode_envelope(store, id, captured, None)
+}
+fn encode_envelope(
+    store: &Store,
+    id: Uuid,
+    captured: &Captured,
+    extension: Option<&[u8]>,
+) -> Result<Vec<u8>> {
     let context = captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
     uuid(id.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
     uuid(context.allocation.checkout.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
     let mut bytes = Vec::new();
-    frame(&mut bytes, 0, b"work.inspection.receipt.v1");
+    frame(
+        &mut bytes,
+        0,
+        if extension.is_some() {
+            b"work.inspection.receipt.v2"
+        } else {
+            b"work.inspection.receipt.v1"
+        },
+    );
     frame(&mut bytes, 1, id.to_string().as_bytes());
     frame(
         &mut bytes,
@@ -593,6 +684,9 @@ fn encode(store: &Store, id: Uuid, captured: &Captured) -> Result<Vec<u8>> {
     );
     frame(&mut bytes, 8, &captured.observation.digest());
     frame(&mut bytes, 9, captured.observation.canonical_bytes());
+    if let Some(extension) = extension {
+        frame(&mut bytes, 11, extension);
+    }
     let checksum = Sha256::digest(&bytes);
     frame(&mut bytes, 10, &checksum);
     if bytes.len() as u64 > MAX_RECEIPT {
@@ -911,9 +1005,11 @@ fn decode(store: &Store, expected_id: Uuid, bytes: &[u8]) -> Result<ReceiptData>
         return Err(ReceiptError::Corrupt);
     }
     let mut c = Cursor::new(bytes);
-    if c.field(0)? != b"work.inspection.receipt.v1" {
-        return Err(ReceiptError::Corrupt);
-    }
+    let approval_version = match c.field(0)? {
+        b"work.inspection.receipt.v1" => false,
+        b"work.inspection.receipt.v2" => true,
+        _ => return Err(ReceiptError::Corrupt),
+    };
     let id = uuid(c.field(1)?)?;
     if id != expected_id {
         return Err(ReceiptError::Corrupt);
@@ -938,12 +1034,26 @@ fn decode(store: &Store, expected_id: Uuid, bytes: &[u8]) -> Result<ReceiptData>
     if hash(&Sha256::digest(body))? != digest {
         return Err(ReceiptError::Corrupt);
     }
+    let approval = if approval_version {
+        if coverage != Coverage::Complete {
+            return Err(ReceiptError::Corrupt);
+        }
+        Some(
+            super::approval::ApprovalRecord::decode(c.field(11)?, id, context, started, ended)
+                .map_err(|_| ReceiptError::Corrupt)?,
+        )
+    } else {
+        None
+    };
     let checksum_at = c.at;
     if hash(c.field(10)?)? != hash(&Sha256::digest(&bytes[..checksum_at]))? {
         return Err(ReceiptError::Corrupt);
     }
     c.end()?;
     let (policy_digest, findings) = body_metadata(body, coverage, context)?;
+    if approval.is_some() && !findings.is_empty() {
+        return Err(ReceiptError::Corrupt);
+    }
     Ok(ReceiptData {
         id,
         checkout,
@@ -952,6 +1062,7 @@ fn decode(store: &Store, expected_id: Uuid, bytes: &[u8]) -> Result<ReceiptData>
         body: body.to_vec(),
         policy_digest,
         findings,
+        approval,
     })
 }
 
@@ -986,6 +1097,104 @@ mod tests {
                     .ends_with(b".receipt")
             })
             .count()
+    }
+    #[test]
+    fn approval_v2_uses_same_pending_capacity_failure_and_unknown_durability_protocol() {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let (path, _) = f.approval();
+        for fault in [
+            Fault::Write,
+            Fault::FileSync,
+            Fault::Rename,
+            Fault::DirectorySync,
+        ] {
+            let (mut store, mut sealed) =
+                super::super::approval::collect_for_receipt_test(&path, f.allocation.checkout);
+            let id = sealed.id();
+            let result = publish(&mut store, Publication::SealedApproval(&mut sealed), fault);
+            if fault == Fault::DirectorySync {
+                assert!(
+                    matches!(result,Err(ReceiptError::DurabilityUnknown { id: actual,.. }) if actual==id)
+                );
+                assert!(read_receipt(&store, id)
+                    .unwrap()
+                    .approval_record()
+                    .is_some());
+            } else {
+                assert_eq!(result.unwrap_err(), ReceiptError::Io);
+                assert!(matches!(
+                    read_receipt(&store, id),
+                    Err(ReceiptError::Missing)
+                ));
+            }
+            // Same reserved UUID cannot overwrite or retry into a renewed assertion.
+            assert_eq!(
+                publish_approval(&mut store, &mut sealed).unwrap_err(),
+                ReceiptError::Conflict
+            );
+        }
+        let (mut store, mut sealed) =
+            super::super::approval::collect_for_receipt_test(&path, f.allocation.checkout);
+        for _ in 0..7 {
+            reserve(&store, Uuid::now_v7(), MAX_RECEIPT).unwrap();
+        }
+        // Fill the final remaining reservation with its exact declared free capacity.
+        let location = Location::open(&store, false).unwrap();
+        let total: u64 = std::fs::read_dir(directory(&f))
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                name_charge(entry.file_name().as_encoded_bytes(), metadata.len())
+                    .unwrap()
+                    .1
+            })
+            .sum();
+        reserve(&store, Uuid::now_v7(), MAX_TOTAL - total).unwrap();
+        assert_eq!(
+            publish_approval(&mut store, &mut sealed).unwrap_err(),
+            ReceiptError::CapacityFull
+        );
+        location.check(&store).unwrap();
+    }
+    #[test]
+    fn v2_envelope_checksums_all_extension_bytes_without_changing_v1_decoder() {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let (path, _) = f.approval();
+        let (store, mut sealed) =
+            super::super::approval::collect_for_receipt_test(&path, f.allocation.checkout);
+        let id = sealed.id();
+        let extension = sealed.extension().unwrap();
+        let bytes = encode_envelope(&store, id, sealed.captured(), Some(&extension)).unwrap();
+        assert!(decode(&store, id, &bytes)
+            .unwrap()
+            .approval_record()
+            .is_some());
+        let mut corrupt = bytes.clone();
+        let at = corrupt
+            .windows(extension.len())
+            .position(|v| v == extension)
+            .unwrap();
+        corrupt[at + 1] ^= 1;
+        assert!(matches!(
+            decode(&store, id, &corrupt),
+            Err(ReceiptError::Corrupt)
+        ));
+        for invalid in [b"{}".as_slice(), b"{\"kind\":\"unknown\"}"] {
+            let corrupt = encode_envelope(&store, id, sealed.captured(), Some(invalid)).unwrap();
+            assert!(matches!(
+                decode(&store, id, &corrupt),
+                Err(ReceiptError::Corrupt)
+            ));
+        }
+        let v1 = encode(&store, id, sealed.captured()).unwrap();
+        assert!(decode(&store, id, &v1).unwrap().approval_record().is_none());
+        let mut duplicate = bytes.clone();
+        duplicate.extend_from_slice(&bytes);
+        assert!(matches!(
+            decode(&store, id, &duplicate),
+            Err(ReceiptError::Corrupt)
+        ));
     }
     #[test]
     fn native_authority_metadata_and_readable_opens_share_bound_identity() {

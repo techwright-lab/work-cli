@@ -158,10 +158,91 @@ The independent existing Task10 GitHub job selects preservation unit/integration
 source alongside remote regression tests and scoped Clippy. No local test/build
 execution or passing claim accompanies this source change. Full Task10 still needs
 fresh, verified durable recovery-ref creation, preservation of held content,
-versioned semantic approval binding (including adopted quiet-window/activity,
-maximum 30-minute age and backward-clock rules), fresh physical writer quiescence, and separately reviewed crash-safe
-retirement/quarantine/removal and charge-release gates. No gate is waived; Task8
-and performance qualification remain parked/opt-in.
+qualification of the adopted assertion pilot below, fresh physical writer quiescence,
+and separately reviewed crash-safe retirement/quarantine/removal and charge-release
+gates. No gate is waived; Task8 and performance qualification remain parked/opt-in.
+
+### Adopted assertion pilot (source-only; no retirement or OS proof)
+
+Configure explicitly, alongside the inspection and remote-preservation policies:
+
+```toml
+[approval]
+format = 1
+version = "operator-policy-v1"
+operator_id = "explicit-accountable-operator"
+quiet_window_seconds = 60
+expiry_seconds = 600
+```
+
+Every field is mandatory. Version/operator must be nonblank, control-free and at
+most 256 UTF-8 bytes; both durations must be 1–1800 seconds. This subtree is strict
+and lazy: absent/invalid approval policy holds approval, not ordinary inspection,
+audit or remote commands. Identity is never inferred from login or environment.
+Unrelated malformed execution/capture subtrees confer no approval authority.
+
+```sh
+work approve begin <checkout-uuidv7>
+# Review the printed findings and limitations. Stop relevant sessions/jobs/editors.
+# After the configured quiet interval, explicitly invoke:
+work approve confirm <checkout-uuidv7> --observation <baseline-uuidv7> --assert-quiescent
+```
+
+No bare approval, stdin proof, prompt, auto-confirm or waiting loop exists.
+`begin` prints fresh bounded findings; it records a baseline only for exactly one
+validated adopted group, its matching retained writer/request/root/roster/segments,
+complete inspection and configured remote verification with **no content or
+additional-work holds**. Supervised/mixed/capture/Gap contradictions refuse.
+An adopted writer is expected declaration ownership, not evidence of a running
+process and not an automatic veto. No writer, reconcile flag, readiness, finish,
+charge or other SQL row is changed. Shared-repository ownership holds remain holds.
+`LOCAL` still means same-host transport, not off-host backup.
+
+`confirm` requires a second complete audit from the same private coordinator and
+compares both a versioned semantic commitment and exact invalidation witnesses,
+including original context, stored activity/heartbeat/segments, filesystem and Git
+mtime/ctime, reflog bytes, config/admin and path bindings. The original canonical
+inspection body/digest retains its accounting meaning; it is not relabeled a
+cross-invocation semantic digest. Semantic v1 excludes collection clocks, counters,
+duration and scratch IDs; stored metadata and participant revisions remain bound.
+Content returning to the same bytes does not erase observed metadata activity.
+
+The second collection must **start** at least the quiet interval after baseline
+collection **ends**, on wall time and bracketed Linux CLOCK_BOOTTIME. Reboot,
+backwards clocks, overflow, invalid order and elapsed-clock disagreement over one
+second refuse. Baseline deadline is baseline end + quiet + expiry; assertion expiry
+is the earlier of that deadline and claim time + expiry, independently on both
+clocks. Time is rechecked immediately before publication; duplicate confirmation
+uses the baseline's fixed assertion UUID and cannot overwrite or renew its expiry.
+
+Publication reuses the existing private receipt directory/capacity/pending charges
+and NOREPLACE protocol. Explicit checksum-bound `work.inspection.receipt.v2` records
+have closed `approval_observation`/`operator_assertion` kinds. Ordinary v1 bytes and
+reads remain unchanged, but v1 is **ineligible** as an approval baseline. Failed
+pending reservations stay charged. Rename followed by sync/binding uncertainty
+reports `durability_unknown`, not "not stored"; passive reads do not restore an
+original acknowledgement or confer fresh authority. No receipt cleanup is added.
+
+Physical/config/admin checks and payload writes remain outside SQL and the lease.
+The existing authority lease spans the final short exact context/mode READ snapshot,
+SQL-off metadata publication and directory sync. Adopted `record_activity` now takes
+that same lease before SQL through commit, so it cannot commit in that metadata
+publication interval. It does not lock editors, files or processes. Idempotent
+activity retries retain their existing no-write behavior; read-only Store handles
+do not gain activity permission.
+
+JSON always includes `retirement_authority:false` and `automatic_quiescence:false`.
+Only acknowledged storage exits zero; held/early/expired/unknown exits nonzero,
+and malformed arguments are sanitized. The assertion means the configured operator
+claims relevant sessions, background jobs and editors are stopped. Two unchanged
+endpoints are **not continuous monitoring**, absence of transient activity, OS
+quiescence, permission to release the writer or permission to remove anything.
+Expiry or any changed binding/activity makes the assertion historical only. Future
+supervised physical-proof and retirement gates are unchanged and separate.
+
+Tests are prospective owned-fixture sources selected in the existing Task10 GitHub
+job, at normal concurrency, with private finite clock/failure seams. No local
+execution, compiled correctness, passing CI or full Task10 completion is claimed.
 
 ### Capture construction (Tasks 8.1–8.4b; implementation, not acceptance)
 
@@ -1280,7 +1361,7 @@ Status is read-only existing-schema-15-authority metadata, with
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
 logical closures never release the adopted writer, finish a task, change checkout
 state or uncharge it. The writer remains explicitly held until a future qualified
-handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
+handoff path (the Task10 adopted assertion pilot above never releases it). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
 Use `work adopt status` for adopted metadata. Existing-authority reads require schema 15.

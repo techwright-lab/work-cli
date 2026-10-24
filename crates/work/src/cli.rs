@@ -53,6 +53,11 @@ enum Command {
         #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
         checkout: uuid::Uuid,
     },
+    /// Two explicit adopted observations and operator assertion; never OS or retirement authority
+    Approve {
+        #[command(subcommand)]
+        command: crate::inspection::ApprovalCommand,
+    },
     /// Explicit task completion; retirement disabled, tree and charge retained
     Finish {
         #[arg(value_name = "checkout-id")]
@@ -108,6 +113,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             || a == "inspect"
             || a == "verify-remote"
             || a == "audit-preservation"
+            || a == "approve"
             || a == "finish"
             || a == "run"
             || a == "recover"
@@ -246,6 +252,25 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 serde_json::to_string(&report).expect("preservation audit serialization")
             );
             if !report.observed() {
+                std::process::exit(1);
+            }
+        }
+        Command::Approve { command } => {
+            let report = match command {
+                crate::inspection::ApprovalCommand::Begin { checkout } => {
+                    crate::inspection::approve_begin(checkout)
+                }
+                crate::inspection::ApprovalCommand::Confirm {
+                    checkout,
+                    observation,
+                    assert_quiescent,
+                } => crate::inspection::approve_confirm(checkout, observation, assert_quiescent),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&report).expect("approval summary serialization")
+            );
+            if !report.recorded() {
                 std::process::exit(1);
             }
         }

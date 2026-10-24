@@ -22,7 +22,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 rusqlite = { version = "0.38", features = ["bundled", "hooks", "limits"] }
 sha2 = "0.10"
 signal-hook = "0.3"
-rustix = { version = "1", features = ["process", "fs"] }
+rustix = { version = "1", features = ["process", "fs", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -21,6 +21,10 @@ pub use remote_proof::{verify_remote, RemoteReport};
 mod preservation;
 pub use preservation::{audit_preservation, PreservationReport};
 
+mod approval;
+pub(crate) use approval::ApprovalCommand;
+pub use approval::{approve_begin, approve_confirm, ApprovalReport};
+
 mod receipts;
 pub use receipts::{
     inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,
@@ -2041,6 +2045,25 @@ impl GitInputs {
         result.recheck(b)?;
         Ok(result)
     }
+    // Explicit separate projection; original timestamped fingerprints stay intact.
+    fn approval_semantic_v1(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        frame(&mut out, 0, b"work.approval.git-inputs.semantic.v1");
+        for value in [
+            self.common.approval_semantic_v1(),
+            self.private.approval_semantic_v1(),
+            self.checkout.approval_semantic_v1(),
+        ] {
+            frame(&mut out, 1, &value);
+        }
+        for endpoint in &self.endpoints {
+            frame(&mut out, 2, &endpoint.approval_semantic_v1());
+        }
+        frame(&mut out, 3, &self.boot);
+        frame(&mut out, 4, &self.version);
+        frame(&mut out, 5, &self.head);
+        Sha256::digest(out).to_vec()
+    }
     fn native_read_reservation(&self) -> Result<u64, IncompleteReason> {
         let size = self
             .common
@@ -2787,6 +2810,19 @@ mod filesystem {
         fn kind(&self) -> FileType {
             FileType::from_raw_mode(self.mode)
         }
+        fn approval_semantic_v1(&self, out: &mut Vec<u8>) {
+            for n in [
+                self.device,
+                self.inode,
+                u64::from(self.mode),
+                self.links,
+                u64::from(self.uid),
+                u64::from(self.gid),
+                self.size as u64,
+            ] {
+                frame(out, 1, &n.to_be_bytes());
+            }
+        }
         pub(super) fn encode(&self, out: &mut Vec<u8>) {
             for n in [
                 self.device,
@@ -3121,6 +3157,20 @@ mod filesystem {
         _proc: TrustedProc,
     }
     impl Census {
+        pub(super) fn approval_semantic_v1(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            self._held[0].identity.approval_semantic_v1(&mut out);
+            for e in &self.entries {
+                frame(&mut out, 2, e.path.as_bytes());
+                e.identity.approval_semantic_v1(&mut out);
+                frame(
+                    &mut out,
+                    3,
+                    e.content_sha256.as_ref().map_or(&[][..], |v| v.as_slice()),
+                );
+            }
+            Sha256::digest(out).to_vec()
+        }
         pub(super) fn root_matches(&self, device: u64, inode: u64) -> bool {
             self._held[0].identity.device == device && self._held[0].identity.inode == inode
         }
@@ -3406,6 +3456,26 @@ mod filesystem {
             }
             Ok(())
         }
+        pub(super) fn approval_semantic_v1(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for (path, i) in &self.paths {
+                frame(&mut out, 1, path);
+                self.held[*i].identity.approval_semantic_v1(&mut out);
+                if let Some(names) = &self.held[*i].names {
+                    for name in names {
+                        frame(&mut out, 2, name);
+                    }
+                }
+            }
+            for path in self.absent.keys() {
+                frame(&mut out, 3, path);
+            }
+            for (path, data) in &self.data {
+                frame(&mut out, 4, path);
+                frame(&mut out, 5, &Sha256::digest(data));
+            }
+            Sha256::digest(out).to_vec()
+        }
         pub(super) fn read_size(&self) -> u64 {
             self.data.values().map(|v| v.len() as u64).sum()
         }
@@ -3478,6 +3548,30 @@ mod filesystem {
                 anchor.descend(name, false, b, &mut SystemBoundary)?;
             }
             Err(IncompleteReason::InvalidPath)
+        }
+        pub(super) fn approval_semantic_v1(&self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for link in &self.anchor.route {
+                frame(&mut out, 1, &link.name);
+                // Route-only identity excludes unrelated ancestor directory churn.
+                for n in [
+                    link.identity.device,
+                    link.identity.inode,
+                    u64::from(link.identity.mode),
+                    u64::from(link.identity.uid),
+                    u64::from(link.identity.gid),
+                ] {
+                    frame(&mut out, 2, &n.to_be_bytes());
+                }
+            }
+            if let Some((_, name, identity)) = &self.final_entry {
+                frame(&mut out, 3, name);
+                identity.approval_semantic_v1(&mut out);
+            }
+            if let Some(name) = &self.absent {
+                frame(&mut out, 4, name);
+            }
+            Sha256::digest(out).to_vec()
         }
         pub(super) fn missing(&self) -> bool {
             self.absent.is_some()

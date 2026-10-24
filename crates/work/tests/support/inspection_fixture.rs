@@ -108,6 +108,61 @@ impl ManagedFixture {
             store,
         }
     }
+    /// Approval-only owned setup: public adoption plus an actually populated local bare remote.
+    pub fn approval(&self) -> (PathBuf, work_cli::adopted::AdoptedRequest) {
+        let remote = self.temp.path().join("approval-backup.git");
+        git(
+            self.temp.path(),
+            &[
+                "init".as_ref(),
+                "--bare".as_ref(),
+                "--template=".as_ref(),
+                remote.as_os_str(),
+            ],
+        );
+        let url = format!("file://{}", remote.display());
+        self.git(&[
+            "remote".as_ref(),
+            "add".as_ref(),
+            "backup".as_ref(),
+            url.as_ref(),
+        ]);
+        self.git(&[
+            "-c".as_ref(),
+            "protocol.file.allow=always".as_ref(),
+            "push".as_ref(),
+            "backup".as_ref(),
+            "HEAD:refs/heads/preserved".as_ref(),
+        ]);
+        let config = work_cli::config::Config {
+            store_dir: Some(self.temp.path().join("authority")),
+            trusted_registry: Some(self.temp.path().join("registry")),
+            roots: vec![self.root.clone()],
+            ..Default::default()
+        };
+        let request: work_cli::adopted::AdoptedRequest = serde_json::from_value(serde_json::json!({
+            "operation": uuid::Uuid::now_v7(), "identity": {
+                "checkout": self.allocation.checkout, "group": uuid::Uuid::now_v7(),
+                "run": uuid::Uuid::now_v7(), "run_ref": "approval-root", "actor": "fixture",
+                "parent_run_ref": null, "execution_chain": [{"kind":"executor", "system":"test"}]
+            }, "source":"approval-fixture", "session":"root-session", "agent":null
+        })).unwrap();
+        work_cli::adopted::begin(&config, &request).unwrap();
+        let path = self.temp.path().join("approval.toml");
+        fs::write(&path, format!("store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\n[approval]\nformat=1\nversion='fixture-v1'\noperator_id='explicit-operator'\nquiet_window_seconds=1\nexpiry_seconds=60\n[remote_preservation]\nformat=1\nversion='fixture-v1'\n[[remote_preservation.targets]]\ncommon_dir={:?}\nremote='backup'\nurl={url:?}\nbranch='refs/heads/preserved'\n[capture]\nexecutable=false\n", config.store_dir.unwrap(), config.trusted_registry.unwrap(), self.root, self.common())).unwrap();
+        (path, request)
+    }
+    pub fn activity(
+        request: &work_cli::adopted::AdoptedRequest,
+    ) -> work_cli::participants::Activity {
+        serde_json::from_value(serde_json::json!({
+            "run":request.identity.run, "group":request.identity.group, "source":request.source,
+            "participant":{"session":request.session, "agent":request.agent},
+            "parent":null,"actor":null,"prompt":null,"tool":null,"event_ref":"stop-1",
+            "kind":"stop","observed_at":100
+        }))
+        .unwrap()
+    }
     pub fn path(&self, raw: &[u8]) -> PathBuf {
         self.allocation.destination.join(OsStr::from_bytes(raw))
     }
