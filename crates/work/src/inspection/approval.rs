@@ -145,9 +145,21 @@ struct Clock {
     offset_ms: u64,
     #[cfg(test)]
     fault: Option<ClockFault>,
+    #[cfg(test)]
+    sequence: Option<std::cell::RefCell<std::collections::VecDeque<ApprovalStamp>>>,
 }
 impl Clock {
     fn sample(&self, boot: &str) -> Held<ApprovalStamp> {
+        #[cfg(test)]
+        if let Some(sequence) = &self.sequence {
+            // Instance-local, payload-free test samples; exhaustion fails closed.
+            let stamp = sequence.borrow_mut().pop_front().ok_or("clock_anomaly")?;
+            validate_stamp(&stamp)?;
+            if stamp.boot != boot {
+                return Err("clock_anomaly");
+            }
+            return Ok(stamp);
+        }
         fn ns() -> Held<u64> {
             let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
             let seconds = u64::try_from(t.tv_sec).map_err(|_| "clock_anomaly")?;
@@ -736,6 +748,13 @@ impl Collector {
             record.collection_start.wall_ms,
             record.collection_end.wall_ms,
         )?;
+        // Only freshly sampled claim/end metadata seeds the live ordering fence.
+        // The persisted record and all deadlines remain immutable.
+        let latest_trusted = record
+            .claim_time
+            .as_ref()
+            .unwrap_or(&record.collection_end)
+            .clone();
         let captured = Captured {
             observation,
             context: Some(retained.context),
@@ -752,6 +771,7 @@ impl Collector {
             manifests: retained.manifests,
             local,
             clock: std::mem::take(&mut self.clock),
+            latest_trusted,
             #[cfg(test)]
             before_publication: None,
         });
@@ -796,6 +816,7 @@ pub(super) struct SealedApproval {
     manifests: [filesystem::Manifest; 2],
     local: preservation::ApprovalLocal,
     clock: Clock,
+    latest_trusted: ApprovalStamp,
     #[cfg(test)]
     before_publication: Option<Box<dyn FnOnce()>>,
 }
@@ -816,7 +837,9 @@ impl SealedApproval {
         }
         self.local.recheck(b)?;
         let now = self.clock.sample(&boot(b)?)?;
+        elapsed(&self.latest_trusted, &now)?;
         elapsed(&self.record.collection_end, &now)?;
+        self.latest_trusted = now;
         Ok(())
     }
     pub(super) fn context_matches(&self, tx: &rusqlite::Connection, context: &Context) -> Held<()> {
@@ -834,6 +857,7 @@ impl SealedApproval {
         }
         self.captured.budget.check().map_err(|_| "deadline")?;
         let now = self.clock.sample(&self.record.collection_end.boot)?;
+        elapsed(&self.latest_trusted, &now)?;
         elapsed(&self.record.collection_end, &now)?;
         within(
             &self.record.baseline_end,
@@ -843,7 +867,9 @@ impl SealedApproval {
                 .as_ref()
                 .unwrap_or(&self.record.confirmation_deadline),
         )?;
-        self.captured.budget.check().map_err(|_| "deadline")
+        self.captured.budget.check().map_err(|_| "deadline")?;
+        self.latest_trusted = now;
+        Ok(())
     }
 }
 
@@ -887,6 +913,191 @@ mod tests {
             remote_proof::approval_path(path, f.allocation.checkout, &mut audit, &mut collector);
         assert!(remote.observed(), "{}", remote.reason());
         collector
+    }
+    // Genuine collected seals only; scripted timestamps replace private clock
+    // samples after collection, never Context, receipt bytes or preservation proof.
+    fn sequential_fixture(kind: RecordKind) -> (fixture::ManagedFixture, Store, SealedApproval) {
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let (path, _) = f.approval();
+        let mut collector = collected(&f, &path, Operation::Begin, 0);
+        if kind == RecordKind::OperatorAssertion {
+            let mut baseline = collector.sealed.take().unwrap();
+            receipts::publish_approval(collector.store.as_mut().unwrap(), &mut baseline).unwrap();
+            collector = collected(
+                &f,
+                &path,
+                Operation::Confirm {
+                    observation: baseline.id,
+                },
+                2000,
+            );
+        }
+        let sealed = collector.sealed.take().unwrap();
+        assert_eq!(sealed.record.kind, kind);
+        assert_eq!(sealed.latest_trusted, live_anchor(&sealed));
+        (f, collector.store.take().unwrap(), sealed)
+    }
+    fn live_anchor(sealed: &SealedApproval) -> ApprovalStamp {
+        sealed
+            .record
+            .claim_time
+            .as_ref()
+            .unwrap_or(&sealed.record.collection_end)
+            .clone()
+    }
+    fn sequential_stamp(anchor: &ApprovalStamp, wall_ms: u64, boottime_ms: u64) -> ApprovalStamp {
+        let ns = anchor
+            .high_ns
+            .checked_add(boottime_ms.checked_mul(1_000_000).unwrap())
+            .unwrap();
+        ApprovalStamp {
+            boot: anchor.boot.clone(),
+            wall_ms: anchor.wall_ms.checked_add(wall_ms).unwrap(),
+            low_ns: ns,
+            high_ns: ns,
+        }
+    }
+    fn script_samples(sealed: &mut SealedApproval, samples: Vec<ApprovalStamp>) {
+        sealed.clock.sequence = Some(std::cell::RefCell::new(samples.into_iter().collect()));
+    }
+    fn script_consumed(sealed: &SealedApproval) {
+        assert!(sealed.clock.sequence.as_ref().unwrap().borrow().is_empty());
+    }
+    #[test]
+    fn sequential_clock_regression_before_or_after_rename_keeps_truthful_storage_outcome() {
+        for kind in [
+            RecordKind::ApprovalObservation,
+            RecordKind::OperatorAssertion,
+        ] {
+            for after_rename in [false, true] {
+                for regressing_clock in ["wall", "boottime"] {
+                    let (_fixture, mut store, mut sealed) = sequential_fixture(kind);
+                    let anchor = live_anchor(&sealed);
+                    let accepted = sequential_stamp(&anchor, 300, 300);
+                    let regressed = if regressing_clock == "wall" {
+                        sequential_stamp(&anchor, 100, 400)
+                    } else {
+                        sequential_stamp(&anchor, 400, 100)
+                    };
+                    // Both samples remain after the collection endpoint and obey
+                    // its original <=1000ms skew allowance: only ordering is wrong.
+                    assert!(elapsed(&sealed.record.collection_end, &regressed).is_ok());
+                    assert!(elapsed(&anchor, &regressed).is_ok());
+                    assert!(elapsed(&accepted, &regressed).is_err());
+                    let extension = sealed.extension().unwrap();
+                    let digest = sealed.captured.observation.digest();
+                    let id = sealed.id;
+                    let samples = if after_rename {
+                        vec![
+                            sequential_stamp(&anchor, 50, 50),
+                            accepted.clone(),
+                            regressed,
+                        ]
+                    } else {
+                        vec![accepted.clone(), regressed]
+                    };
+                    script_samples(&mut sealed, samples);
+                    let result = receipts::publish_approval(&mut store, &mut sealed);
+                    script_consumed(&sealed);
+                    assert_eq!(sealed.latest_trusted, accepted);
+                    assert_eq!(sealed.extension().unwrap(), extension);
+                    if after_rename {
+                        assert_eq!(
+                            result.unwrap_err(),
+                            ReceiptError::DurabilityUnknown { id, digest }
+                        );
+                        // Valid passive bytes are NOT the missing publication ACK.
+                        let passive = read_receipt(&store, id).unwrap();
+                        assert_eq!(passive.id(), id);
+                        assert_eq!(passive.digest(), digest);
+                        assert_eq!(
+                            passive.approval_record().unwrap().encode().unwrap(),
+                            extension
+                        );
+                        assert_eq!(
+                            receipts::publish_approval(&mut store, &mut sealed).unwrap_err(),
+                            ReceiptError::Conflict
+                        );
+                    } else {
+                        assert_eq!(result.unwrap_err(), ReceiptError::Conflict);
+                        assert!(matches!(
+                            read_receipt(&store, id),
+                            Err(ReceiptError::Missing)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn successive_rechecks_reject_regression_and_keep_the_last_accepted_stamp() {
+        for kind in [
+            RecordKind::ApprovalObservation,
+            RecordKind::OperatorAssertion,
+        ] {
+            let (_fixture, _store, mut sealed) = sequential_fixture(kind);
+            let anchor = live_anchor(&sealed);
+            let accepted = sequential_stamp(&anchor, 300, 300);
+            let regressed = sequential_stamp(&anchor, 100, 400);
+            assert!(elapsed(&sealed.record.collection_end, &regressed).is_ok());
+            script_samples(&mut sealed, vec![accepted.clone(), regressed]);
+            sealed.recheck().unwrap();
+            assert_eq!(sealed.latest_trusted, accepted);
+            assert_eq!(sealed.recheck(), Err("clock_anomaly"));
+            assert_eq!(sealed.latest_trusted, accepted);
+            script_consumed(&sealed);
+        }
+    }
+    #[test]
+    fn sequential_monotonic_publication_preserves_record_and_deadlines() {
+        for kind in [
+            RecordKind::ApprovalObservation,
+            RecordKind::OperatorAssertion,
+        ] {
+            let (_fixture, mut store, mut sealed) = sequential_fixture(kind);
+            let anchor = live_anchor(&sealed);
+            let final_sample = sequential_stamp(&anchor, 300, 300);
+            let extension = sealed.extension().unwrap();
+            script_samples(
+                &mut sealed,
+                vec![
+                    sequential_stamp(&anchor, 100, 100),
+                    sequential_stamp(&anchor, 200, 200),
+                    final_sample.clone(),
+                ],
+            );
+            let receipt = receipts::publish_approval(&mut store, &mut sealed).unwrap();
+            assert_eq!(receipt.id(), sealed.id);
+            assert_eq!(sealed.latest_trusted, final_sample);
+            script_consumed(&sealed);
+            assert_eq!(sealed.extension().unwrap(), extension);
+            assert_eq!(
+                read_receipt(&store, receipt.id())
+                    .unwrap()
+                    .approval_record()
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+                extension
+            );
+        }
+    }
+    #[test]
+    fn failed_deadline_check_does_not_advance_latest_trusted_sample() {
+        for kind in [
+            RecordKind::ApprovalObservation,
+            RecordKind::OperatorAssertion,
+        ] {
+            let (_fixture, _store, mut sealed) = sequential_fixture(kind);
+            let anchor = live_anchor(&sealed);
+            let accepted = sequential_stamp(&anchor, 100, 100);
+            let expired = sequential_stamp(&anchor, 62_000, 62_000);
+            script_samples(&mut sealed, vec![accepted.clone(), expired]);
+            sealed.publication_time().unwrap();
+            assert_eq!(sealed.publication_time(), Err("approval_expired"));
+            assert_eq!(sealed.latest_trusted, accepted);
+            script_consumed(&sealed);
+        }
     }
     #[test]
     fn actual_collector_clock_seam_expiry_and_early_without_minutes_sleep() {
@@ -978,6 +1189,7 @@ mod tests {
                 Clock {
                     offset_ms: 2000,
                     fault: Some(fault),
+                    ..Clock::default()
                 },
             );
             assert!(!result.recorded());
@@ -990,6 +1202,7 @@ mod tests {
             Clock {
                 offset_ms: u64::MAX,
                 fault: None,
+                ..Clock::default()
             },
         );
         assert!(!result.recorded());
