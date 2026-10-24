@@ -412,7 +412,7 @@ fn ordinary_branch_index_payload_and_logs_are_invariant() {
     assert_eq!(original(&f.private().join("logs")), before_private_logs);
     let after = original(f.common());
     for (path, bytes) in &before_common {
-        if path.starts_with(&f.common().join("refs/work-recovery")) {
+        if path.starts_with(f.common().join("refs/work-recovery")) {
             continue;
         }
         assert_eq!(

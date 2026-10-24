@@ -150,6 +150,9 @@ thread_local! {
     static ACTIVE_FAULT: std::cell::Cell<Fault> = const { std::cell::Cell::new(Fault::None) };
     static AFTER_CAS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static AFTER_CLOSING_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+    static WITNESS_DELTA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -190,6 +193,11 @@ pub(super) fn active_fault_is_publish_deadline() -> bool {
 #[cfg(test)]
 pub(super) fn note_active_fault() {
     ACTIVE_FAULT.with(|active| fault_hit(active.get()));
+}
+
+#[cfg(test)]
+fn take_witness_delta() -> bool {
+    WITNESS_DELTA.with(|hit| hit.replace(false))
 }
 
 struct CommonKey {
@@ -491,7 +499,7 @@ fn resume_or_execute(
         return Err("incomplete_observation");
     }
     sync::persistent_manifest(plan.census.common())?;
-    match receipts::read_raw(store, plan.operation) {
+    match receipts::read_raw(store, plan.operation, &mut plan.budget) {
         Ok(bytes) => resume_published(
             store,
             bytes,
@@ -561,6 +569,8 @@ fn resume_published(
     {
         return Err("intent_binding_changed");
     }
+    #[cfg(test)]
+    WITNESS_DELTA.with(|hit| hit.set(true));
     preservation::source_witness_delta(&intent.source_witness, &current_witness, &planned_new)?;
     receipts::resync_recovery_published(store, plan.operation, &mut plan.budget).map_err(
         |error| {
@@ -575,7 +585,7 @@ fn resume_published(
     report.intent_checksum = Some(hex(&storage::intent_checksum(&bytes)?));
     report.result_id = Some(intent.result_id);
     plan.result_id = intent.result_id;
-    match receipts::read_raw(store, intent.result_id) {
+    match receipts::read_raw(store, intent.result_id, &mut plan.budget) {
         Ok(result_bytes) => historical_result(
             &result_bytes,
             &intent,
@@ -667,13 +677,19 @@ fn execute_fresh(
     )?;
     let result_len = storage::encode_result(&empty_result_stub(plan))?.len() as u64;
     let result_res =
-        receipts::reserve(store, plan.result_id, result_len).map_err(receipt_reason)?;
+        receipts::reserve_with_budget(store, plan.result_id, result_len, Some(&mut plan.budget))
+            .map_err(receipt_reason)?;
     let bound = receipts::reservation_binding(&result_res).map_err(receipt_reason)?;
     drop(result_res);
     let intent = current_intent(store, plan, &bound)?;
     let intent_bytes = storage::encode_intent(&intent)?;
-    let intent_res = receipts::reserve(store, plan.operation, intent_bytes.len() as u64)
-        .map_err(receipt_reason)?;
+    let intent_res = receipts::reserve_with_budget(
+        store,
+        plan.operation,
+        intent_bytes.len() as u64,
+        Some(&mut plan.budget),
+    )
+    .map_err(receipt_reason)?;
     let publication = mint_intent_publication(plan, intent_bytes, &bound, plan.operation)?;
     #[cfg(test)]
     if fault == Fault::IntentWrite {
@@ -871,7 +887,7 @@ fn fail_after(
 ) -> Held<()> {
     report.created_refs = created;
     report.verified_refs = verified;
-    if launched {
+    if launched || reason == "durability_unknown" {
         report.outcome = "unknown";
         report.durability = "unknown";
     }
@@ -1016,6 +1032,18 @@ fn execute_cas(
     if let Err(reason) = short_context_matches(store, &plan.retained.context, &mut plan.budget) {
         return fail(report, reason);
     }
+    #[cfg(test)]
+    AFTER_CLOSING_CAPTURE.with(|hook| {
+        if let Some(call) = hook.borrow_mut().take() {
+            call();
+        }
+    });
+    if after_checkout.recheck(&mut plan.budget).is_err() {
+        return fail(report, "census_changed");
+    }
+    if after_inputs.recheck(&mut plan.budget).is_err() {
+        return fail(report, "census_changed");
+    }
     if plan.retained.config.recheck(&mut plan.budget).is_err() {
         return fail(report, "census_changed");
     }
@@ -1148,7 +1176,7 @@ fn lock_directory_meta(file: &File) -> Held<()> {
     let meta = file.metadata().map_err(|_| "lock_unknown")?;
     if !meta.is_dir()
         || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o777 != 0o700
+        || meta.mode() & 0o7777 != 0o700
     {
         return Err("lock_unknown");
     }
@@ -1160,7 +1188,7 @@ fn lock_file_meta(file: &File) -> Held<()> {
     if !meta.is_file()
         || meta.nlink() != 1
         || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o777 != 0o600
+        || meta.mode() & 0o7777 != 0o600
     {
         return Err("lock_unknown");
     }
@@ -1181,7 +1209,7 @@ fn open_lock_authority(store: &Store) -> Held<File> {
     let meta = directory.metadata().map_err(|_| "lock_unknown")?;
     if !meta.is_dir()
         || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o777 != 0o700
+        || meta.mode() & 0o7777 != 0o700
         || (meta.dev(), meta.ino()) != identity.directory_id
     {
         return Err("lock_unknown");
@@ -1259,6 +1287,7 @@ mod fixture;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::{
         fs,
         os::unix::fs::{MetadataExt, PermissionsExt},
@@ -1482,26 +1511,34 @@ mod tests {
             let operation = Uuid::now_v7();
             let first = prepare_path(&config, f.allocation.checkout, operation, Fault::BeforeCas);
             assert_eq!(take_fault_hit(), Fault::BeforeCas, "{case} {first:?}");
+            let _ = take_witness_delta();
             match case {
                 "payload" => fs::write(f.path(b"tracked"), b"mutated payload\n").unwrap(),
-                "index" => {
-                    let path = f.private().join("index");
-                    let mut bytes = fs::read(&path).unwrap();
-                    bytes.push(0);
-                    fs::write(&path, bytes).unwrap();
-                }
+                "index" => f.git(&[
+                    "update-index".as_ref(),
+                    "--chmod=+x".as_ref(),
+                    "tracked".as_ref(),
+                ]),
                 "config" => {
-                    let path = f.common().join("config");
-                    let mut bytes = fs::read(&path).unwrap();
-                    bytes.extend(b"\n[work]\nextra=1\n");
-                    fs::write(&path, bytes).unwrap();
+                    let mut bytes = fs::read(&config).unwrap();
+                    bytes.extend(b"\n# valid-field-comment\n");
+                    fs::write(&config, bytes).unwrap();
                 }
-                _ => fs::write(f.private().join("work-lease.json"), b"{}").unwrap(),
+                _ => {
+                    let path = f.private().join("work-lease.json");
+                    let bytes = fs::read(&path).unwrap();
+                    let mode = fs::metadata(&path).unwrap().permissions();
+                    let tmp = path.with_extension("json.replace");
+                    fs::write(&tmp, &bytes).unwrap();
+                    fs::set_permissions(&tmp, mode).unwrap();
+                    fs::rename(&tmp, &path).unwrap();
+                }
             }
             let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+            assert!(take_witness_delta(), "{case} {resume:?}");
+            assert_eq!(resume.reason, "census_changed", "{case} {resume:?}");
             assert_ne!(resume.outcome, "prepared", "{case} {resume:?}");
             assert_ne!(resume.durability, "acknowledged", "{case}");
-            assert_ne!(resume.reason, "lock_unknown", "{case} {resume:?}");
             assert!(!f.common().join("refs/work-recovery").exists(), "{case}");
         }
     }
@@ -1629,6 +1666,35 @@ mod tests {
     }
 
     #[test]
+    fn lock_special_mode_bits_fail_revalidate() {
+        let (f, config) = setup("sha1");
+        let lock = lock_file(&f);
+        AFTER_CAS.with(|hook| {
+            let path = lock.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o4600));
+            }));
+        });
+        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(report.reason, "lock_unknown", "{report:?}");
+        assert_ne!(report.outcome, "prepared");
+        let (f, config) = setup("sha1");
+        let dir = f
+            .temp
+            .path()
+            .join("authority/recovery-preparation-locks-v1");
+        AFTER_CAS.with(|hook| {
+            let path = dir.clone();
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o2700));
+            }));
+        });
+        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(report.reason, "lock_unknown", "{report:?}");
+        assert_ne!(report.outcome, "prepared");
+    }
+
+    #[test]
     fn rechecksummed_source_commitment_contradiction_is_rejected_on_resume() {
         let (f, config) = setup("sha1");
         let operation = Uuid::now_v7();
@@ -1648,6 +1714,175 @@ mod tests {
         fs::write(&path, forged).unwrap();
         let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
         assert_eq!(resume.reason, "source_commitment_changed", "{resume:?}");
+        assert_ne!(resume.outcome, "prepared");
+        assert!(!f.common().join("refs/work-recovery").exists());
+    }
+
+    fn framed(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let mut at = 0;
+        let mut out = Vec::new();
+        while at < bytes.len() {
+            let tag = bytes[at];
+            at += 1;
+            let len = u64::from_be_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+            at += 8;
+            out.push((tag, bytes[at..at + len].to_vec()));
+            at += len;
+        }
+        out
+    }
+
+    fn encode_framed(frames: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (tag, value) in frames {
+            out.push(*tag);
+            out.extend((value.len() as u64).to_be_bytes());
+            out.extend(value);
+        }
+        out
+    }
+
+    fn swap_two_path_blocks(manifest: &[u8]) -> Vec<u8> {
+        let frames = framed(manifest);
+        assert_eq!(frames[0].0, 0);
+        let mut blocks = Vec::new();
+        let mut absences = Vec::new();
+        let mut i = 1;
+        while i < frames.len() {
+            if frames[i].0 == 6 {
+                absences.extend_from_slice(&frames[i..]);
+                break;
+            }
+            assert_eq!(frames[i].0, 1);
+            let start = i;
+            i += 1;
+            while i < frames.len() && !matches!(frames[i].0, 1 | 6) {
+                i += 1;
+            }
+            blocks.push(frames[start..i].to_vec());
+        }
+        assert!(blocks.len() >= 2, "need two path blocks to swap");
+        blocks.swap(0, 1);
+        let mut out = vec![frames[0].clone()];
+        for block in blocks {
+            out.extend(block);
+        }
+        out.extend(absences);
+        encode_framed(&out)
+    }
+
+    #[test]
+    fn closing_payload_mutation_is_caught_by_live_recheck() {
+        let (f, config) = setup("sha1");
+        AFTER_CLOSING_CAPTURE.with(|hook| {
+            let path = f.path(b"tracked");
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(&path, b"mutated after closing capture\n").unwrap();
+            }));
+        });
+        let report = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(report.reason, "census_changed", "{report:?}");
+        assert_ne!(report.outcome, "prepared", "{report:?}");
+        assert_eq!(report.durability, "unknown", "{report:?}");
+        assert!(!report.created_refs.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn verified_only_publication_unknown_is_independent_of_git_launch() {
+        let (f, config) = setup("sha1");
+        let first = prepare_path(&config, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+        assert_eq!(first.outcome, "prepared", "{first:?}");
+        assert!(!first.verified_refs.is_empty() || !first.created_refs.is_empty());
+        let report = prepare_path(
+            &config,
+            f.allocation.checkout,
+            Uuid::now_v7(),
+            Fault::PublishReopen,
+        );
+        assert_eq!(take_fault_hit(), Fault::PublishReopen, "{report:?}");
+        assert_eq!(report.reason, "durability_unknown", "{report:?}");
+        assert_eq!(report.outcome, "unknown", "{report:?}");
+        assert_eq!(report.durability, "unknown", "{report:?}");
+        assert!(!report.recorded, "{report:?}");
+        assert!(report.created_refs.is_empty(), "{report:?}");
+        assert!(!report.verified_refs.is_empty(), "{report:?}");
+        let published = f.temp.path().join(format!(
+            "authority/inspection-receipts-v1/{}.receipt",
+            report.result_id.expect("result id")
+        ));
+        let _ = published.exists();
+    }
+
+    #[test]
+    fn matching_short_prefix_pending_retries_same_inode() {
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(
+            &config,
+            f.allocation.checkout,
+            operation,
+            Fault::ResultFsync,
+        );
+        assert_eq!(take_fault_hit(), Fault::ResultFsync, "{first:?}");
+        assert_eq!(first.reason, "receipt_io", "{first:?}");
+        let pending = pending_result_path(&f, &first);
+        let before = fs::metadata(&pending).unwrap();
+        let ino = before.ino();
+        let full = fs::read(&pending).unwrap();
+        assert!(full.len() > 1, "{first:?}");
+        {
+            let file = fs::OpenOptions::new().write(true).open(&pending).unwrap();
+            file.set_len((full.len() / 2) as u64).unwrap();
+        }
+        assert_eq!(fs::metadata(&pending).unwrap().ino(), ino);
+        let prefix = fs::read(&pending).unwrap();
+        assert!(!prefix.is_empty());
+        assert!(prefix.len() < full.len());
+        assert_eq!(prefix, &full[..prefix.len()]);
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert_eq!(resume.outcome, "prepared", "{resume:?}");
+        assert_eq!(resume.durability, "acknowledged");
+        let published = f.temp.path().join(format!(
+            "authority/inspection-receipts-v1/{}.receipt",
+            first.result_id.unwrap()
+        ));
+        assert!(published.exists(), "{resume:?}");
+        assert_eq!(fs::metadata(&published).unwrap().ino(), ino);
+        assert!(!pending.exists());
+    }
+
+    #[test]
+    fn rechecksummed_reordered_manifest_witness_is_rejected_on_resume() {
+        let (f, config) = setup("sha1");
+        let operation = Uuid::now_v7();
+        let first = prepare_path(&config, f.allocation.checkout, operation, Fault::BeforeCas);
+        assert_eq!(take_fault_hit(), Fault::BeforeCas, "{first:?}");
+        let path = f.temp.path().join(format!(
+            "authority/inspection-receipts-v1/{}.receipt",
+            operation
+        ));
+        let bytes = fs::read(&path).unwrap();
+        let mut intent = match storage::decode(&bytes).unwrap() {
+            storage::Record::Intent(intent) => *intent,
+            storage::Record::Result(_) => panic!("kind"),
+        };
+        let mut source = framed(&intent.source_witness);
+        let mut swapped = false;
+        for frame in &mut source {
+            if frame.0 == 3 {
+                frame.1 = swap_two_path_blocks(&frame.1);
+                swapped = true;
+            }
+        }
+        assert!(swapped, "admin manifest witness missing");
+        intent.source_witness = encode_framed(&source);
+        intent.source_commitment = hash32(&Sha256::digest(&intent.source_witness));
+        let forged = storage::encode_intent(&intent).unwrap();
+        fs::write(&path, forged).unwrap();
+        let _ = take_witness_delta();
+        let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
+        assert!(take_witness_delta(), "{resume:?}");
+        assert_eq!(resume.reason, "census_changed", "{resume:?}");
         assert_ne!(resume.outcome, "prepared");
         assert!(!f.common().join("refs/work-recovery").exists());
     }

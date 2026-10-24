@@ -390,6 +390,54 @@ fn open_relative(parent: &File, name: &str, flags: OFlags) -> Result<File> {
         }
     })
 }
+fn read_charged(file: &File, limit: u64, budget: &mut super::Budget) -> Result<Vec<u8>> {
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
+    budget.entry().map_err(|_| ReceiptError::Conflict)?;
+    budget
+        .file_length(limit)
+        .map_err(|_| ReceiptError::Conflict)?;
+    let mut reader = file;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        if bytes.len() as u64 > limit {
+            return Err(ReceiptError::Corrupt);
+        }
+        let remaining = (limit + 1).saturating_sub(bytes.len() as u64);
+        let n = remaining.min(buffer.len() as u64) as usize;
+        if n == 0 {
+            break;
+        }
+        let got = super::read_chunk(&mut reader, &mut buffer[..n], budget)
+            .map_err(|_| ReceiptError::Conflict)?;
+        if got == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..got]);
+    }
+    if bytes.len() as u64 > limit {
+        return Err(ReceiptError::Corrupt);
+    }
+    Ok(bytes)
+}
+fn next_receipt_name(
+    entries: &mut RawDir<'_>,
+    budget: Option<&mut super::Budget>,
+) -> Result<Option<Vec<u8>>> {
+    match budget {
+        Some(b) => super::directory_next(b, entries.is_buffer_empty(), || match entries.next() {
+            None => Ok(None),
+            Some(Err(_)) => Err(ReceiptError::UnsafeReceiptStore),
+            Some(Ok(entry)) => Ok(Some(entry.file_name().to_bytes().to_vec())),
+        })
+        .map_err(|_| ReceiptError::Conflict)?,
+        None => match entries.next() {
+            None => Ok(None),
+            Some(Err(_)) => Err(ReceiptError::UnsafeReceiptStore),
+            Some(Ok(entry)) => Ok(Some(entry.file_name().to_bytes().to_vec())),
+        },
+    }
+}
 fn open_authority(store: &Store) -> Result<File> {
     let authority = store.authority_identity();
     let directory = fs::openat2(
@@ -540,8 +588,9 @@ pub(super) fn authority_bytes_for_recovery(store: &Store) -> Vec<u8> {
     authority_bytes(store)
 }
 
-pub(super) fn read_raw(store: &Store, id: Uuid) -> Result<Vec<u8>> {
+pub(super) fn read_raw(store: &Store, id: Uuid, budget: &mut super::Budget) -> Result<Vec<u8>> {
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
     uuid(id.to_string().as_bytes())?;
     let location = Location::open(store, false)?;
     let name = format!("{id}.receipt");
@@ -553,11 +602,7 @@ pub(super) fn read_raw(store: &Store, id: Uuid) -> Result<Vec<u8>> {
     }
     let file = open_relative(&location.dir, &name, OFlags::RDONLY)?;
     check_named(&location.dir, &name, &file, expected.st_size as u64, true)?;
-    let mut bytes = Vec::new();
-    (&file)
-        .take(MAX_RECEIPT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ReceiptError::Io)?;
+    let bytes = read_charged(&file, expected.st_size as u64, budget)?;
     if bytes.len() != expected.st_size as usize {
         return Err(ReceiptError::Corrupt);
     }
@@ -591,6 +636,7 @@ pub(super) fn resync_recovery_published(
     recovery_storage_persistent(store)?;
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     budget.check().map_err(|_| ReceiptError::Conflict)?;
+    budget.entry().map_err(|_| ReceiptError::Conflict)?;
     let location = Location::open(store, false)?;
     reject_volatile(&location.dir)?;
     reject_volatile(&location.parent)?;
@@ -616,7 +662,7 @@ pub(super) fn publish_recovery_intent(
     if reservation.id != publication.id() || reservation.length != publication.length() {
         return Err(ReceiptError::Conflict);
     }
-    write_reserved(reservation, publication.bytes())?;
+    write_reserved(reservation, publication.bytes(), budget)?;
     publish_recovery_record(
         store,
         publication.id(),
@@ -673,19 +719,29 @@ pub(super) fn reservation_binding(reservation: &Reservation) -> Result<RecoveryR
     })
 }
 
-pub(super) fn write_reserved(mut reservation: Reservation, bytes: &[u8]) -> Result<()> {
+fn write_reserved(
+    mut reservation: Reservation,
+    bytes: &[u8],
+    budget: &mut super::Budget,
+) -> Result<()> {
     if bytes.len() as u64 != reservation.length {
         return Err(ReceiptError::EncodingLimit);
     }
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
+    budget.entry().map_err(|_| ReceiptError::Conflict)?;
+    budget
+        .reserve(bytes.len() as u64)
+        .map_err(|_| ReceiptError::Conflict)?;
     reservation
         .file
         .write_all(bytes)
         .map_err(|_| ReceiptError::Io)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
     reservation.file.sync_all().map_err(|_| ReceiptError::Io)?;
     Ok(())
 }
 
-pub(super) fn publish_reserved(
+fn publish_reserved(
     store: &mut Store,
     id: Uuid,
     length: u64,
@@ -694,6 +750,8 @@ pub(super) fn publish_reserved(
 ) -> Result<PersistedReceipt> {
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     uuid(id.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
+    budget.check().map_err(|_| ReceiptError::Conflict)?;
+    budget.entry().map_err(|_| ReceiptError::Conflict)?;
     let location = Location::open(store, false)?;
     let pending = format!("pending-{id}-{length}");
     let file = open_relative(&location.dir, &pending, OFlags::RDONLY)?;
@@ -727,21 +785,32 @@ pub(super) fn publish_reserved(
     let unknown = || ReceiptError::DurabilityUnknown { id, digest };
     location.dir.sync_all().map_err(|_| unknown())?;
     location.check(store).map_err(|_| unknown())?;
-    let published =
-        open_relative(&location.dir, &final_name, OFlags::RDONLY).map_err(|_| unknown())?;
+    let published = {
+        #[cfg(test)]
+        if RESULT_PUBLISH.with(|flag| flag.get())
+            && super::recovery_refs::active_fault_is_publish_reopen()
+        {
+            super::recovery_refs::note_active_fault();
+            open_relative(&location.dir, ".__reopen_missing__", OFlags::RDONLY)
+        } else {
+            open_relative(&location.dir, &final_name, OFlags::RDONLY)
+        }
+        #[cfg(not(test))]
+        open_relative(&location.dir, &final_name, OFlags::RDONLY)
+    }
+    .map_err(|_| unknown())?;
     check_named(&location.dir, &final_name, &published, length, true).map_err(|_| unknown())?;
     location.parent.sync_all().map_err(|_| unknown())?;
     location.check(store).map_err(|_| unknown())?;
-    budget.check().map_err(|_| unknown())?;
-    lease.check(store).map_err(|_| unknown())?;
     #[cfg(test)]
     if RESULT_PUBLISH.with(|flag| flag.get())
-        && (super::recovery_refs::active_fault_is_publish_reopen()
-            || super::recovery_refs::active_fault_is_publish_deadline())
+        && super::recovery_refs::active_fault_is_publish_deadline()
     {
         super::recovery_refs::note_active_fault();
-        return Err(unknown());
+        budget.test_elapsed = Some(std::time::Duration::from_secs(30));
     }
+    budget.check().map_err(|_| unknown())?;
+    lease.check(store).map_err(|_| unknown())?;
     #[cfg(test)]
     if !RESULT_PUBLISH.with(|flag| flag.get())
         && super::recovery_refs::active_fault_is_intent_durability()
@@ -795,15 +864,15 @@ pub(super) fn restart_recovery_result(
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|_| ReceiptError::Io)?;
-    let mut existing = Vec::new();
-    (&file)
-        .take(MAX_RECEIPT + 1)
-        .read_to_end(&mut existing)
-        .map_err(|_| ReceiptError::Io)?;
+    let existing = read_charged(&file, size, budget)?;
     if existing.len() as u64 != size || !bytes.starts_with(&existing) {
         return Err(ReceiptError::Corrupt);
     }
     if size < bound.length {
+        budget.check().map_err(|_| ReceiptError::Conflict)?;
+        budget
+            .reserve((bound.length - size) as u64)
+            .map_err(|_| ReceiptError::Conflict)?;
         file.seek(SeekFrom::Start(size))
             .map_err(|_| ReceiptError::Io)?;
         file.write_all(&bytes[existing.len()..])
@@ -821,10 +890,22 @@ pub(super) fn restart_recovery_result(
 }
 
 pub(super) fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservation> {
+    reserve_with_budget(store, id, length, None)
+}
+
+pub(super) fn reserve_with_budget(
+    store: &Store,
+    id: Uuid,
+    length: u64,
+    mut budget: Option<&mut super::Budget>,
+) -> Result<Reservation> {
     if length == 0 || length > MAX_RECEIPT {
         return Err(ReceiptError::EncodingLimit);
     }
     uuid(id.to_string().as_bytes())?;
+    if let Some(b) = budget.as_mut() {
+        b.check().map_err(|_| ReceiptError::Conflict)?;
+    }
     let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     let location = Location::open(store, true)?;
@@ -835,27 +916,32 @@ pub(super) fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservatio
     let mut total = 0u64;
     let mut ids = std::collections::BTreeSet::new();
     let mut duplicate = false;
-    while let Some(entry) = entries.next() {
-        let entry = entry.map_err(|_| ReceiptError::UnsafeReceiptStore)?;
-        let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+    loop {
+        let Some(name) = next_receipt_name(&mut entries, budget.as_deref_mut())? else {
+            break;
+        };
+        if name == b"." || name == b".." {
             continue;
+        }
+        if let Some(b) = budget.as_mut() {
+            b.entry().map_err(|_| ReceiptError::Conflict)?;
         }
         count += 1;
         if count > MAX_NAMES {
             return Err(ReceiptError::CapacityFull);
         }
-        let metadata = fs::statat(&location.dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        let c_name =
+            std::ffi::CString::new(name.clone()).map_err(|_| ReceiptError::UnsafeReceiptStore)?;
+        let metadata = fs::statat(&location.dir, c_name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|_| ReceiptError::UnsafeReceiptStore)?;
         validate_file(&metadata)?;
         // O_PATH + NO_XDEV also refuses same-device bind mounts.
-        let text =
-            std::str::from_utf8(name.to_bytes()).map_err(|_| ReceiptError::UnsafeReceiptStore)?;
+        let text = std::str::from_utf8(&name).map_err(|_| ReceiptError::UnsafeReceiptStore)?;
         let held = open_relative(&location.dir, text, OFlags::PATH)?;
         if identity(&stat(&held)?) != identity(&metadata) {
             return Err(ReceiptError::UnsafeReceiptStore);
         }
-        let (existing, charge) = name_charge(name.to_bytes(), metadata.st_size as u64)?;
+        let (existing, charge) = name_charge(&name, metadata.st_size as u64)?;
         if !ids.insert(existing) {
             return Err(ReceiptError::UnsafeReceiptStore);
         }

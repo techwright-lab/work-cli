@@ -843,10 +843,31 @@ struct ManifestWitness {
     absent: BTreeSet<Vec<u8>>,
 }
 
+fn encode_manifest_witness(witness: &ManifestWitness) -> Vec<u8> {
+    let mut out = Vec::new();
+    frame(&mut out, 0, b"work.recovery.manifest.v1");
+    for (path, held) in &witness.paths {
+        frame(&mut out, 1, path);
+        frame(&mut out, 2, &held.identity);
+        frame(&mut out, 3, &[u8::from(held.directory)]);
+        for name in &held.names {
+            frame(&mut out, 4, name);
+        }
+        if let Some(content) = &held.content {
+            frame(&mut out, 5, content);
+        }
+    }
+    for path in &witness.absent {
+        frame(&mut out, 6, path);
+    }
+    out
+}
+
 fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
     let frames = take_frames(bytes)?;
     let mut paths = BTreeMap::new();
     let mut absent = BTreeSet::new();
+    let mut last_path: Option<Vec<u8>> = None;
     let mut i = match frames.first() {
         Some((0, value)) if value == b"work.recovery.manifest.v1" => 1,
         _ => return Err("census_changed"),
@@ -856,7 +877,10 @@ fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
             1 => {
                 let path = frames[i].1.clone();
                 i += 1;
-                if paths.contains_key(&path) || absent.contains(&path) {
+                if last_path.as_ref().is_some_and(|prev| prev >= &path)
+                    || paths.contains_key(&path)
+                    || absent.contains(&path)
+                {
                     return Err("census_changed");
                 }
                 if i >= frames.len() || frames[i].0 != 2 {
@@ -876,7 +900,9 @@ fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
                 let mut names = Vec::new();
                 let mut seen_names = BTreeSet::new();
                 while i < frames.len() && frames[i].0 == 4 {
-                    if !seen_names.insert(frames[i].1.clone()) {
+                    if names.last().is_some_and(|prev| prev >= &frames[i].1)
+                        || !seen_names.insert(frames[i].1.clone())
+                    {
                         return Err("census_changed");
                     }
                     names.push(frames[i].1.clone());
@@ -890,6 +916,7 @@ fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
                 if i < frames.len() && matches!(frames[i].0, 2 | 3 | 5) {
                     return Err("census_changed");
                 }
+                last_path = Some(path.clone());
                 paths.insert(
                     path,
                     WitnessPath {
@@ -904,17 +931,26 @@ fn parse_manifest_witness(bytes: &[u8]) -> Held<ManifestWitness> {
             _ => return Err("census_changed"),
         }
     }
+    let mut last_absent: Option<Vec<u8>> = None;
     while i < frames.len() {
         if frames[i].0 != 6 {
             return Err("census_changed");
         }
         let path = frames[i].1.clone();
-        if paths.contains_key(&path) || !absent.insert(path) {
+        if last_absent.as_ref().is_some_and(|prev| prev >= &path)
+            || paths.contains_key(&path)
+            || !absent.insert(path.clone())
+        {
             return Err("census_changed");
         }
+        last_absent = Some(path);
         i += 1;
     }
-    Ok(ManifestWitness { paths, absent })
+    let witness = ManifestWitness { paths, absent };
+    if encode_manifest_witness(&witness) != bytes {
+        return Err("census_changed");
+    }
+    Ok(witness)
 }
 
 fn binding_blob(identity: &[u8]) -> Held<([u8; 24], [u8; 16])> {
@@ -1934,6 +1970,44 @@ mod tests {
         let mut absent_and_present = ok.clone();
         frame(&mut absent_and_present, 6, b"HEAD");
         assert!(parse_manifest_witness(&absent_and_present).is_err());
+    }
+    #[test]
+    fn manifest_witness_rejects_noncanonical_path_or_absence_order() {
+        fn path_block(out: &mut Vec<u8>, path: &[u8]) {
+            frame(out, 1, path);
+            frame(out, 2, &[0u8; 88]);
+            frame(out, 3, &[0]);
+            frame(out, 5, &[1; 32]);
+        }
+        let mut canonical = Vec::new();
+        frame(&mut canonical, 0, b"work.recovery.manifest.v1");
+        path_block(&mut canonical, b"HEAD");
+        path_block(&mut canonical, b"config");
+        frame(&mut canonical, 6, b"a");
+        frame(&mut canonical, 6, b"b");
+        assert!(parse_manifest_witness(&canonical).is_ok());
+        let mut swapped_paths = Vec::new();
+        frame(&mut swapped_paths, 0, b"work.recovery.manifest.v1");
+        path_block(&mut swapped_paths, b"config");
+        path_block(&mut swapped_paths, b"HEAD");
+        frame(&mut swapped_paths, 6, b"a");
+        frame(&mut swapped_paths, 6, b"b");
+        assert!(parse_manifest_witness(&swapped_paths).is_err());
+        let mut swapped_absences = Vec::new();
+        frame(&mut swapped_absences, 0, b"work.recovery.manifest.v1");
+        path_block(&mut swapped_absences, b"HEAD");
+        path_block(&mut swapped_absences, b"config");
+        frame(&mut swapped_absences, 6, b"b");
+        frame(&mut swapped_absences, 6, b"a");
+        assert!(parse_manifest_witness(&swapped_absences).is_err());
+        let mut unsorted_names = Vec::new();
+        frame(&mut unsorted_names, 0, b"work.recovery.manifest.v1");
+        frame(&mut unsorted_names, 1, b"refs");
+        frame(&mut unsorted_names, 2, &[0u8; 88]);
+        frame(&mut unsorted_names, 3, &[1]);
+        frame(&mut unsorted_names, 4, b"heads");
+        frame(&mut unsorted_names, 4, b"HEAD");
+        assert!(parse_manifest_witness(&unsorted_names).is_err());
     }
     #[test]
     fn provenance_round_trip_rejects_unknown_kind_and_noncanonical_order() {
