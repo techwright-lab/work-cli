@@ -157,11 +157,11 @@ pub(crate) enum Phase {
 type Observer<'a> = Option<&'a mut dyn FnMut(Phase, &Scratch)>;
 #[cfg(test)]
 thread_local! {
-    static RETIREMENT_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(Phase, &Scratch)>>> =
+    static RETIREMENT_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(Phase, &Path)>>> =
         std::cell::RefCell::new(None);
 }
 #[cfg(test)]
-pub(crate) fn set_retirement_observer<F: FnMut(Phase, &Scratch) + 'static>(hook: F) {
+pub(crate) fn set_retirement_observer<F: FnMut(Phase, &Path) + 'static>(hook: F) {
     RETIREMENT_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 #[cfg(test)]
@@ -172,7 +172,7 @@ fn notify(observer: &mut Observer<'_>, phase: Phase, scratch: &Scratch) {
     }
     RETIREMENT_OBSERVER.with(|slot| {
         if let Some(hook) = slot.borrow_mut().as_mut() {
-            hook(phase, scratch);
+            hook(phase, scratch.path());
         }
     });
 }

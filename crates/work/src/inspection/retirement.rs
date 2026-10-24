@@ -1418,7 +1418,7 @@ mod tests {
                     "HEAD:refs/heads/preserved".as_ref(),
                 ],
             );
-            std::os::unix::fs::symlink(&dest, scratch.path().join("unexpected-link")).unwrap();
+            std::os::unix::fs::symlink(&dest, scratch.join("unexpected-link")).unwrap();
         });
         let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
         assert_eq!(report.outcome(), "held");
