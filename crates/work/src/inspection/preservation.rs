@@ -449,11 +449,10 @@ fn parse_reflog(
             return Err("reflog_unknown");
         }
         let rest = &row[2 * width + 2..];
-        let tab = rest
-            .iter()
-            .position(|c| *c == b'\t')
-            .ok_or("reflog_unknown")?;
-        let identity = &rest[..tab];
+        // Git 2.55 files-backend log_ref_write_fd omits TAB for no message.
+        // Only the message is optional; validate the entire identity either way.
+        let identity_end = rest.iter().position(|c| *c == b'\t').unwrap_or(rest.len());
+        let identity = &rest[..identity_end];
         let mut parts = identity.rsplitn(3, |c| *c == b' ');
         let zone = parts.next().ok_or("reflog_unknown")?;
         let time = parts.next().ok_or("reflog_unknown")?;
@@ -922,46 +921,84 @@ mod tests {
     }
     #[test]
     fn reflog_zero_sentinel_and_both_endpoint_provenance_without_payload() {
-        let id = "1".repeat(40);
-        let bytes = format!("{} {id} Name <DO_NOT_ECHO> 1 +0000\tsecret\n{id} {} Name <DO_NOT_ECHO> 2 +0000\tsecret\n", "0".repeat(40), "0".repeat(40));
-        let mut roots = Roots::new();
-        parse_reflog(
-            b"logs/HEAD",
-            bytes.as_bytes(),
-            ObjectFormat::Sha1,
-            &mut roots,
-            &mut Budget::new(),
-        )
-        .unwrap();
-        assert_eq!(roots.len(), 1);
-        let provenance = roots.get(id.as_bytes()).unwrap();
-        assert_eq!(provenance.len(), 2);
-        assert!(provenance
-            .iter()
-            .any(|p| p.kind == "reflog_new" && p.record_ordinal == Some(1)));
-        assert!(provenance
-            .iter()
-            .any(|p| p.kind == "reflog_old" && p.record_ordinal == Some(2)));
-        assert!(!serde_json::to_string(provenance)
-            .unwrap()
-            .contains("DO_NOT_ECHO"));
-        for invalid in [
-            bytes.trim_end().to_owned(),
-            bytes.replace(" +0000", " BAD"),
-            bytes.replace("Name <DO_NOT_ECHO>", "BAD"),
-            bytes.replace("Name <DO_NOT_ECHO>", "Name <bad <nested>"),
-            bytes.replace("Name <DO_NOT_ECHO>", "Name <bad email>"),
-            bytes.replace('\t', " "),
-            bytes.replace(&id, &"0".repeat(39)),
-        ] {
-            assert!(parse_reflog(
-                b"logs/HEAD",
-                invalid.as_bytes(),
-                ObjectFormat::Sha1,
-                &mut Roots::new(),
-                &mut Budget::new()
-            )
-            .is_err());
+        for format in [ObjectFormat::Sha1, ObjectFormat::Sha256] {
+            let width = format.width() * 2;
+            let old = "1".repeat(width);
+            let new = "2".repeat(width);
+            let zero = "0".repeat(width);
+            // Git's files backend omits the TAB entirely for an absent message.
+            // A present delimiter may have an empty or arbitrary non-UTF8 body.
+            for suffix in [b"".as_slice(), b"\t", b"\tDO_NOT_ECHO\t\xff"] {
+                let mut bytes = Vec::new();
+                for (from, to, time) in [(&zero, &old, 1), (&old, &new, 2), (&new, &zero, 3)] {
+                    bytes.extend(format!("{from} {to} Name <DO_NOT_ECHO> {time} +0000").bytes());
+                    bytes.extend_from_slice(suffix);
+                    bytes.push(b'\n');
+                }
+                let mut roots = Roots::new();
+                parse_reflog(b"logs/HEAD", &bytes, format, &mut roots, &mut Budget::new()).unwrap();
+                assert_eq!(roots.len(), 2);
+                assert!(!roots.contains_key(zero.as_bytes()));
+                for (id, records) in [
+                    (&old, [("reflog_new", 1), ("reflog_old", 2)]),
+                    (&new, [("reflog_new", 2), ("reflog_old", 3)]),
+                ] {
+                    let expected: BTreeSet<_> = records
+                        .into_iter()
+                        .map(|(kind, ordinal)| Provenance {
+                            kind,
+                            path_hex: hex(b"logs/HEAD"),
+                            record_ordinal: Some(ordinal),
+                        })
+                        .collect();
+                    assert_eq!(roots.get(id.as_bytes()), Some(&expected));
+                }
+                assert!(!serde_json::to_string(&roots.values().collect::<Vec<_>>())
+                    .unwrap()
+                    .contains("DO_NOT_ECHO"));
+            }
+            let bytes = format!("{old} {new} Name <DO_NOT_ECHO> 1 +0000\tsecret\n");
+            // All three optional-message forms still require a complete identity.
+            for suffix in ["", "\t", "\tsecret"] {
+                for identity in [
+                    "Name <DO_NOT_ECHO> 1",
+                    "Name <DO_NOT_ECHO> 1 +000",
+                    "Name <DO_NOT_ECHO> +0000",
+                    "Name\t<DO_NOT_ECHO> 1 +0000",
+                    "Name <DO_NOT_ECHO> 1\t+0000",
+                    "Name <DO_NOT_ECHO>\t\t",
+                ] {
+                    let invalid = format!("{old} {new} {identity}{suffix}\n");
+                    assert!(parse_reflog(
+                        b"logs/HEAD",
+                        invalid.as_bytes(),
+                        format,
+                        &mut Roots::new(),
+                        &mut Budget::new()
+                    )
+                    .is_err());
+                }
+            }
+            for invalid in [
+                bytes.trim_end().to_owned(),
+                bytes.replace(" +0000", " BAD"),
+                bytes.replace("Name <DO_NOT_ECHO>", "BAD"),
+                bytes.replace("Name <DO_NOT_ECHO>", "Name <bad <nested>"),
+                bytes.replace("Name <DO_NOT_ECHO>", "Name <bad email>"),
+                bytes.replace(" +0000\tsecret", "\tsecret"),
+                bytes.replace(&old, &"0".repeat(width - 1)),
+                bytes.replace("secret", "bad\0body"),
+                bytes.replace("secret", "bad\rbody"),
+            ] {
+                assert!(parse_reflog(
+                    b"logs/HEAD",
+                    invalid.as_bytes(),
+                    format,
+                    &mut Roots::new(),
+                    &mut Budget::new()
+                )
+                .is_err());
+            }
         }
     }
     fn setup(format: &str) -> (fixture::ManagedFixture, PathBuf) {
