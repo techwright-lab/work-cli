@@ -294,7 +294,9 @@ fn context_change_is_incomplete_without_inspection_mutations() {
     let observation = inspect_inner(&mut f.store, checkout, &policies, Some(&mut change)).unwrap();
     assert!(
         reached,
-        "initial inspection refused before context mutation: {observation:?}"
+        "initial inspection refused before context mutation: reasons={:?}, counters={:?}",
+        observation.reasons(),
+        observation.counters()
     );
     assert_eq!(observation.reasons(), [IncompleteReason::ContextConflict]);
     assert_eq!(events, f.store.pending_events(100).unwrap());
@@ -365,10 +367,117 @@ fn byte_identical_registration_replacement_invalidates_observation() {
     .unwrap();
     assert!(
         reached,
-        "initial inspection refused before registration replacement: {o:?}"
+        "initial inspection refused before registration replacement: reasons={:?}, counters={:?}",
+        o.reasons(),
+        o.counters()
     );
     assert_eq!(o.coverage(), Coverage::Incomplete);
     assert!(o.reasons().contains(&IncompleteReason::Changed));
+}
+
+#[test]
+fn private_refs_identity_and_empty_names_are_rechecked() {
+    for (case, reason) in [
+        ("replacement", IncompleteReason::Changed),
+        ("new-name", IncompleteReason::UnsupportedGit),
+    ] {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let policies = crate::disposal::validate(crate::disposal::PolicyDocument {
+            format: 1,
+            policies: vec![],
+        })
+        .unwrap();
+        let refs = f.private().join("refs");
+        assert!(fs::symlink_metadata(&refs).unwrap().is_dir());
+        assert!(fs::read_dir(&refs).unwrap().next().is_none());
+        let mut reached = false;
+        let mut change = |_: &mut Store| {
+            reached = true;
+            match case {
+                "replacement" => {
+                    fs::rename(&refs, refs.with_extension("old")).unwrap();
+                    fs::create_dir(&refs).unwrap();
+                }
+                "new-name" => fs::create_dir(refs.join("bisect")).unwrap(),
+                _ => unreachable!(),
+            }
+        };
+        let o = inspect_inner(
+            &mut f.store,
+            f.allocation.checkout,
+            &policies,
+            Some(&mut change),
+        )
+        .unwrap();
+        assert!(
+            reached,
+            "{case}: initial inspection refused: reasons={:?}, counters={:?}",
+            o.reasons(),
+            o.counters()
+        );
+        assert_eq!(o.coverage(), Coverage::Incomplete, "{case}");
+        // A new name is refused during repeated admission; an empty replacement
+        // remains structurally admissible but fails the retained identity check.
+        assert!(o.reasons().contains(&reason), "{case}");
+    }
+}
+
+#[test]
+fn tracked_git_mode_equivalence_uses_owner_execute_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = InspectionFixture::directory();
+    let payload = b"tracked\n";
+    f.write(b"tracked", payload);
+    let path = RawPath::from_bytes(b"tracked").unwrap();
+    let oid = object_digest(ObjectFormat::Sha1, b"blob", payload);
+    let policies = crate::disposal::validate(crate::disposal::PolicyDocument {
+        format: 1,
+        policies: vec![],
+    })
+    .unwrap();
+    // Private classification test, not synthetic authority for full inspection.
+    for (indexed_mode, actual_mode, changed) in [
+        (0o100755, 0o654, true), // group execute cannot substitute for owner execute
+        (0o100755, 0o744, false),
+        (0o100755, 0o755, false),
+        (0o100644, 0o654, false),
+        (0o100644, 0o645, false), // other execute is likewise irrelevant to Git mode
+        (0o100644, 0o744, true),
+    ] {
+        fs::set_permissions(f.path(b"tracked"), fs::Permissions::from_mode(actual_mode)).unwrap();
+        let census =
+            filesystem::walk(&f.checkout, &mut Budget::new(), &mut SystemBoundary).unwrap();
+        let index = BTreeMap::from([(
+            path.clone(),
+            IndexEntry {
+                mode: indexed_mode,
+                oid: oid.clone(),
+                assume_unchanged: false,
+                skip_worktree: false,
+            },
+        )]);
+        let proof = GitProof {
+            tree: index.clone(),
+            index,
+            ignored: BTreeMap::new(),
+            blobs: BTreeMap::from([(
+                oid.clone(),
+                (payload.len() as u64, Sha256::digest(payload).into()),
+            )]),
+            canonical: vec![],
+        };
+        let (entries, findings) = classify(&census, &proof, &policies);
+        assert_eq!(
+            findings
+                .iter()
+                .any(|f| f.path == path && f.kind == FindingKind::TrackedContent),
+            changed,
+            "index={indexed_mode:o}, actual={actual_mode:o}"
+        );
+        assert_eq!(entries[0].mode & 0o7777, actual_mode);
+        assert_eq!(census.entries[0].mode() & 0o7777, actual_mode);
+        assert!(!findings.iter().any(|f| f.kind == FindingKind::StagedChange));
+    }
 }
 
 #[test]

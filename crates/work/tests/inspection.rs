@@ -28,6 +28,11 @@ fn native_sha1_sha256_v2_v3_positive() {
         ("sha256", "3"),
     ] {
         let mut f = fixture::ManagedFixture::new(format, version);
+        // Native files-backend creation leaves an ordinary empty private refs
+        // directory. Keep it intact: admission must support this native layout.
+        let private_refs = f.private().join("refs");
+        assert!(fs::symlink_metadata(&private_refs).unwrap().is_dir());
+        assert!(fs::read_dir(&private_refs).unwrap().next().is_none());
         let before = fs::read(f.private().join("index")).unwrap();
         assert_eq!(
             &before[4..8],
@@ -195,6 +200,56 @@ fn native_git_input_preflight_and_manifest() {
         // commands remain behind the complete native-input admission boundary.
         assert_eq!(o.counters().repository_launches, 0, "{case}");
         assert_eq!(fs::read(&sentinel).unwrap(), b"outside metadata");
+    }
+}
+
+#[test]
+fn private_refs_reject_links_special_files_and_nonempty_directories_before_git() {
+    for case in [
+        "symlink",
+        "fifo",
+        "regular-file",
+        "direct-ref",
+        "bisect",
+        "worktree",
+        "rewritten",
+    ] {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let refs = f.private().join("refs");
+        assert!(fs::symlink_metadata(&refs).unwrap().is_dir());
+        assert!(fs::read_dir(&refs).unwrap().next().is_none());
+        match case {
+            "symlink" => {
+                let outside = f.temp.path().join("outside-empty-refs");
+                fs::create_dir(&outside).unwrap();
+                fs::remove_dir(&refs).unwrap();
+                symlink(&outside, &refs).unwrap();
+            }
+            "fifo" => {
+                fs::remove_dir(&refs).unwrap();
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &refs,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::RUSR,
+                    0,
+                )
+                .unwrap();
+            }
+            "regular-file" => {
+                fs::remove_dir(&refs).unwrap();
+                fs::write(&refs, b"").unwrap();
+            }
+            "direct-ref" => {
+                fs::write(refs.join("unexpected"), b"unsupported private ref\n").unwrap();
+            }
+            _ => fs::create_dir(refs.join(case)).unwrap(),
+        }
+        let o = f.inspect(&empty());
+        assert_eq!(o.coverage(), Coverage::Incomplete, "{case}");
+        assert_eq!(o.counters().child_launches, 0, "{case}");
+        assert_eq!(o.counters().repository_launches, 0, "{case}");
+        assert_eq!(o.counters().observed_process_bytes, 0, "{case}");
     }
 }
 

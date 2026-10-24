@@ -1639,13 +1639,24 @@ impl GitInputs {
             b"shallow".as_slice(),
             b"info/sparse-checkout",
             b"info/attributes",
-            b"refs",
             b"packed-refs",
             b"objects",
             b"modules",
             b"reftable",
         ] {
             private.absent(name, b)?;
+        }
+        // Native files-backend creation leaves an empty private refs directory.
+        // Admit only absence or an ordinary empty directory; the manifest retains
+        // its descriptor identity and bounded names for repeated checks.
+        match private.absent(b"refs", b) {
+            Ok(()) => (),
+            Err(IncompleteReason::UnsupportedGit) => {
+                if !private.is_directory(b"refs", b)? || !private.list(b"refs", b)?.is_empty() {
+                    return Err(IncompleteReason::UnsupportedGit);
+                }
+            }
+            Err(reason) => return Err(reason),
         }
         common.optional(b"info/exclude", b)?;
         let config = common.required(b"config", b)?;
@@ -2207,7 +2218,7 @@ fn classify(
                 || blob.is_none_or(|(length, hash)| {
                     *length != e.length() || Some(*hash) != e.content_sha256
                 })
-                || (index.mode == 0o100755) != (e.mode() & 0o111 != 0)
+                || (index.mode == 0o100755) != (e.mode() & 0o100 != 0)
             {
                 findings.push(Finding {
                     path: e.path.clone(),
