@@ -22,6 +22,10 @@ pub(crate) enum Event {
         output_bytes: Option<usize>,
         outcome: ProcessOutcome,
     },
+    TransportProgress {
+        operation: Operation,
+        progress: TransportProgress,
+    },
     Store {
         phase: &'static str,
         category: StoreCategory,
@@ -49,6 +53,80 @@ pub(crate) enum Event {
         roots: usize,
     },
 }
+/// Fixed, payload-free observations; false/None means unobserved, not proof of
+/// a live process/open pipe. Cleanup results do not prove descendant death.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TransportProgress {
+    pub(crate) phase: TransportPhase,
+    pub(crate) timeout_site: Option<TransportTimeoutSite>,
+    pub(crate) spawn_attempts: u64,
+    pub(crate) etxtbsy_failures: u64,
+    pub(crate) stdin_bytes_written: u64,
+    pub(crate) stdout_bytes_read: u64,
+    pub(crate) stderr_bytes_read: u64,
+    pub(crate) spawned: bool,
+    /// True only after complete input and deliberate stdin closure.
+    pub(crate) input_complete_closed: bool,
+    pub(crate) stdout_eof: bool,
+    pub(crate) stderr_eof: bool,
+    pub(crate) exit_observed: bool,
+    pub(crate) helper_returned: bool,
+    pub(crate) spawn_return_us: Option<u128>,
+    pub(crate) timeout_observed_us: Option<u128>,
+    pub(crate) cleanup_start_us: Option<u128>,
+    pub(crate) cleanup_end_us: Option<u128>,
+    pub(crate) group_kill_ok: Option<bool>,
+    pub(crate) child_kill_ok: Option<bool>,
+    pub(crate) leader_wait_ok: Option<bool>,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TransportPhase {
+    #[default]
+    PreSpawn,
+    Spawn,
+    PipeSetup,
+    IoLoop,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportTimeoutSite {
+    PreSpawn,
+    IoLoop,
+}
+
+/// Owns observations only, never a collector borrow or a subprocess. Drop emits
+/// once to the current scoped collector; it adds no unwind-safe child cleanup.
+/// Nested collectors must end before their enclosing transport guard.
+pub(crate) struct TransportGuard {
+    operation: Operation,
+    progress: TransportProgress,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl TransportGuard {
+    pub(crate) fn new(operation: &str) -> Option<Self> {
+        enabled().then(|| Self {
+            operation: match operation {
+                "begin" => Operation::Begin,
+                "finish" => Operation::Finish,
+                "retry" => Operation::Retry,
+                _ => Operation::Other,
+            },
+            progress: TransportProgress::default(),
+            _thread: std::marker::PhantomData,
+        })
+    }
+    pub(crate) fn progress(&mut self) -> &mut TransportProgress {
+        &mut self.progress
+    }
+}
+impl Drop for TransportGuard {
+    fn drop(&mut self) {
+        record(Event::TransportProgress {
+            operation: self.operation,
+            progress: self.progress,
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreCategory {
     Unsafe,
@@ -364,6 +442,86 @@ impl Drop for Guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_progress_scopes_restore_after_error_and_unwind() {
+        fn attempt() -> Result<(), ()> {
+            let mut transport = TransportGuard::new("begin");
+            if let Some(guard) = transport.as_mut() {
+                guard.progress().spawn_attempts = 1;
+            }
+            Err(())
+        }
+        let early = Event::TransportProgress {
+            operation: Operation::Begin,
+            progress: TransportProgress {
+                spawn_attempts: 1,
+                ..TransportProgress::default()
+            },
+        };
+        assert!(!enabled());
+        assert!(TransportGuard::new("begin").is_none());
+        assert_eq!(attempt(), Err(()));
+        let diagnostics = Guard::new();
+        assert!(diagnostics.events().is_empty());
+        assert_eq!(attempt(), Err(()));
+        assert_eq!(diagnostics.events(), [early]);
+        let mut outer = TransportGuard::new("finish").unwrap();
+        outer.progress().spawn_attempts = 2;
+        {
+            let inner = Guard::new();
+            assert_eq!(attempt(), Err(()));
+            assert_eq!(inner.events(), [early]);
+            // Synthetic guards only: no child exists during this unwind.
+            assert!(std::panic::catch_unwind(|| {
+                let mut transport = TransportGuard::new("retry").unwrap();
+                transport.progress().spawn_attempts = 3;
+                panic!("synthetic transport guard unwind");
+            })
+            .is_err());
+            assert_eq!(
+                inner.events(),
+                [
+                    early,
+                    Event::TransportProgress {
+                        operation: Operation::Retry,
+                        progress: TransportProgress {
+                            spawn_attempts: 3,
+                            ..TransportProgress::default()
+                        },
+                    }
+                ]
+            );
+        }
+        assert_eq!(
+            diagnostics.events(),
+            [early],
+            "inner collector must restore outer without leaking events"
+        );
+        drop(outer);
+        assert_eq!(
+            diagnostics.events(),
+            [
+                early,
+                Event::TransportProgress {
+                    operation: Operation::Finish,
+                    progress: TransportProgress {
+                        spawn_attempts: 2,
+                        ..TransportProgress::default()
+                    },
+                }
+            ]
+        );
+        drop(diagnostics);
+        assert!(!enabled());
+        assert!(TransportGuard::new("finish").is_none());
+        assert_eq!(attempt(), Err(()));
+        let fresh = Guard::new();
+        assert!(fresh.events().is_empty());
+        drop(fresh);
+        assert!(!enabled());
+    }
+
     #[test]
     fn cpu_wall_outer_seams_emit_on_error_and_unwind_only_when_enabled() {
         fn attempt() -> Result<(), ()> {

@@ -224,8 +224,29 @@ fn report(
         [record.request.identity().checkout.to_string()],
         |r| r.get(0),
     ))?;
-    let mapped = db(store.capture_snapshot(run))?.is_some();
-    let confirmation = db(store.capture_finalization_snapshot(run))?.and_then(|s| s.confirmation);
+    let gap = db(crate::attribution_gap::observation(
+        &store.conn,
+        &record.request,
+    ))?;
+    let (mapped, confirmation) = if gap.is_some() {
+        // run_status_record already qualified this Root and its complete Gap
+        // history in our still-open snapshot. Preserve capture/coexistence
+        // qualification without repeating public Root/history reads.
+        if db(crate::capture_journal::qualified_terminal(
+            &store.conn,
+            &record,
+        ))?
+        .is_some()
+        {
+            return db(Err(crate::store::StoreError::Invalid));
+        }
+        (false, None)
+    } else {
+        (
+            db(store.capture_snapshot(run))?.is_some(),
+            db(store.capture_finalization_snapshot(run))?.and_then(|s| s.confirmation),
+        )
+    };
     let capture_unfrozen = mapped && confirmation.is_none();
     let capture_delivery = confirmation.map(|c| {
         if c.delivered {
@@ -234,10 +255,6 @@ fn report(
             crate::capture_bridge::DeliveryObservation::Pending
         }
     });
-    let gap = db(crate::attribution_gap::observation(
-        &store.conn,
-        &record.request,
-    ))?;
     let attribution_not_configured = gap.is_none()
         && !mapped
         && db(crate::finish::capture_not_configured(
@@ -257,6 +274,15 @@ fn report(
         capture_unfrozen,
         capture_delivery,
     })
+}
+#[cfg(test)]
+pub(crate) fn report_for_test(
+    store: &Store,
+    run: &RunId,
+    existing: bool,
+    exit_code: Option<i32>,
+) -> io::Result<RunReport> {
+    report(store, run, existing, exit_code)
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExpectedMode {
@@ -628,9 +654,9 @@ fn execute(
         .ok_or_else(|| err("supervisor not configured"))?;
     let policy = settings.policy()?;
     let run = request.identity().run.clone();
-    let (live, completion) = match &mode {
-        ExecutionMode::Captured { live, completion } => (Some(live), *completion),
-        _ => (None, CaptureCompletion::Unfrozen),
+    let live = match &mode {
+        ExecutionMode::Captured { live, .. } => Some(live),
+        _ => None,
     };
     let owned_driver = match &mode {
         ExecutionMode::Captured { live, .. } => Some(driver.for_capture(live)),
@@ -801,17 +827,30 @@ fn execute(
                     driver,
                     launch.binding().ok_or_else(|| err("missing binding"))?,
                 ) {
-                    let seal = match (&live, completion) {
-                        (Some(live), CaptureCompletion::Certify) => {
-                            db(store.close_live_capture(&snapshot, &proof, live))?.1
+                    let (seal, gap_seal) = match &mode {
+                        ExecutionMode::Gap(live) => {
+                            (None, db(store.close_live_gap(&snapshot, &proof, live))?.1)
                         }
+                        ExecutionMode::Captured {
+                            live,
+                            completion: CaptureCompletion::Certify,
+                        } => (
+                            db(store.close_live_capture(&snapshot, &proof, live))?.1,
+                            None,
+                        ),
                         _ => {
                             db(store.close_supervised_group(&snapshot, &proof))?;
-                            None
+                            (None, None)
                         }
                     };
                     physically_closed = true;
                     observer(Boundary::Closed, &record(&store, &request)?);
+                    if let Some(seal) = gap_seal {
+                        // Physical closure already committed. Publication consumes
+                        // this one seal outside all SQL/allocator guards; errors
+                        // cannot reopen the Root or install a recovery outcome.
+                        db(crate::gap_continuation::publish(config, seal))?;
+                    }
                     if let Some(seal) = seal {
                         // Physical closure is already committed. Neither FINISH
                         // nor fresh filesystem inspection spans SQL or flock.
@@ -992,8 +1031,11 @@ fn print_report(report: &RunReport) -> i32 {
     );
     if let Some(gap) = &report.gap {
         eprintln!("attribution_gap: event_recorded={}; event_id={}; delivery={:?}; transport_deferred={}; origin={}",gap.event_recorded,gap.event_id,gap.delivery,gap.transport_deferred,gap.origin);
-        if gap.origin == "required_initial" {
-            eprintln!("RequiredInitial: charge retained; physical closure leaves held/not_ready; next root and new finish unsupported");
+        if matches!(gap.origin, "required_initial" | "required_continuation") {
+            eprintln!(
+                "RequiredGap: {}",
+                crate::attribution_gap::REQUIRED_LIMITATIONS
+            );
         }
     }
     report.process_exit_code()

@@ -650,6 +650,12 @@ pub(crate) fn gap_history(
     conn: &Connection,
     checkout: uuid::Uuid,
 ) -> Result<Vec<(RunRecord, Option<crate::attribution_gap::GapRecord>)>> {
+    crate::gap_continuation::with_history(conn, checkout, |history| Ok(history.nodes))
+}
+pub(crate) fn gap_history_base(
+    conn: &Connection,
+    checkout: uuid::Uuid,
+) -> Result<Vec<(RunRecord, Option<crate::attribution_gap::GapRecord>)>> {
     let _snapshot = read_transaction(conn)?;
     crate::attribution_gap::validate_raw(conn)?;
     let mut rosters = crate::run_participants::TargetRosters::read(conn, &checkout.to_string())?;
@@ -659,6 +665,8 @@ pub(crate) fn gap_history(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut history = Vec::with_capacity(rows.len());
     for row in rows {
+        #[cfg(test)]
+        crate::gap_continuation::decoded_node();
         let mut record = row?;
         record.children = rosters.roster(conn, &record.request, record.binding.as_ref())?;
         validate_child_history(&record)?;
@@ -699,6 +707,27 @@ pub(crate) fn exact(conn: &Connection, request: &RootRunRequest) -> Result<RunRe
     let record = read(conn, &request.identity.run)?.ok_or(StoreError::Invalid)?;
     exact_record(conn, request, &record)?;
     Ok(record)
+}
+// Close-only counterpart of exact/read: retain the related qualification at
+// read's existing validation point, on this actual unmutated transaction.
+fn exact_for_close<'tx, 'conn>(
+    tx: &'tx rusqlite::Transaction<'conn>,
+    request: &RootRunRequest,
+) -> Result<(
+    RunRecord,
+    Option<crate::gap_continuation::Related<'tx, 'conn>>,
+)> {
+    crate::attribution_gap::validate_raw(tx)?;
+    let record = read_base(tx, &request.identity.run)?.ok_or(StoreError::Invalid)?;
+    let checkout = uuid(&record.request.identity.checkout)?;
+    let related = if crate::attribution_gap::raw_history(tx, checkout)? {
+        Some(crate::gap_continuation::Related::qualify(tx, checkout)?)
+    } else {
+        None
+    };
+    crate::capture_journal::read(tx, &record)?;
+    exact_record(tx, request, &record)?;
+    Ok((record, related))
 }
 fn exact_record(conn: &Connection, request: &RootRunRequest, record: &RunRecord) -> Result<()> {
     if &record.request != request {
@@ -760,7 +789,10 @@ pub(crate) enum WriterAdmission<'a, 'tx, 'conn> {
         &'a crate::capture_setup::AdmissionProof<'a>,
         &'a crate::capture_setup::Related<'tx, 'conn>,
     ),
-    Gap(&'a crate::attribution_gap::GapAdmissionProof),
+    Gap(
+        &'a crate::attribution_gap::GapAdmissionProof,
+        &'a crate::gap_continuation::Related<'tx, 'conn>,
+    ),
 }
 pub(crate) fn begin_run_tx(
     tx: &Connection,
@@ -778,7 +810,7 @@ pub(crate) fn begin_run_context(
     authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
 ) -> Result<BeginRun> {
     lease.check_authority(authority)?;
-    if !matches!(materialized, WriterAdmission::Gap(_)) && request.input.attribution.is_some() {
+    if !matches!(materialized, WriterAdmission::Gap(_, _)) && request.input.attribution.is_some() {
         return Err(StoreError::Invalid);
     }
     if let WriterAdmission::Captured(_, related) = materialized {
@@ -792,7 +824,7 @@ pub(crate) fn begin_run_context(
         exact(tx, request)?;
         return Ok(BeginRun::Existing);
     }
-    if !matches!(materialized, WriterAdmission::Gap(_)) {
+    if !matches!(materialized, WriterAdmission::Gap(_, _)) {
         crate::attribution_gap::validate_related(tx, uuid(&request.identity.checkout)?)?;
     }
     let i = &request.identity;
@@ -828,7 +860,7 @@ pub(crate) fn begin_run_context(
             i.group.to_string(),
             i.run_ref.as_str(),
             match materialized {
-                WriterAdmission::Gap(proof) => proof.request_bytes(request)?.to_owned(),
+                WriterAdmission::Gap(proof, _) => proof.request_bytes(request)?.to_owned(),
                 _ => json(request)?,
             },
         ),
@@ -916,6 +948,7 @@ impl Store {
             .map(|r| r.map_err(StoreError::from).and_then(|v| v))
             .collect::<Result<Vec<_>>>()?;
         crate::attribution_gap::validate_raw(&self.conn)?;
+        let mut checkouts = std::collections::BTreeSet::new();
         for record in &mut records {
             crate::attribution_gap::qualify_root(&self.conn, &record.request)?;
             record.children = crate::run_participants::roster(
@@ -924,6 +957,13 @@ impl Store {
                 record.binding.as_ref(),
             )?;
             validate_child_history(record)?;
+            checkouts.insert(uuid(&record.request.identity.checkout)?);
+        }
+        // Closed receipts retain cursor/Q/claim obligations. Validate each
+        // related checkout once in this snapshot, before filtering, without
+        // recursive public Root reads or decoding unrelated capture payloads.
+        for checkout in checkouts {
+            crate::attribution_gap::validate_related(&self.conn, checkout)?;
         }
         records.retain(|record| !record.closed);
         Ok(records)
@@ -968,6 +1008,38 @@ impl Store {
         live: Option<&crate::capture_preparation::LiveCapture>,
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<(Transition, Option<crate::capture_readiness::ClosureSeal>)> {
+        let mode = live.map_or(CloseMode::Ordinary, CloseMode::Captured);
+        let result = self.close_mode_under_lease(snapshot, proof, mode, lease)?;
+        Ok((result.transition, result.capture_seal))
+    }
+    pub(crate) fn close_live_gap(
+        &mut self,
+        snapshot: &GroupSnapshot,
+        proof: &GroupEmptyProof,
+        live: &crate::attribution_gap::CreatedOffLive,
+    ) -> Result<(Transition, Option<crate::gap_continuation::GapClosureSeal>)> {
+        let lease = self.authority_lease()?;
+        self.close_live_gap_under_lease(snapshot, proof, live, &lease)
+    }
+    pub(crate) fn close_live_gap_under_lease(
+        &mut self,
+        snapshot: &GroupSnapshot,
+        proof: &GroupEmptyProof,
+        live: &crate::attribution_gap::CreatedOffLive,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<(Transition, Option<crate::gap_continuation::GapClosureSeal>)> {
+        let result = self.close_mode_under_lease(snapshot, proof, CloseMode::Gap(live), lease)?;
+        Ok((result.transition, result.gap_seal))
+    }
+    fn close_mode_under_lease(
+        &mut self,
+        snapshot: &GroupSnapshot,
+        proof: &GroupEmptyProof,
+        mode: CloseMode<'_>,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<CloseResult> {
+        #[cfg(test)]
+        let _counts = CloseHistorySample::start();
         lease.check(self)?;
         let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
@@ -979,7 +1051,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let expected = &snapshot.record;
         crate::capture_journal::validate_related(&tx, &expected.request.identity.checkout)?;
-        let current = exact(&tx, &expected.request)?;
+        let (current, related) = exact_for_close(&tx, &expected.request)?;
         let revision = expected
             .revision
             .checked_add(1)
@@ -992,7 +1064,11 @@ impl Store {
             receipt.revision = revision;
             apply_interruptions(&mut receipt, &proof.interrupted_children)?;
             return if current == receipt {
-                Ok((Transition::Existing, None))
+                Ok(CloseResult {
+                    transition: Transition::Existing,
+                    capture_seal: None,
+                    gap_seal: None,
+                })
             } else {
                 Err(StoreError::Conflict)
             };
@@ -1006,6 +1082,22 @@ impl Store {
         {
             return Err(StoreError::Conflict);
         }
+        let live = match mode {
+            CloseMode::Captured(live) => Some(live),
+            _ => None,
+        };
+        let gap_live = match mode {
+            CloseMode::Gap(live) => Some(live),
+            _ => None,
+        };
+        let classification = if let Some(related) = related {
+            crate::gap_continuation::before_close_related(
+                &tx, related, &current, gap_live, &authority,
+            )?
+        } else {
+            crate::gap_continuation::before_close(&tx, &current, gap_live, &authority)?
+        };
+        let required = classification.required();
         let seal_eligible = live.is_some()
             && crate::capture_readiness::before_close(&tx, &current).unwrap_or(false);
         let mut receipt = expected.clone();
@@ -1054,9 +1146,22 @@ impl Store {
             (i.group.to_string(), revision as i64),
         )?;
         journal_event(&tx, &expected.request, revision, JournalChange::GroupClosed)?;
-        if crate::attribution_gap::required_origin(&tx, uuid(&i.checkout)?)? {
+        if required {
             tx.execute("UPDATE checkouts SET state='held',ready=0 WHERE id=?1 AND state IN ('active','partial','held') AND NOT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)", [i.checkout.to_string()])?;
         }
+        receipt.closed = true;
+        receipt.recovery_hold = false;
+        receipt.revision = revision;
+        let gap_seal = crate::gap_continuation::after_changed_close(
+            &tx,
+            &authority,
+            lease,
+            &receipt,
+            classification,
+        )?;
+        // Validate only after child/writer/group/checkout/cursor writes form a
+        // coherent graph. Never inspect closed+unavailable between writes.
+        crate::attribution_gap::validate_related(&tx, uuid(&i.checkout)?)?;
         // Capture eligibility never vetoes proven physical closure. Only this
         // Changed transaction can seal its exact post-close context.
         let seal = if seal_eligible {
@@ -1073,7 +1178,11 @@ impl Store {
             return Err(StoreError::Conflict);
         }
         tx.commit()?;
-        Ok((Transition::Changed, seal))
+        Ok(CloseResult {
+            transition: Transition::Changed,
+            capture_seal: seal,
+            gap_seal,
+        })
     }
     fn transition(&mut self, request: &RootRunRequest, change: Change) -> Result<Transition> {
         let lease = self.authority_lease()?;
@@ -1086,6 +1195,7 @@ impl Store {
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<Transition> {
         lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -1166,6 +1276,12 @@ impl Store {
                 if record.recovery_hold {
                     return Ok(Transition::Existing);
                 }
+                crate::gap_continuation::revoke(
+                    &tx,
+                    &authority,
+                    lease,
+                    uuid(&request.identity.checkout)?,
+                )?;
                 tx.execute(
                     "UPDATE run_groups SET recovery_hold=1 WHERE id=?1",
                     [&group],
@@ -1187,6 +1303,66 @@ impl Store {
         Ok(Transition::Changed)
     }
 }
+#[cfg(test)]
+type CloseHistoryCounts = (usize, usize, usize, usize);
+#[cfg(test)]
+thread_local! {
+    static CLOSE_HISTORY_COUNTS: std::cell::RefCell<Option<Vec<CloseHistoryCounts>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) struct CloseHistoryCounter;
+#[cfg(test)]
+impl CloseHistoryCounter {
+    pub(crate) fn new() -> Self {
+        CLOSE_HISTORY_COUNTS.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Vec::new());
+        });
+        Self
+    }
+    pub(crate) fn take(&self) -> Vec<CloseHistoryCounts> {
+        CLOSE_HISTORY_COUNTS.with(|slot| std::mem::take(slot.borrow_mut().as_mut().unwrap()))
+    }
+}
+#[cfg(test)]
+impl Drop for CloseHistoryCounter {
+    fn drop(&mut self) {
+        CLOSE_HISTORY_COUNTS.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+struct CloseHistorySample(bool);
+#[cfg(test)]
+impl CloseHistorySample {
+    fn start() -> Self {
+        let enabled = CLOSE_HISTORY_COUNTS.with(|slot| slot.borrow().is_some());
+        if enabled {
+            crate::gap_continuation::take_history_counts();
+        }
+        Self(enabled)
+    }
+}
+#[cfg(test)]
+impl Drop for CloseHistorySample {
+    fn drop(&mut self) {
+        if self.0 {
+            let counts = crate::gap_continuation::take_history_counts();
+            CLOSE_HISTORY_COUNTS.with(|slot| slot.borrow_mut().as_mut().unwrap().push(counts));
+        }
+    }
+}
+
+enum CloseMode<'a> {
+    Ordinary,
+    Captured(&'a crate::capture_preparation::LiveCapture),
+    Gap(&'a crate::attribution_gap::CreatedOffLive),
+}
+struct CloseResult {
+    transition: Transition,
+    capture_seal: Option<crate::capture_readiness::ClosureSeal>,
+    gap_seal: Option<crate::gap_continuation::GapClosureSeal>,
+}
+
 enum Change {
     Bound(BoundSnapshot),
     Permit(BoundSnapshot),

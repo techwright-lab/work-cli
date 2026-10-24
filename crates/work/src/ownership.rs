@@ -19,6 +19,7 @@ impl Store {
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<()> {
         lease.check(self)?;
+        let authority = self.authority_identity().clone();
         identity(recipient)?;
         let _phase = self.sql_phase();
         let tx = self
@@ -40,6 +41,7 @@ impl Store {
         if retired || count(&tx, &repo, Some(recipient))? >= limits.owner {
             return Err(StoreError::Capacity);
         }
+        crate::gap_continuation::revoke(&tx, &authority, lease, checkout)?;
         tx.execute(
             "UPDATE checkouts SET owner=?1 WHERE id=?2",
             (recipient, checkout.to_string()),
@@ -65,6 +67,7 @@ impl Store {
     ) -> Result<usize> {
         let lease = self.authority_lease()?;
         lease.check(self)?;
+        let authority = self.authority_identity().clone();
         identity(owner)?;
         let _phase = self.sql_phase();
         let operator = operator.ok_or(StoreError::Invalid)?;
@@ -93,6 +96,7 @@ impl Store {
         tx.execute("INSERT OR IGNORE INTO retired_owners VALUES(?1)", [owner])?;
         for (id, repo) in &rows {
             let checkout = Uuid::parse_str(id).map_err(|_| StoreError::Invalid)?;
+            crate::gap_continuation::revoke(&tx, &authority, &lease, checkout)?;
             tx.execute("UPDATE checkouts SET owner=?1 WHERE id=?2", (operator, id))?;
             let over_quota = count(&tx, repo, Some(operator))? > limits.owner
                 || count(&tx, repo, None)? > limits.repository;

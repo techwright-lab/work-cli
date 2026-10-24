@@ -48,6 +48,7 @@ use uuid::Uuid;
 const MAX_RECORD: usize = 2 * 1024 * 1024;
 const MAX_AGE: Duration = Duration::from_secs(2);
 const REASON: &str = "operator_attribution_off";
+pub(crate) const REQUIRED_LIMITATIONS: &str = "continuation requires a live-close qualification and fresh same-boot/actor/target checks; closure retains held/not_ready and charge; recovery never qualifies; generic Ready, new finish and transport remain unsupported";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +78,7 @@ pub(crate) fn observation(
 enum Origin {
     OrdinaryUnconfigured,
     RequiredInitial,
+    RequiredContinuation,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +88,7 @@ struct Requirement {
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Destination {
+pub(crate) struct Destination {
     family: String,
     endpoint: String,
     registry: PathBuf,
@@ -97,7 +99,7 @@ struct Destination {
     removal_names: Vec<String>,
 }
 impl Destination {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let scalar = |s: &str| {
             !s.trim().is_empty() && s.chars().count() <= 4096 && !s.chars().any(char::is_control)
         };
@@ -144,6 +146,8 @@ struct Context {
     state: String,
     ready: bool,
     requirement: Option<Requirement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    continuation: Option<crate::gap_continuation::Continuation>,
 }
 impl Context {
     fn read(conn: &Connection, checkout: Uuid) -> Result<Self> {
@@ -152,7 +156,7 @@ impl Context {
             [checkout.to_string()], |r| Ok(Self {
                 allocation:r.get(0)?, allocation_request:r.get(1)?, operation:r.get(2)?, charge_digest:r.get(3)?,
                 repository:PathBuf::from(r.get::<_,String>(4)?), actor:r.get(5)?, task:r.get(6)?, owner:r.get(7)?,
-                state:r.get(8)?, ready:r.get(9)?, requirement:None,
+                state:r.get(8)?, ready:r.get(9)?, requirement:None, continuation:None,
             }),
         )?;
         context.requirement =
@@ -196,6 +200,64 @@ pub(crate) struct GapRecord {
     delivery: GapDelivery,
 }
 impl GapRecord {
+    pub(crate) fn continuation(&self) -> Option<&crate::gap_continuation::Continuation> {
+        self.context.continuation.as_ref()
+    }
+    pub(crate) fn actor(&self) -> &str {
+        &self.actor
+    }
+    pub(crate) fn destination(&self) -> Option<&Destination> {
+        self.destination.as_ref()
+    }
+    pub(crate) fn request_digest(&self) -> [u8; 32] {
+        self.request_digest
+    }
+    pub(crate) fn fingerprint(&self) -> Result<[u8; 32]> {
+        Ok(Sha256::digest(encode(self)?.as_bytes()).into())
+    }
+    pub(crate) fn allocation(&self) -> Result<Allocation> {
+        self.context.allocation(id(&self.checkout)?)
+    }
+    pub(crate) fn context_digest(&self) -> Result<[u8; 32]> {
+        let c = &self.context;
+        let mut hash = Sha256::new();
+        hash.update(b"work.required-gap.context.v1\0");
+        for bytes in [
+            c.allocation.as_bytes(),
+            c.allocation_request.as_bytes(),
+            c.operation.as_bytes(),
+            c.repository.to_str().ok_or(StoreError::Invalid)?.as_bytes(),
+            c.actor.as_bytes(),
+            c.task.as_bytes(),
+            c.owner.as_bytes(),
+            b"held",
+        ] {
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        hash.update(&c.charge_digest);
+        hash.update([0]); // post-close not-ready
+        let requirement = c.requirement.as_ref().ok_or(StoreError::Invalid)?;
+        hash.update((requirement.operation.len() as u64).to_be_bytes());
+        hash.update(requirement.operation.as_bytes());
+        hash.update(requirement.revision.to_be_bytes());
+        Ok(hash.finalize().into())
+    }
+    pub(crate) fn closed_context_matches(&self, conn: &Connection) -> Result<bool> {
+        let mut expected = self.context.clone();
+        expected.state = "held".into();
+        expected.continuation = None;
+        Ok(Context::read(conn, id(&self.checkout)?)? == expected)
+    }
+    pub(crate) fn required_initial(&self) -> bool {
+        self.origin == Origin::RequiredInitial
+    }
+    pub(crate) fn required(&self) -> bool {
+        matches!(
+            self.origin,
+            Origin::RequiredInitial | Origin::RequiredContinuation
+        )
+    }
     pub(crate) fn observation(&self) -> Result<GapObservation> {
         Ok(GapObservation {
             mode: AttributionDecision::Off,
@@ -207,6 +269,7 @@ impl GapRecord {
             origin: match self.origin {
                 Origin::OrdinaryUnconfigured => "ordinary_unconfigured",
                 Origin::RequiredInitial => "required_initial",
+                Origin::RequiredContinuation => "required_continuation",
             },
         })
     }
@@ -231,6 +294,35 @@ fn event(event_id: &str) -> Result<String> {
         reason: REASON.into(),
     })
 }
+/// Strict wire decoding is separate from related-history and live authority.
+/// Extracted from the v1 reader so wire compatibility can be qualified alone.
+pub(crate) fn decode_record(bytes: &str) -> Result<GapRecord> {
+    if bytes.len() > MAX_RECORD {
+        return Err(StoreError::Invalid);
+    }
+    let record: GapRecord = serde_json::from_str(bytes).map_err(|_| StoreError::Invalid)?;
+    if encode(&record)? != bytes {
+        return Err(StoreError::Invalid);
+    }
+    match (
+        record.format_version,
+        record.origin,
+        &record.context.continuation,
+    ) {
+        (1, Origin::OrdinaryUnconfigured | Origin::RequiredInitial, None) => {}
+        (2, Origin::RequiredContinuation, Some(link)) => {
+            link.validate()?;
+            if record.context.state != "held"
+                || record.context.ready
+                || record.context.requirement.is_none()
+            {
+                return Err(StoreError::Invalid);
+            }
+        }
+        _ => return Err(StoreError::Invalid),
+    }
+    Ok(record)
+}
 pub(crate) fn read_record(conn: &Connection, root: &RootRunRequest) -> Result<GapRecord> {
     // Raw checkout presence wins even when the contradictory payload is invalid.
     if capture_history_present(conn, id(&root.identity().checkout.to_string())?)? {
@@ -244,10 +336,8 @@ pub(crate) fn read_record(conn: &Connection, root: &RootRunRequest) -> Result<Ga
     if bytes.len() > MAX_RECORD || Sha256::digest(bytes.as_bytes()).as_slice() != fingerprint {
         return Err(StoreError::Invalid);
     }
-    let record: GapRecord = serde_json::from_str(&bytes).map_err(|_| StoreError::Invalid)?;
-    if encode(&record)? != bytes
-        || record.format_version != 1
-        || record.run != root.identity().run.to_string()
+    let record = decode_record(&bytes)?;
+    if record.run != root.identity().run.to_string()
         || record.group != root.identity().group.to_string()
         || record.checkout != root.identity().checkout.to_string()
         || record.actor != root.identity().actor.as_str()
@@ -286,14 +376,19 @@ pub(crate) fn read_record(conn: &Connection, root: &RootRunRequest) -> Result<Ga
                 return Err(StoreError::Invalid);
             }
         }
-        Origin::RequiredInitial => {
+        Origin::RequiredInitial | Origin::RequiredContinuation => {
             if record.destination.is_none()
                 || record.delivery != GapDelivery::Pending
                 || record.context.requirement.is_none()
                 || allocation.stage != "capture_pending"
                 || allocation.reason.as_deref()
                     != Some("capture required; root preparation pending")
-                || record.context.state != "partial"
+                || record.context.state
+                    != if record.origin == Origin::RequiredInitial {
+                        "partial"
+                    } else {
+                        "held"
+                    }
                 || record.context.ready
             {
                 return Err(StoreError::Invalid);
@@ -315,6 +410,7 @@ pub(crate) fn validate_raw(conn: &Connection) -> Result<()> {
     if version < 14 {
         return Ok(());
     }
+    crate::gap_continuation::validate_raw(conn)?;
     let invalid: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM attribution_gaps a LEFT JOIN runs r ON r.id=a.run LEFT JOIN run_groups g ON g.id=a.group_id LEFT JOIN checkouts c ON c.id=a.checkout WHERE r.id IS NULL OR g.id IS NULL OR c.id IS NULL OR r.group_id<>a.group_id OR g.checkout<>a.checkout
         OR EXISTS(SELECT 1 FROM checkouts WHERE id=a.event_id OR operation=a.event_id)
@@ -411,6 +507,9 @@ pub(crate) fn capture_history_present(conn: &Connection, checkout: Uuid) -> Resu
 }
 
 pub(crate) fn raw_history(conn: &Connection, checkout: Uuid) -> Result<bool> {
+    if crate::gap_continuation::raw_presence(conn, checkout)? {
+        return Ok(true);
+    }
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= 14
         && conn.query_row(
@@ -445,7 +544,7 @@ pub(crate) fn required_origin(conn: &Connection, checkout: Uuid) -> Result<bool>
     }
     let mut required = false;
     for (_, gap) in crate::run_journal::gap_history(conn, checkout)? {
-        required |= gap.is_some_and(|record| record.origin == Origin::RequiredInitial);
+        required |= gap.is_some_and(|record| record.required());
     }
     Ok(required)
 }
@@ -463,7 +562,7 @@ pub(crate) fn guard_legacy_allocation(conn: &Connection, checkout: Uuid) -> Resu
     Ok(())
 }
 
-fn eligible_history(conn: &Connection, checkout: Uuid, origin: Origin) -> Result<()> {
+fn eligible_context(conn: &Connection, checkout: Uuid) -> Result<()> {
     validate_raw(conn)?;
     crate::run_journal::validate_enrollment_rosters(conn)?;
     let forbidden: bool = conn.query_row(
@@ -479,6 +578,10 @@ fn eligible_history(conn: &Connection, checkout: Uuid, origin: Origin) -> Result
     if forbidden {
         return Err(StoreError::Invalid);
     }
+    Ok(())
+}
+fn eligible_history(conn: &Connection, checkout: Uuid, origin: Origin) -> Result<()> {
+    eligible_context(conn, checkout)?;
     let history = crate::run_journal::gap_history(conn, checkout)?;
     if origin == Origin::RequiredInitial && !history.is_empty() {
         return Err(StoreError::Invalid);
@@ -497,6 +600,7 @@ pub(crate) struct GapAdmissionProof {
     request_bytes: String,
     context: Context,
     physical: crate::capture_setup::Physical,
+    continuation: Option<crate::gap_continuation::ContinuationProof>,
     observed: Instant,
 }
 impl GapAdmissionProof {
@@ -514,6 +618,7 @@ impl GapAdmissionProof {
         conn: &Connection,
         checkout: Uuid,
         group: Uuid,
+        related: &crate::gap_continuation::Related<'_, '_>,
         lease: &crate::allocate::AuthorityLease,
         authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
     ) -> Result<()> {
@@ -528,7 +633,16 @@ impl GapAdmissionProof {
         {
             return Err(StoreError::Conflict);
         }
-        eligible_history(conn, checkout, self.origin)?;
+        related.check(conn, checkout)?;
+        eligible_context(conn, checkout)?;
+        if (self.origin == Origin::RequiredInitial && !related.history().nodes.is_empty())
+            || related.history().nodes.iter().any(|(root, _)| !root.closed)
+        {
+            return Err(StoreError::Invalid);
+        }
+        if let Some(proof) = &self.continuation {
+            proof.validate(related, &self.root, authority)?;
+        }
         Ok(())
     }
     pub(crate) fn request_bytes(&self, root: &RootRunRequest) -> Result<&str> {
@@ -546,6 +660,53 @@ pub(crate) struct CreatedOffLive {
     argv: Vec<OsString>,
     git: ActorGitProfile,
     nonce: Uuid,
+}
+/// Owned, checked live-close metadata, never a reconstructed capability. The
+/// continuation module can retain it in a one-use seal but cannot assemble it.
+pub(crate) struct GapClosureContext {
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+    record: GapRecord,
+    context: Context,
+    physical: crate::capture_setup::Physical,
+}
+impl GapClosureContext {
+    pub(crate) fn authority(&self) -> &crate::store::AuthorityIdentity {
+        &self.authority
+    }
+    pub(crate) fn record(&self) -> &GapRecord {
+        &self.record
+    }
+    /// Actual public registry and complete physical observation; called only
+    /// outside SQL/flock in the publisher's original observation window.
+    pub(crate) fn inspect(&self) -> Result<crate::capture_setup::Physical> {
+        let destination = self
+            .record
+            .destination
+            .as_ref()
+            .ok_or(StoreError::Invalid)?;
+        let registry =
+            crate::capture_artifacts::Registry::qualify(&destination.registry, &destination.pin)
+                .map_err(|_| StoreError::Conflict)?;
+        if registry.key_env != destination.actual_name {
+            return Err(StoreError::Conflict);
+        }
+        let allocation = self.record.allocation()?;
+        let physical = crate::gap_continuation::inspect_physical(
+            &allocation,
+            &self.context.repository,
+            &self.physical,
+            &self.physical.checkout.head,
+        )?;
+        registry.revalidate().map_err(|_| StoreError::Conflict)?;
+        Ok(physical)
+    }
+    pub(crate) fn matches_closed(&self, conn: &Connection, root: &RootRunRequest) -> Result<bool> {
+        let checkout = id(&self.record.checkout)?;
+        let mut expected = self.context.clone();
+        expected.state = "held".into();
+        Ok(root.identity().run.to_string() == self.record.run
+            && Context::read(conn, checkout)? == expected)
+    }
 }
 pub(crate) struct RecoveryRemoval {
     policy: RemovalPolicy,
@@ -590,6 +751,7 @@ pub(crate) struct GapReleaseProof {
     guard: GapGuard,
     record: GapRecord,
     context: Context,
+    admission_revision: Option<i64>,
     observed: Instant,
 }
 impl GapReleaseProof {
@@ -643,6 +805,9 @@ impl GapReleaseProof {
         {
             return Err(StoreError::Conflict);
         }
+        if let Some(admission) = self.admission_revision {
+            crate::gap_continuation::release_current(&store.conn, root, admission)?;
+        }
         let b = current.binding.as_ref().ok_or(StoreError::Invalid)?;
         let actual = binding.identity();
         let child = binding.trusted_child();
@@ -664,6 +829,50 @@ impl GapReleaseProof {
     }
 }
 impl CreatedOffLive {
+    /// Only metadata comparisons in the caller's pre-write SQL snapshot. No
+    /// registry/physical observation or renewed admission clock occurs here.
+    pub(crate) fn closure_context(
+        &self,
+        conn: &Connection,
+        current: &crate::run_journal::RunRecord,
+        authority: &crate::store::AuthorityIdentity,
+    ) -> Result<Option<GapClosureContext>> {
+        if current.request != self.root || self.proof.authority.as_ref() != authority {
+            return Err(StoreError::Conflict);
+        }
+        if !self.record.required() {
+            return Ok(None);
+        }
+        let checkout = id(&self.record.checkout)?;
+        let mut expected = self.proof.context.clone();
+        expected.state = "active".into();
+        if read_record(conn, &self.root)? != self.record {
+            return Err(StoreError::Conflict);
+        }
+        let barrier: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_finishes WHERE checkout=?1)",
+            [checkout.to_string()],
+            |r| r.get(0),
+        )?;
+        if current.closed
+            || current.recovery_hold
+            || current.outcome.is_none()
+            || barrier
+            || Context::read(conn, checkout)? != expected
+        {
+            return Ok(None);
+        }
+        Ok(Some(GapClosureContext {
+            authority: self.proof.authority.clone(),
+            record: self.record.clone(),
+            context: self.proof.context.clone(),
+            physical: crate::capture_setup::Physical {
+                checkout: self.proof.physical.checkout.clone(),
+                directories: self.proof.physical.directories.clone(),
+                marker: self.proof.physical.marker.clone(),
+            },
+        }))
+    }
     pub(crate) fn guard(&self) -> GapGuard {
         GapGuard {
             root: self.root.clone(),
@@ -699,8 +908,16 @@ impl CreatedOffLive {
     pub(crate) fn release_proof(&self) -> Result<GapReleaseProof> {
         let observed = Instant::now();
         let allocation = self.proof.context.allocation(id(&self.record.checkout)?)?;
-        let physical =
-            crate::capture_setup::inspect_physical(&allocation, &self.proof.context.repository)?;
+        let physical = if self.proof.continuation.is_some() {
+            crate::gap_continuation::inspect_physical(
+                &allocation,
+                &self.proof.context.repository,
+                &self.proof.physical,
+                &self.proof.physical.checkout.head,
+            )?
+        } else {
+            crate::capture_setup::inspect_physical(&allocation, &self.proof.context.repository)?
+        };
         if physical != self.proof.physical {
             return Err(StoreError::Conflict);
         }
@@ -712,6 +929,12 @@ impl CreatedOffLive {
             guard: self.guard(),
             record: self.record.clone(),
             context: self.proof.context.clone(),
+            admission_revision: self.record.required().then(|| {
+                self.proof
+                    .continuation
+                    .as_ref()
+                    .map_or(1, |p| p.link().admission_revision())
+            }),
             observed,
         };
         #[cfg(test)]
@@ -773,8 +996,25 @@ pub(crate) fn begin(
     if root.input().attribution != Some(AttributionDecision::Off) {
         return Err(StoreError::Invalid);
     }
-    let (mut store, lock) = crate::allocate::locked(config)?;
+    let (store, lock) = crate::allocate::locked(config)?;
     drop(lock);
+    begin_in_store(config, store, root, argv)
+}
+// Private common core also lets owned contender tests preopen two native Stores
+// before their timed observations. No public bypass, alternate authority, or
+// caller-created proof is accepted.
+fn begin_in_store(
+    config: &Config,
+    mut store: Store,
+    root: &RootRunRequest,
+    argv: &[OsString],
+) -> Result<(Store, BeginGap)> {
+    if root.input().attribution != Some(AttributionDecision::Off)
+        || config.store_dir.as_deref() != Some(store.authority_identity().directory.as_path())
+        || config.trusted_registry.as_deref() != Some(store.authority_identity().registry())
+    {
+        return Err(StoreError::Invalid);
+    }
     let checkout = id(&root.identity().checkout.to_string())?;
     let context = {
         let _phase = store.sql_phase();
@@ -803,6 +1043,16 @@ pub(crate) fn begin(
                 && requirement.operation == context.operation =>
         {
             Origin::RequiredInitial
+        }
+        (Some(_), Some(requirement))
+            if context.state == "held"
+                && !context.ready
+                && allocation.stage == "capture_pending"
+                && allocation.reason.as_deref()
+                    == Some("capture required; root preparation pending")
+                && requirement.operation == context.operation =>
+        {
+            Origin::RequiredContinuation
         }
         _ => return Err(StoreError::Invalid),
     };
@@ -856,7 +1106,27 @@ pub(crate) fn begin(
     };
     #[cfg(test)]
     tests::observe_admission("inspect", &store.conn);
-    let physical = crate::capture_setup::inspect_physical(&allocation, &context.repository)?;
+    let continuation = if origin == Origin::RequiredContinuation {
+        Some(crate::gap_continuation::inspect_continuation(
+            &store,
+            root,
+            destination.as_ref().ok_or(StoreError::Invalid)?,
+            &allocation,
+            &context.repository,
+        )?)
+    } else {
+        None
+    };
+    let physical = if let Some(proof) = &continuation {
+        let physical = proof.physical();
+        crate::capture_setup::Physical {
+            checkout: physical.checkout.clone(),
+            directories: physical.directories.clone(),
+            marker: physical.marker.clone(),
+        }
+    } else {
+        crate::capture_setup::inspect_physical(&allocation, &context.repository)?
+    };
     // inspect_physical delegates to Ready verification, including real Git
     // ancestry and immutable lease/registration identity checks. Ordinary
     // history may advance HEAD without refreshing the stored allocation. Keep
@@ -876,19 +1146,26 @@ pub(crate) fn begin(
         request_bytes: serde_json::to_string(root).map_err(|_| StoreError::Invalid)?,
         context: context.clone(),
         physical,
+        continuation,
         observed,
     };
     let event_id = Uuid::now_v7().to_string();
     let nonce = Uuid::now_v7();
+    let mut record_context = context;
+    record_context.continuation = proof.continuation.as_ref().map(|p| p.link().clone());
     let record = GapRecord {
-        format_version: 1,
+        format_version: if origin == Origin::RequiredContinuation {
+            2
+        } else {
+            1
+        },
         run: root.identity().run.to_string(),
         group: root.identity().group.to_string(),
         checkout: checkout.to_string(),
         actor: root.identity().actor.as_str().into(),
         request_digest: Sha256::digest(proof.request_bytes.as_bytes()).into(),
         origin,
-        context,
+        context: record_context,
         event: event(&event_id)?,
         event_id,
         reason: REASON.into(),
@@ -915,7 +1192,9 @@ pub(crate) fn begin(
     })?;
     #[cfg(test)]
     tests::observe_admission("reinspect", &store.conn);
-    if crate::capture_setup::inspect_physical(&allocation, &proof.context.repository)?
+    if let Some(continuation) = &proof.continuation {
+        continuation.reinspect(&allocation, &proof.context.repository)?;
+    } else if crate::capture_setup::inspect_physical(&allocation, &proof.context.repository)?
         != proof.physical
     {
         return Err(StoreError::Conflict);
@@ -942,18 +1221,29 @@ pub(crate) fn begin(
             return Err(StoreError::Conflict);
         }
         exclude_new_event(&tx, &record.event_id)?;
+        let related = crate::gap_continuation::Related::qualify(&tx, checkout)?;
+        let prepared = proof
+            .continuation
+            .as_ref()
+            .map(|p| p.prepare(&related, root, &authority))
+            .transpose()?;
         crate::run_journal::begin_run_context(
             &tx,
             root,
-            crate::run_journal::WriterAdmission::Gap(&proof),
+            crate::run_journal::WriterAdmission::Gap(&proof, &related),
             &lock,
             &authority,
         )?;
+        drop(related);
         tx.execute("INSERT INTO attribution_gaps(run,group_id,checkout,event_id,record,fingerprint) VALUES(?1,?2,?3,?4,?5,?6)",
             rusqlite::params![record.run,record.group,record.checkout,record.event_id,bytes,fingerprint.as_slice()])?;
         tx.execute("INSERT INTO outbox(version,payload) VALUES(1,?1)", [notice])?;
         if origin == Origin::RequiredInitial {
-            tx.execute("UPDATE checkouts SET state='active',ready=0 WHERE id=?1 AND state='partial' AND ready=0", [checkout.to_string()])?;
+            crate::gap_continuation::initialize_initial(&tx, &authority, &lock, root)?;
+            if tx.execute("UPDATE checkouts SET state='active',ready=0 WHERE id=?1 AND state='partial' AND ready=0", [checkout.to_string()])? != 1 { return Err(StoreError::Conflict); }
+        } else if let Some(prepared) = prepared {
+            crate::gap_continuation::consume(&tx, &authority, &lock, prepared)?;
+            if tx.execute("UPDATE checkouts SET state='active',ready=0 WHERE id=?1 AND state='held' AND ready=0", [checkout.to_string()])? != 1 { return Err(StoreError::Conflict); }
         }
         proof.fresh()?;
         tx.commit()?;

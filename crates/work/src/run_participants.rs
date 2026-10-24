@@ -755,6 +755,7 @@ impl Store {
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<Transition> {
         lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
@@ -790,6 +791,9 @@ impl Store {
             if child.enrollment == Enrollment::Unverified {
                 return Ok(Transition::Existing);
             }
+            let checkout = uuid::Uuid::parse_str(&root.identity().checkout.to_string())
+                .map_err(|_| StoreError::Invalid)?;
+            crate::gap_continuation::revoke(&tx, &authority, lease, checkout)?;
             tx.execute(
                 "UPDATE run_participants SET enrollment='unverified' WHERE id=?1",
                 [request.run.to_string()],

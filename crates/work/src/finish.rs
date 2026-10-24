@@ -1529,7 +1529,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
     #[test]
     fn lost_finish_reply_replays_exact_intent_without_reexecuting_actor() {
         let _diagnostics = crate::capture_diagnostics::Guard::new();
-        let (temp, mut cfg, a, root, _seal) = closed_capture();
+        let (temp, mut cfg, a, root, _seal) = closed_capture_with_timeout(1000);
         std::fs::write(temp.path().join("producer"), "#!/bin/sh\nexit 1\n").unwrap();
         let first = super::finish(&cfg, a.checkout).unwrap();
         assert!(first.task_finished && first.charge_retained);

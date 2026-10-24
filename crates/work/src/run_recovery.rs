@@ -41,8 +41,10 @@ pub fn status(store: &Store, run: &RunId) -> Result<HistoricalStatus> {
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let gap = crate::attribution_gap::observation(&store.conn, &record.request)?;
-    let gap_limitations = gap.as_ref().filter(|g|g.origin=="required_initial")
-        .map(|_|"physical closure leaves held/not_ready; charge retained; next root and new finish unsupported");
+    let gap_limitations = gap
+        .as_ref()
+        .filter(|g| matches!(g.origin, "required_initial" | "required_continuation"))
+        .map(|_| crate::attribution_gap::REQUIRED_LIMITATIONS);
     let child_enrollment = if record.children.iter().any(|child| child.host.is_some()) {
         "enrollment recorded; runtime not inspected now"
     } else {

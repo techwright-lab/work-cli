@@ -212,7 +212,7 @@ Only after final artifact revalidation does a private verified-observation metho
 consume the Created handle through the existing exact preparation CAS. It atomically
 promotes allocation JSON/readiness and adds an optional typed context digest/stat
 observation. That preparation increment required no change beyond schema 11;
-older preparation JSON omits this field unchanged. Current authority requires schema 14.
+older preparation JSON omits this field unchanged. Current authority requires schema 15.
 The public `record_capture_prepared` remains a metadata observer without an artifact
 claim. Failures retain tree, charge and exact writer, record the root recovery hold
 (without inventing outcome/capture ID), and return no live result. If hold persistence
@@ -298,7 +298,7 @@ work capture retry <run-id>
 ```
 
 These commands require a UUIDv7 root run and an existing registered current-schema
-(14) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
+(15) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
 They never initialize, migrate or repair an authority. Help/version are read-only;
 invalid arguments exit 2 without echoing argument values. Historical operations need
 no current supervisor, actor profile or capture selection. Their configuration loader
@@ -581,8 +581,9 @@ and a 16-KiB byte bound. Uncertainty retains the charge and never triggers delet
 
 A previously allocated checkout ID is required: active/ready for ordinary no-sink roots,
 or capture-pending first-use / certified active/ready continuation for explicitly configured
-captured roots. No implicit allocation, path reuse, repository discovery or generic
-held-lease revival occurs. Extend host configuration
+captured roots. Explicit `--attribution off` uses the bounded ordinary/initial/qualified
+required-Gap classes described below. No implicit allocation, path reuse, repository
+discovery or generic held-lease revival occurs. Extend host configuration
 with explicit finite policy and named actor Git profiles (values below are examples,
 not compiled defaults):
 
@@ -662,7 +663,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted schema-14 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-15 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -684,14 +685,52 @@ The option applies to this run only. Omitting it retains the default configured/
 policy; there is no global Off default or `on` value. Public `RootCommand` and
 `AttributedCommand` shapes are unchanged. A durable Off marker is intent, not launch authority.
 
-| Supported initial class | Admission | Immutable queue | After fresh full-roster closure |
+| Supported class | Admission | Immutable queue | After fresh full-roster closure |
 | --- | --- | --- | --- |
 | OrdinaryUnconfigured | Current selection genuinely absent; Ready allocation; no permanent capture requirement, capture history or certificate | NoTarget / NotConfigured | Ordinary no-sink continuation and receipt-v1 finish remain possible after complete history validation |
-| RequiredInitial | First exact capture_pending allocation; permanent requirement; valid selected target; partial/not-ready; no previous run/writer/history | Configured target / Pending | Held, not-ready and charged; no next root, Ready restoration or new task-finish receipt |
+| RequiredInitial | First exact capture_pending allocation; permanent requirement; valid selected target; partial/not-ready; no previous run/writer/history | Configured target / Pending, unchanged Gap-v1 bytes | Held, not-ready and charged; an eligible new live closure may qualify a later explicit-Off run |
+| RequiredContinuation | Held/not-ready capture_pending allocation; unchanged requirement and original allocation; available qualification from the preceding required Gap; fresh same-boot/actor/exact-target checks | New distinct Pending event and Gap-v2 predecessor link | Held, not-ready and charged; each eligible new live closure may qualify the next explicit-Off run, never generic Ready or new task finish |
 
 Other combinations refuse. Off cannot repair an uncertain captured intent, change a past
-run's mode, bypass a certificate, or mix Gap and capture history. Root exit/cancellation
-alone never releases a writer. RequiredInitial closure is not task completion.
+run's mode, bypass a certificate, or mix ordinary/captured/adopted history into a required
+Gap chain. Root exit/cancellation alone never releases a writer. Required Gap closure is
+not task completion.
+
+Required continuation is future-live-only. An actual Changed full-roster close using that
+run's private live metadata may qualify known Completed, Failed or Cancelled outcomes;
+qualification does not reinterpret failure/cancellation as success. Unknown outcomes,
+recovery-only closure, legacy closed rows, lost/abandoned qualification and reboot never
+gain eligibility through reads, Existing, reconcile or backfill. Process restart in the
+same boot may consume an already committed qualification only through fresh admission
+checks. Same-ID Existing is always passive and never republishes or relaunches.
+
+The new run derives its actor/Git profile and public destination/removal metadata from
+its own immutable Config and actual pinned registry, then compares the same Work actor
+and exact sealed target. No key values, producer or session artifacts are read for Off.
+Fresh physical observations retain all four source/checkout/private/common directory
+identities and marker bytes. HEAD may advance only as an immutable-object descendant of
+BOTH the original allocation HEAD and the latest qualified HEAD; rewinds, divergence and
+non-HEAD replacements refuse. Neither allocation identity nor old records are rewritten.
+
+Qualification is durable Work-only provenance, not a decoded live capability or perpetual
+physical freshness. A private once-used close seal produces two equal complete physical
+observations in one original two-second window before atomic qualification publication.
+Each next admission and release has its own fresh observations. Predecessor claim, new
+Root/group/writer/Gap/event and cursor transition commit together. Actual owner/context
+or independent safety revocation permanently blocks the checked eligibility epoch, even
+when owner or visible held flags are restored; no-op/refused attempts do not revoke.
+The existing authority lease excludes participating revokers through actual permit
+publication, not the actor lifetime. A later committed hold blocks future qualification,
+not an already issued permit. Publication failure preserves committed physical closure,
+outcome, held state and charge; there is no public retry publisher. A committed qualification
+whose acknowledgement was lost may be freshly consumed by a DIFFERENT run; a qualification
+that never committed remains unavailable. Neither case gives same-ID retry live authority.
+
+Schema 15 adds empty required-Gap eligibility and closure-qualification tables.
+Migration does not backfill old runs or rewrite historical records. Older-version
+writer processes and Store handles must be quiesced before migration and must not
+write the new authority afterward; overlapping old writers are unsupported.
+This is a deployment prerequisite, not permission to operate on a live authority.
 
 Schema 14 adds an immutable typed non-session Gap decision/local queue without rewriting
 old Root, capture, readiness, finalization, receipt or outbox bytes. Its exact public
@@ -704,8 +743,10 @@ BEGIN/FINISH, capture ID, session, freeze or receiver call.
 Matching Off retries return the same recorded event before current execution profiles,
 registry or runtime work. Conflicts/corruption refuse rather than falling through to a new
 run. Run/status/finish observations distinguish event recording, execution, physical closure,
-charge and delivery. Status includes actual checkout state/readiness and RequiredInitial
-limitations; historical metadata never restores live launch or closure authority.
+charge and delivery. Status includes actual checkout state/readiness and required-Gap
+limitations, with `required_continuation` origin for Gap-v2. Qualification payloads and
+public-target/removal metadata are not report fields; historical metadata never restores
+live launch or closure authority.
 
 Off filters verified receiver credential names plus `AGENT_ATTRIBUTION_CONTEXT`,
 `DEVDIARY_ATTRIBUTION_CONTEXT` and `DEVDIARY_CAPTURE_ID` from owned helper/actor commands.
@@ -724,7 +765,9 @@ cannot inspect an open bound Gap. No historical metadata becomes live/release au
 Normal execution configuration still requires and validates execution actors.
 
 A later selected sink blocks a **new** NoTarget Gap finish before either library callbacks
-or integrated capture aggregation. Already-persisted receipts remain passive and unchanged.
+or integrated capture aggregation. Neither required origin supports a new task-finish
+receipt. Already-persisted receipts remain passive and unchanged. Generic Ready, capture
+certificates, transport/ACK and mixed-frontier continuation remain unsupported.
 This is construction/testing only: no live private-product/systemd qualification, transport,
 retirement, deletion, uncharging, operational activation or whole-Task-8 completion.
 
@@ -732,7 +775,7 @@ retirement, deletion, uncharging, operational activation or whole-Task-8 complet
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8/v9/v10/v11/v12/v13 store to schema 14; malformed schemas, missing tables, views, incorrect
+upgrade a valid v8/v9/v10/v11/v12/v13/v14 store to schema 15; malformed schemas, missing tables, views, incorrect
 claims and non-WAL authority fail closed, without repair. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
@@ -1016,7 +1059,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-schema-14-authority metadata, with
+Status is read-only existing-schema-15-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -1025,7 +1068,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (operator quiescence/retirement approval is Task 10). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema 14.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 15.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned

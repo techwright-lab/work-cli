@@ -608,8 +608,10 @@ pub fn start_observed(
     let matches = db(store.find_reusable(r.actor.as_ref().unwrap(), common, &r.task))?;
     if !matches.is_empty() {
         if matches.len() != 1 {
+            let _phase = store.sql_phase();
             let tx = sql(store.conn.transaction())?;
             for id in matches {
+                db(crate::gap_continuation::revoke(&tx, &authority, &lease, id))?;
                 db(crate::capture_readiness::invalidate(
                     &tx, id, &lease, &authority,
                 ))?;

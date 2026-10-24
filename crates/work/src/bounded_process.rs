@@ -6,12 +6,23 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use crate::capture_diagnostics::{TransportPhase, TransportProgress, TransportTimeoutSite};
+
 pub(crate) fn output_aggregate(
     command: &mut Command,
     timeout: Duration,
     limit: usize,
 ) -> Result<Output, &'static str> {
-    output_mode(command, timeout, limit, true, None)
+    output_mode(
+        command,
+        timeout,
+        limit,
+        true,
+        None,
+        #[cfg(test)]
+        None,
+    )
 }
 
 pub(crate) fn output_with_input_aggregate(
@@ -20,7 +31,28 @@ pub(crate) fn output_with_input_aggregate(
     limit: usize,
     input: &[u8],
 ) -> Result<Output, &'static str> {
-    output_mode(command, timeout, limit, true, Some(input))
+    output_mode(
+        command,
+        timeout,
+        limit,
+        true,
+        Some(input),
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn output_with_input_aggregate_observed(
+    command: &mut Command,
+    timeout: Duration,
+    limit: usize,
+    input: &[u8],
+    progress: &mut TransportProgress,
+) -> Result<Output, &'static str> {
+    let result = output_mode(command, timeout, limit, true, Some(input), Some(progress));
+    progress.helper_returned = true;
+    result
 }
 
 // Aggregate capture cannot probe EOF at an exhausted boundary: even a one-byte
@@ -38,7 +70,15 @@ pub(crate) fn output(
     timeout: Duration,
     limit: usize,
 ) -> Result<Output, &'static str> {
-    output_mode(command, timeout, limit, false, None)
+    output_mode(
+        command,
+        timeout,
+        limit,
+        false,
+        None,
+        #[cfg(test)]
+        None,
+    )
 }
 
 fn output_mode(
@@ -47,6 +87,7 @@ fn output_mode(
     limit: usize,
     aggregate: bool,
     input: Option<&[u8]>,
+    #[cfg(test)] mut progress: Option<&mut TransportProgress>,
 ) -> Result<Output, &'static str> {
     use std::os::unix::process::CommandExt;
     const IO_ERROR: &str = "Git process I/O unavailable; inventory incomplete";
@@ -61,17 +102,39 @@ fn output_mode(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = loop {
-        if start.elapsed() >= timeout {
+        let elapsed = start.elapsed();
+        if elapsed >= timeout {
+            #[cfg(test)]
+            if let Some(p) = progress.as_deref_mut() {
+                p.timeout_site = Some(TransportTimeoutSite::PreSpawn);
+                p.timeout_observed_us = Some(elapsed.as_micros());
+            }
             return Err("Git runtime limit reached; inventory incomplete");
         }
+        #[cfg(test)]
+        if let Some(p) = progress.as_deref_mut() {
+            p.phase = TransportPhase::Spawn;
+            p.spawn_attempts = p.spawn_attempts.saturating_add(1);
+        }
         match command.spawn() {
-            Ok(child) => break child,
+            Ok(child) => {
+                #[cfg(test)]
+                if let Some(p) = progress.as_deref_mut() {
+                    p.spawned = true;
+                    p.spawn_return_us = Some(start.elapsed().as_micros());
+                }
+                break child;
+            }
             // Internal callers use fixed programs without pre_exec callbacks.
             // ETXTBSY is a failed exec: no helper code or stdin protocol ran.
             // Reuse Command; std closes each failed attempt's capture pipes.
             Err(error)
                 if error.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error()) =>
             {
+                #[cfg(test)]
+                if let Some(p) = progress.as_deref_mut() {
+                    p.etxtbsy_failures = p.etxtbsy_failures.saturating_add(1);
+                }
                 std::thread::sleep(
                     Duration::from_millis(2).min(timeout.saturating_sub(start.elapsed())),
                 );
@@ -80,6 +143,10 @@ fn output_mode(
         }
     };
     let group = rustix::process::Pid::from_raw(child.id() as i32).ok_or(IO_ERROR)?;
+    #[cfg(test)]
+    if let Some(p) = progress.as_deref_mut() {
+        p.phase = TransportPhase::PipeSetup;
+    }
     let result = (|| {
         let mut stdout = child.stdout.take().ok_or(IO_ERROR)?;
         let mut stderr = child.stderr.take().ok_or(IO_ERROR)?;
@@ -97,13 +164,27 @@ fn output_mode(
         let mut written: usize = 0;
         if input.is_empty() {
             drop(stdin.take());
+            #[cfg(test)]
+            if let Some(p) = progress.as_deref_mut() {
+                p.input_complete_closed = true;
+            }
         }
         let mut out = Vec::new();
         let mut err = Vec::new();
         let mut eof = [false; 2];
         let mut remaining = limit;
+        #[cfg(test)]
+        if let Some(p) = progress.as_deref_mut() {
+            p.phase = TransportPhase::IoLoop;
+        }
         loop {
-            if start.elapsed() >= timeout {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
+                #[cfg(test)]
+                if let Some(p) = progress.as_deref_mut() {
+                    p.timeout_site = Some(TransportTimeoutSite::IoLoop);
+                    p.timeout_observed_us = Some(elapsed.as_micros());
+                }
                 return Err("Git runtime limit reached; inventory incomplete");
             }
             let mut progressed = false;
@@ -127,8 +208,27 @@ fn output_mode(
                     pipe.read(&mut buffer)
                 };
                 match read {
-                    Ok(0) => eof[index] = true,
+                    Ok(0) => {
+                        eof[index] = true;
+                        #[cfg(test)]
+                        if let Some(p) = progress.as_deref_mut() {
+                            if index == 0 {
+                                p.stdout_eof = true;
+                            } else {
+                                p.stderr_eof = true;
+                            }
+                        }
+                    }
                     Ok(n) => {
+                        #[cfg(test)]
+                        if let Some(p) = progress.as_deref_mut() {
+                            let count = if index == 0 {
+                                &mut p.stdout_bytes_read
+                            } else {
+                                &mut p.stderr_bytes_read
+                            };
+                            *count = count.saturating_add(n as u64);
+                        }
                         if n > limit.saturating_sub(bytes.len()) {
                             return Err("Git capture limit reached; inventory incomplete");
                         }
@@ -155,6 +255,10 @@ fn output_mode(
                     Ok(0) => return Err(IO_ERROR),
                     Ok(n) => {
                         written += n;
+                        #[cfg(test)]
+                        if let Some(p) = progress.as_deref_mut() {
+                            p.stdin_bytes_written = p.stdin_bytes_written.saturating_add(n as u64);
+                        }
                         progressed = true;
                     }
                     Err(e)
@@ -166,6 +270,10 @@ fn output_mode(
                 }
                 if written == input.len() {
                     drop(stdin.take());
+                    #[cfg(test)]
+                    if let Some(p) = progress.as_deref_mut() {
+                        p.input_complete_closed = true;
+                    }
                 }
             }
             // Observe exit without reaping: keep the leader PID/group owned until
@@ -179,6 +287,10 @@ fn output_mode(
                 .map_err(|_| IO_ERROR)?
                 .is_some()
             {
+                #[cfg(test)]
+                if let Some(p) = progress.as_deref_mut() {
+                    p.exit_observed = true;
+                }
                 if written != input.len() {
                     return Err(IO_ERROR);
                 }
@@ -193,11 +305,36 @@ fn output_mode(
     // reader threads survive a deadline and neither pipe grows without bound.
     // Kill the owned group even when the leader exited successfully: descendants
     // must not escape through closed capture pipes. Never target the caller's group.
+    #[cfg(test)]
+    if let Some(p) = progress.as_deref_mut() {
+        p.cleanup_start_us = Some(start.elapsed().as_micros());
+    }
+    #[cfg(not(test))]
     let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    #[cfg(test)]
+    {
+        let killed = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        if let Some(p) = progress.as_deref_mut() {
+            p.group_kill_ok = Some(killed.is_ok());
+        }
+    }
     if result.is_err() {
+        #[cfg(not(test))]
         let _ = child.kill();
+        #[cfg(test)]
+        {
+            let killed = child.kill();
+            if let Some(p) = progress.as_deref_mut() {
+                p.child_kill_ok = Some(killed.is_ok());
+            }
+        }
     }
     let status = child.wait().map_err(|_| IO_ERROR);
+    #[cfg(test)]
+    if let Some(p) = progress {
+        p.leader_wait_ok = Some(status.is_ok());
+        p.cleanup_end_us = Some(start.elapsed().as_micros());
+    }
     let (stdout, stderr) = result?;
     Ok(Output {
         status: status?,
@@ -209,6 +346,169 @@ fn output_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_progress_preserves_partial_reads_at_cap() {
+        use crate::capture_diagnostics::{Event, Guard, Operation, TransportGuard};
+        let diagnostics = Guard::new();
+        let mut transport = TransportGuard::new("finish").unwrap();
+        let result = output_with_input_aggregate_observed(
+            Command::new("/usr/bin/printf").arg("12345678"),
+            Duration::from_secs(2),
+            8,
+            b"",
+            transport.progress(),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "Git capture limit reached; inventory incomplete"
+        );
+        drop(transport);
+        let events = diagnostics.events();
+        assert_eq!(events.len(), 1);
+        let Event::TransportProgress {
+            operation: Operation::Finish,
+            progress: p,
+        } = events[0]
+        else {
+            panic!("missing cap progress: {events:?}");
+        };
+        assert_eq!((p.stdout_bytes_read, p.stderr_bytes_read), (8, 0));
+        assert_eq!(p.stdin_bytes_written, 0);
+        assert!(p.input_complete_closed);
+        assert!(!p.stdout_eof, "exact-cap refusal must not infer EOF");
+        assert!(!p.exit_observed, "cap refusal precedes waitid observation");
+        assert!(p.spawned && p.helper_returned);
+        assert_eq!(p.phase, TransportPhase::IoLoop);
+        assert_eq!(p.timeout_site, None);
+        assert_eq!(p.timeout_observed_us, None);
+        assert!(p.spawn_return_us.is_some() && p.spawn_return_us <= p.cleanup_start_us);
+        assert!(p.cleanup_start_us.is_some() && p.cleanup_start_us <= p.cleanup_end_us);
+        assert!(p.group_kill_ok.is_some() && p.child_kill_ok.is_some());
+        assert_eq!(p.leader_wait_ok, Some(true));
+    }
+
+    #[test]
+    fn transport_progress_distinguishes_deadline_sites() {
+        use crate::capture_diagnostics::TransportTimeoutSite;
+        const TIMEOUT: &str = "Git runtime limit reached; inventory incomplete";
+        fn no_child(p: &TransportProgress) {
+            assert!(!p.spawned && !p.input_complete_closed && !p.exit_observed);
+            assert!(!p.stdout_eof && !p.stderr_eof);
+            assert!(p.helper_returned);
+            assert_eq!(
+                (
+                    p.stdin_bytes_written,
+                    p.stdout_bytes_read,
+                    p.stderr_bytes_read
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(p.spawn_return_us, None);
+            assert_eq!(p.cleanup_start_us, None);
+            assert_eq!(p.cleanup_end_us, None);
+            assert_eq!(p.group_kill_ok, None);
+            assert_eq!(p.child_kill_ok, None);
+            assert_eq!(p.leader_wait_ok, None);
+        }
+        let mut zero = TransportProgress::default();
+        assert_eq!(
+            output_with_input_aggregate_observed(
+                &mut Command::new("/usr/bin/true"),
+                Duration::ZERO,
+                1024,
+                b"",
+                &mut zero,
+            )
+            .unwrap_err(),
+            TIMEOUT
+        );
+        assert_eq!(
+            zero.timeout_site,
+            Some(TransportTimeoutSite::PreSpawn),
+            "missing pre-spawn deadline observation"
+        );
+        assert_eq!(zero.phase, TransportPhase::PreSpawn);
+        assert_eq!(zero.spawn_attempts, 0);
+        assert_eq!(zero.etxtbsy_failures, 0);
+        assert!(zero.timeout_observed_us.is_some());
+        no_child(&zero);
+
+        let temp = tempfile::tempdir().unwrap();
+        let (mut command, _writer) = writable_script(&temp, "printf called > \"$1\"");
+        let mut busy = TransportProgress::default();
+        assert_eq!(
+            output_with_input_aggregate_observed(
+                &mut command,
+                Duration::from_millis(40),
+                1024,
+                b"input",
+                &mut busy,
+            )
+            .unwrap_err(),
+            TIMEOUT
+        );
+        assert!(!temp.path().join("called").exists());
+        assert_eq!(busy.timeout_site, Some(TransportTimeoutSite::PreSpawn));
+        assert!(busy.timeout_observed_us.unwrap() >= 40_000);
+        assert_eq!(busy.spawn_attempts, busy.etxtbsy_failures);
+        assert_eq!(
+            busy.phase,
+            if busy.spawn_attempts == 0 {
+                TransportPhase::PreSpawn
+            } else {
+                TransportPhase::Spawn
+            }
+        );
+        no_child(&busy);
+
+        // Natural scheduling qualification, not a deterministic timeout seam.
+        // The owned shell publishes its PID/output then execs a native sleeper.
+        let pid = temp.path().join("leader");
+        let mut io = TransportProgress::default();
+        let result = output_with_input_aggregate_observed(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '%s' $$ > \"$1\"; printf partial; exec /usr/bin/sleep 30",
+                    "transport-fixture",
+                ])
+                .arg(&pid),
+            Duration::from_millis(100),
+            1024,
+            b"",
+            &mut io,
+        );
+        assert_eq!(result.unwrap_err(), TIMEOUT);
+        let leader = std::fs::read_to_string(pid).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{leader}")).exists(),
+            "leader not reaped"
+        );
+        assert_eq!(io.timeout_site, Some(TransportTimeoutSite::IoLoop));
+        assert_eq!(io.phase, TransportPhase::IoLoop);
+        assert_eq!(io.spawn_attempts, 1);
+        assert_eq!(io.etxtbsy_failures, 0);
+        assert!(io.spawned && io.input_complete_closed && io.helper_returned);
+        assert_eq!(
+            (
+                io.stdin_bytes_written,
+                io.stdout_bytes_read,
+                io.stderr_bytes_read
+            ),
+            (0, 7, 0)
+        );
+        assert!(!io.stdout_eof && !io.stderr_eof && !io.exit_observed);
+        assert!(io.timeout_observed_us.unwrap() >= 100_000);
+        assert!(io.spawn_return_us.is_some() && io.spawn_return_us <= io.timeout_observed_us);
+        assert!(io.timeout_observed_us <= io.cleanup_start_us);
+        assert!(io.cleanup_start_us <= io.cleanup_end_us);
+        assert!(io.cleanup_end_us.is_some());
+        assert_eq!(io.group_kill_ok, Some(true));
+        assert!(io.child_kill_ok.is_some());
+        assert_eq!(io.leader_wait_ok, Some(true));
+    }
+
     fn writable_script(temp: &tempfile::TempDir, body: &str) -> (Command, std::fs::File) {
         use std::{io::Write, os::unix::fs::PermissionsExt};
         let path = temp.path().join("helper");

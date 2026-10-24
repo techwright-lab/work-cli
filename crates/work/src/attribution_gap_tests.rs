@@ -1,3 +1,5 @@
+#[path = "required_gap_continuation_tests.rs"]
+mod continuation;
 #[path = "attribution_gap_lease_tests.rs"]
 mod lease_tests;
 
@@ -191,6 +193,39 @@ fn historical_gap_capture_coexistence_refuses_before_receiver() {
         .unwrap()
         .is_none());
 
+        if case == "off_without_gap" {
+            assert!(super::read_record(&store.conn, &root)
+                .unwrap()
+                .required_initial());
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            let cursor = store.conn.query_row(
+                "SELECT latest_run,revision,disposition,qualification FROM gap_eligibility WHERE checkout=?1",
+                [root.identity().checkout.to_string()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?)),
+            ).unwrap();
+            assert_eq!(
+                cursor,
+                (
+                    root.identity().run.to_string(),
+                    1,
+                    "unavailable".into(),
+                    None
+                )
+            );
+            let qualifications: i64 = store.conn.query_row(
+                "SELECT count(*) FROM gap_qualifications WHERE checkout=?1 OR run=?2 OR successor_run=?2",
+                (root.identity().checkout.to_string(), root.identity().run.to_string()),
+                |r| r.get(0),
+            ).unwrap();
+            assert_eq!(qualifications, 0);
+        }
+
         // A genuine captured sibling in the SAME authority is the isolation
         // control; no receiver call or prepared response is needed to create it.
         let mut start = allocation.request.clone();
@@ -263,10 +298,34 @@ fn historical_gap_capture_coexistence_refuses_before_receiver() {
                     .execute("UPDATE attribution_gaps SET record='{'", [])
                     .unwrap();
             } else if case == "off_without_gap" {
-                store
-                    .conn
-                    .execute("DELETE FROM attribution_gaps", [])
-                    .unwrap();
+                // Dispose only this qualified, unpublished initial cursor. Keep
+                // FK enforcement and the intended Off+capture/missing-Gap clash.
+                assert_eq!(store.conn.execute(
+                    "DELETE FROM gap_eligibility WHERE checkout=?1 AND latest_run=?2 AND revision=1 AND disposition='unavailable' AND qualification IS NULL",
+                    (root.identity().checkout.to_string(), root.identity().run.to_string()),
+                ).unwrap(), 1);
+                assert_eq!(
+                    store
+                        .conn
+                        .execute(
+                            "DELETE FROM attribution_gaps WHERE run=?1 AND checkout=?2",
+                            (
+                                root.identity().run.to_string(),
+                                root.identity().checkout.to_string()
+                            ),
+                        )
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    store
+                        .conn
+                        .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    1
+                );
+                let mut foreign_keys = store.conn.prepare("PRAGMA foreign_key_check").unwrap();
+                assert!(foreign_keys.query([]).unwrap().next().unwrap().is_none());
             }
         }
         let before = durable_rows(&store);
@@ -910,6 +969,8 @@ fn durable_rows(store: &Store) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
         "capture_readiness",
         "task_finishes",
         "outbox",
+        "gap_qualifications",
+        "gap_eligibility",
     ]
     .into_iter()
     .map(|table| {
@@ -1986,7 +2047,7 @@ fn gap_reports_are_journal_only_allowlisted_observations() {
                 value["checkout_ready"], false,
                 "required Gap status must report not_ready truth"
             );
-            assert_eq!(value["gap_limitations"],"physical closure leaves held/not_ready; charge retained; next root and new finish unsupported");
+            assert_eq!(value["gap_limitations"],"continuation requires a live-close qualification and fresh same-boot/actor/target checks; closure retains held/not_ready and charge; recovery never qualifies; generic Ready, new finish and transport remain unsupported");
         }
         let gap = status
             .gap
@@ -2869,10 +2930,69 @@ fn isolated_environment() {
         ),
     );
     executable(&p.join("manager"),format!("#!/bin/sh\ncase \" $* \" in *' kill '*) /usr/bin/env -0 > '{0}/cancel.env'; exit 0;; esac\n/usr/bin/env -0 > '{0}/inspection.env'\nexec /usr/bin/cat '{0}/properties'\n",p.display()));
+    let mut tested_command = h.command.clone();
+    let prefix = if required {
+        // SAME explicitly seeded env_clear child. This is a real live close,
+        // never a recovered predecessor or a Q manufactured from stored bytes.
+        let prefix = crate::supervisor::supervise_off(
+            &h.config,
+            h.command.clone(),
+            &h.driver,
+            Some(h.io()),
+            &crate::supervisor::CancelToken::default(),
+            |boundary, root| {
+                if boundary == crate::supervisor::Boundary::RootTerminal {
+                    h.empty(root);
+                }
+            },
+        )
+        .unwrap();
+        assert!(prefix.record.closed);
+        assert_eq!(prefix.gap.as_ref().unwrap().origin, "required_initial");
+        let (keeper, lease) = crate::allocate::locked(&h.config).unwrap();
+        drop(lease);
+        let q: (String, Vec<u8>) = keeper
+            .conn
+            .query_row(
+                "SELECT record,fingerprint FROM gap_qualifications WHERE run=?1",
+                [prefix.record.request.identity().run.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            keeper
+                .conn
+                .query_row("SELECT disposition FROM gap_eligibility", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "available"
+        );
+        tested_command.run_id = uuid::Uuid::now_v7();
+        std::fs::remove_file(p.join("properties")).unwrap();
+        std::fs::remove_file(p.join("executed")).unwrap();
+        // Prefix helpers have all completed at physical close. Remove ONLY
+        // these existing fixture-owned probes; absence before the new run makes
+        // their later contents evidence of the tested continuation, not prefix.
+        for helper in ["launcher", "actor", "inspection", "cancel"] {
+            let path = p.join(format!("{helper}.env"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => panic!("owned {helper} probe cleanup: {error}"),
+            }
+            assert!(
+                !path.exists(),
+                "prefix probe must not satisfy tested-run assertions"
+            );
+        }
+        Some((keeper, prefix.record, q))
+    } else {
+        None
+    };
     let cancel = crate::supervisor::CancelToken::default();
     let report = crate::supervisor::supervise_off(
         &h.config,
-        h.command.clone(),
+        tested_command.clone(),
         &h.driver,
         Some(h.io()),
         &cancel,
@@ -2887,6 +3007,21 @@ fn isolated_environment() {
         !report.record.closed,
         "root exit/cancel without full-roster absence cannot close"
     );
+    assert_eq!(
+        report.record.request.identity().run.to_string(),
+        tested_command.run_id.to_string()
+    );
+    if let Some((_, prefix, _)) = &prefix {
+        assert_ne!(
+            report.record.request.identity().run,
+            prefix.request.identity().run
+        );
+        assert_eq!(report.gap.as_ref().unwrap().origin, "required_continuation");
+        assert!(
+            p.join("executed").exists(),
+            "tested continuation actually executed after probe cleanup"
+        );
+    }
     for helper in ["launcher", "actor", "inspection", "cancel"] {
         let bytes = std::fs::read(p.join(format!("{helper}.env")))
             .unwrap_or_else(|e| panic!("{helper}: {e}"));
@@ -2973,6 +3108,53 @@ fn isolated_environment() {
         .unwrap(),
         crate::run_recovery::RecoveryState::Closed
     );
+    if let Some((keeper, prefix, q)) = prefix {
+        let current: (String, Vec<u8>) = keeper
+            .conn
+            .query_row(
+                "SELECT record,fingerprint FROM gap_qualifications WHERE run=?1",
+                [prefix.request.identity().run.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(current, q, "recovery retains immutable prefix Q");
+        let claim: (String, i64) = keeper
+            .conn
+            .query_row(
+                "SELECT successor_run,successor_revision FROM gap_qualifications WHERE run=?1",
+                [prefix.request.identity().run.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(claim, (report.record.request.identity().run.to_string(), 4));
+        let cursor: (String, i64, String, Option<String>) = keeper
+            .conn
+            .query_row(
+                "SELECT latest_run,revision,disposition,qualification FROM gap_eligibility",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(cursor.0, report.record.request.identity().run.to_string());
+        assert!(cursor.1 > 4);
+        assert_eq!(cursor.2, "blocked");
+        assert!(cursor.3.is_none());
+        assert_eq!(
+            keeper
+                .conn
+                .query_row("SELECT count(*) FROM gap_qualifications", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "tested recovery cannot qualify its own Q"
+        );
+        let recovered = keeper
+            .run_snapshot(&report.record.request.identity().run)
+            .unwrap()
+            .unwrap();
+        assert!(recovered.closed);
+        assert_eq!(recovered.outcome, report.record.outcome);
+    }
 }
 #[test]
 fn all_off_commands_filter_credentials_without_resetting_io() {
@@ -4155,7 +4337,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         }
         store
             .conn
-            .execute_batch("DROP TABLE attribution_gaps; PRAGMA user_version=13;")
+            .execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
             .unwrap();
         let migrated = Store::open_registered(
             config.trusted_registry.as_ref().unwrap(),
@@ -4173,7 +4355,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            14
+            15
         );
         assert_eq!(
             migrated
@@ -4292,7 +4474,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 14,
+        version, 15,
         "new authorities must install the additive Gap schema"
     );
     let original: String = store
@@ -4303,7 +4485,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
     // Construct an authentic schema13 authority, retaining its original payloads.
     store
         .conn
-        .execute_batch("DROP TABLE attribution_gaps; PRAGMA user_version=13;")
+        .execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
         .unwrap();
     drop(store);
     let store = test_run_fixture::reopen(&dir).unwrap();
@@ -4324,7 +4506,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         "CREATE TABLE attribution_gaps(run TEXT PRIMARY KEY, group_id TEXT, checkout TEXT, event_id TEXT, record TEXT, fingerprint BLOB)",
     ] {
         let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-        sql.execute_batch("DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
+        sql.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
         sql.execute_batch(malformed).unwrap();
         assert!(Store::open(&dir.path().join("private"), &[dir.path().join("root")]).is_err());
         let version: i64 = sql.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();

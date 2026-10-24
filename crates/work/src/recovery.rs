@@ -5,7 +5,11 @@ use crate::{
     store::Store,
 };
 use serde::{Deserialize, Serialize};
-use std::{io, path::PathBuf};
+use std::{
+    io::{self, Read},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +51,7 @@ pub(crate) fn hold_under_lease(
     lease: &allocate::AuthorityLease,
 ) -> io::Result<()> {
     allocate::db(lease.check(store))?;
+    let authority = store.authority_identity().clone();
     let _phase = store.sql_phase();
     {
         let tx = allocate::sql(
@@ -62,6 +67,9 @@ pub(crate) fn hold_under_lease(
             if finished || !matches!(state.as_str(), "active" | "partial" | "held") {
                 return Ok(());
             }
+            allocate::db(crate::gap_continuation::revoke(
+                &tx, &authority, lease, a.checkout,
+            ))?;
             let mut current: Allocation = serde_json::from_str(&record)?;
             if current
                 .reason
@@ -160,6 +168,66 @@ pub(crate) fn reconcile_under_lease(
     }
 }
 pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
+    verify_identity(a, false)
+}
+
+/// Narrow descriptor reader for the Gap-only verifier. Do not relax the legacy
+/// identity reader or accept a hardlinked, symlinked or blocking metadata file.
+pub(crate) fn gap_metadata(path: &Path) -> io::Result<Vec<u8>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let matches = |current: &std::fs::Metadata| {
+        current.is_file()
+            && current.nlink() == 1
+            && (current.dev(), current.ino()) == (metadata.dev(), metadata.ino())
+    };
+    if !matches(&metadata) || !matches(&std::fs::symlink_metadata(path)?) || metadata.len() > 16384
+    {
+        return Err(allocate::err("unsafe Gap metadata descriptor"));
+    }
+    let mut bytes = Vec::new();
+    file.take(16385).read_to_end(&mut bytes)?;
+    if bytes.len() > 16384 || !matches(&std::fs::symlink_metadata(path)?) {
+        return Err(allocate::err("changed or oversized Gap metadata"));
+    }
+    Ok(bytes)
+}
+
+/// Only the continuation module calls this purpose-specific verifier. Pending
+/// allocations remain exact-HEAD in verify(); no stage or identity is rewritten.
+pub(crate) fn verify_gap(a: &Allocation) -> io::Result<CheckoutIdentity> {
+    let prior = a
+        .identity
+        .as_ref()
+        .ok_or_else(|| allocate::err("missing Gap identity"))?;
+    let text = |path: &Path| -> io::Result<String> {
+        String::from_utf8(gap_metadata(path)?).map_err(|_| allocate::err("non-UTF8 Gap metadata"))
+    };
+    // Check the known linked-worktree metadata BEFORE asking Git to consume it.
+    let dotgit = text(&a.destination.join(".git"))?;
+    if dotgit.trim_end_matches('\n') != format!("gitdir: {}", prior.private_git_dir.display()) {
+        return Err(allocate::err("Gap gitdir link changed"));
+    }
+    let backlink = text(&prior.private_git_dir.join("gitdir"))?;
+    if Path::new(backlink.trim_end_matches('\n')) != a.destination.join(".git") {
+        return Err(allocate::err("Gap backlink changed"));
+    }
+    let common = text(&prior.private_git_dir.join("commondir"))?;
+    let common = prior
+        .private_git_dir
+        .join(common.trim_end_matches('\n'))
+        .canonicalize()?;
+    if common != prior.common_git_dir || prior.private_git_dir == prior.common_git_dir {
+        return Err(allocate::err("Gap common directory changed"));
+    }
+    gap_metadata(&prior.private_git_dir.join("work-lease.json"))?;
+    verify_identity(a, true)
+}
+
+fn verify_identity(a: &Allocation, gap_descendants: bool) -> io::Result<CheckoutIdentity> {
     let fail = || allocate::err("insufficient allocation identity");
     let prior = a.identity.as_ref().ok_or_else(fail)?;
     for path in [
@@ -188,7 +256,7 @@ pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
         return Err(fail());
     }
     if current.head != prior.head {
-        if a.stage != "ready" {
+        if !gap_descendants && a.stage != "ready" {
             return Err(fail());
         }
         crate::identity::query(
@@ -197,7 +265,11 @@ pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
         )?;
     }
     let path = prior.private_git_dir.join("work-lease.json");
-    let marker: Marker = serde_json::from_slice(&crate::identity::read_metadata(&path, 16384)?)?;
+    let marker: Marker = serde_json::from_slice(&if gap_descendants {
+        gap_metadata(&path)?
+    } else {
+        crate::identity::read_metadata(&path, 16384)?
+    })?;
     if marker != Marker::from(a) {
         return Err(fail());
     }

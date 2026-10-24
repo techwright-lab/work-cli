@@ -255,6 +255,31 @@ fn nested_allocator_and_direct_library_mutations_share_one_lease() {
     );
     crate::recovery::hold(&mut store, &mut current, "standalone safety hold").unwrap();
     crate::allocate::save(&mut store, &current).unwrap();
+    let limits = Limits {
+        repository: 10,
+        owner: 10,
+        available_bytes: None,
+        floor_bytes: 0,
+        warn_bytes: 0,
+    };
+    // Public acquiring owner operations belong on this existing ordinary
+    // fixture AFTER the outer lease and standalone wrapper checks above.
+    store.transfer(allocation.checkout, "bob", limits).unwrap();
+    let before = durable_rows(&store);
+    store.transfer(allocation.checkout, "bob", limits).unwrap();
+    assert_eq!(durable_rows(&store), before);
+    store
+        .transfer(allocation.checkout, "alice", limits)
+        .unwrap();
+    assert_eq!(
+        store
+            .charged(
+                allocation.request.repository.as_ref().unwrap(),
+                Some("alice")
+            )
+            .unwrap(),
+        1
+    );
     assert_eq!(
         store
             .charged(allocation.request.repository.as_ref().unwrap(), None)
@@ -273,13 +298,6 @@ fn nested_allocator_and_direct_library_mutations_share_one_lease() {
         &h.config.roots,
     )
     .unwrap();
-    let limits = Limits {
-        repository: 10,
-        owner: 10,
-        available_bytes: None,
-        floor_bytes: 0,
-        warn_bytes: 0,
-    };
     let mut sleeper = super::OwnedSleeper(None);
     let mut child_pid = None;
     let result = crate::supervisor::supervise_off(
@@ -290,17 +308,11 @@ fn nested_allocator_and_direct_library_mutations_share_one_lease() {
         &crate::supervisor::CancelToken::default(),
         |boundary, root| {
             if boundary == crate::supervisor::Boundary::PermitAttempt {
-                direct
-                    .transfer(h.allocation.checkout, "bob", limits)
-                    .unwrap();
                 let before = durable_rows(&direct);
-                direct
-                    .transfer(h.allocation.checkout, "bob", limits)
-                    .unwrap();
-                assert_eq!(durable_rows(&direct), before);
                 direct
                     .transfer(h.allocation.checkout, "alice", limits)
                     .unwrap();
+                assert_eq!(durable_rows(&direct), before);
                 let binding = root.binding.as_ref().unwrap();
                 let child = std::process::Command::new("/usr/bin/sleep")
                     .arg("30")
