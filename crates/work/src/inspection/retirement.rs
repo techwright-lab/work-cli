@@ -474,16 +474,16 @@ fn decide(
         }
         assertion = Some(validated);
     }
-    #[cfg(test)]
-    if let Some(hook) = take_after_protection() {
-        hook();
-    }
     recovery_refs::sync_existing_protection(
         &assessment.physical.before.common,
         &mut assessment.census,
         &targets,
         &mut assessment.budget,
     )?;
+    #[cfg(test)]
+    if let Some(hook) = take_after_protection() {
+        hook();
+    }
     assessment
         .lock
         .revalidate(&assessment.store, &common_path)?;
@@ -557,7 +557,7 @@ fn decide(
     assessment
         .lock
         .revalidate(&assessment.store, &common_path)?;
-    let current = {
+    {
         let lease = assessment
             .store
             .authority_lease()
@@ -603,13 +603,12 @@ fn decide(
                 first.age_for_test();
             }
         }
+        if current.canonical != assessment.context.canonical {
+            return Err("context_changed");
+        }
         tx.rollback().map_err(|_| "context_changed")?;
         drop(phase);
         drop(lease);
-        current
-    };
-    if current.canonical != assessment.context.canonical {
-        return Err("context_changed");
     }
     if let Some(mut assertion) = assertion {
         assertion.recheck_expiry(&mut assessment.budget)?;
@@ -735,6 +734,10 @@ mod tests {
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         process::Command,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
     };
     use work_contract::{RunId, RunRef};
 
@@ -976,18 +979,48 @@ mod tests {
         crate::finish::finish(&config, f.allocation.checkout).unwrap();
     }
     fn git_text(f: &fixture::ManagedFixture, args: &[&str]) -> String {
+        git_at(&f.allocation.destination, args)
+    }
+    fn git_at(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("/usr/bin/git")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args([
+                "-c",
+                "user.name=Owned Fixture",
+                "-c",
+                "user.email=fixture@invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+            ])
             .args(args)
-            .current_dir(&f.allocation.destination)
+            .current_dir(dir)
             .output()
             .unwrap();
         assert!(out.status.success(), "{out:?}");
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    fn recovery_ref_rows(f: &fixture::ManagedFixture) -> Vec<(String, String)> {
+        git_text(
+            f,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/work-recovery",
+            ],
+        )
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let (name, oid) = line.split_once(' ').expect("recovery ref oid");
+            (name.to_owned(), oid.to_owned())
+        })
+        .collect()
     }
     fn enroll(
         f: &mut fixture::ManagedFixture,
@@ -1193,19 +1226,37 @@ mod tests {
         let mut f = fixture::ManagedFixture::recovery("sha1", "2");
         let (_r, _b, os, config) = prepared_supervised(&mut f);
         let dest = f.allocation.destination.clone();
+        let common = f.common().to_path_buf();
         let tree = git_text(&f, &["rev-parse", "HEAD^{tree}"]);
+        let reached = Arc::new(AtomicBool::new(false));
+        let flag = reached.clone();
+        let expected = tree.clone();
         set_after_protection(move || {
             fixture::git(
                 &dest,
                 &[
                     "update-ref".as_ref(),
-                    "refs/heads/extra-tree".as_ref(),
-                    tree.as_ref(),
+                    "refs/tags/extra-tree".as_ref(),
+                    expected.as_ref(),
                 ],
             );
+            let path = common.join("refs/tags/extra-tree");
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(bytes, format!("{expected}\n").into_bytes());
+            flag.store(true, Ordering::SeqCst);
         });
         let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "after-protection hook not consumed"
+        );
+        assert_eq!(git_text(&f, &["rev-parse", "refs/tags/extra-tree"]), tree);
+        assert_eq!(
+            fs::read(f.common().join("refs/tags/extra-tree")).unwrap(),
+            format!("{tree}\n").into_bytes()
+        );
         assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "census_changed");
         assert_ne!(report.reason(), "prerequisites_complete");
     }
 
@@ -1214,13 +1265,23 @@ mod tests {
         let mut f = fixture::ManagedFixture::recovery("sha1", "2");
         let (_r, _b, os, config) = prepared_supervised(&mut f);
         let path = config.clone();
+        let reached = Arc::new(AtomicBool::new(false));
+        let flag = reached.clone();
         set_after_protection(move || {
             let text = fs::read_to_string(&path)
                 .unwrap()
                 .replace("fixture-v1", "fixture-v2");
-            fs::write(&path, text).unwrap();
+            fs::write(&path, &text).unwrap();
+            assert!(text.contains("store_dir="));
+            assert!(text.contains("fixture-v2"));
+            toml::from_str::<toml::Value>(&text).unwrap();
+            flag.store(true, Ordering::SeqCst);
         });
         let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "supervised config hook not consumed"
+        );
         assert_eq!(report.outcome(), "held");
         assert_eq!(report.reason(), "configuration_changed");
         let f = fixture::ManagedFixture::recovery("sha1", "2");
@@ -1236,13 +1297,23 @@ mod tests {
         );
         let assertion = confirm.test_receipt_id().expect("assertion");
         let path = config.clone();
+        let reached = Arc::new(AtomicBool::new(false));
+        let flag = reached.clone();
         set_after_protection(move || {
             let text = fs::read_to_string(&path)
                 .unwrap()
                 .replace("fixture-v1", "fixture-v2");
-            fs::write(&path, text).unwrap();
+            fs::write(&path, &text).unwrap();
+            assert!(text.contains("store_dir="));
+            assert!(text.contains("fixture-v2"));
+            toml::from_str::<toml::Value>(&text).unwrap();
+            flag.store(true, Ordering::SeqCst);
         });
         let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "adopted config hook not consumed"
+        );
         assert_eq!(report.outcome(), "held");
         assert_eq!(report.reason(), "configuration_changed");
     }
@@ -1308,11 +1379,37 @@ mod tests {
             report.reason()
         );
         let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let tree = git_text(&f, &["rev-parse", "HEAD^{tree}"]);
+        f.git(&[
+            "update-ref".as_ref(),
+            "refs/tags/extra-root".as_ref(),
+            tree.as_ref(),
+        ]);
         let (_r, _b, os, config) = prepared_supervised(&mut f);
         pack_recovery_refs(&f);
-        let name = first_recovery_ref(&f);
-        let oid = git_text(&f, &["rev-parse", &name]);
-        f.git(&["update-ref".as_ref(), name.as_ref(), oid.as_ref()]);
+        let rows = recovery_ref_rows(&f);
+        assert!(rows.len() >= 2, "{rows:?}");
+        let (loose_name, loose_oid) = &rows[0];
+        let (packed_name, packed_oid) = &rows[1];
+        assert_ne!(loose_name, packed_name);
+        let loose_path = f.common().join(loose_name);
+        fs::create_dir_all(loose_path.parent().unwrap()).unwrap();
+        let canonical = format!("{loose_oid}\n").into_bytes();
+        fs::write(&loose_path, &canonical).unwrap();
+        assert_eq!(fs::read(&loose_path).unwrap(), canonical);
+        assert!(!f.common().join(packed_name).exists());
+        let packed_refs = fs::read_to_string(f.common().join("packed-refs")).unwrap();
+        assert!(
+            packed_refs.contains(&format!("{packed_oid} {packed_name}\n")),
+            "{packed_refs}"
+        );
+        assert!(
+            packed_refs.contains(&format!("{loose_oid} {loose_name}\n")),
+            "{packed_refs}"
+        );
+        let before_rows = rows.clone();
+        let before_loose = fs::read(&loose_path).unwrap();
+        let before_packed = fs::read(f.common().join("packed-refs")).unwrap();
         let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
         assert_eq!(
             report.outcome(),
@@ -1320,6 +1417,13 @@ mod tests {
             "{}",
             report.reason()
         );
+        assert_eq!(recovery_ref_rows(&f), before_rows);
+        assert_eq!(fs::read(&loose_path).unwrap(), before_loose);
+        assert_eq!(
+            fs::read(f.common().join("packed-refs")).unwrap(),
+            before_packed
+        );
+        assert!(!f.common().join(packed_name).exists());
         let mut f = fixture::ManagedFixture::recovery("sha1", "2");
         let (_r, _b, os, config) = prepared_supervised(&mut f);
         let name = first_recovery_ref(&f);
@@ -1337,7 +1441,7 @@ mod tests {
 
     #[test]
     fn enrolled_child_still_present_escaped_reused_reboot_and_missing() {
-        for case in ["present", "escaped", "reused", "reboot"] {
+        for case in ["present", "escaped", "reused", "reboot", "missing"] {
             let mut f = fixture::ManagedFixture::recovery("sha1", "2");
             let r = request(f.allocation.checkout);
             f.store.begin_run(&r).unwrap();
@@ -1379,6 +1483,9 @@ mod tests {
                     "650e8400-e29b-41d4-a716-446655440000",
                 )
                 .unwrap(),
+                "missing" => {
+                    fs::create_dir_all(os.tmp.path().join("proc/43")).unwrap();
+                }
                 _ => unreachable!(),
             }
             let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
@@ -1388,6 +1495,7 @@ mod tests {
                 "escaped" => "missing_enrollment",
                 "reused" => "missing_enrollment",
                 "reboot" => "boot_mismatch",
+                "missing" => "observation_incomplete",
                 _ => unreachable!(),
             };
             assert_eq!(report.reason(), expected, "{case}");
@@ -1395,33 +1503,77 @@ mod tests {
     }
 
     #[test]
-    fn shared_remote_change_before_cleanup_holds() {
+    fn remote_tip_changed_between_advertisements_holds() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let remote = f.temp.path().join("backup.git");
+        let before_head = git_text(&f, &["rev-parse", "HEAD"]);
+        let before_status = git_text(&f, &["status", "--porcelain"]);
+        let before_refs = git_text(&f, &["show-ref"]);
+        let reached = Arc::new(AtomicBool::new(false));
+        let flag = reached.clone();
+        super::super::remote_proof::set_retirement_observer(move |phase, _scratch| {
+            if phase != super::super::remote_proof::Phase::BeforeFinalAdvertisement
+                || flag.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            let parent = git_at(&remote, &["rev-parse", "refs/heads/preserved"]);
+            let tree = git_at(&remote, &["rev-parse", "refs/heads/preserved^{tree}"]);
+            let commit = git_at(
+                &remote,
+                &["commit-tree", &tree, "-p", &parent, "-m", "remote-only"],
+            );
+            fixture::git(
+                &remote,
+                &[
+                    "update-ref".as_ref(),
+                    "refs/heads/preserved".as_ref(),
+                    commit.as_ref(),
+                ],
+            );
+            flag.store(true, Ordering::SeqCst);
+        });
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "advertisement hook not consumed"
+        );
+        assert_eq!(git_text(&f, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(git_text(&f, &["status", "--porcelain"]), before_status);
+        assert_eq!(git_text(&f, &["show-ref"]), before_refs);
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "remote_changed");
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["preservation"]["cleanup"], "complete");
+        assert_eq!(
+            value["preservation"]["remote_head"]["reason"],
+            "remote_changed"
+        );
+        assert_eq!(value["preservation"]["remote_head"]["cleanup"], "complete");
+        assert_ne!(report.reason(), "prerequisites_complete");
+    }
+
+    #[test]
+    fn unsafe_scratch_symlink_cleanup_holds() {
         let mut f = fixture::ManagedFixture::recovery("sha1", "2");
         let (_r, _b, os, config) = prepared_supervised(&mut f);
         let dest = f.allocation.destination.clone();
+        let reached = Arc::new(AtomicBool::new(false));
+        let flag = reached.clone();
         super::super::remote_proof::set_retirement_observer(move |phase, scratch| {
             if phase != super::super::remote_proof::Phase::BeforeCleanup {
                 return;
             }
-            fs::write(dest.join("tracked"), b"shared remote change\n").unwrap();
-            fixture::git(
-                &dest,
-                &["commit".as_ref(), "-am".as_ref(), "shared tip".as_ref()],
-            );
-            fixture::git(
-                &dest,
-                &[
-                    "-c".as_ref(),
-                    "protocol.file.allow=always".as_ref(),
-                    "push".as_ref(),
-                    "backup".as_ref(),
-                    "HEAD:refs/heads/preserved".as_ref(),
-                ],
-            );
             std::os::unix::fs::symlink(&dest, scratch.join("unexpected-link")).unwrap();
+            flag.store(true, Ordering::SeqCst);
         });
         let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert!(reached.load(Ordering::SeqCst), "cleanup hook not consumed");
         assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "cleanup_unknown");
+        let value = serde_json::to_value(&report).unwrap();
+        assert_ne!(value["preservation"]["cleanup"], "complete");
         assert_ne!(report.reason(), "prerequisites_complete");
     }
 }

@@ -259,7 +259,7 @@ fn dirty_work_holds_and_does_not_mutate() {
     let before_refs = recovery_refs(&f);
     let report = assess_retirement(&config, f.allocation.checkout, Some(assertion));
     assert_eq!(report.outcome(), "held");
-    assert_eq!(report.reason(), "inspection_held");
+    assert_eq!(report.reason(), "preservation_requirements_held");
     assert_disabled(&report);
     assert_eq!(sql_bytes(&f), before_sql);
     assert_eq!(recovery_refs(&f), before_refs);
