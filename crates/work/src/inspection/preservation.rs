@@ -31,7 +31,7 @@ impl PreservationReport {
     pub fn observed(&self) -> bool {
         self.outcome == "observed"
     }
-    pub fn reason(&self) -> &str {
+    pub fn reason(&self) -> &'static str {
         self.reason
     }
 }

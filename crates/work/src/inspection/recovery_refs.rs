@@ -392,7 +392,7 @@ fn resume_published(
     {
         return Err("intent_binding_changed");
     }
-    receipts::resync_published(store, plan.operation)?;
+    receipts::resync_published(store, plan.operation).map_err(receipt_reason)?;
     report.intent_id = Some(plan.operation);
     report.intent_checksum = Some(hex(&storage::intent_checksum(&bytes)?));
     report.result_id = Some(intent.result_id);
@@ -758,6 +758,8 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     }
 }
 
+#[cfg(test)]
+use crate as work_cli_api;
 #[cfg(test)]
 #[path = "../../tests/support/inspection_fixture.rs"]
 mod fixture;
