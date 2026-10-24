@@ -1,5 +1,7 @@
 //! Closed `work.recovery-preparation.v1` intent/result codec. Historical bytes
 //! never become a fresh plan. Tests authored with the protocol cases.
+#[cfg(test)]
+use super::super::hex;
 use super::super::{frame, Store};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
