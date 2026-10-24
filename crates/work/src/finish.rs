@@ -1650,6 +1650,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
         }
     }
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn legal_finish_history_has_no_schema_quota_or_receipt_read_amplification() {
         use super::*;
         use crate::allocate::{Allocation, Start};

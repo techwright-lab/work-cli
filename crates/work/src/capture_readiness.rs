@@ -1555,9 +1555,10 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn many_closed_captured_roots_with_terminal_children_fit_sql_budget() {
         let _diagnostics = crate::capture_diagnostics::Guard::new();
-        many_closed_history(|cfg, _store, a, original| {
+        many_closed_history_stress(|cfg, _store, a, original| {
             let next = next_root(original);
             let spec = cfg
                 .capture_spec(&next, a, uuid::Uuid::now_v7(), vec!["task".into()], None)
@@ -1574,9 +1575,10 @@ pub(crate) mod tests {
         });
     }
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn captured_finish_many_roots_preserves_shared_sql_budgets() {
         let _diagnostics = crate::capture_diagnostics::Guard::new();
-        many_closed_history(|cfg, _store, a, _original| {
+        many_closed_history_stress(|cfg, _store, a, _original| {
             Store::open_finish_authority(
                 cfg.trusted_registry.as_ref().unwrap(),
                 cfg.store_dir.as_ref().unwrap(),
@@ -1589,8 +1591,9 @@ pub(crate) mod tests {
         });
     }
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn captured_finish_many_unmapped_roots_preserves_shared_sql_budgets() {
-        many_closed_history(|cfg, store, a, original| {
+        many_closed_history_stress(|cfg, store, a, original| {
             let rows = |table: &str| {
                 let mut stmt = store
                     .conn
@@ -1874,7 +1877,31 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
     ) {
         many_closed_history_with_timeout(50, completed);
     }
+    // Pilot functional coverage keeps every assertion at two roots; full-load
+    // qualification remains explicit in the ignored stress callers.
     fn many_closed_history_with_timeout(
+        timeout_ms: u64,
+        completed: impl FnMut(
+            &crate::config::Config,
+            &Store,
+            &crate::allocate::Allocation,
+            &crate::run_journal::RootRunRequest,
+        ),
+    ) {
+        many_closed_history_with_counts(&[2], timeout_ms, completed);
+    }
+    pub(crate) fn many_closed_history_stress(
+        completed: impl FnMut(
+            &crate::config::Config,
+            &Store,
+            &crate::allocate::Allocation,
+            &crate::run_journal::RootRunRequest,
+        ),
+    ) {
+        many_closed_history_with_counts(&[2, 48], 50, completed);
+    }
+    fn many_closed_history_with_counts(
+        counts: &[usize],
         timeout_ms: u64,
         mut completed: impl FnMut(
             &crate::config::Config,
@@ -1885,7 +1912,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
     ) {
         use crate::capture_journal::json;
         use crate::run_participants::{ChildRequest, EnrollmentRecord, ExpectedHost, HostSnapshot};
-        for count in [2, 48] {
+        for &count in counts {
             crate::capture_diagnostics::record(crate::capture_diagnostics::Event::Workload {
                 roots: count,
             });

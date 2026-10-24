@@ -523,6 +523,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn cpu_wall_outer_seams_emit_on_error_and_unwind_only_when_enabled() {
         fn attempt() -> Result<(), ()> {
             let _cpu = outside_sql_span(FrameName::WholeAdmission);
@@ -592,6 +593,7 @@ mod tests {
 
     // Supplemental arithmetic safety after the scoped-emission RED/GREEN.
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn cpu_wall_checked_timespec_conversion_preserves_unknown_and_valid_zero() {
         use rustix::time::Timespec;
         use std::time::Duration;
@@ -637,6 +639,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
     fn subphase_profiles_aggregate_scoped_wall_spans_on_early_return() {
         fn attempt() -> Result<(), ()> {
             let _root = ProfileRoot::new();

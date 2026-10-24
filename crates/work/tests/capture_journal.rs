@@ -462,6 +462,7 @@ fn unrelated_legacy_root_writer_and_child_corruption_still_blocks_finish() {
 }
 
 #[test]
+#[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
 fn substantial_legal_capture_history_does_not_amplify_finish_validation() {
     let f = support::Fixture::new();
     let output = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);

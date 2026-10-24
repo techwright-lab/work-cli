@@ -316,6 +316,8 @@ mod filesystem {
         ctime_ns: u64,
     }
     impl Identity {
+        // st_nlink has architecture-dependent width; retain the portable u64 conversion.
+        #[allow(clippy::useless_conversion)]
         fn from_stat(s: fs::Stat) -> Self {
             Self {
                 device: s.st_dev,
@@ -746,11 +748,10 @@ mod filesystem {
                 // Check type/link count BEFORE any readable data open.
                 let directory = identity.kind() == FileType::Directory;
                 if !directory {
-                    if let Err(reason) = regular(&identity) {
-                        #[cfg(test)]
-                        self.hooks.rejected(&path, reason);
-                        return Err(reason);
-                    }
+                    let result = regular(&identity);
+                    #[cfg(test)]
+                    let result = result.inspect_err(|reason| self.hooks.rejected(&path, *reason));
+                    result?;
                 }
                 if identity.device != self.held[0].identity.device {
                     return Err(IncompleteReason::MountCrossing);

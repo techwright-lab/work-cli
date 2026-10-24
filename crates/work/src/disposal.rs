@@ -69,7 +69,7 @@ impl<'de> Deserialize<'de> for RawPath {
     }
 }
 fn decode_hex(wire: &str, maximum: usize) -> Result<Vec<u8>, PolicyError> {
-    if wire.is_empty() || wire.len() > maximum * 2 || wire.len() % 2 != 0 {
+    if wire.is_empty() || wire.len() > maximum * 2 || !wire.len().is_multiple_of(2) {
         return Err(PolicyError("hex bounds"));
     }
     fn digit(b: u8) -> Result<u8, PolicyError> {
@@ -80,7 +80,9 @@ fn decode_hex(wire: &str, maximum: usize) -> Result<Vec<u8>, PolicyError> {
         }
     }
     wire.as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| Ok((digit(p[0])? << 4) | digit(p[1])?))
         .collect()
 }

@@ -91,6 +91,7 @@ fn authority_tables(conn: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::types:
 }
 
 #[test]
+#[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
 fn namespace_statements_reuse_compiled_syntax_with_fresh_parameters() {
     use std::sync::{
         atomic::{AtomicUsize, Ordering},

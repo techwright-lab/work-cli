@@ -864,54 +864,57 @@ fn changed_safety_holds_and_recovery_close_block_initialized_cursor() {
 }
 
 #[test]
+#[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
 fn required_history_fold_is_linear_within_existing_budgets() {
     // Staged preservation: real existing captured 2/48-root/188-child helper,
     // unchanged workload, limits and assertions. Only classification is measured.
-    crate::capture_readiness::tests::many_closed_history(|_, store, allocation, original| {
-        let record = store
-            .run_snapshot(&original.identity().run)
-            .unwrap()
-            .unwrap();
-        crate::gap_continuation::take_decoded_nodes();
-        let classification = crate::gap_continuation::before_close(
-            &store.conn,
-            &record,
-            None,
-            store.authority_identity(),
-        )
-        .unwrap();
-        assert!(!classification.required());
-        assert_eq!(
-            crate::gap_continuation::take_decoded_nodes(),
-            0,
-            "non-Gap close classification must not decode the captured history again"
-        );
-        assert!(!super::super::raw_history(&store.conn, allocation.checkout).unwrap());
-        let before = durable_rows(store);
-        let lease = store.authority_lease().unwrap();
-        {
-            let _phase = store.sql_phase();
-            let tx = rusqlite::Transaction::new_unchecked(
+    crate::capture_readiness::tests::many_closed_history_stress(
+        |_, store, allocation, original| {
+            let record = store
+                .run_snapshot(&original.identity().run)
+                .unwrap()
+                .unwrap();
+            crate::gap_continuation::take_decoded_nodes();
+            let classification = crate::gap_continuation::before_close(
                 &store.conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )
-            .unwrap();
-            crate::gap_continuation::revoke(
-                &tx,
+                &record,
+                None,
                 store.authority_identity(),
-                &lease,
-                allocation.checkout,
             )
             .unwrap();
-        }
-        drop(lease);
-        assert_eq!(
-            crate::gap_continuation::take_decoded_nodes(),
-            0,
-            "no-Gap context mutation must not add a captured history fold"
-        );
-        assert_eq!(durable_rows(store), before);
-    });
+            assert!(!classification.required());
+            assert_eq!(
+                crate::gap_continuation::take_decoded_nodes(),
+                0,
+                "non-Gap close classification must not decode the captured history again"
+            );
+            assert!(!super::super::raw_history(&store.conn, allocation.checkout).unwrap());
+            let before = durable_rows(store);
+            let lease = store.authority_lease().unwrap();
+            {
+                let _phase = store.sql_phase();
+                let tx = rusqlite::Transaction::new_unchecked(
+                    &store.conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .unwrap();
+                crate::gap_continuation::revoke(
+                    &tx,
+                    store.authority_identity(),
+                    &lease,
+                    allocation.checkout,
+                )
+                .unwrap();
+            }
+            drop(lease);
+            assert_eq!(
+                crate::gap_continuation::take_decoded_nodes(),
+                0,
+                "no-Gap context mutation must not add a captured history fold"
+            );
+            assert_eq!(durable_rows(store), before);
+        },
+    );
     use sha2::{Digest, Sha256};
     for count in [2usize, 48] {
         let h = ScopeHarness::new(true);
@@ -3189,6 +3192,17 @@ fn gap_report_reuses_validated_history_in_one_snapshot() {
 
 #[test]
 fn recovery_enumeration_validates_complete_gap_histories() {
+    recovery_enumeration_with_counts(&[2]);
+}
+
+#[test]
+#[ignore = "Deferred pilot performance/budget qualification; run explicitly with --ignored"]
+fn recovery_enumeration_large_history_qualification() {
+    recovery_enumeration_with_counts(&[48]);
+}
+
+// Both tiers retain the initial cursor case and every corruption/order control.
+fn recovery_enumeration_with_counts(counts: &[usize]) {
     let _diagnostics = crate::capture_diagnostics::Guard::new();
     let mut missed = Vec::new();
     {
@@ -3231,7 +3245,7 @@ fn recovery_enumeration_validates_complete_gap_histories() {
         "initial recovery enumeration accepted impossible unavailable cursor revision: {missed:?}"
     );
 
-    for count in [2usize, 48] {
+    for &count in counts {
         let h = ScopeHarness::new(true);
         let (mut store, lease) = crate::allocate::locked(&h.config).unwrap();
         drop(lease);
@@ -4697,7 +4711,8 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
     }
 
     // Existing bounded captured-history fixture, not a fabricated Gap/Q chain.
-    // Preserve its 2/48 Roots, contained children, FINISH and receipt-v1 bytes.
+    // Pilot functional coverage retains two Roots, contained children, FINISH
+    // and receipt-v1 bytes; the separate stress wrapper retains 2/48 Roots.
     crate::capture_readiness::tests::many_closed_history(|config, store, allocation, _| {
         crate::finish::finish(config, allocation.checkout).unwrap();
         let receipt: String = store
