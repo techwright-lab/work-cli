@@ -797,8 +797,8 @@ mod tests {
                 "execution_chain": [{"kind":"executor","system":"test"}]
             },
             "input": {
-                "command_digest": [1; 32],
-                "input_digest": [2; 32],
+                "command_digest": vec![1; 32],
+                "input_digest": vec![2; 32],
                 "context_ref": "context",
                 "intent_ref": "intent",
                 "boot": BOOT
