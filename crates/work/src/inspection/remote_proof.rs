@@ -163,6 +163,7 @@ fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>)
         None,
         None,
         None,
+        None,
         #[cfg(test)]
         observer,
         #[cfg(test)]
@@ -196,6 +197,7 @@ pub(super) fn audit_path(
         Some(audit),
         None,
         None,
+        None,
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -213,6 +215,7 @@ pub(super) fn approval_path(
         checkout,
         Some(audit),
         Some(collector),
+        None,
         None,
         #[cfg(test)]
         None,
@@ -232,6 +235,26 @@ pub(super) fn recovery_path(
         Some(audit),
         None,
         Some(collector),
+        None,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        None,
+    )
+}
+pub(super) fn retirement_path(
+    path: &Path,
+    checkout: Uuid,
+    audit: &mut super::preservation::Audit,
+    collector: &mut super::retirement::Collector,
+) -> RemoteReport {
+    verify_with_audit(
+        path,
+        checkout,
+        Some(audit),
+        None,
+        None,
+        Some(collector),
         #[cfg(test)]
         None,
         #[cfg(test)]
@@ -244,6 +267,7 @@ fn verify_with_audit(
     mut audit: Option<&mut super::preservation::Audit>,
     mut approval: Option<&mut super::approval::Collector>,
     mut recovery: Option<&mut super::recovery_refs::Collector>,
+    mut retirement: Option<&mut super::retirement::Collector>,
     #[cfg(test)] mut observer: Observer<'_>,
     #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
 ) -> RemoteReport {
@@ -251,6 +275,7 @@ fn verify_with_audit(
     let mut audit_nonancestor = false;
     let mut approval_retained = None;
     let mut recovery_retained = None;
+    let mut retirement_retained = None;
     let mut report = RemoteReport::held(checkout);
     let mut scratch = None;
     let result = (|| -> Held<()> {
@@ -272,6 +297,9 @@ fn verify_with_audit(
         } else if let Some(collector) = recovery.as_deref_mut() {
             collector.configure(&document, &config)?;
             collector.context(&mut b)?
+        } else if let Some(collector) = retirement.as_deref_mut() {
+            collector.configure(&document, &config)?;
+            collector.context(&mut b)?
         } else {
             readonly_context(&config, checkout, &mut b)?
         };
@@ -288,6 +316,9 @@ fn verify_with_audit(
             input(native_anchor_path(path))?;
         }
         if let Some(collector) = recovery.as_deref_mut() {
+            collector.lock_common(&context, &mut b)?;
+        }
+        if let Some(collector) = retirement.as_deref_mut() {
             collector.lock_common(&context, &mut b)?;
         }
         let targets: Vec<_> = policy
@@ -326,6 +357,12 @@ fn verify_with_audit(
         ))?;
         let inputs = input(GitInputs::capture(&context, &census, &mut b))?;
         if let Some(collector) = recovery.as_deref_mut() {
+            collector.confirm_common(
+                &inputs.common,
+                identity.common_git_dir.as_os_str().as_bytes(),
+            )?;
+        }
+        if let Some(collector) = retirement.as_deref_mut() {
             collector.confirm_common(
                 &inputs.common,
                 identity.common_git_dir.as_os_str().as_bytes(),
@@ -529,6 +566,8 @@ fn verify_with_audit(
             collector.context(&mut b)?
         } else if let Some(collector) = recovery.as_deref_mut() {
             collector.context(&mut b)?
+        } else if let Some(collector) = retirement.as_deref_mut() {
+            collector.context(&mut b)?
         } else {
             readonly_context(&config, checkout, &mut b)?
         };
@@ -612,6 +651,30 @@ fn verify_with_audit(
                 document_policy: policy_bytes,
                 config: current_config_manifest,
             });
+        } else if retirement.is_some() {
+            let policies = document
+                .inspection_policies()
+                .map_err(|_| "inspection_policy_unknown")?;
+            let (entries, findings) = classify(&census, &proof, &policies);
+            let mut evidence = Vec::new();
+            frame(&mut evidence, 1, &census.fingerprint());
+            frame(&mut evidence, 2, &inputs.fingerprint());
+            frame(&mut evidence, 3, &proof.canonical);
+            frame(&mut evidence, 4, &last_census.fingerprint());
+            frame(&mut evidence, 5, &last_inputs.fingerprint());
+            frame(&mut evidence, 6, &last_proof.canonical);
+            retirement_retained = Some(super::retirement::RetainedRetirement {
+                context,
+                physical: Physical {
+                    first: census,
+                    before: inputs,
+                    last: Some((last_census, last_inputs)),
+                },
+                manifests: [config_manifest, current_config_manifest],
+                entries,
+                findings,
+                evidence,
+            });
         }
         input(b.check())
     })();
@@ -685,6 +748,20 @@ fn verify_with_audit(
                     .take_recovery_plan()
                     .and_then(|census| collector.seal(retained, census, b, &report)),
                 _ => Err("recovery_sequence_unknown"),
+            }
+        } else {
+            Err(report.reason)
+        };
+        if let Err(reason) = seal {
+            collector.failed(reason);
+        }
+    } else if let Some(collector) = retirement {
+        let seal = if report.observed() {
+            match (retirement_retained, audit) {
+                (Some(retained), Some(audit)) => audit
+                    .take_retirement_evidence()
+                    .and_then(|evidence| collector.seal(retained, evidence, b)),
+                _ => Err("retirement_sequence_unknown"),
             }
         } else {
             Err(report.reason)

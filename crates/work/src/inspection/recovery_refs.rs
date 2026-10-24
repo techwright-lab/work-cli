@@ -1278,6 +1278,154 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     }
 }
 
+fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    let authority = open_lock_authority(store)?;
+    let authority_id = lock_identity(&authority)?;
+    let directory = match rfs::openat2(
+        &authority,
+        LOCK_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        LOCK_RESOLVE,
+    ) {
+        Ok(dir) => File::from(dir),
+        Err(error) if error == rustix::io::Errno::NOENT => return Err("preparation_required"),
+        Err(_) => return Err("lock_unknown"),
+    };
+    lock_directory_meta(&directory)?;
+    let named_dir = open_lock_child(&authority, LOCK_DIR, OFlags::PATH | OFlags::DIRECTORY)?;
+    if lock_identity(&named_dir)? != lock_identity(&directory)? {
+        return Err("lock_unknown");
+    }
+    let name = format!("{:016x}-{:016x}.lock", key.dev, key.ino);
+    let file = match rfs::openat2(
+        &directory,
+        name.as_str(),
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        LOCK_RESOLVE,
+    ) {
+        Ok(file) => File::from(file),
+        Err(error) if error == rustix::io::Errno::NOENT => return Err("preparation_required"),
+        Err(_) => return Err("lock_unknown"),
+    };
+    lock_file_meta(&file)?;
+    let named_file = open_lock_child(&directory, &name, OFlags::PATH)?;
+    if lock_identity(&named_file)? != lock_identity(&file)? {
+        return Err("lock_unknown");
+    }
+    match rfs::flock(&file, rfs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(OperationLock {
+            authority,
+            directory,
+            file,
+            authority_id,
+            directory_id: lock_identity(&named_dir)?,
+            file_id: lock_identity(&named_file)?,
+            name,
+        }),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err("preparation_busy"),
+        Err(_) => Err("lock_unknown"),
+    }
+}
+
+pub(super) struct ExistingLock {
+    lock: OperationLock,
+    key: CommonKey,
+}
+impl ExistingLock {
+    pub(super) fn retain(store: &Store, context: &Context, b: &mut Budget) -> Held<Self> {
+        let identity = context
+            .allocation
+            .identity
+            .as_ref()
+            .ok_or("identity_unknown")?;
+        native_anchor_path(&identity.common_git_dir).map_err(|_| "identity_unknown")?;
+        let manifest = filesystem::Manifest::new(&identity.common_git_dir, b)
+            .map_err(|_| "identity_unknown")?;
+        sync::persistent_manifest(&manifest)?;
+        let (dev, ino) = manifest.root_dev_ino();
+        let key = CommonKey {
+            path: identity.common_git_dir.as_os_str().as_bytes().to_vec(),
+            dev,
+            ino,
+        };
+        Ok(Self {
+            lock: acquire_existing_lock(store, &key)?,
+            key,
+        })
+    }
+    pub(super) fn confirm(
+        &self,
+        store: &Store,
+        common: &filesystem::Manifest,
+        path: &[u8],
+    ) -> Held<()> {
+        let (dev, ino) = common.root_dev_ino();
+        if (dev, ino) != (self.key.dev, self.key.ino) || self.key.path != path {
+            return Err("common_identity_changed");
+        }
+        self.lock.revalidate(store, &self.key, path)?;
+        sync::persistent_manifest(common)?;
+        Ok(())
+    }
+    pub(super) fn revalidate(&self, store: &Store, path: &[u8]) -> Held<()> {
+        self.lock.revalidate(store, &self.key, path)
+    }
+    pub(super) fn matches_census(&self, census: &preservation::RecoveryCensus) -> Held<()> {
+        if census.common_dev_ino() != (self.key.dev, self.key.ino) {
+            return Err("common_identity_changed");
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn verify_existing_protection(
+    census: &preservation::RecoveryCensus,
+    checkout: Uuid,
+) -> Held<Vec<(String, String)>> {
+    if census.reserved_namespace_held() {
+        return Err("recovery_namespace_unknown");
+    }
+    if census.packed_recovery() {
+        return Err("packed_recovery");
+    }
+    let plan = census.plan(checkout)?;
+    if plan.is_empty() {
+        return Err("recovery_target_unknown");
+    }
+    let targets = plan
+        .into_iter()
+        .map(|row| (row.reference, row.oid))
+        .collect::<Vec<_>>();
+    census.verify_named(&targets)?;
+    Ok(targets)
+}
+
+pub(super) fn sync_existing_protection(
+    objects: &filesystem::Manifest,
+    census: &mut preservation::RecoveryCensus,
+    targets: &[(String, String)],
+    b: &mut Budget,
+) -> Held<()> {
+    sync::persistent_manifest(census.common())?;
+    sync::sync_objects(objects, b)?;
+    let names = targets
+        .iter()
+        .map(|(reference, _)| reference.clone())
+        .collect::<Vec<_>>();
+    sync::sync_refs(census.common(), &names, false, b)?;
+    for (reference, _) in targets {
+        sync::recovery_log_absent(census.common_mut(), reference, b)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn prepare_for_assessment(path: &Path, checkout: Uuid) -> RecoveryReport {
+    prepare_path(path, checkout, Uuid::now_v7(), Fault::None)
+}
+
 #[cfg(test)]
 use crate as work_cli_api;
 #[cfg(test)]

@@ -175,6 +175,54 @@ impl Audit {
         }
         Ok(RecoveryCensus { local })
     }
+    pub(super) fn take_retirement_evidence(&mut self) -> Held<RetirementEvidence> {
+        if !self.sealed
+            || !self.report.inspection_findings.is_empty()
+            || !self.report.additional_work_holds.is_empty()
+        {
+            return Err("preservation_requirements_held");
+        }
+        if self.graph.is_none() || !self.rechecked {
+            return Err("census_unknown");
+        }
+        let local = self.local.as_ref().ok_or("census_unknown")?;
+        let graph = self.graph.as_ref().ok_or("census_unknown")?;
+        let mut semantic = Vec::new();
+        frame(&mut semantic, 0, b"work.approval.preservation.semantic.v1");
+        frame(&mut semantic, 1, &local.admin.approval_semantic_v1());
+        for (oid, object) in &local.objects {
+            frame(&mut semantic, 2, oid);
+            frame(&mut semantic, 3, object.kind.as_bytes());
+            frame(&mut semantic, 4, &object.size.to_be_bytes());
+            frame(
+                &mut semantic,
+                5,
+                &[
+                    u8::from(local.head_graph.contains(oid)),
+                    u8::from(graph.contains(oid)),
+                    u8::from(local.unclassified.contains(oid)),
+                ],
+            );
+        }
+        for (oid, provenance) in &local.roots {
+            frame(&mut semantic, 6, oid);
+            frame(
+                &mut semantic,
+                7,
+                &serde_json::to_vec(provenance).map_err(|_| "census_unknown")?,
+            );
+        }
+        for oid in graph {
+            frame(&mut semantic, 8, oid);
+        }
+        let approval_invalidation = local.fingerprint();
+        let local = self.local.take().ok_or("census_unknown")?;
+        Ok(RetirementEvidence {
+            census: RecoveryCensus { local },
+            approval_semantic: Sha256::digest(semantic).to_vec(),
+            approval_invalidation,
+        })
+    }
     pub(super) fn begin(
         &mut self,
         document: &ConfigDocument,
@@ -573,6 +621,12 @@ pub(super) struct RecoveryPlanRow {
     pub oid: String,
     pub object_type: &'static str,
     pub provenance: Vec<u8>,
+}
+
+pub(super) struct RetirementEvidence {
+    pub(super) census: RecoveryCensus,
+    pub(super) approval_semantic: Vec<u8>,
+    pub(super) approval_invalidation: Vec<u8>,
 }
 
 pub(super) struct RecoveryCensus {

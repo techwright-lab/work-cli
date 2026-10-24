@@ -28,6 +28,9 @@ pub use approval::{approve_begin, approve_confirm, ApprovalReport};
 mod recovery_refs;
 pub use recovery_refs::{prepare_recovery, prepare_recovery_refused, RecoveryReport};
 
+mod retirement;
+pub use retirement::{assess_retirement, RetirementAssessmentReport};
+
 mod receipts;
 pub use receipts::{
     inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,

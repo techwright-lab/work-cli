@@ -47,6 +47,10 @@ impl ApprovalReport {
     pub fn reason(&self) -> &str {
         self.reason
     }
+    #[cfg(test)]
+    pub(super) fn test_receipt_id(&self) -> Option<Uuid> {
+        self.receipt_id
+    }
     fn held(checkout: Uuid) -> Self {
         Self { checkout, outcome:"held", reason:"configuration_unknown", receipt_id:None, baseline_id:None, reserved_assertion_id:None, inspection_digest:None, quiet_window_seconds:None, confirmation_deadline:None, assertion_expiry:None, preservation:None, recorded:false, retirement_authority:false, automatic_quiescence:false, limitation:"Two unchanged observations are not continuous monitoring or OS quiescence. Only confirm --assert-quiescent records the operator's claim that relevant sessions, background jobs and editors are stopped. Writer, holds, task charge and all lifecycle rows remain unchanged; assertions expire and are historical after any activity or binding change." }
     }
@@ -410,12 +414,12 @@ impl ApprovalRecord {
 }
 
 #[derive(PartialEq, Eq)]
-struct AdoptedMode {
+pub(super) struct AdoptedMode {
     digest: [u8; 32],
     activity: [u8; 32],
 }
 impl AdoptedMode {
-    fn read(tx: &rusqlite::Connection, context: &Context) -> Held<Self> {
+    pub(super) fn read(tx: &rusqlite::Connection, context: &Context) -> Held<Self> {
         let checkout = context.allocation.checkout.to_string();
         let runs: Vec<String> = {
             let mut stmt = tx
@@ -873,6 +877,140 @@ impl SealedApproval {
     }
 }
 
+/// Fresh validation of a named v2 operator assertion. Never publishes, renews,
+/// reconfirms, or treats the decoded receipt as a transaction capability.
+pub(super) struct AssertionAssessment {
+    id: Uuid,
+    record: ApprovalRecord,
+    latest_trusted: ApprovalStamp,
+    clock: Clock,
+}
+impl AssertionAssessment {
+    pub(super) fn recheck_expiry(&mut self, budget: &mut Budget) -> Held<()> {
+        let now = self.clock.sample(&boot(budget)?)?;
+        elapsed(&self.latest_trusted, &now)?;
+        elapsed(&self.record.collection_end, &now)?;
+        let expiry = self
+            .record
+            .claim_expiry
+            .as_ref()
+            .ok_or("assertion_ineligible")?;
+        within(&self.record.baseline_end, &now, expiry)?;
+        self.latest_trusted = now;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self) {
+        self.record.claim_expiry = Some(Deadline {
+            wall_ms: 1,
+            boottime_ns: 1,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn consume_operator_assertion(
+    store: &Store,
+    checkout: Uuid,
+    assertion: Uuid,
+    context: &Context,
+    physical: &Physical,
+    manifests: &[filesystem::Manifest; 2],
+    local_semantic: &[u8],
+    local_invalidation: &[u8],
+    observation: &Observation,
+    mode: &AdoptedMode,
+    policy_digest: &str,
+    budget: &mut Budget,
+) -> Held<AssertionAssessment> {
+    let receipt = read_receipt(store, assertion).map_err(|_| "assertion_ineligible")?;
+    let record = receipt
+        .approval_record()
+        .ok_or("assertion_ineligible")?
+        .clone();
+    if receipt.checkout() != checkout
+        || record.kind != RecordKind::OperatorAssertion
+        || record.binding_version != 1
+        || record.claim_version != Some(1)
+        || record.mode != "adopted"
+        || record.reserved_assertion_id != assertion
+    {
+        return Err("assertion_ineligible");
+    }
+    if observation.coverage() != Coverage::Complete || !observation.findings().is_empty() {
+        return Err("inspection_held");
+    }
+    let context_digest = hex(&Sha256::digest(&context.canonical));
+    let mut semantic = Vec::new();
+    frame(&mut semantic, 0, b"work.approval.semantic.v1");
+    for bytes in [
+        context_digest.as_bytes(),
+        policy_digest.as_bytes(),
+        &mode.digest,
+        &mode.activity,
+        &entry_semantics(observation),
+        &physical.first.approval_semantic_v1(),
+        &physical.before.approval_semantic_v1(),
+        local_semantic,
+    ] {
+        frame(&mut semantic, 1, bytes);
+    }
+    let mut invalidation = Vec::new();
+    frame(&mut invalidation, 0, b"work.approval.invalidation.v1");
+    for bytes in [
+        context.canonical.as_slice(),
+        &mode.digest,
+        &mode.activity,
+        &physical.first.fingerprint(),
+        &physical.before.fingerprint(),
+        local_invalidation,
+    ] {
+        frame(&mut invalidation, 1, bytes);
+    }
+    for manifest in manifests {
+        frame(&mut semantic, 2, &manifest.approval_semantic_v1());
+        frame(&mut invalidation, 2, &manifest.fingerprint());
+    }
+    if record.semantic != hex(&Sha256::digest(semantic))
+        || record.context != context_digest
+        || record.invalidation != hex(&Sha256::digest(invalidation))
+        || record.activity != hex(&mode.activity)
+        || record.mode_digest != hex(&mode.digest)
+        || record.policy_digest != policy_digest
+    {
+        return Err("assertion_invalidated");
+    }
+    let clock = Clock::default();
+    let now = clock.sample(&boot(budget)?)?;
+    let claim = record.claim_time.as_ref().ok_or("assertion_ineligible")?;
+    elapsed(claim, &now)?;
+    elapsed(&record.collection_end, &now)?;
+    within(
+        &record.baseline_end,
+        &now,
+        record.claim_expiry.as_ref().ok_or("assertion_ineligible")?,
+    )?;
+    Ok(AssertionAssessment {
+        id: assertion,
+        record,
+        latest_trusted: now,
+        clock,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn begin_path(path: &Path, checkout: Uuid) -> ApprovalReport {
+    approve_path(path, checkout, Operation::Begin, Clock::default())
+}
+#[cfg(test)]
+pub(super) fn confirm_path(path: &Path, checkout: Uuid, observation: Uuid) -> ApprovalReport {
+    approve_path(
+        path,
+        checkout,
+        Operation::Confirm { observation },
+        Clock::default(),
+    )
+}
 #[cfg(test)]
 pub(super) fn collect_for_receipt_test(path: &Path, checkout: Uuid) -> (Store, SealedApproval) {
     let mut collector = Collector::new(checkout, Operation::Begin, Clock::default());

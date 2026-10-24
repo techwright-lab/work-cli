@@ -245,6 +245,22 @@ fn fresh_root_only_proof_hands_off_writer_without_finishing_or_releasing_charge(
 }
 
 #[test]
+fn closed_group_snapshot_and_empty_certify_still_reject() {
+    let (_dir, mut store, checkout) = fixture();
+    let r = request(checkout);
+    store.begin_run(&r).unwrap();
+    let b = binding(&r);
+    store.record_bound(&r, &b).unwrap();
+    let os = ClosureOs::new(&r, &b);
+    let snap = store.group_snapshot(&r.identity().run).unwrap();
+    let proof = snap.certify_empty(&os.driver, &b).unwrap();
+    store.close_supervised_group(&snap, &proof).unwrap();
+    assert!(store.group_snapshot(&r.identity().run).is_err());
+    assert!(snap.certify_empty(&os.driver, &b).is_err());
+    assert!(snap.certify_historical_empty(&os.driver).is_err());
+}
+
+#[test]
 fn root_roster_cannot_be_omitted_and_uncertain_os_evidence_never_certifies() {
     for case in [
         "live",

@@ -294,31 +294,7 @@ impl GroupSnapshot {
     /// Actual validated hosts only, never raw expected_host or a caller roster.
     /// Keep same-PID/different-start identities; exact shared hosts may dedup.
     fn closure_roster(&self, root: ChildIdentity) -> Result<Vec<Participant>> {
-        use crate::run_participants::Enrollment;
-        let mut identities = vec![root];
-        for child in &self.record.children {
-            if child.enrollment != Enrollment::Contained {
-                return Err(StoreError::Invalid);
-            }
-            let host = &child.host.as_ref().ok_or(StoreError::Invalid)?.host;
-            let identity = ChildIdentity {
-                pid: host.pid,
-                start_ticks: host.start_ticks,
-                boot: host.boot.clone(),
-                cgroup: host.cgroup.clone(),
-            };
-            if !identities.contains(&identity) {
-                identities.push(identity);
-            }
-        }
-        Ok(identities
-            .into_iter()
-            .map(|identity| Participant {
-                // Candidate only, inspected twice even for declared terminal hosts.
-                status: ParticipantStatus::ProvenAbsent,
-                identity: Some(identity),
-            })
-            .collect())
+        closure_roster(&self.record, root)
     }
     fn empty_proof(&self, collected_at: Instant) -> GroupEmptyProof {
         GroupEmptyProof {
@@ -388,9 +364,148 @@ impl GroupSnapshot {
     }
 }
 
+fn closure_roster(record: &RunRecord, root: ChildIdentity) -> Result<Vec<Participant>> {
+    use crate::run_participants::Enrollment;
+    let mut identities = vec![root];
+    for child in &record.children {
+        if child.enrollment != Enrollment::Contained {
+            return Err(StoreError::Invalid);
+        }
+        let host = &child.host.as_ref().ok_or(StoreError::Invalid)?.host;
+        let identity = ChildIdentity {
+            pid: host.pid,
+            start_ticks: host.start_ticks,
+            boot: host.boot.clone(),
+            cgroup: host.cgroup.clone(),
+        };
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+    }
+    Ok(identities
+        .into_iter()
+        .map(|identity| Participant {
+            // Candidate only, inspected twice even for declared terminal hosts.
+            status: ParticipantStatus::ProvenAbsent,
+            identity: Some(identity),
+        })
+        .collect())
+}
+
+/// Snapshot-local closed ordinary supervised candidate. Not a Binding, emptiness
+/// token, or writer-release capability. Private fields, no Clone/Deserialize.
+pub(crate) struct TerminalCandidate {
+    record: RunRecord,
+    expected: RecordedScopeExpectation,
+    roster: Vec<Participant>,
+}
+/// Live recorded-scope evidence bound to one candidate. Not serializable.
+pub(crate) struct TerminalObservation {
+    observed_at: Instant,
+    identity: ScopeIdentity,
+    boot: String,
+    observation: crate::runtime_scope::Observation,
+    completed: bool,
+}
+impl TerminalCandidate {
+    fn from_record(record: RunRecord) -> Result<Self> {
+        if !record.closed
+            || record.recovery_hold
+            || record.binding.is_none()
+            || record.outcome.is_none()
+        {
+            return Err(StoreError::Invalid);
+        }
+        let b = record.binding.as_ref().ok_or(StoreError::Invalid)?;
+        let expected = RecordedScopeExpectation {
+            identity: ScopeIdentity {
+                unit: b.unit.clone(),
+                invocation: b.invocation.clone(),
+                cgroup: b.cgroup.clone(),
+            },
+            boot: b.boot.clone(),
+        };
+        let roster = closure_roster(
+            &record,
+            ChildIdentity {
+                pid: b.root_pid,
+                start_ticks: b.root_start_ticks,
+                boot: b.boot.clone(),
+                cgroup: b.root_cgroup.clone(),
+            },
+        )?;
+        Ok(Self {
+            record,
+            expected,
+            roster,
+        })
+    }
+    pub(crate) fn observe(&self, driver: &Driver) -> Result<TerminalObservation> {
+        let intent = LaunchIntent::new(
+            self.record.request.identity.run.clone(),
+            &self.record.request.input.boot,
+        )
+        .map_err(|_| StoreError::Invalid)?;
+        let observation = driver.observe_recorded(&intent, &self.expected, &self.roster);
+        Ok(TerminalObservation {
+            observed_at: observation.observed_at,
+            identity: self.expected.identity.clone(),
+            boot: self.expected.boot.clone(),
+            observation,
+            completed: self.record.outcome == Some(RootOutcome::Completed),
+        })
+    }
+}
+impl TerminalObservation {
+    pub(crate) fn observed_at(&self) -> Instant {
+        self.observed_at
+    }
+    pub(crate) fn completed(&self) -> bool {
+        self.completed
+    }
+    pub(crate) fn verify_empty(
+        &self,
+        now: Instant,
+    ) -> std::result::Result<(), crate::runtime_scope::HoldReason> {
+        crate::runtime_scope::verify_empty_evidence(
+            &self.identity,
+            &self.boot,
+            &self.observation,
+            now,
+            EMPTY_MAX_AGE,
+        )
+    }
+}
 use crate::{events::Event, store::emit};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
+/// Validate every related group in this snapshot. Closed ordinary supervised
+/// terminal records become candidates; open, held, mixed, or unbindable rows fail.
+pub(crate) fn terminal_candidates(
+    conn: &Connection,
+    checkout: Uuid,
+) -> Result<Vec<TerminalCandidate>> {
+    let checkout_id = CheckoutId::parse(&checkout.to_string()).map_err(|_| StoreError::Invalid)?;
+    crate::capture_journal::validate_related(conn, &checkout_id)?;
+    let ids: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT r.id FROM runs r JOIN run_groups g ON g.id=r.group_id WHERE g.checkout=?1 ORDER BY r.id",
+        )?;
+        let rows = stmt.query_map([checkout.to_string()], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if ids.is_empty() {
+        return Err(StoreError::Invalid);
+    }
+    let mut candidates = Vec::new();
+    for id in ids {
+        let run = RunId::parse(&id).map_err(|_| StoreError::Invalid)?;
+        let record = read(conn, &run)?.ok_or(StoreError::Invalid)?;
+        let record = exact(conn, &record.request)?;
+        candidates.push(TerminalCandidate::from_record(record)?);
+    }
+    Ok(candidates)
+}
 fn json<T: Serialize>(value: &T) -> Result<String> {
     serde_json::to_string(value).map_err(|_| StoreError::Invalid)
 }

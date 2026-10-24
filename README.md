@@ -278,6 +278,43 @@ Tests are prospective owned-fixture sources selected in the existing Task10 GitH
 job, at normal concurrency, with private finite clock/failure seams. No local
 execution, compiled correctness, passing CI or full Task10 completion is claimed.
 
+### Retirement assessment prerequisite (Task10 source, not retirement acceptance)
+
+There is **no** `work retire` command, flag, or automatic finish/reap invocation.
+The public library wrapper is:
+
+```rust
+inspection::assess_retirement(config_path, checkout, assertion) -> RetirementAssessmentReport
+```
+
+`config_path` is an explicit trusted configuration document read with the existing
+bounded no-follow authority readers. Callers cannot supply a Driver, clock, roster,
+OID, or positive proof field. The wrapper always reports `execution_enabled:false`,
+`retirement_authority:false`, retained writer charges, and cooperative/LOCAL
+limitations. It never says ready-to-delete. The private assessment object is not
+Clone/Deserialize and is dropped after the passive report is produced.
+
+The collector reuses the existing remote/audit coordinator: one bounded SQL snapshot
+(mode, immutable terminal candidates, finish receipt) then drop SQL; retain the
+existing recovery-preparation lock without creating it (absent preparation holds);
+complete inspection/remote validation before local import; verify and fsync **existing**
+recovery objects/refs/attachments without CAS, intent/result publication, or new lock
+files; recapture actual census/Git/admin/config/lock after that I/O; observe supervised
+quiescence last with `Driver::observe_recorded` and the original two-second age, or
+consume a named strict v2 operator assertion without publishing; then a short authority
+lease/read of exact context. Historic receipts are never positive authority.
+
+Closed ordinary supervised groups are observed through a separate private terminal
+candidate path. Existing `group_snapshot` / `certify_empty` / `certify_historical_empty`
+still reject closed groups and still mint no Binding or GroupEmptyProof. Captured/Gap
+histories are explicit holds. Adopted positive assessment still reports
+`task_completion: declaration_required`; an assertion is not a completion declaration.
+No lifecycle, receipt, ref, writer, charge, or outbox rows are written.
+
+Tests are source-authored for the Task10 GitHub job using owned Store/Git/local-bare
+and simulated manager/proc/cgroup fixtures. Simulated fixtures are not live user-systemd
+qualification. No local execution or full Task10 completion is claimed.
+
 ### Capture construction (Tasks 8.1–8.4b; implementation, not acceptance)
 
 The library exposes `capture_bridge` typed begin/finish/retry requests and
