@@ -518,7 +518,7 @@ fn public_adopted_prepare_writer_hold_offline_abort_and_fresh_assertion() {
         // directory (which also anchors the config witness) or any local input.
         let remote = f.temp.path().join("approval-backup.git");
         let permissions = fs::metadata(&remote).unwrap().permissions();
-        fs::set_permissions(&remote, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0o0)).unwrap();
         let aborted = wire(abort_retirement(&config, checkout, operation, revision));
         committed(&aborted, operation, "aborted", revision + 1);
         expected_events.push((
