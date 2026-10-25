@@ -525,6 +525,40 @@ mod physical_fixture {
     type Callback = Box<dyn FnOnce(&super::Store)>;
     thread_local! { pub(super) static AFTER_FIRST: std::cell::RefCell<Option<Callback>> = const { std::cell::RefCell::new(None) }; }
 }
+#[cfg(test)]
+mod precheckout_fixture {
+    type Callback = Box<dyn FnMut(&super::Store, &super::Allocation)>;
+    thread_local! {
+        static OBSERVER: std::cell::RefCell<Option<Callback>> = const { std::cell::RefCell::new(None) };
+    }
+    // A thread-local registration must be removed on its installing thread,
+    // including unwinding. The marker makes this scoped guard non-Send/non-Sync.
+    pub(super) struct Guard(std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    pub(super) fn observe(
+        callback: impl FnMut(&super::Store, &super::Allocation) + 'static,
+    ) -> Guard {
+        OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(callback));
+        });
+        Guard(std::marker::PhantomData)
+    }
+    pub(super) fn boundary(store: &super::Store, candidate: &super::Allocation) {
+        OBSERVER.with(|slot| {
+            if let Some(callback) = slot.borrow_mut().as_mut() {
+                callback(store, candidate);
+            }
+        });
+    }
+}
+
 fn collect_physical(
     store: &Store,
     a: Allocation,
@@ -947,6 +981,143 @@ mod physical_tests {
         .unwrap();
         (temp, config, allocation)
     }
+    #[test]
+    fn schema_participation_covers_precheckout_allocation() {
+        use crate::retirement_journal::tests::source_rows;
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+        use std::{cell::RefCell, rc::Rc};
+
+        // Reuse the genuine native fixture, then start a distinct task/branch.
+        // fixture() returns no Store, so it cannot lend SH to the operation.
+        let (_temp, config, original) = fixture();
+        let registry = config.trusted_registry.as_ref().unwrap();
+        let directory = config.store_dir.as_ref().unwrap();
+        let repo = original.request.repository.as_ref().unwrap();
+        let identity = original.identity.as_ref().unwrap();
+        let store =
+            Store::open_existing_registered_readonly(registry, directory, &config.roots).unwrap();
+        let before_rows = source_rows(&store);
+        let before_charge = store.charged(&identity.common_git_dir, None).unwrap();
+        drop(store);
+        let source_identity = CheckoutIdentity::inspect(repo).unwrap();
+        let refs = || query(repo, &["for-each-ref", "--format=%(refname) %(objectname)"]).unwrap();
+        let before_refs = refs();
+        let marker = identity.private_git_dir.join("work-lease.json");
+        let before_marker = fs::read(&marker).unwrap();
+        let mut request = original.request.clone();
+        request.operation = Uuid::now_v7();
+        request.task = "schema-participation".into();
+        request.branch = Some("schema-participation".into());
+        assert_eq!(
+            probe_initialization_exclusive(registry).unwrap(),
+            ExclusiveProbe::Acquired,
+            "setup must not retain a participant"
+        );
+
+        let observations = Rc::new(RefCell::new(Vec::new()));
+        let observed = Rc::clone(&observations);
+        let hook = precheckout_fixture::observe(move |store, candidate| {
+            // Inspect the real nil-checkout candidate, after authority release
+            // but before any reservation. Neither probe opens another Store.
+            let schema = probe_initialization_exclusive(store.authority_identity().registry());
+            let authority = db(crate::store::AuthorityIdentity::open_lock(
+                &store.authority_identity().directory,
+                false,
+            ))
+            .and_then(|file| {
+                rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .map_err(io::Error::from)?;
+                rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock)
+                    .map_err(io::Error::from)
+            });
+            let autocommit = store.conn.is_autocommit();
+            // Read only the existing connection; no writer/open/transaction or
+            // new production budget phase is introduced by this observation.
+            let durable_count = store.conn.query_row(
+                "SELECT count(*) FROM checkouts WHERE operation=?1",
+                [candidate.request.operation.to_string()],
+                |row| row.get::<_, i64>(0),
+            );
+            // In particular, successful old-code EX is already unlocked here.
+            // Defer all assertions until start has finished its normal protocol.
+            observed.borrow_mut().push((
+                candidate.clone(),
+                autocommit,
+                durable_count,
+                authority,
+                schema,
+            ));
+        });
+        let result = start(&config, request.clone());
+        drop(hook);
+        let after_return = probe_initialization_exclusive(registry);
+        let store =
+            Store::open_existing_registered_readonly(registry, directory, &config.roots).unwrap();
+        let after_rows = source_rows(&store);
+        let after_charge = store.charged(&identity.common_git_dir, None).unwrap();
+        drop(store);
+
+        let allocation = result.unwrap();
+        assert_eq!(allocation.request, request);
+        assert_ne!(allocation.checkout, Uuid::nil());
+        assert_ne!(allocation.checkout, original.checkout);
+        assert_eq!(allocation.stage, "ready");
+        assert_eq!(allocation.base_commit, source_identity.head);
+        assert_eq!(CheckoutIdentity::inspect(repo).unwrap(), source_identity);
+        assert_eq!(
+            CheckoutIdentity::inspect(&original.destination).unwrap(),
+            *identity
+        );
+        assert_eq!(fs::read(&marker).unwrap(), before_marker);
+        let after_refs = refs();
+        for reference in before_refs.lines() {
+            assert!(after_refs.lines().any(|line| line == reference));
+        }
+        assert_eq!(
+            query(repo, &["rev-parse", "refs/heads/schema-participation"]).unwrap(),
+            allocation.base_commit
+        );
+        assert_eq!(before_charge, 1);
+        assert_eq!(
+            after_charge, 2,
+            "both original and newly acknowledged charges remain"
+        );
+        for (table, rows) in before_rows {
+            let (_, after) = after_rows.iter().find(|(name, _)| *name == table).unwrap();
+            for row in rows {
+                assert!(
+                    after.contains(&row),
+                    "original {table} row changed or disappeared"
+                );
+            }
+        }
+        assert_eq!(after_return.unwrap(), ExclusiveProbe::Acquired);
+        let observations = observations.borrow();
+        assert_eq!(
+            observations.len(),
+            1,
+            "actual precheckout boundary must be reached once"
+        );
+        let (candidate, autocommit, durable_count, authority, schema) = &observations[0];
+        assert_eq!(candidate.checkout, Uuid::nil());
+        assert_eq!(candidate.request, request);
+        assert_eq!(candidate.destination, allocation.destination);
+        assert!(candidate.identity.is_none());
+        assert!(*autocommit, "observation must be outside SQL");
+        assert_eq!(
+            *durable_count.as_ref().unwrap(),
+            0,
+            "no durable checkout yet"
+        );
+        assert!(
+            authority.is_ok(),
+            "actual authority must already be released: {authority:?}"
+        );
+        assert_eq!(schema.as_ref().unwrap(), &ExclusiveProbe::Blocked);
+    }
+
     #[test]
     fn authority_lease_drop_unlocks_while_an_inherited_descriptor_remains_open() {
         let (_temp, config, _) = fixture();
@@ -1702,6 +1873,10 @@ pub fn start_observed(
     };
     // New-charge-only physical inputs cannot defeat a reusable match.
     let candidate = candidate_observation(config, &r, &source);
+    #[cfg(test)]
+    if let Ok((candidate, _, _)) = &candidate {
+        precheckout_fixture::boundary(&store, candidate);
+    }
     for (path, original) in &alias_observations {
         if CheckoutIdentity::inspect(path)? != *original {
             return Err(err("repository alias changed during observation"));

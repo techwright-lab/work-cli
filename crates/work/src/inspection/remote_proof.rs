@@ -1486,6 +1486,129 @@ mod tests {
         assert_eq!(report.transport(), Some("LOCAL"));
     }
     #[test]
+    fn schema_participation_survives_readonly_connection_close() {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+
+        let (f, config_path, remote) = setup();
+        let fixture::ManagedFixture {
+            temp,
+            repo,
+            root,
+            allocation,
+            store,
+        } = f;
+        let source_rows = crate::retirement_journal::tests::source_rows(&store);
+        // The fixture normally keeps a Store. It must not supply this operation's
+        // missing participation, even after the eventual implementation exists.
+        drop(store);
+        let registry = temp.path().join("registry");
+        let directory = temp.path().join("authority");
+        let config = Config::from_text(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        // Independent before/after fixture snapshots return DATA only, never a
+        // retained Context/Store. These are not the invocation's Budget or clocks.
+        let snapshot_data = || {
+            let context =
+                readonly_context(&config, allocation.checkout, &mut Budget::new()).unwrap();
+            (
+                context.canonical.clone(),
+                context.source.clone(),
+                context.history.clone(),
+                context.history_count,
+                serde_json::to_value(&context.allocation).unwrap(),
+            )
+        };
+        let before = snapshot_data();
+        let identity = allocation.identity.as_ref().unwrap();
+        let paths = [
+            config_path.clone(),
+            repo.join("tracked"),
+            allocation.destination.join("tracked"),
+            allocation.destination.join(".git"),
+            identity.private_git_dir.join("work-lease.json"),
+        ];
+        let contents: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+        let refs = |path: &Path| {
+            crate::identity::query(path, &["for-each-ref", "--format=%(refname) %(objectname)"])
+                .unwrap()
+        };
+        let local_refs = refs(&repo);
+        let remote_refs = refs(&remote);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired,
+            "no fixture Store or Context may survive into the invocation"
+        );
+
+        let mut observations = Vec::new();
+        let mut hook = |phase, scratch: &Scratch| {
+            if matches!(phase, Phase::AfterAdvertisement | Phase::BeforeCleanup) {
+                // readonly_context has closed its connection before either real
+                // native boundary. Record only; do not panic and strand scratch
+                // when the old implementation lets this EX probe succeed.
+                observations.push((
+                    phase,
+                    probe_initialization_exclusive(&registry),
+                    scratch.path().to_owned(),
+                ));
+            }
+        };
+        let report = verify_path(&config_path, allocation.checkout, Some(&mut hook));
+        let after_return = probe_initialization_exclusive(&registry);
+        let after = snapshot_data();
+        let store = Store::open_existing_registered_readonly(
+            &registry,
+            &directory,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        let after_rows = crate::retirement_journal::tests::source_rows(&store);
+        drop(store);
+
+        assert!(report.observed(), "{report:?}");
+        assert_eq!(report.reason(), "consistent_observation");
+        assert_eq!(report.cleanup(), "complete");
+        assert_eq!(report.transport(), Some("LOCAL"));
+        assert_eq!(report.checkout(), allocation.checkout);
+        assert_eq!(report.local_oid(), Some(identity.head.as_str()));
+        assert_eq!(report.initial_remote_oid, report.local_oid);
+        assert_eq!(report.fetched_remote_oid, report.local_oid);
+        assert_eq!(report.fetched_local_oid, report.local_oid);
+        assert_eq!(report.final_remote_oid, report.local_oid);
+        assert_eq!(report.context_digest, Some(hex(&Sha256::digest(&before.0))));
+        assert!(!report.recorded && !report.retirement_authority);
+        assert_eq!(
+            before, after,
+            "complete source/history/allocation must survive"
+        );
+        assert_eq!(source_rows, after_rows, "including ownership and charges");
+        assert_eq!(local_refs, refs(&repo));
+        assert_eq!(remote_refs, refs(&remote));
+        for (path, bytes) in paths.iter().zip(contents) {
+            assert_eq!(fs::read(path).unwrap(), bytes, "{}", path.display());
+        }
+        assert_eq!(
+            observations.len(),
+            2,
+            "both native boundaries must be reached"
+        );
+        assert!(observations[0].0 == Phase::AfterAdvertisement);
+        assert!(observations[1].0 == Phase::BeforeCleanup);
+        for (_, _, scratch) in &observations {
+            assert!(
+                !scratch.try_exists().unwrap(),
+                "scratch cleanup must finish"
+            );
+        }
+        assert_eq!(after_return.unwrap(), ExclusiveProbe::Acquired);
+        // These are the intended old-code behavioral failures, deliberately last.
+        for (_, result, _) in observations {
+            assert_eq!(result.unwrap(), ExclusiveProbe::Blocked);
+        }
+    }
+
+    #[test]
     fn native_sha256_full_flow_uses_matching_object_format() {
         let (f, config, _) = setup_format("sha256");
         let report = verify_path(&config, f.allocation.checkout, None);

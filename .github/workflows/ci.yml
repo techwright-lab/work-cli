@@ -109,6 +109,9 @@ jobs:
             selector: 'capture_finalization::tests::'
           - kind: lib
             selector: 'store::tests::'
+          # W1 tests-first schema participation; no public movement wiring.
+          - kind: lib
+            selector: 'store::schema_participation_tests::'
           - kind: lib
             selector: 'run_participants::tests::'
           - kind: lib
@@ -162,6 +165,8 @@ jobs:
           - kind: test
             selector: run_recovery
           - kind: test
+            selector: store_recovery
+          - kind: test
             selector: inspection_receipts
           - kind: test
             selector: inspection_cli
@@ -178,10 +183,17 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Scoped tests
         run: |
+          set -o pipefail
+          output="$(mktemp)"
           if [ "${{ matrix.kind }}" = "lib" ]; then
-            cargo test -p work-cli --locked --lib ${{ matrix.selector }}
+            cargo test -p work-cli --locked --lib ${{ matrix.selector }} | tee "$output"
           else
-            cargo test -p work-cli --locked --test ${{ matrix.selector }}
+            cargo test -p work-cli --locked --test ${{ matrix.selector }} | tee "$output"
+          fi
+          if ! grep -Eq '^running [1-9][0-9]* tests?$' "$output" ||
+             ! grep -Eq '^test result: ok\. [1-9][0-9]* passed;' "$output"; then
+            echo "Scoped selector executed zero tests: ${{ matrix.selector }}" >&2
+            exit 1
           fi
       - name: Scoped Clippy
         run: |
