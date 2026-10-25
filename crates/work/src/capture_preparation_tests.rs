@@ -318,7 +318,10 @@ fn prepare_holds_prepared_intent_before_receiver() {
     let store = fixture_store(&cfg);
     let checkout = root_checkout(&root);
     seed_prepared_fence(&store, checkout);
-    let error = prepare(&cfg, &root, &spec).unwrap_err();
+    let error = match prepare(&cfg, &root, &spec) {
+        Ok(_) => panic!("fenced capture preparation unexpectedly succeeded"),
+        Err(error) => error,
+    };
     assert_eq!(
         error.to_string(),
         crate::store::StoreError::RetirementFenced.to_string()

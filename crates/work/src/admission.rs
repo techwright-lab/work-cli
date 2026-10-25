@@ -116,7 +116,7 @@ pub(crate) fn allocation_scope(
         repositories.insert(common.to_str().ok_or(StoreError::Invalid)?.to_owned());
     }
     Ok(crate::retirement_journal::Scope::Allocation {
-        checkouts,
+        checkouts: checkouts.into_iter().collect(),
         repositories,
     })
 }

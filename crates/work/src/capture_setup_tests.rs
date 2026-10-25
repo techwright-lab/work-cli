@@ -462,7 +462,10 @@ fn begin_under_guard_refuses_unrelated_checkout_guard() {
 fn begin_holds_prepared_intent_before_admission_rows() {
     let (_temp, cfg, store, a, r, s) = materialized();
     seed_prepared_fence(&store, a.checkout);
-    let error = super::begin(&cfg, &r, &s).unwrap_err();
+    let error = match super::begin(&cfg, &r, &s) {
+        Ok(_) => panic!("fenced capture setup unexpectedly succeeded"),
+        Err(error) => error,
+    };
     assert_eq!(
         error.to_string(),
         crate::store::StoreError::RetirementFenced.to_string()

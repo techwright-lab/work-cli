@@ -302,7 +302,7 @@ pub(crate) fn restore_under_guard(
     let physical =
         crate::capture_setup::inspect_physical(&allocation, seal.allocation.source_common())?;
     let registry = registry.canonicalize()?;
-    let authority = dir.canonicalize()?;
+    let authority_path = dir.canonicalize()?;
     let mut reinspection = allocation.clone();
     reinspection.identity = Some(physical.checkout.clone());
     if physical
@@ -343,7 +343,7 @@ pub(crate) fn restore_under_guard(
         physical,
         frontier: frontier_before,
         registry,
-        store: authority,
+        store: authority_path,
     };
     tx.execute("INSERT INTO capture_readiness(checkout,run,certificate) VALUES(?1,?2,?3) ON CONFLICT(checkout) DO UPDATE SET run=excluded.run,certificate=excluded.certificate,revoked=0", (allocation.checkout.to_string(), ack.run().to_string(), crate::capture_journal::json(&certificate)?))?;
     tx.execute(
