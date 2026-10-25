@@ -982,6 +982,26 @@ pub(crate) fn insert_prepared(
     lease.check_authority(authority)?;
     crate::store::SchemaRole::Current17.validate(tx)?;
     crate::quarantine_journal::validate_all(tx)?;
+    insert_prepared_checked(tx, insert)
+}
+
+/// Test-only fixture/fresh-owner admission, never an abort-role permission.
+/// The opaque proof borrows this exact final transaction, lease and insertion.
+#[cfg(test)]
+pub(crate) fn insert_prepared_legacy16(
+    tx: &Connection,
+    insert: &PreparedInsert,
+    lease: &AuthorityLease,
+    authority: &Arc<crate::store::AuthorityIdentity>,
+    proof: &crate::inspection::Legacy16PreparedInsertion<'_>,
+) -> Result<()> {
+    proof.check(tx, insert, lease, authority)?;
+    insert_prepared_checked(tx, insert)
+}
+
+// Structural insertion is private: both callers first admit their actual lease
+// and exact schema, and the legacy caller additionally requires live proof.
+fn insert_prepared_checked(tx: &Connection, insert: &PreparedInsert) -> Result<()> {
     exclude_prepare_operation(tx, insert.operation)?;
     let decoded = decode_record(&insert.record)?;
     let prior_count = decoded.prior_history_count;

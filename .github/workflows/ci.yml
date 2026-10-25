@@ -118,6 +118,9 @@ jobs:
           # Strict physical metadata only; no native movement authority.
           - kind: lib
             selector: 'quarantine_journal::tests::'
+          # Genuine16 fixture consumer only; no ordinary legacy preparation.
+          - kind: lib
+            selector: 'inspection::retirement::tests::legacy16_consumer_'
           - kind: lib
             selector: 'run_participants::tests::'
           - kind: lib

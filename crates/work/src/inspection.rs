@@ -30,6 +30,8 @@ pub(crate) use recovery_refs::AllocationCommonLock;
 pub use recovery_refs::{prepare_recovery, prepare_recovery_refused, RecoveryReport};
 
 mod retirement;
+#[cfg(test)]
+pub(crate) use retirement::Legacy16PreparedInsertion;
 pub use retirement::{assess_retirement, RetirementAssessmentReport};
 mod retirement_intent;
 pub use retirement_intent::{

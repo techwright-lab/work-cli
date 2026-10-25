@@ -109,6 +109,8 @@ struct Assessment {
     store: Store,
     assertion: Option<Uuid>,
     runtime: Option<(std::path::PathBuf, String)>,
+    #[cfg(test)]
+    legacy16: Option<Legacy16Admission>,
 }
 
 #[cfg(test)]
@@ -117,6 +119,224 @@ enum AssessmentReportPhase {
     NegativeDecision(&'static str),
     NoAssessment,
     MetadataComplete,
+}
+
+/// Owns the original constructor result and checkout EX. There is deliberately
+/// no constructor accepting an arbitrary Store, role, report or historical row.
+#[cfg(test)]
+struct Legacy16PrepareFixture {
+    store: Store,
+    guard: crate::checkout_guard::CheckoutGuard,
+    admission: Legacy16Admission,
+}
+
+#[cfg(test)]
+struct Legacy16Admission {
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+    schema: crate::store::SchemaParticipation,
+    checkout: Uuid,
+    cookie: i64,
+}
+
+#[cfg(test)]
+impl Legacy16PrepareFixture {
+    fn construct(
+        registry: &Path,
+        directory: &Path,
+        roots: &[PathBuf],
+        checkout: Uuid,
+    ) -> Held<Self> {
+        let store = Store::construct_legacy16_preobservation_fixture(registry, directory, roots)
+            .map_err(|_| "authority_unknown")?;
+        let guard = crate::checkout_guard::CheckoutGuard::exclusive(&store, checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let cookie = {
+            let _phase = store.sql_phase();
+            store
+                .schema_role()
+                .validate(&store.conn)
+                .map_err(|_| "authority_unknown")?;
+            let nonempty: bool = store
+                .conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM retirement_intents)", [], |r| {
+                    r.get(0)
+                })
+                .map_err(|_| "history_unknown")?;
+            if nonempty {
+                return Err("intent_conflict");
+            }
+            store
+                .conn
+                .query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .map_err(|_| "authority_unknown")?
+        };
+        let admission = Legacy16Admission {
+            authority: std::sync::Arc::clone(store.authority_identity()),
+            schema: store.schema_participation(),
+            checkout,
+            cookie,
+        };
+        admission
+            .check_store(&store)
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+        Ok(Self {
+            store,
+            guard,
+            admission,
+        })
+    }
+
+    fn collect(self, path: &Path, driver: &Driver) -> Held<Legacy16FreshPreparation> {
+        self.admission
+            .check_store(&self.store)
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+        self.guard
+            .require_matching(&self.store, self.admission.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let mut collector = Collector::new(self.admission.checkout, None);
+        collector.store = Some(self.store);
+        collector.guard = Some(self.guard);
+        collector.legacy16 = Some(self.admission);
+        let mut owner = collect_fresh_from_collector(path, collector, Some(driver))?;
+        owner.recheck_prepare_configuration(path)?;
+        Ok(Legacy16FreshPreparation { owner })
+    }
+}
+
+#[cfg(test)]
+impl Legacy16Admission {
+    fn check_store(&self, store: &Store) -> Result<(), crate::store::RetirementAdmissionError> {
+        if store.schema_role() != crate::store::SchemaRole::Legacy16Abort
+            || !store.writable_authority()
+            || !std::sync::Arc::ptr_eq(&self.authority, store.authority_identity())
+        {
+            return Err(crate::store::StoreError::Unsafe.into());
+        }
+        self.schema.matches_authority(store.authority_identity())?;
+        Ok(())
+    }
+
+    // Cached ownership and SQL only. Full guard/schema filesystem checks occur
+    // before the caller enters SQL or takes authority, never from this method.
+    fn check_sql(
+        &self,
+        conn: &rusqlite::Connection,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> Result<(), crate::store::RetirementAdmissionError> {
+        if !std::sync::Arc::ptr_eq(&self.authority, authority) {
+            return Err(crate::store::StoreError::Unsafe.into());
+        }
+        self.schema.matches_authority(authority)?;
+        crate::store::SchemaRole::Legacy16Abort.validate(conn)?;
+        let cookie: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .map_err(crate::store::StoreError::from)?;
+        if cookie != self.cookie {
+            return Err(crate::store::StoreError::Invalid.into());
+        }
+        crate::retirement_journal::validate_all(conn)
+            .map_err(crate::store::RetirementAdmissionError::history)
+    }
+
+    fn require_unfenced(
+        &self,
+        conn: &rusqlite::Connection,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+        checkout: Uuid,
+    ) -> Held<()> {
+        self.check_sql(conn, authority)
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+        if checkout != self.checkout {
+            return Err("authority_unknown");
+        }
+        let active: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE checkout=?1 AND stage IN ('prepared','held'))",
+            [checkout.to_string()], |r| r.get(0),
+        ).map_err(|_| "authority_unknown")?;
+        if active {
+            Err("intent_conflict")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn lease(
+        &self,
+        store: &Store,
+        guard: &crate::checkout_guard::CheckoutGuard,
+    ) -> Held<crate::allocate::AuthorityLease> {
+        self.check_store(store)
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+        if !guard.exclusive_held() {
+            return Err("exclusive_guard_required");
+        }
+        guard
+            .require_matching(store, self.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let lease =
+            crate::allocate::retirement_abort_lease(store).map_err(|_| "authority_unknown")?;
+        lease.check_abort(store).map_err(|_| "authority_unknown")?;
+        Ok(lease)
+    }
+}
+
+#[cfg(test)]
+struct Legacy16FreshPreparation {
+    owner: FreshRetirementAssessment,
+}
+#[cfg(test)]
+impl Legacy16FreshPreparation {
+    fn commit_prepared(self, operation: Uuid, fault: PrepareFault) -> Held<PrepareCommit> {
+        let a = &self.owner.retained.assessment;
+        a.legacy16
+            .as_ref()
+            .ok_or("authority_unknown")?
+            .check_store(&a.store)
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+        self.owner.commit_prepared_core(operation, false, fault)
+    }
+}
+
+/// Opaque, non-Clone borrow of the actual fresh owner's final transaction and
+/// insertion. Only the commit core below constructs it; DATA cannot mint one.
+#[cfg(test)]
+pub(crate) struct Legacy16PreparedInsertion<'a> {
+    admission: &'a Legacy16Admission,
+    tx: &'a rusqlite::Connection,
+    lease: &'a crate::allocate::AuthorityLease,
+    authority: &'a std::sync::Arc<crate::store::AuthorityIdentity>,
+    guard: &'a crate::checkout_guard::CheckoutGuard,
+    insert: &'a crate::retirement_journal::PreparedInsert,
+}
+#[cfg(test)]
+impl Legacy16PreparedInsertion<'_> {
+    pub(crate) fn check(
+        &self,
+        tx: &rusqlite::Connection,
+        insert: &crate::retirement_journal::PreparedInsert,
+        lease: &crate::allocate::AuthorityLease,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> crate::store::Result<()> {
+        use crate::store::{RetirementAdmissionError, StoreError};
+        if !std::ptr::eq(tx, self.tx)
+            || !std::ptr::eq(insert, self.insert)
+            || !std::ptr::eq(lease, self.lease)
+            || !std::sync::Arc::ptr_eq(authority, self.authority)
+            || tx.is_autocommit()
+            || !self.guard.exclusive_held()
+            || insert.checkout != self.admission.checkout
+            || insert.mode != crate::retirement_journal::Mode::Supervised
+        {
+            return Err(StoreError::Invalid);
+        }
+        self.guard.matches_checkout(insert.checkout)?;
+        self.admission
+            .check_sql(tx, authority)
+            .map_err(RetirementAdmissionError::into_store_error)?;
+        lease
+            .check_abort_transaction(tx, authority)
+            .map_err(RetirementAdmissionError::into_store_error)
+    }
 }
 
 pub(super) struct Collector {
@@ -134,6 +354,8 @@ pub(super) struct Collector {
     policies: Option<ValidatedPolicies>,
     runtime: Option<(std::path::PathBuf, String)>,
     sealed: Option<Assessment>,
+    #[cfg(test)]
+    legacy16: Option<Legacy16Admission>,
     failure: Option<&'static str>,
     // Scoped to this actual collection; never supplies evidence or ownership.
     #[cfg(test)]
@@ -156,6 +378,8 @@ impl Collector {
             policies: None,
             runtime: None,
             sealed: None,
+            #[cfg(test)]
+            legacy16: None,
             failure: None,
             #[cfg(test)]
             report_observer: None,
@@ -175,6 +399,7 @@ impl Collector {
         store: Store,
         guard: crate::checkout_guard::CheckoutGuard,
     ) -> Held<Self> {
+        store.require_current().map_err(|_| "authority_unknown")?;
         if !guard.exclusive_held() {
             return Err("exclusive_guard_required");
         }
@@ -195,15 +420,7 @@ impl Collector {
         document: &ConfigDocument,
         config: &crate::config::Config,
     ) -> Held<()> {
-        let readonly = Store::open_existing_registered_readonly(
-            config
-                .trusted_registry
-                .as_deref()
-                .ok_or("authority_unknown")?,
-            config.store_dir.as_deref().ok_or("authority_unknown")?,
-            &config.roots,
-        )
-        .map_err(|_| "authority_unknown")?;
+        let readonly = self.comparison_store(config)?;
         if let Some(guard) = &self.guard {
             // This separate readonly connection must not keep BEGIN open while
             // the retained Store's guard performs filesystem metadata checks.
@@ -214,8 +431,6 @@ impl Collector {
                     .execute_batch("ROLLBACK;")
                     .map_err(|_| "authority_unknown")?;
             }
-            // Configuration must match the retained guarded authority; never
-            // reopen a replacement mutable Store for the prepare collector.
             let retained = self.store.as_ref().ok_or("authority_unknown")?;
             guard
                 .require_matching(retained, self.checkout)
@@ -234,6 +449,56 @@ impl Collector {
                 .map_err(|error| receipts::store_error(error).label())?;
         }
         drop(readonly);
+        self.configure_retained(document, config)
+    }
+
+    fn comparison_store(&self, config: &crate::config::Config) -> Held<Store> {
+        #[cfg(test)]
+        if let Some(admission) = &self.legacy16 {
+            let retained = self.store.as_ref().ok_or("authority_unknown")?;
+            admission
+                .check_store(retained)
+                .map_err(crate::store::RetirementAdmissionError::reason)?;
+            let reader = Store::open_retirement_readonly(
+                config
+                    .trusted_registry
+                    .as_deref()
+                    .ok_or("authority_unknown")?,
+                config.store_dir.as_deref().ok_or("authority_unknown")?,
+                &config.roots,
+            )
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+            if reader.schema_role()
+                != crate::store::SchemaRole::HistoricalRead(
+                    crate::store::SupportedRetirementVersion::V16,
+                )
+            {
+                return Err("authority_unknown");
+            }
+            {
+                let _phase = reader.sql_phase();
+                admission
+                    .check_sql(&reader.conn, retained.authority_identity())
+                    .map_err(crate::store::RetirementAdmissionError::reason)?;
+            }
+            return Ok(reader);
+        }
+        Store::open_existing_registered_readonly(
+            config
+                .trusted_registry
+                .as_deref()
+                .ok_or("authority_unknown")?,
+            config.store_dir.as_deref().ok_or("authority_unknown")?,
+            &config.roots,
+        )
+        .map_err(|_| "authority_unknown")
+    }
+
+    fn configure_retained(
+        &mut self,
+        document: &ConfigDocument,
+        config: &crate::config::Config,
+    ) -> Held<()> {
         let (policies, approval_policy_digest, binding_policy_digest) =
             configuration_bindings(document)?;
         let store = match self.store.take() {
@@ -265,6 +530,12 @@ impl Collector {
                 .map_err(|_| "checkout_guard_unavailable")?;
         }
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
+        #[cfg(test)]
+        if let Some(admission) = &self.legacy16 {
+            admission
+                .check_store(store)
+                .map_err(crate::store::RetirementAdmissionError::reason)?;
+        }
         let authority = std::sync::Arc::clone(store.authority_identity());
         let schema = store.schema_participation();
         let role = store.schema_role();
@@ -274,13 +545,15 @@ impl Collector {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "authority_unknown")?;
         // Passive refusal only; never commits an ordinary-activity hold.
-        crate::retirement_journal::require_unfenced(&tx, self.checkout).map_err(|error| {
-            if self.guard.is_some() && matches!(error, crate::store::StoreError::RetirementFenced) {
-                "intent_conflict"
-            } else {
-                receipts::store_error(error).label()
-            }
-        })?;
+        require_collection_unfenced(
+            &tx,
+            self.checkout,
+            self.guard.as_ref(),
+            #[cfg(test)]
+            self.legacy16
+                .as_ref()
+                .map(|admission| (admission, &authority)),
+        )?;
         let context = snapshot_in_transaction(&tx, &authority, &schema, role, self.checkout, b)
             .map_err(|_| "context_unknown")?;
         b.reserve(context.history.len() as u64)
@@ -314,6 +587,10 @@ impl Collector {
         } else {
             return Err("mode_unknown");
         };
+        #[cfg(test)]
+        if self.legacy16.is_some() && mode != ModeKind::Supervised {
+            return Err("mode_unknown");
+        }
         if self.mode.as_ref().is_some_and(|m| *m != mode) {
             return Err("mode_changed");
         }
@@ -351,7 +628,15 @@ impl Collector {
             }
         }
         if self.guard.is_some() {
-            require_prepare_predecessor(&tx, &context, mode)?;
+            require_prepare_predecessor(
+                &tx,
+                &context,
+                mode,
+                #[cfg(test)]
+                self.legacy16
+                    .as_ref()
+                    .map(|admission| (admission, &authority)),
+            )?;
         }
         self.mode = Some(mode);
         tx.rollback().map_err(|_| "context_unknown")?;
@@ -401,6 +686,8 @@ impl Collector {
             store,
             assertion: self.assertion,
             runtime: self.runtime.take(),
+            #[cfg(test)]
+            legacy16: self.legacy16.take(),
         });
         Ok(())
     }
@@ -746,13 +1033,14 @@ fn decide(
             .map_err(|_| "checkout_guard_unavailable")?;
     }
     {
-        let lease = assessment
-            .store
-            .authority_lease()
-            .map_err(|_| "authority_unknown")?;
-        lease
-            .check(&assessment.store)
-            .map_err(|_| "authority_unknown")?;
+        let lease = prepare_lease(
+            &assessment.store,
+            #[cfg(test)]
+            assessment
+                .legacy16
+                .as_ref()
+                .map(|admission| (admission, assessment.guard.as_ref())),
+        )?;
         let authority = std::sync::Arc::clone(assessment.store.authority_identity());
         let schema = assessment.store.schema_participation();
         let role = assessment.store.schema_role();
@@ -762,6 +1050,10 @@ fn decide(
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "authority_unknown")?;
+        #[cfg(test)]
+        if let Some(admission) = assessment.legacy16.as_ref() {
+            check_prepare_transaction(&tx, &lease, &authority, Some(admission))?;
+        }
         let current = snapshot_in_transaction(
             &tx,
             &authority,
@@ -776,7 +1068,16 @@ fn decide(
             .reserve(current.history.len() as u64)
             .map_err(|_| "deadline")?;
         if assessment.guard.is_some() {
-            require_prepare_predecessor(&tx, &current, assessment.mode)?;
+            require_prepare_predecessor(
+                &tx,
+                &current,
+                assessment.mode,
+                #[cfg(test)]
+                assessment
+                    .legacy16
+                    .as_ref()
+                    .map(|admission| (admission, &authority)),
+            )?;
         }
         match assessment.mode {
             ModeKind::Adopted => {
@@ -827,19 +1128,106 @@ fn decide(
     })
 }
 
+fn prepare_lease(
+    store: &Store,
+    #[cfg(test)] legacy16: Option<(
+        &Legacy16Admission,
+        Option<&crate::checkout_guard::CheckoutGuard>,
+    )>,
+) -> Held<crate::allocate::AuthorityLease> {
+    #[cfg(test)]
+    if let Some((admission, guard)) = legacy16 {
+        return admission.lease(store, guard.ok_or("exclusive_guard_required")?);
+    }
+    let lease = store.authority_lease().map_err(|_| "authority_unknown")?;
+    lease.check(store).map_err(|_| "authority_unknown")?;
+    Ok(lease)
+}
+
+fn check_prepare_transaction(
+    #[cfg(test)] tx: &rusqlite::Connection,
+    lease: &crate::allocate::AuthorityLease,
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    #[cfg(test)] legacy16: Option<&Legacy16Admission>,
+) -> Held<()> {
+    #[cfg(test)]
+    if let Some(admission) = legacy16 {
+        admission
+            .check_sql(tx, authority)
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
+        return lease
+            .check_abort_transaction(tx, authority)
+            .map_err(crate::store::RetirementAdmissionError::reason);
+    }
+    lease
+        .check_authority(authority)
+        .map_err(|_| "authority_unknown")
+}
+
+fn require_collection_unfenced(
+    conn: &rusqlite::Connection,
+    checkout: Uuid,
+    guard: Option<&crate::checkout_guard::CheckoutGuard>,
+    #[cfg(test)] legacy16: Option<(
+        &Legacy16Admission,
+        &std::sync::Arc<crate::store::AuthorityIdentity>,
+    )>,
+) -> Held<()> {
+    #[cfg(test)]
+    if let Some((admission, authority)) = legacy16 {
+        let guard = guard.ok_or("exclusive_guard_required")?;
+        if !guard.exclusive_held() {
+            return Err("exclusive_guard_required");
+        }
+        guard
+            .matches_checkout(checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        return admission.require_unfenced(conn, authority, checkout);
+    }
+    crate::retirement_journal::require_unfenced(conn, checkout).map_err(|error| {
+        if guard.is_some() && matches!(error, crate::store::StoreError::RetirementFenced) {
+            "intent_conflict"
+        } else {
+            receipts::store_error(error).label()
+        }
+    })
+}
+
+fn require_prepare_unfenced(
+    tx: &rusqlite::Connection,
+    checkout: Uuid,
+    #[cfg(test)] legacy16: Option<(
+        &Legacy16Admission,
+        &std::sync::Arc<crate::store::AuthorityIdentity>,
+    )>,
+) -> Held<()> {
+    #[cfg(test)]
+    if let Some((admission, authority)) = legacy16 {
+        return admission.require_unfenced(tx, authority, checkout);
+    }
+    crate::retirement_journal::require_unfenced(tx, checkout).map_err(|error| {
+        if matches!(error, crate::store::StoreError::RetirementFenced) {
+            "intent_conflict"
+        } else {
+            receipts::store_error(error).label()
+        }
+    })
+}
+
 fn require_prepare_predecessor(
     tx: &rusqlite::Connection,
     context: &Context,
     mode: ModeKind,
+    #[cfg(test)] legacy16: Option<(
+        &Legacy16Admission,
+        &std::sync::Arc<crate::store::AuthorityIdentity>,
+    )>,
 ) -> Held<()> {
-    crate::retirement_journal::require_unfenced(tx, context.allocation.checkout).map_err(
-        |error| {
-            if matches!(error, crate::store::StoreError::RetirementFenced) {
-                "intent_conflict"
-            } else {
-                receipts::store_error(error).label()
-            }
-        },
+    require_prepare_unfenced(
+        tx,
+        context.allocation.checkout,
+        #[cfg(test)]
+        legacy16,
     )?;
     let (state, ready): (String, bool) = tx
         .query_row(
@@ -903,6 +1291,19 @@ pub(super) fn collect_fresh_prepare_inner(
         parse_checkout(&id.to_string()).map_err(|_| "assertion_ineligible")?;
     }
     let collector = Collector::with_exclusive(checkout, assertion, store, guard)?;
+    collect_fresh_from_collector(
+        path,
+        collector,
+        #[cfg(test)]
+        driver,
+    )
+}
+
+fn collect_fresh_from_collector(
+    path: &Path,
+    collector: Collector,
+    #[cfg(test)] driver: Option<&Driver>,
+) -> Held<FreshRetirementAssessment> {
     let (report, retained) = collect_retained(
         path,
         collector,
@@ -1121,6 +1522,27 @@ impl FreshRetirementAssessment {
     }
 
     pub(super) fn commit_prepared(
+        self,
+        operation: Uuid,
+        task_complete: bool,
+        #[cfg(test)] fault: PrepareFault,
+    ) -> Held<PrepareCommit> {
+        // This ordinary entry remains Current17-only even in test builds and
+        // even if its caller holds an actual sealed legacy fresh owner.
+        self.retained
+            .assessment
+            .store
+            .require_current()
+            .map_err(|_| "authority_unknown")?;
+        self.commit_prepared_core(
+            operation,
+            task_complete,
+            #[cfg(test)]
+            fault,
+        )
+    }
+
+    fn commit_prepared_core(
         mut self,
         operation: Uuid,
         task_complete: bool,
@@ -1151,10 +1573,19 @@ impl FreshRetirementAssessment {
                 mode,
                 adopted,
                 task_completed,
+                #[cfg(test)]
+                legacy16,
+                #[cfg(test)]
+                guard,
                 ..
             } = assessment;
-            let lease = store.authority_lease().map_err(|_| "authority_unknown")?;
-            lease.check(store).map_err(|_| "authority_unknown")?;
+            let lease = prepare_lease(
+                store,
+                #[cfg(test)]
+                legacy16
+                    .as_ref()
+                    .map(|admission| (admission, guard.as_ref())),
+            )?;
             let authority = std::sync::Arc::clone(store.authority_identity());
             let schema = store.schema_participation();
             let role = store.schema_role();
@@ -1163,9 +1594,14 @@ impl FreshRetirementAssessment {
                 .conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(|_| "commit_unknown")?;
-            lease
-                .check_authority(&authority)
-                .map_err(|_| "authority_unknown")?;
+            check_prepare_transaction(
+                #[cfg(test)]
+                &tx,
+                &lease,
+                &authority,
+                #[cfg(test)]
+                legacy16.as_ref(),
+            )?;
             role.validate(&tx).map_err(|_| "authority_unknown")?;
             if let Some((row, count, fence_active)) =
                 historical_operation(&tx, checkout, operation)?
@@ -1194,7 +1630,13 @@ impl FreshRetirementAssessment {
             if current.canonical != context.canonical {
                 return Err("context_changed");
             }
-            require_prepare_predecessor(&tx, &current, *mode)?;
+            require_prepare_predecessor(
+                &tx,
+                &current,
+                *mode,
+                #[cfg(test)]
+                legacy16.as_ref().map(|admission| (admission, &authority)),
+            )?;
             match mode {
                 ModeKind::Adopted => {
                     let current_mode = approval::AdoptedMode::read(&tx, &current)?;
@@ -1240,25 +1682,38 @@ impl FreshRetirementAssessment {
                     }
                 }
             }
-            journal::insert_prepared(
-                &tx,
-                &PreparedInsert {
-                    operation,
-                    checkout,
-                    mode: record.mode,
-                    assertion: assertion
-                        .as_ref()
-                        .map(approval::AssertionAssessment::assertion_id),
-                    declared_task: record.declaration.as_ref().map(|d| d.task.clone()),
-                    declared_operator: record.declaration.as_ref().map(|d| d.operator.clone()),
-                    predecessor,
-                    source,
-                    record: encoded.clone(),
-                },
-                &lease,
-                &authority,
-            )
-            .map_err(prepare_store_error)?;
+            let insert = PreparedInsert {
+                operation,
+                checkout,
+                mode: record.mode,
+                assertion: assertion
+                    .as_ref()
+                    .map(approval::AssertionAssessment::assertion_id),
+                declared_task: record.declaration.as_ref().map(|d| d.task.clone()),
+                declared_operator: record.declaration.as_ref().map(|d| d.operator.clone()),
+                predecessor,
+                source,
+                record: encoded.clone(),
+            };
+            #[cfg(test)]
+            if let Some(admission) = legacy16.as_ref() {
+                let proof = Legacy16PreparedInsertion {
+                    admission,
+                    tx: &tx,
+                    lease: &lease,
+                    authority: &authority,
+                    guard: guard.as_ref().ok_or("exclusive_guard_required")?,
+                    insert: &insert,
+                };
+                journal::insert_prepared_legacy16(&tx, &insert, &lease, &authority, &proof)
+                    .map_err(prepare_store_error)?;
+            } else {
+                journal::insert_prepared(&tx, &insert, &lease, &authority)
+                    .map_err(prepare_store_error)?;
+            }
+            #[cfg(not(test))]
+            journal::insert_prepared(&tx, &insert, &lease, &authority)
+                .map_err(prepare_store_error)?;
             // Read back every immutable binding/declaration column. The new row
             // never participates in its OWN predecessor/hash; only successor S.
             let inserted = journal::load_operation(&tx, operation).map_err(|_| "record_invalid")?;
@@ -1290,6 +1745,12 @@ impl FreshRetirementAssessment {
         #[cfg(test)]
         if fault == PrepareFault::LostAck {
             return Err("commit_unknown");
+        }
+        // A legacy fixture cannot turn a late acknowledgment into a fresh owner;
+        // this rejection spends the original collection clock, never a new one.
+        #[cfg(test)]
+        if self.retained.assessment.legacy16.is_some() {
+            self.check_commit_freshness()?;
         }
         // The sole constructor is AFTER acknowledged commit. No row decoder,
         // historical retry or uncertainty branch can construct this owner.
@@ -3075,6 +3536,370 @@ mod tests {
             ExclusiveProbe::Acquired
         );
         drop(manager_resources);
+    }
+
+    struct Legacy16NativeResources {
+        temp: tempfile::TempDir,
+        repo: PathBuf,
+        root: PathBuf,
+        allocation: crate::allocate::Allocation,
+        manager: Manager,
+        config: PathBuf,
+        configuration: Vec<u8>,
+        native: Vec<u8>,
+        source_rows: Vec<String>,
+    }
+
+    fn legacy16_native() -> (Legacy16PrepareFixture, Legacy16NativeResources) {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (request, binding, os) = close_completed(&mut f);
+        finish_task(&f);
+        let config = remote_config(&f, &os.tmp.path().join("runtime"));
+        enable_prepare(&config);
+        assert!(recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared());
+        let configuration = fs::read(&config).unwrap();
+        let native = abort_files(&f);
+        let source_rows = {
+            let _phase = f.store.sql_phase();
+            abort_source_rows(&f.store)
+        };
+        let fixture::ManagedFixture {
+            temp,
+            repo,
+            root,
+            allocation,
+            store,
+        } = f;
+        let Manager { tmp, _bus, driver } = os;
+        drop(driver);
+        drop(binding);
+        drop(request);
+        drop(store);
+        let registry = temp.path().join("registry");
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired
+        );
+        let fixture = Legacy16PrepareFixture::construct(
+            &registry,
+            &temp.path().join("authority"),
+            std::slice::from_ref(&root),
+            allocation.checkout,
+        )
+        .unwrap();
+        // The manager filesystem/listener survive, but no setup Driver or
+        // terminal observation crosses genuine format construction.
+        let driver = Driver::with_io(
+            RuntimeContext::new(
+                tmp.path().join("runtime"),
+                format!("unix:path={}/runtime/bus", tmp.path().display()),
+            )
+            .unwrap(),
+            LibraryIo {
+                systemctl: tmp.path().join("manager"),
+                proc_root: tmp.path().join("proc"),
+                cgroup_root: tmp.path().join("cg"),
+                between_censuses: None,
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        (
+            fixture,
+            Legacy16NativeResources {
+                temp,
+                repo,
+                root,
+                allocation,
+                manager: Manager { tmp, _bus, driver },
+                config,
+                configuration,
+                native,
+                source_rows,
+            },
+        )
+    }
+
+    #[test]
+    fn legacy16_consumer_full_native_prepare_uses_original_format() {
+        let (fixture, resources) = legacy16_native();
+        let checkout = resources.allocation.checkout;
+        let cookie: i64 = {
+            let _phase = fixture.store.sql_phase();
+            fixture
+                .store
+                .conn
+                .query_row("PRAGMA schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let mut fresh = fixture
+            .collect(&resources.config, &resources.manager.driver)
+            .unwrap();
+        let a = &fresh.owner.retained.assessment;
+        assert_eq!(
+            a.store.schema_role(),
+            crate::store::SchemaRole::Legacy16Abort
+        );
+        assert_eq!(a.context.role, crate::store::SchemaRole::Legacy16Abort);
+        assert!(a.context.physical_history.is_empty());
+        assert_eq!(a.context.physical_count, 0);
+        assert_eq!(a.context.history_count, 0);
+        assert!(!fresh.owner.retained.observations.is_empty());
+        let source = a.context.source.clone();
+        let predecessor = a.context.canonical.clone();
+        let history = a.context.history.clone();
+        let before_outbox: Vec<(i64, i64, String, i64)> = {
+            let _phase = a.store.sql_phase();
+            let mut stmt = a
+                .store
+                .conn
+                .prepare(
+                    "SELECT sequence,version,payload,acknowledged FROM outbox ORDER BY sequence",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        fresh
+            .owner
+            .recheck_prepare_configuration(&resources.config)
+            .unwrap();
+        let operation = Uuid::now_v7();
+        let committed = fresh
+            .commit_prepared(operation, PrepareFault::None)
+            .unwrap();
+        let PrepareCommit::Prepared(prepared) = committed else {
+            panic!("historical DATA cannot acknowledge this fresh preparation");
+        };
+        let a = &prepared.owner.retained.assessment;
+        assert_eq!(prepared.operation, operation);
+        assert_eq!(prepared.revision, 1);
+        assert_eq!(prepared.history_count, 1);
+        {
+            let _phase = a.store.sql_phase();
+            a.store.schema_role().validate(&a.store.conn).unwrap();
+            assert_eq!(
+                a.store
+                    .conn
+                    .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                cookie
+            );
+            assert_eq!(abort_source_rows(&a.store), resources.source_rows);
+            let rows = crate::retirement_journal::read_history(&a.store.conn, checkout).unwrap();
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.operation, operation);
+            assert_eq!(row.mode, "supervised");
+            assert_eq!(row.stage, "prepared");
+            assert_eq!(row.decoded.remote_cleanup, "complete");
+            assert_eq!(row.decoded.prior_history_count, 0);
+            assert_eq!(row.predecessor, Sha256::digest(&predecessor).to_vec());
+            assert_eq!(row.source, Sha256::digest(&source).to_vec());
+            assert_eq!(
+                row.decoded.history_predecessor_hex,
+                hex(&Sha256::digest(&history))
+            );
+            assert_eq!(
+                row.record,
+                crate::retirement_journal::encode_record(&row.decoded).unwrap()
+            );
+            let mut budget = Budget::new();
+            let current = snapshot_in_transaction(
+                &a.store.conn,
+                a.store.authority_identity(),
+                &a.store.schema_participation(),
+                a.store.schema_role(),
+                checkout,
+                &mut budget,
+            )
+            .unwrap();
+            assert_eq!(current.source, source);
+            assert!(current.physical_history.is_empty());
+            let mut original16 = source;
+            let (framed, count) =
+                crate::retirement_journal::frame_history_rows(&rows, &mut original16).unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(current.history, framed);
+            assert_eq!(current.canonical, original16, "no empty17 physical domain");
+            let mut stmt = a
+                .store
+                .conn
+                .prepare(
+                    "SELECT sequence,version,payload,acknowledged FROM outbox ORDER BY sequence",
+                )
+                .unwrap();
+            let after: Vec<(i64, i64, String, i64)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(&after[..before_outbox.len()], before_outbox.as_slice());
+            assert_eq!(after.len(), before_outbox.len() + 1);
+            let expected = crate::events::Event::RetirementIntentChanged {
+                checkout,
+                operation,
+                revision: 1,
+                stage: "prepared".into(),
+                reason: None,
+            };
+            let (_, version, payload, acknowledged) = after.last().unwrap();
+            assert_eq!(*version, 1);
+            assert_eq!(*acknowledged, 0);
+            assert_eq!(*payload, serde_json::to_string(&expected).unwrap());
+        }
+        drop(prepared);
+        let store = Store::open_retirement_abort_existing(
+            &resources.temp.path().join("registry"),
+            &resources.temp.path().join("authority"),
+            std::slice::from_ref(&resources.root),
+        )
+        .unwrap();
+        let f = fixture::ManagedFixture {
+            temp: resources.temp,
+            repo: resources.repo,
+            root: resources.root,
+            allocation: resources.allocation,
+            store,
+        };
+        assert_eq!(
+            fs::read(&resources.config).unwrap(),
+            resources.configuration
+        );
+        assert_eq!(
+            abort_files(&f),
+            resources.native,
+            "native identities and old17 receipts remain historical bytes"
+        );
+        drop(f);
+        drop(resources.manager);
+    }
+
+    #[test]
+    fn legacy16_consumer_does_not_enable_ordinary_prepare_or_commit() {
+        let (fixture, resources) = legacy16_native();
+        assert!(fixture.store.authority_lease().is_err());
+        assert!(matches!(
+            Store::open_existing_registered_mut(
+                &resources.temp.path().join("registry"),
+                &resources.temp.path().join("authority"),
+                std::slice::from_ref(&resources.root),
+            ),
+            Err(crate::store::StoreError::UpgradeRequired)
+        ));
+        assert!(
+            matches!(
+                prepare_test(
+                    &resources.config,
+                    resources.allocation.checkout,
+                    Uuid::now_v7(),
+                    None,
+                    false,
+                    Some(&resources.manager.driver),
+                    PrepareFault::None,
+                ),
+                Err("authority_unknown")
+            ),
+            "ordinary preflight refuses schema16 before checkout contention"
+        );
+        let reopened = Store::open_retirement_abort_existing(
+            &resources.temp.path().join("registry"),
+            &resources.temp.path().join("authority"),
+            std::slice::from_ref(&resources.root),
+        )
+        .unwrap();
+        assert_eq!(reopened.schema_role(), fixture.store.schema_role());
+        assert!(
+            fixture.admission.check_store(&reopened).is_err(),
+            "same role, path and cookie do not reproduce the actual fixture Store owner"
+        );
+        drop(reopened);
+        let fresh = fixture
+            .collect(&resources.config, &resources.manager.driver)
+            .unwrap();
+        let checkout = fresh.owner.checkout();
+        let operation = Uuid::now_v7();
+        let record = fresh.owner.prepare_record(operation, false).unwrap();
+        let a = &fresh.owner.retained.assessment;
+        let lease = crate::allocate::retirement_abort_lease(&a.store).unwrap();
+        assert!(lease.check(&a.store).is_err());
+        {
+            let _phase = a.store.sql_phase();
+            let (predecessor, source, _, _) = fresh.owner.context_bindings();
+            let insert = crate::retirement_journal::PreparedInsert {
+                operation,
+                checkout,
+                mode: record.mode,
+                assertion: None,
+                declared_task: None,
+                declared_operator: None,
+                predecessor,
+                source,
+                record: crate::retirement_journal::encode_record(&record).unwrap(),
+            };
+            assert!(
+                crate::retirement_journal::insert_prepared(
+                    &a.store.conn,
+                    &insert,
+                    &lease,
+                    a.store.authority_identity(),
+                )
+                .is_err(),
+                "an actual abort lease is not preparation admission"
+            );
+            assert!(
+                crate::retirement_journal::read_history(&a.store.conn, checkout)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        drop(lease);
+        // Even the actual fully collected legacy owner cannot use the ordinary
+        // commit entry. This is not a copied report/row standing in for an owner.
+        assert!(matches!(
+            fresh
+                .owner
+                .commit_prepared(operation, false, PrepareFault::None),
+            Err("authority_unknown")
+        ));
+        let store = Store::open_retirement_abort_existing(
+            &resources.temp.path().join("registry"),
+            &resources.temp.path().join("authority"),
+            std::slice::from_ref(&resources.root),
+        )
+        .unwrap();
+        let guard = crate::checkout_guard::CheckoutGuard::exclusive(&store, checkout).unwrap();
+        assert!(matches!(
+            collect_fresh_prepare_inner(
+                &resources.config,
+                checkout,
+                None,
+                store,
+                guard,
+                Some(&resources.manager.driver)
+            ),
+            Err("authority_unknown")
+        ));
+        let store = Store::open_retirement_abort_existing(
+            &resources.temp.path().join("registry"),
+            &resources.temp.path().join("authority"),
+            std::slice::from_ref(&resources.root),
+        )
+        .unwrap();
+        let _phase = store.sql_phase();
+        assert!(
+            crate::retirement_journal::read_history(&store.conn, checkout)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(abort_source_rows(&store), resources.source_rows);
     }
 
     fn fresh_for_test(
