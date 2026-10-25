@@ -16,6 +16,9 @@ not production activation. Adopted-only declarations (`work adopt begin/event/st
 available without process control. Explicit `work finish <checkout-id>` records task completion;
 retirement remains disabled by default and every finished checkout retains its tree and charge.
 Schema 16 adds a persistent retirement-intent fence: `work retire prepare|abort|status`.
+Current source targets schema 17 with strict physical-action metadata and pinned retirement admission.
+This is an intermediate CI checkpoint: genuine16 fresh-preparation/abort qualification and the full matrix remain unfinished.
+Physical movement is not implemented or activated.
 Prepare is disabled by default (absent or false `[retirement] prepare_intents`); abort and status never require that flag.
 A prepared or held intent stays fenced across expiry, reboot and lost acknowledgments until an explicit validated abort.
 Historical matching prepared/held/aborted results are not fresh authority. Schema-15 approvals are ineligible and require a fresh assertion; they are not migrated.
@@ -565,7 +568,7 @@ Only after final artifact revalidation does a private verified-observation metho
 consume the Created handle through the existing exact preparation CAS. It atomically
 promotes allocation JSON/readiness and adds an optional typed context digest/stat
 observation. That preparation increment required no change beyond schema 11;
-older preparation JSON omits this field unchanged. Current authority requires schema 16.
+older preparation JSON omits this field unchanged. Current authority requires schema 17.
 The public `record_capture_prepared` remains a metadata observer without an artifact
 claim. Failures retain tree, charge and exact writer, record the root recovery hold
 (without inventing outcome/capture ID), and return no live result. If hold persistence
@@ -651,7 +654,7 @@ work capture retry <run-id>
 ```
 
 These commands require a UUIDv7 root run and an existing registered current-schema
-(15) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
+(17) authority configured by `store_dir`, `trusted_registry` and nonempty `roots`.
 They never initialize, migrate or repair an authority. Help/version are read-only;
 invalid arguments exit 2 without echoing argument values. Historical operations need
 no current supervisor, actor profile or capture selection. Their configuration loader
@@ -821,7 +824,7 @@ work inspect CHECKOUT_UUIDV7 --record
 
 Inspection uses one bounded configuration snapshot: `store_dir`, `trusted_registry`,
 `roots` and only the optional `[inspection]` policy subtree. It requires an existing
-registered schema-16 authority with an existing qualified `allocation.lock`;
+registered schema-17 authority with an existing qualified `allocation.lock`;
 plain inspection and `--record` refuse a missing lock rather than repair it.
 A no-create lock descriptor is retained across Store opening and checked against
 the named lock and cached authority afterward. This cooperative check does not
@@ -1088,7 +1091,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted schema-16 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-17 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -1200,8 +1203,10 @@ retirement, deletion, uncharging, operational activation or whole-Task-8 complet
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8/v9/v10/v11/v12/v13/v14/v15 store to schema 16; malformed schemas, missing tables, views, incorrect
-claims and non-WAL authority fail closed, without repair. Other historical commands
+upgrade a valid v8/v9/v10/v11/v12/v13/v14/v15/v16 store to schema 17; malformed schemas, missing tables, views, incorrect
+claims and non-WAL authority fail closed, without repair. Active or corrupt schema16 retirement history blocks migration.
+Valid active16 intents require the dedicated validated offline-abort path with unchanged original configuration before upgrade;
+that genuine16 path remains pending native qualification in this intermediate checkpoint. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
 Finish refuses active/unknown/bare/adopted writers and incomplete or contradictory
@@ -1484,7 +1489,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-schema-16-authority metadata, with
+Status is read-only existing-schema-17-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -1493,7 +1498,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (the Task10 adopted assertion pilot above never releases it). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema 16.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 17.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned

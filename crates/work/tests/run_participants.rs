@@ -564,8 +564,9 @@ fn entire_tree_is_bounded_and_missing_or_orphaned_members_fail_closed() {
         store.register_child(&r, &child(&r)).unwrap();
     }
     assert!(store.register_child(&r, &child(&r)).is_err(), "child 257");
-    let events = store.pending_events(1000).unwrap();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    // Observe the entire outbox without validating the deliberately damaged roster.
+    let events = table_rows(&sql, "outbox");
     sql.execute(
         "DELETE FROM run_participants WHERE rowid=(SELECT max(rowid) FROM run_participants)",
         [],
@@ -580,8 +581,9 @@ fn entire_tree_is_bounded_and_missing_or_orphaned_members_fail_closed() {
     )
     .unwrap();
     assert!(store.recovery_runs().is_err());
+    drop(store);
     assert!(reopen(&dir).is_err(), "orphan must fail schema preflight");
-    assert_eq!(store.pending_events(1000).unwrap(), events);
+    assert_eq!(table_rows(&sql, "outbox"), events);
 }
 
 #[test]
@@ -778,7 +780,7 @@ fn v6_migration_preserves_closed_and_active_roots_adopted_legacy_aliases_and_out
     let active_before = store.run_snapshot(&active.identity().run).unwrap().unwrap();
     let adopted_before =
         serde_json::to_value(store.adopted_status(&adopted.identity.run).unwrap()).unwrap();
-    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
+    sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
     drop(store);
     let migrated = reopen(&dir).unwrap();
     assert_eq!(
@@ -829,9 +831,9 @@ fn v8_child_ledger_is_additive_and_versioned_tables_fail_closed() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
-    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
+    sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6").unwrap();
     drop(store);
     let store = reopen(&dir).unwrap();
     assert_eq!(store.pending_events(100).unwrap(), events);
@@ -849,6 +851,7 @@ fn v8_child_ledger_is_additive_and_versioned_tables_fail_closed() {
             .unwrap(),
         1
     );
+    drop(store);
     sql.execute_batch("ALTER TABLE run_participants RENAME TO saved_children; CREATE VIEW run_participants AS SELECT * FROM saved_children").unwrap();
     assert!(reopen(&dir).is_err());
     sql.execute_batch("DROP VIEW run_participants").unwrap();

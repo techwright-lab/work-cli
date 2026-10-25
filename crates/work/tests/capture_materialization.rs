@@ -556,7 +556,7 @@ fn schema_eleven_preserves_v10_capture_finish_allocation_and_outbox_bytes_withou
     };
     let before = rows();
     db.execute_batch(
-        "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10",
+        "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10",
     )
     .unwrap();
     drop(store);
@@ -573,6 +573,7 @@ fn schema_eleven_preserves_v10_capture_finish_allocation_and_outbox_bytes_withou
         work_cli::capture_journal::BeginCapturedRun::Existing(_)
     ));
     assert!(store.begin_run(&run_fixture::request(a.checkout)).is_err());
+    drop(store);
     for ddl in ["DROP INDEX capture_requirement_operation", "ALTER TABLE capture_requirements RENAME TO old_requirements; CREATE VIEW capture_requirements AS SELECT * FROM old_requirements"] {
         db.execute_batch(ddl).unwrap();
         assert!(work_cli::store::Store::open_registered(&f.temp.path().join("registry"),&f.temp.path().join("private"),std::slice::from_ref(&f.root)).is_err());
@@ -580,7 +581,7 @@ fn schema_eleven_preserves_v10_capture_finish_allocation_and_outbox_bytes_withou
         if ddl.starts_with("DROP INDEX") {db.execute_batch("CREATE INDEX capture_requirement_operation ON capture_requirements(allocation_operation)").unwrap();}
         else {db.execute_batch("DROP VIEW capture_requirements; ALTER TABLE old_requirements RENAME TO capture_requirements").unwrap();}
     }
-    db.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10; CREATE VIEW capture_requirements AS SELECT 1 AS obstruction").unwrap();
+    db.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; PRAGMA user_version=10; CREATE VIEW capture_requirements AS SELECT 1 AS obstruction").unwrap();
     assert!(work_cli::store::Store::open_registered(
         &f.temp.path().join("registry"),
         &f.temp.path().join("private"),

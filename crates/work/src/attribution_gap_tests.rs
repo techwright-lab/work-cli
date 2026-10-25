@@ -223,7 +223,7 @@ fn new_gap_event_cannot_reuse_active_or_aborted_retirement_operation() {
 
 #[test]
 fn existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths() {
-    use crate::retirement_journal::tests::{seed_prepared, source_rows};
+    use crate::retirement_journal::tests::{raw_table_rows, seed_prepared, source_rows};
     for aborted in [false, true] {
         for late in [false, true] {
             let (_temp, config, allocation, root, argv) = ordinary();
@@ -269,10 +269,10 @@ fn existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths() 
                 if aborted {
                     store.conn.execute("UPDATE retirement_intents SET stage='aborted',revision=2,aborted_from=1 WHERE operation=?1", [operation.to_string()]).unwrap();
                 }
-                let history = crate::retirement_journal::read_history(&store.conn, other).unwrap();
+                let history = raw_table_rows(&store.conn, "retirement_intents");
                 *captured.borrow_mut() = Some((
                     source_rows(&store),
-                    store.pending_events(1000).unwrap(),
+                    raw_table_rows(&store.conn, "outbox"),
                     history,
                 ));
             };
@@ -298,17 +298,22 @@ fn existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths() 
                 .as_ref()
                 .expect("committed Gap and conflicting namespace reached");
             assert_eq!(&source_rows(&observer_store), rows);
-            assert_eq!(&observer_store.pending_events(1000).unwrap(), events);
+            assert_eq!(&raw_table_rows(&observer_store.conn, "outbox"), events);
             assert_eq!(
-                &crate::retirement_journal::read_history(&observer_store.conn, other).unwrap(),
+                &raw_table_rows(&observer_store.conn, "retirement_intents"),
                 history
             );
-            assert!(crate::retirement_journal::read_history(
-                &observer_store.conn,
-                allocation.checkout
-            )
-            .unwrap()
-            .is_empty());
+            assert_eq!(
+                observer_store
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM retirement_intents WHERE checkout=?1",
+                        [allocation.checkout.to_string()],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                0
+            );
             assert!(matches!(
                 super::read_record(&observer_store.conn, &root),
                 Err(crate::store::StoreError::Invalid)
@@ -4736,7 +4741,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         }
         store
             .conn
-            .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
+            .execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
             .unwrap();
         // The helper transfers the actual Store, retaining its TempDir until
         // this callback returns. No schema participant may block migration EX.
@@ -4757,7 +4762,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            16
+            17
         );
         assert_eq!(
             migrated
@@ -4876,8 +4881,8 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 16,
-        "new authorities must install the additive Gap schema"
+        version, 17,
+        "new authorities must install the current schema including Gap history"
     );
     let original: String = store
         .conn
@@ -4887,7 +4892,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
     // Construct an authentic schema13 authority, retaining its original payloads.
     store
         .conn
-        .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
+        .execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
         .unwrap();
     drop(store);
     let store = test_run_fixture::reopen(&dir).unwrap();
@@ -4915,7 +4920,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
             true,
         )
         .unwrap();
-        sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
+        sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
         sql.execute_batch(malformed).unwrap();
         assert!(Store::open(&dir.path().join("private"), &[dir.path().join("root")]).is_err());
         let version: i64 = sql.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();

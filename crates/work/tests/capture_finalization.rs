@@ -674,7 +674,7 @@ fn schema_twelve_migration_preserves_old_bytes_and_requires_explicit_upgrade() {
         .unwrap();
     let events = f.store.pending_events(100).unwrap();
     sql.execute_batch(
-        "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; PRAGMA user_version=11",
+        "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; PRAGMA user_version=11",
     )
     .unwrap();
     assert!(matches!(
@@ -703,6 +703,7 @@ fn schema_twelve_migration_preserves_old_bytes_and_requires_explicit_upgrade() {
         .capture_finalization_snapshot(&f.root.identity().run)
         .unwrap()
         .is_none());
+    drop(store);
     sql.execute_batch(
         "DROP TABLE capture_readiness; DROP TABLE capture_finalizations; CREATE VIEW capture_finalizations AS SELECT 1 AS run",
     )
@@ -885,7 +886,7 @@ fn current_schema_has_separate_terminal_journal() {
     let version: i64 = sql
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert!(sql
         .prepare("SELECT run,intent,confirmation,revision FROM capture_finalizations")
         .is_ok());

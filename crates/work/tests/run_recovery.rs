@@ -496,7 +496,36 @@ fn corrupt_or_wrong_authority_and_malformed_history_fail_closed_without_events()
             }
             _ => unreachable!(),
         }
-        let n = store.pending_events(100).unwrap().len();
+        // Snapshot raw surviving tables after deliberate corruption. A current-schema
+        // Store getter would reject the setup before the recovery entrypoint runs.
+        let tables = sql
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let rows = || {
+            tables
+                .iter()
+                .map(|table| {
+                    let mut query = sql
+                        .prepare(&format!("SELECT rowid,* FROM \"{table}\" ORDER BY rowid"))
+                        .unwrap();
+                    let columns = query.column_count();
+                    query
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = rows();
         for writable in [false, true] {
             let opened = if writable {
                 Store::open_existing_registered_mut(&registry, &private, &roots)
@@ -508,7 +537,7 @@ fn corrupt_or_wrong_authority_and_malformed_history_fail_closed_without_events()
                 Err(_) => assert_ne!(case, "history"),
             }
         }
-        assert_eq!(store.pending_events(100).unwrap().len(), n);
+        assert_eq!(rows(), before);
         assert_eq!(
             sql.query_row("SELECT count(*) FROM writers", [], |r| r.get::<_, i64>(0))
                 .unwrap(),

@@ -228,7 +228,9 @@ fn path(value: &str) -> Result<Vec<u8>> {
     }
     let bytes: Vec<u8> = value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (nibble(pair[0]) << 4) | nibble(pair[1]))
         .collect();
     if bytes[0] != b'/' || bytes.contains(&0) {

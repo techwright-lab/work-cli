@@ -2142,7 +2142,7 @@ fn key_rotation_and_unqualified_tails() {
     store
         .conn
         .execute_batch(
-            "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14",
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14",
         )
         .unwrap();
     drop(store);
@@ -4359,7 +4359,7 @@ fn schema15_validation_preserves_sql_literal_semantics() {
     let pristine_rows = durable_rows(&store);
     assert!(pristine_rows[14].is_empty() && pristine_rows[15].is_empty());
     crate::gap_continuation::validate_schema(&store.conn).unwrap();
-    drop(open().expect("native schema15 is accepted before malformed DDL qualification"));
+    drop(open().expect("native schema17 is accepted before malformed DDL qualification"));
     let mut accepted = Vec::new();
     for literal in ["'UNAVAILABLE'", "'un available'", "'un\"available'"] {
         // Only literal contents change; column, constraint, FK and index shapes
@@ -4394,7 +4394,7 @@ fn schema15_validation_preserves_sql_literal_semantics() {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            16
+            17
         );
         store
             .conn
@@ -4422,8 +4422,8 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        16,
-        "current native authority must migrate to schema16",
+        17,
+        "current native authority must migrate to schema17",
     );
     let expected = [
         ("gap_qualifications", "table", "CREATE TABLE gap_qualifications(run TEXT PRIMARY KEY REFERENCES attribution_gaps(run), checkout TEXT NOT NULL REFERENCES checkouts(id), record TEXT NOT NULL, fingerprint BLOB NOT NULL CHECK(length(fingerprint)=32), successor_run TEXT UNIQUE REFERENCES attribution_gaps(run), successor_revision INTEGER, CHECK((successor_run IS NULL AND successor_revision IS NULL) OR (successor_run IS NOT NULL AND successor_revision IS NOT NULL AND successor_revision>0)))"),
@@ -4474,7 +4474,7 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
     store
         .conn
         .execute_batch(
-            "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;",
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;",
         )
         .unwrap();
     drop(store);
@@ -4645,7 +4645,7 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
             true,
         )
         .unwrap();
-        migrated.conn.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;").unwrap();
+        migrated.conn.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;").unwrap();
         migrated.conn.execute_batch(ddl).unwrap();
         drop(migrated);
         for sidecar in &sidecars {
@@ -4713,7 +4713,7 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
     migrated
         .conn
         .execute_batch(
-            "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;",
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;",
         )
         .unwrap();
     {
@@ -4777,7 +4777,7 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
             1
         );
         let before = durable_rows(&store);
-        store.conn.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;").unwrap();
+        store.conn.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;").unwrap();
         drop(store);
         let (opened, lease) = crate::allocate::locked(config).unwrap();
         drop(lease);

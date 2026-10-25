@@ -44,6 +44,41 @@ pub enum StoreError {
     OperationsInFlight,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Diagnostic provenance only at retirement open/abort admission. It grants no
+/// role or permission and preserves the original error for StoreError callers.
+#[derive(Debug)]
+pub(crate) enum RetirementAdmissionError {
+    Authority(StoreError),
+    History(StoreError),
+}
+impl RetirementAdmissionError {
+    // Call ONLY at the actual global-history validation phase. An Invalid from
+    // binding or role admission must never be relabeled as history corruption.
+    pub(crate) fn history(error: StoreError) -> Self {
+        match error {
+            StoreError::Invalid | StoreError::Conflict => Self::History(error),
+            _ => Self::Authority(error),
+        }
+    }
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Authority(_) => "authority_unknown",
+            Self::History(_) => "history_unknown",
+        }
+    }
+    pub(crate) fn into_store_error(self) -> StoreError {
+        match self {
+            Self::Authority(error) | Self::History(error) => error,
+        }
+    }
+}
+impl From<StoreError> for RetirementAdmissionError {
+    fn from(error: StoreError) -> Self {
+        Self::Authority(error)
+    }
+}
+
 pub struct Store {
     pub(crate) conn: Connection,
     budget: SqlBudget,
@@ -786,17 +821,18 @@ impl Store {
         registry: &Path,
         dir: &Path,
         managed: &[PathBuf],
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, RetirementAdmissionError> {
         let (schema, conn, budget, _, authority) =
             existing_authority(registry, dir, managed, false)?;
         let phase = budget.enter();
         let role = match crate::retirement_journal::schema_version(&conn)? {
             16 => SchemaRole::HistoricalRead(SupportedRetirementVersion::V16),
             17 => SchemaRole::HistoricalRead(SupportedRetirementVersion::V17),
-            _ => return Err(StoreError::UpgradeRequired),
+            _ => return Err(StoreError::UpgradeRequired.into()),
         };
         role.validate(&conn)?;
-        crate::retirement_journal::validate_all(&conn)?;
+        crate::retirement_journal::validate_all(&conn)
+            .map_err(RetirementAdmissionError::history)?;
         drop(phase);
         Ok(Self {
             conn,
@@ -811,18 +847,21 @@ impl Store {
         registry: &Path,
         dir: &Path,
         managed: &[PathBuf],
-    ) -> Result<Self> {
+    ) -> std::result::Result<Self, RetirementAdmissionError> {
         let reader = Self::open_retirement_readonly(registry, dir, managed)?;
         let role = match reader.role {
             SchemaRole::HistoricalRead(SupportedRetirementVersion::V16) => {
                 SchemaRole::Legacy16Abort
             }
             SchemaRole::HistoricalRead(SupportedRetirementVersion::V17) => SchemaRole::Current17,
-            _ => return Err(StoreError::Invalid),
+            _ => return Err(StoreError::Invalid.into()),
         };
         {
             let _phase = reader.sql_phase();
-            reader.conn.execute_batch("ROLLBACK;")?;
+            reader
+                .conn
+                .execute_batch("ROLLBACK;")
+                .map_err(StoreError::from)?;
         }
         let schema = reader.schema_participation();
         drop(reader);
@@ -833,7 +872,8 @@ impl Store {
         let phase = budget.enter();
         query_protections(&conn)?;
         role.validate(&conn)?;
-        crate::retirement_journal::validate_all(&conn)?;
+        crate::retirement_journal::validate_all(&conn)
+            .map_err(RetirementAdmissionError::history)?;
         drop(phase);
         let authority = AuthorityIdentity::collect(registry, dir, true)?;
         schema.revalidate()?;
@@ -962,7 +1002,8 @@ impl Store {
         drop(conn);
         drop(guards);
         drop(initialization);
-        let store = Self::open_retirement_abort_existing(registry, dir, &managed)?;
+        let store = Self::open_retirement_abort_existing(registry, dir, &managed)
+            .map_err(RetirementAdmissionError::into_store_error)?;
         if store.schema_role() != SchemaRole::Legacy16Abort
             || store.authority_identity().as_ref() != authority.as_ref()
         {
@@ -1545,7 +1586,7 @@ fn validate_migration_source(conn: &Connection, version: i64) -> Result<()> {
 enum InitializationDatabase {
     Absent,
     Empty,
-    Versioned(Connection, SqlBudget, i64),
+    Versioned(Box<Connection>, SqlBudget, i64),
 }
 
 fn validate_empty_initialization_database(conn: &Connection) -> Result<()> {
@@ -1653,7 +1694,11 @@ fn initialization_database(
         return Err(StoreError::Unsafe);
     }
     drop(phase);
-    Ok(InitializationDatabase::Versioned(conn, budget, version))
+    Ok(InitializationDatabase::Versioned(
+        Box::new(conn),
+        budget,
+        version,
+    ))
 }
 
 fn migration_checkouts(conn: &Connection) -> Result<Vec<Uuid>> {
@@ -2363,7 +2408,7 @@ mod tests {
             // production selector or altered budget is involved.
             store
                 .conn
-                .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements;")
+                .execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements;")
                 .unwrap();
             if version < 10 {
                 store
@@ -2378,8 +2423,8 @@ mod tests {
                     .unwrap();
             }
             store.conn.execute_batch(&format!("PRAGMA user_version={version};
-            INSERT INTO checkouts VALUES('checkout','allocation',x'00','repo','actor','task','owner','held',0);
-            INSERT INTO run_groups VALUES('group','checkout','supervised',1,0,1,0);
+            INSERT INTO checkouts VALUES('00000000-0000-7000-8000-000000000001','00000000-0000-7000-8000-000000000002',x'00','repo','actor','task','owner','held',0);
+            INSERT INTO run_groups VALUES('group','00000000-0000-7000-8000-000000000001','supervised',1,0,1,0);
             INSERT INTO runs VALUES('run','group','ref','{{}}','intent',NULL,NULL);
             WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<{children})
             INSERT INTO run_participants SELECT 'child'||x,'group','ref'||x,'run','{{}}','pending',NULL,1,NULL FROM n;")).unwrap();
@@ -2646,7 +2691,7 @@ mod tests {
                 )
                 .unwrap();
             let events = store.pending_events(100).unwrap();
-            store.conn.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
+            store.conn.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; PRAGMA user_version=6;").unwrap();
             drop(store);
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "store::tests::initialization_worker"])
@@ -2709,7 +2754,7 @@ mod tests {
         let events = store.pending_events(100).unwrap();
         store
             .conn
-            .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
+            .execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3")
             .unwrap();
         drop(store);
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -2752,7 +2797,7 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8",
+                "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8",
             )
             .unwrap();
         drop(store);
@@ -2783,7 +2828,7 @@ mod tests {
         assert_eq!(
             sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            16
+            17
         );
     }
     #[test]

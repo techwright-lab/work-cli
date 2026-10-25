@@ -353,7 +353,7 @@ fn status_inner(
         .ok_or("authority_unknown")?;
     let dir = config.store_dir.as_deref().ok_or("authority_unknown")?;
     let store = Store::open_retirement_readonly(registry, dir, &config.roots)
-        .map_err(|_| "authority_unknown")?;
+        .map_err(crate::store::RetirementAdmissionError::reason)?;
     let _phase = store.sql_phase();
     store
         .schema_role()

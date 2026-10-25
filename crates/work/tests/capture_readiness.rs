@@ -14,7 +14,7 @@ fn schema_thirteen_is_additive_and_does_not_backfill_readiness() {
     );
     let sql = f.sql();
     // Works both before and after the additive migration implementation.
-    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE IF EXISTS capture_readiness; PRAGMA user_version=12;")
+    sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE IF EXISTS capture_readiness; PRAGMA user_version=12;")
         .unwrap();
     let tables = [
         "capture_runs",
@@ -53,7 +53,7 @@ fn schema_thirteen_is_additive_and_does_not_backfill_readiness() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         sql.query_row("SELECT count(*) FROM capture_readiness", [], |r| r

@@ -32,6 +32,24 @@ pub(crate) fn source_rows(store: &Store) -> SourceRows {
         .collect()
 }
 
+// Observational only: complete stored rows (including rowids), without schema or
+// history admission. Deliberate corruption must reach the writer under test.
+pub(crate) fn raw_table_rows(conn: &Connection, table: &str) -> SqlRows {
+    let table = table.replace('"', "\"\"");
+    let mut stmt = conn
+        .prepare(&format!("SELECT rowid,* FROM \"{table}\" ORDER BY rowid"))
+        .unwrap();
+    let columns = stmt.column_count();
+    let rows = stmt
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    rows
+}
+
 // One-shot negative injection at actual late writer boundaries. This test-only
 // observer cannot authorize a writer, return evidence, skip a fence, or reset a budget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +331,7 @@ fn child_request(
 
 #[test]
 fn opened_store_rejects_schema_downgrade_and_future_on_retry_and_mutation() {
-    for version in [15, 17] {
+    for version in [15, 18] {
         for retry in [false, true] {
             let (temp, mut store, root) = open_store();
             let request = Reservation {
@@ -327,8 +345,8 @@ fn opened_store_rejects_schema_downgrade_and_future_on_retry_and_mutation() {
             let intent = Uuid::now_v7();
             seed_prepared(&store, checkout, intent);
             let before = source_rows(&store);
-            let history = load_operation(&store.conn, intent).unwrap();
-            let events = store.pending_events(1000).unwrap();
+            let history = raw_table_rows(&store.conn, "retirement_intents");
+            let events = raw_table_rows(&store.conn, "outbox");
             // Only the pragma changes; all retirement DDL and canonical evidence remain.
             let other = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
             other.pragma_update(None, "user_version", version).unwrap();
@@ -343,8 +361,8 @@ fn opened_store_rejects_schema_downgrade_and_future_on_retry_and_mutation() {
             );
             assert_eq!(schema_version(&store.conn).unwrap(), version);
             assert_eq!(source_rows(&store), before);
-            assert_eq!(load_operation(&store.conn, intent).unwrap(), history);
-            assert_eq!(store.pending_events(1000).unwrap(), events);
+            assert_eq!(raw_table_rows(&store.conn, "retirement_intents"), history);
+            assert_eq!(raw_table_rows(&store.conn, "outbox"), events);
         }
     }
 }
@@ -412,18 +430,31 @@ fn child_existing_ack_rejects_retirement_namespace_collision() {
         // Model conflicting historical SQL, not a public prepare capability.
         seed_prepared(&store, a, operation);
         if aborted {
-            abort_cas(&store.conn, a, operation, 1).unwrap();
+            // A validated abort correctly refuses the already-colliding namespace.
+            // Install the same structural tombstone/event without claiming authority.
+            store.conn.execute("UPDATE retirement_intents SET revision=2,stage='aborted',aborted_from=1 WHERE operation=?1", [operation.to_string()]).unwrap();
+            crate::store::emit(
+                &store.conn,
+                &Event::RetirementIntentChanged {
+                    checkout: a,
+                    operation,
+                    revision: 2,
+                    stage: "aborted".into(),
+                    reason: None,
+                },
+            )
+            .unwrap();
         }
         let before = source_rows(&store);
-        let history = load_operation(&store.conn, operation).unwrap();
-        let events = store.pending_events(1000).unwrap();
+        let history = raw_table_rows(&store.conn, "retirement_intents");
+        let events = raw_table_rows(&store.conn, "outbox");
         assert!(matches!(
             store.register_child(&root, &child),
             Err(StoreError::Invalid)
         ));
         assert_eq!(source_rows(&store), before);
-        assert_eq!(load_operation(&store.conn, operation).unwrap(), history);
-        assert_eq!(store.pending_events(1000).unwrap(), events);
+        assert_eq!(raw_table_rows(&store.conn, "retirement_intents"), history);
+        assert_eq!(raw_table_rows(&store.conn, "outbox"), events);
     }
 }
 
@@ -989,7 +1020,9 @@ fn corrupt_batch_member_rolls_back_all_holds_and_events() {
             [second.to_string()],
         )
         .unwrap();
-    let events = store.pending_events(1000).unwrap().len();
+    let before = source_rows(&store);
+    let history = raw_table_rows(&store.conn, "retirement_intents");
+    let events = raw_table_rows(&store.conn, "outbox");
     let lease = store.authority_lease().unwrap();
     assert!(matches!(
         checkpoint(
@@ -1001,10 +1034,19 @@ fn corrupt_batch_member_rolls_back_all_holds_and_events() {
         Err(StoreError::Invalid)
     ));
     assert_eq!(
-        load_operation(&store.conn, first).unwrap().stage,
+        store
+            .conn
+            .query_row(
+                "SELECT stage FROM retirement_intents WHERE operation=?1",
+                [first.to_string()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
         "prepared"
     );
-    assert_eq!(events, store.pending_events(1000).unwrap().len());
+    assert_eq!(source_rows(&store), before);
+    assert_eq!(raw_table_rows(&store.conn, "retirement_intents"), history);
+    assert_eq!(raw_table_rows(&store.conn, "outbox"), events);
 }
 
 #[test]
@@ -1110,16 +1152,18 @@ fn schema_ddl_and_indexes_match_canonical_bytes() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     validate_schema(&store.conn).unwrap();
 }
 
 #[test]
-fn schema15_migrates_atomically_to_16() {
+fn schema15_migrates_atomically_to_17() {
     let (temp, store, root) = open_store();
     store
         .conn
-        .execute_batch("DROP TABLE retirement_intents; PRAGMA user_version=15;")
+        .execute_batch(
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; PRAGMA user_version=15;",
+        )
         .unwrap();
     drop(store);
     let store = Store::open(&temp.path().join("private"), std::slice::from_ref(&root)).unwrap();
@@ -1127,7 +1171,7 @@ fn schema15_migrates_atomically_to_16() {
         .conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     validate_schema(&store.conn).unwrap();
 }
 
@@ -1179,10 +1223,12 @@ fn interrupted_migration_rolls_back() {
     insert_checkout(&store, Uuid::now_v7(), Uuid::now_v7(), "owner");
     store
         .conn
-        .execute_batch("DROP TABLE retirement_intents; PRAGMA user_version=15;")
+        .execute_batch(
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; PRAGMA user_version=15;",
+        )
         .unwrap();
     let before = source_rows(&store);
-    let events = store.pending_events(1000).unwrap();
+    let events = raw_table_rows(&store.conn, "outbox");
     {
         let _phase = store.sql_phase();
         let tx = store
@@ -1215,13 +1261,17 @@ fn interrupted_migration_rolls_back() {
         .unwrap();
     assert_eq!(objects, 0);
     assert_eq!(source_rows(&store), before);
-    assert_eq!(store.pending_events(1000).unwrap(), events);
+    assert_eq!(raw_table_rows(&store.conn, "outbox"), events);
     drop(store);
     let store = Store::open(&temp.path().join("private"), &[root]).unwrap();
-    assert_eq!(schema_version(&store.conn).unwrap(), 16);
+    assert_eq!(schema_version(&store.conn).unwrap(), 17);
     validate_schema(&store.conn).unwrap();
-    assert_eq!(source_rows(&store), before);
-    assert_eq!(store.pending_events(1000).unwrap(), events);
+    // Current admission adds an empty physical journal, never backfilled rows.
+    let mut expected = before;
+    expected.push(("quarantine_actions".into(), Vec::new()));
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(source_rows(&store), expected);
+    assert_eq!(raw_table_rows(&store.conn, "outbox"), events);
 }
 
 #[test]
@@ -1257,7 +1307,7 @@ fn relational_mismatch_and_stage_cas_are_strict() {
     let (_temp, mut store, _) = open_store();
     let checkout = Uuid::now_v7();
     let operation = Uuid::now_v7();
-    insert_checkout(&store, checkout, operation, "owner");
+    insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
     seed_prepared(&store, checkout, operation);
     let lease = store.authority_lease().unwrap();
     let authority = store.authority_identity().clone();
@@ -1375,7 +1425,7 @@ fn repeated_hold_emits_nothing() {
     let (_temp, mut store, _) = open_store();
     let checkout = Uuid::now_v7();
     let operation = Uuid::now_v7();
-    insert_checkout(&store, checkout, operation, "owner");
+    insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
     seed_prepared(&store, checkout, operation);
     let lease = store.authority_lease().unwrap();
     let authority = store.authority_identity().clone();
@@ -1733,7 +1783,7 @@ fn abort_cas_is_idempotent_and_does_not_hold_competitor() {
     let checkout = Uuid::now_v7();
     let operation = Uuid::now_v7();
     let other = Uuid::now_v7();
-    insert_checkout(&store, checkout, operation, "owner");
+    insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
     insert_checkout(&store, other, Uuid::now_v7(), "owner");
     seed_prepared(&store, checkout, operation);
     seed_prepared(&store, other, Uuid::now_v7());

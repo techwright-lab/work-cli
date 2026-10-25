@@ -1221,7 +1221,7 @@ fn v9_upgrade_preserves_receipt_bytes_and_missing_v10_shapes_fail_closed() {
         .unwrap();
     let events = store.pending_events(100).unwrap();
     sql.execute_batch(
-        "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9",
+        "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9",
     )
     .unwrap();
     drop(store);
@@ -1238,6 +1238,7 @@ fn v9_upgrade_preserves_receipt_bytes_and_missing_v10_shapes_fail_closed() {
             .unwrap(),
         0
     );
+    drop(store);
     for corrupt in ["DROP INDEX capture_checkout", "ALTER TABLE capture_runs RENAME TO saved_capture; CREATE VIEW capture_runs AS SELECT * FROM saved_capture"] {
         sql.execute_batch(corrupt).unwrap();
         assert!(reopen(&dir).is_err(),"{corrupt}");
@@ -1273,13 +1274,31 @@ fn v9_capture_migration_failure_rolls_back_version_and_all_existing_rows() {
     let r = request(checkout);
     store.begin_run(&r).unwrap();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9; CREATE VIEW capture_runs AS SELECT 1 AS obstruction").unwrap();
+    let events = store.pending_events(100).unwrap();
+    sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; PRAGMA user_version=9; CREATE VIEW capture_runs AS SELECT 1 AS obstruction").unwrap();
     let body: String = sql
         .query_row("SELECT request FROM runs", [], |r| r.get(0))
         .unwrap();
-    let events = store.pending_events(100).unwrap();
+    // Failed migration must preserve every raw outbox field, including acknowledgments.
+    let outbox = || {
+        let mut query = sql
+            .prepare("SELECT * FROM outbox ORDER BY sequence")
+            .unwrap();
+        let columns = query.column_count();
+        query
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let before_outbox = outbox();
     drop(store);
     assert!(reopen(&dir).is_err());
+    assert_eq!(outbox(), before_outbox);
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -1849,7 +1868,7 @@ fn schema_ten_adds_empty_capture_journal_without_rewriting_no_sink_history() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         sql.query_row("SELECT count(*) FROM capture_runs", [], |r| r

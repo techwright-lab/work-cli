@@ -306,7 +306,9 @@ fn finish_upgrade_never_recursively_upgrades_shared_owner() {
     // Genuine schema15, not a version-only downgrade with modern tables left.
     store
         .conn
-        .execute_batch("DROP TABLE retirement_intents; PRAGMA user_version=15;")
+        .execute_batch(
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; PRAGMA user_version=15;",
+        )
         .unwrap();
     drop(store);
     let upgraded =
@@ -317,7 +319,7 @@ fn finish_upgrade_never_recursively_upgrades_shared_owner() {
         .unwrap();
     let owned = probe_initialization_exclusive(&registry);
     drop(upgraded);
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
     assert_eq!(owned.unwrap(), ExclusiveProbe::Blocked);
     assert_eq!(
         probe_initialization_exclusive(&registry).unwrap(),
@@ -330,7 +332,9 @@ fn exclusive_handoff_discards_observations() {
     let (_temp, registry, directory, root, store) = initialized();
     store
         .conn
-        .execute_batch("DROP TABLE retirement_intents; PRAGMA user_version=15;")
+        .execute_batch(
+            "DROP TABLE quarantine_actions; DROP TABLE retirement_intents; PRAGMA user_version=15;",
+        )
         .unwrap();
     drop(store);
     let probe_registry = registry.clone();
@@ -389,7 +393,7 @@ fn shared_owners_are_concurrent_and_last_drop_unlocks() {
     drop(second);
     let all_dropped = probe_initialization_exclusive(&registry);
 
-    assert_eq!(version, 16, "W1 does not change the schema version");
+    assert_eq!(version, 17, "shared owners use the current schema version");
     assert_eq!(second_error, None, "established participants must coexist");
     assert_eq!(all_dropped.unwrap(), ExclusiveProbe::Acquired);
     assert_eq!(first_alive.unwrap(), ExclusiveProbe::Blocked);

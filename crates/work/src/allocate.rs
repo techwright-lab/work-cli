@@ -1724,17 +1724,18 @@ impl AuthorityLease {
         &self,
         conn: &rusqlite::Connection,
         authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
-    ) -> crate::store::Result<()> {
+    ) -> Result<(), crate::store::RetirementAdmissionError> {
         let role = match self.purpose {
             AuthorityPurpose::Store(
                 role @ (crate::store::SchemaRole::Current17
                 | crate::store::SchemaRole::Legacy16Abort),
             ) => role,
-            _ => return Err(crate::store::StoreError::Invalid),
+            _ => return Err(crate::store::StoreError::Invalid.into()),
         };
         self.check_binding(authority)?;
         role.validate(conn)?;
         crate::retirement_journal::validate_all(conn)
+            .map_err(crate::store::RetirementAdmissionError::history)
     }
     pub(crate) fn check_migration(
         &self,

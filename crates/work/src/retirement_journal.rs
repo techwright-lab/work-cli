@@ -1051,21 +1051,36 @@ pub(crate) fn abort_validated(
     lease: &AuthorityLease,
     authority: &Arc<crate::store::AuthorityIdentity>,
 ) -> Result<u64> {
-    lease.check_abort_transaction(tx, authority)?;
+    lease
+        .check_abort_transaction(tx, authority)
+        .map_err(crate::store::RetirementAdmissionError::into_store_error)?;
     abort_cas(tx, checkout, operation, revision)
 }
 
-pub(crate) fn require_no_physical_action(conn: &Connection, operation: Uuid) -> Result<()> {
-    validate_all(conn)?;
+pub(crate) fn physical_action_present(
+    conn: &Connection,
+    operation: Uuid,
+) -> std::result::Result<bool, crate::store::RetirementAdmissionError> {
+    // Presence is meaningful only after strict global validation. An invalid
+    // history is neither evidence of presence nor permission to bypass a fence.
+    validate_all(conn).map_err(crate::store::RetirementAdmissionError::history)?;
     if schema_version(conn)? == 17 {
-        let present: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM quarantine_actions WHERE operation=?1)",
-            [operation.to_string()],
-            |r| r.get(0),
-        )?;
-        if present {
-            return Err(StoreError::RetirementFenced);
-        }
+        return conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM quarantine_actions WHERE operation=?1)",
+                [operation.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(|error| StoreError::from(error).into());
+    }
+    Ok(false)
+}
+
+pub(crate) fn require_no_physical_action(conn: &Connection, operation: Uuid) -> Result<()> {
+    if physical_action_present(conn, operation)
+        .map_err(crate::store::RetirementAdmissionError::into_store_error)?
+    {
+        return Err(StoreError::RetirementFenced);
     }
     Ok(())
 }
@@ -1139,7 +1154,9 @@ pub(crate) fn hold_abort_validated(
     lease: &AuthorityLease,
     authority: &Arc<crate::store::AuthorityIdentity>,
 ) -> Result<()> {
-    lease.check_abort_transaction(tx, authority)?;
+    lease
+        .check_abort_transaction(tx, authority)
+        .map_err(crate::store::RetirementAdmissionError::into_store_error)?;
     hold_abort_validation(tx, checkout, operation)
 }
 

@@ -840,6 +840,13 @@ mod allocation_tests {
 
     #[test]
     fn all_staged_alias_repositories_are_fenced_in_one_atomic_batch() {
+        use crate::retirement_journal::tests::{raw_table_rows, source_rows};
+        use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+
         let (_dir, mut store, request, mut aliases) = fixture();
         let observed = ReservationIdentity::observe(&store, &request).unwrap();
         let other = aliases[0].0.join("other");
@@ -859,9 +866,62 @@ mod allocation_tests {
         }
         aliases.push((other.clone(), other));
         checkouts.sort();
-        // The later hold write fails: no earlier held row/event may commit.
-        store.conn.execute_batch(&format!("CREATE TRIGGER refuse_hold BEFORE UPDATE ON retirement_intents WHEN NEW.checkout='{}' BEGIN SELECT RAISE(ABORT,'owned hold fault'); END;", checkouts[1])).unwrap();
+        // Observe actual row writes, then deny preparation of the later hold's
+        // UPDATE only after the earlier hold AND its outbox INSERT have run.
+        // These connection-local hooks change no DDL or production SQL budget.
+        let first_rowid: i64 = store
+            .conn
+            .query_row(
+                "SELECT rowid FROM retirement_intents WHERE checkout=?1",
+                [checkouts[0].to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let observed_writes = writes.clone();
+        store
+            .conn
+            .update_hook(Some(
+                move |action: Action, database: &str, table: &str, rowid: i64| {
+                    observed_writes.lock().unwrap().push((
+                        action,
+                        database.to_owned(),
+                        table.to_owned(),
+                        rowid,
+                    ));
+                },
+            ))
+            .unwrap();
+        let denied = Arc::new(AtomicBool::new(false));
+        let fault_reached = denied.clone();
+        let prior_writes = writes.clone();
+        store
+            .conn
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Update {
+                        table_name: "retirement_intents",
+                        ..
+                    }
+                ) && prior_writes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(action, database, table, _)| {
+                        *action == Action::SQLITE_INSERT && database == "main" && table == "outbox"
+                    })
+                {
+                    fault_reached.store(true, Ordering::SeqCst);
+                    Authorization::Deny
+                } else {
+                    Authorization::Allow
+                }
+            }))
+            .unwrap();
         let before = rows(&store);
+        let sources = source_rows(&store);
+        let intents = raw_table_rows(&store.conn, "retirement_intents");
         let lease = store.authority_lease().unwrap();
         let result = store.reserve_recorded_under_lease(
             &observed,
@@ -871,7 +931,40 @@ mod allocation_tests {
             ReservationPurpose::Allocation(&aliases),
         );
         assert!(matches!(result, Err(StoreError::Database(_))));
+        store
+            .conn
+            .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+            .unwrap();
+        store
+            .conn
+            .update_hook(None::<fn(Action, &str, &str, i64)>)
+            .unwrap();
+        assert!(
+            denied.load(Ordering::SeqCst),
+            "later hold UPDATE must reach the injected fault"
+        );
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(
+            writes.len(),
+            2,
+            "exactly one earlier hold and event were written before refusal"
+        );
+        assert_eq!(
+            writes[0],
+            (
+                Action::SQLITE_UPDATE,
+                "main".into(),
+                "retirement_intents".into(),
+                first_rowid
+            )
+        );
+        assert_eq!(
+            (writes[1].0, writes[1].1.as_str(), writes[1].2.as_str()),
+            (Action::SQLITE_INSERT, "main", "outbox")
+        );
         assert_eq!(rows(&store), before);
+        assert_eq!(source_rows(&store), sources);
+        assert_eq!(raw_table_rows(&store.conn, "retirement_intents"), intents);
         assert_eq!(
             store
                 .conn
@@ -883,10 +976,6 @@ mod allocation_tests {
                 .unwrap(),
             2
         );
-        store
-            .conn
-            .execute_batch("DROP TRIGGER refuse_hold;")
-            .unwrap();
         for _ in 0..2 {
             let result = store.reserve_recorded_under_lease(
                 &observed,

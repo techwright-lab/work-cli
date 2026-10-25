@@ -1428,7 +1428,11 @@ fn abort_target(
     revision: u64,
 ) -> Held<(crate::retirement_journal::IntentRow, u64, bool)> {
     use crate::retirement_journal as journal;
-    journal::require_no_physical_action(conn, operation).map_err(|_| "physical_action_present")?;
+    if journal::physical_action_present(conn, operation)
+        .map_err(crate::store::RetirementAdmissionError::reason)?
+    {
+        return Err("physical_action_present");
+    }
     let history = journal::read_history(conn, checkout).map_err(|_| "history_unknown")?;
     let row = journal::find_operation(conn, operation)
         .map_err(|_| "history_unknown")?
@@ -1474,7 +1478,7 @@ pub(super) fn abort_offline(
         .ok_or("authority_unknown")?;
     let dir = config.store_dir.as_deref().ok_or("authority_unknown")?;
     let readonly = Store::open_retirement_readonly(registry, dir, &config.roots)
-        .map_err(|_| "authority_unknown")?;
+        .map_err(crate::store::RetirementAdmissionError::reason)?;
     let (original, count, fence_active) = {
         let _phase = readonly.sql_phase();
         let selected = abort_target(&readonly.conn, checkout, operation, revision)?;
@@ -1503,7 +1507,7 @@ pub(super) fn abort_offline(
             }
         })?;
     let store = Store::open_retirement_abort_existing(registry, dir, &config.roots)
-        .map_err(|_| "authority_unknown")?;
+        .map_err(crate::store::RetirementAdmissionError::reason)?;
     guard
         .require_matching(&store, checkout)
         .map_err(|_| "lock_unknown")?;
@@ -1835,7 +1839,7 @@ impl OfflineAbort {
             .map_err(|_| "commit_unknown")?;
         lease
             .check_abort_transaction(&tx, &authority)
-            .map_err(|_| "authority_unknown")?;
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
         let (current, count, _) = abort_target(
             &tx,
             self.original.checkout,
@@ -1907,7 +1911,7 @@ impl OfflineAbort {
             .map_err(|_| "commit_unknown")?;
         lease
             .check_abort_transaction(&tx, &authority)
-            .map_err(|_| "authority_unknown")?;
+            .map_err(crate::store::RetirementAdmissionError::reason)?;
         let (current, _, _) =
             abort_target(&tx, self.original.checkout, self.original.operation, 1)?;
         // Full strict equality, including immutable bytes and mutable original

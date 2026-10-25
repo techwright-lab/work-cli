@@ -413,7 +413,7 @@ fn v4_migration_preserves_runs_and_fails_closed_on_missing_v5_state() {
     };
     drop(store);
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
+    sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
         .unwrap();
     assert!(
         report().is_ok(),
@@ -573,7 +573,7 @@ fn closure_schema_preserves_existing_charges_and_writer() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        16
+        17
     );
     assert_eq!(
         sql.query_row("SELECT closed FROM run_groups", [], |row| row
@@ -1060,7 +1060,7 @@ fn old_schemas_preserve_charges_outbox_legacy_writers_and_aliases() {
             [dir.path().join("root").to_str().unwrap()],
         )
         .unwrap();
-        sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups;")
+        sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups;")
             .unwrap();
         if version < 3 {
             sql.execute_batch("DROP TABLE repository_aliases").unwrap();
@@ -1139,9 +1139,10 @@ fn schema_five_is_durable_and_missing_versioned_tables_fail_closed() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 16,
+        version, 17,
         "positive child enrollment requires a durable v8 migration"
     );
+    drop(store);
     for table in ["run_groups", "runs"] {
         sql.execute_batch(&format!("ALTER TABLE {table} RENAME TO missing_{table}"))
             .unwrap();
@@ -1152,6 +1153,5 @@ fn schema_five_is_durable_and_missing_versioned_tables_fail_closed() {
         sql.execute_batch(&format!("ALTER TABLE missing_{table} RENAME TO {table}"))
             .unwrap();
     }
-    drop(store);
     assert!(reopen(&dir).is_ok());
 }

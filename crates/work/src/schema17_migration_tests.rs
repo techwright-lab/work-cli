@@ -306,6 +306,7 @@ fn readonly_roles_refuse_authority_mutation() {
                 &temp.path().join("private"),
                 std::slice::from_ref(&root),
             )
+            .map_err(super::RetirementAdmissionError::into_store_error)
         } else {
             Store::open_existing_registered_readonly(
                 &temp.path().join("registry"),
@@ -590,6 +591,59 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
             }
         }
     }
+    fn deltas(
+        phase: &str,
+        case: (i64, bool),
+        before: &BTreeMap<PathBuf, Vec<u8>>,
+        after: &BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        let paths: std::collections::BTreeSet<_> = before.keys().chain(after.keys()).collect();
+        eprintln!(
+            "pending-storage case={case:?} phase={phase} equal={}",
+            before == after
+        );
+        for path in paths {
+            if before.get(path) == after.get(path) {
+                continue;
+            }
+            eprintln!("pending-storage case={case:?} phase={phase} path={path:?}");
+            match (before.get(path), after.get(path)) {
+                (Some(old), Some(new)) => {
+                    for (index, field) in [
+                        "dev",
+                        "ino",
+                        "mode",
+                        "uid",
+                        "gid",
+                        "nlink",
+                        "len",
+                        "mtime",
+                        "mtime_nsec",
+                        "ctime",
+                        "ctime_nsec",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        let start = index * 8;
+                        let old = u64::from_be_bytes(old[start..start + 8].try_into().unwrap());
+                        let new = u64::from_be_bytes(new[start..start + 8].try_into().unwrap());
+                        if old != new {
+                            eprintln!("  {field}: {old} -> {new}");
+                        }
+                    }
+                    if old[88..] != new[88..] {
+                        eprintln!(
+                            "  content_sha256: {:02x?} -> {:02x?}",
+                            &old[88..],
+                            &new[88..]
+                        );
+                    }
+                }
+                (old, new) => eprintln!("  entry: {old:?} -> {new:?}"),
+            }
+        }
+    }
     for (version, store_wal) in [
         (16, false),
         (16, true),
@@ -686,6 +740,10 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
                 .unwrap();
             (snapshot, store_mode, registry_mode, claims)
         };
+        // Fault injection is finished. Measure the initial observer separately;
+        // no product call or intentional filesystem write occurs in this window.
+        let mut native_setup = BTreeMap::new();
+        files(temp.path(), &mut native_setup);
         let before = observe();
         assert_eq!(before.0.user_version, version);
         assert_eq!(before.0.repository_charge, 1);
@@ -694,23 +752,53 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
         assert_eq!(before.2, "delete");
         let mut native_before = BTreeMap::new();
         files(temp.path(), &mut native_before);
+        // Observer-only control, with the same connection open/read/close path
+        // and native owner state as the post-refusal observer. Keep the original
+        // native_before baseline unchanged even if this control changes SHM.
+        let control = observe();
+        let mut native_control = BTreeMap::new();
+        files(temp.path(), &mut native_control);
         let result = Store::open_registered(&registry, &directory, &[root]);
         let refused = result.is_err();
         drop(result);
+        // Filesystem ONLY, immediately after product cleanup and before opening
+        // either after-observer. This isolates product from observer effects.
+        let mut native_refused = BTreeMap::new();
+        files(temp.path(), &mut native_refused);
         let after = observe();
         let mut native_after = BTreeMap::new();
         files(temp.path(), &mut native_after);
+        let case = (version, store_wal);
+        deltas("initial-observer", case, &native_setup, &native_before);
+        deltas("observer-only", case, &native_before, &native_control);
+        deltas("product-only", case, &native_control, &native_refused);
+        deltas("after-observer", case, &native_refused, &native_after);
+        deltas(
+            "original-baseline-to-final",
+            case,
+            &native_before,
+            &native_after,
+        );
         assert!(
             refused,
-            "pending version {version} must not gain bootstrap admission"
+            "pending case {case:?} must not gain bootstrap admission"
         );
+        assert_eq!(control, before, "observer-only logical equality: {case:?}");
         assert_eq!(
             after, before,
-            "journal/header/cookies/history/outbox/accounting/claims"
+            "journal/header/cookies/history/outbox/accounting/claims: {case:?}"
         );
         assert_eq!(
             native_after, native_before,
-            "native inodes/bytes and sidecar set must not change"
+            "native inodes/bytes and sidecar set must not change: {case:?}"
+        );
+        assert_eq!(
+            native_refused, native_control,
+            "product-only native equality: {case:?}"
+        );
+        assert_eq!(
+            native_control, native_before,
+            "observer-only native equality: {case:?}"
         );
     }
 }
