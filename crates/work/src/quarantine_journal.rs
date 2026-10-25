@@ -376,8 +376,13 @@ pub(crate) fn encode_plan_with_result_capacity(plan: &PhysicalPlan) -> Result<St
 }
 pub(crate) fn decode_plan(bytes: &str) -> Result<PhysicalPlan> {
     let plan: PhysicalPlan = strict(bytes)?;
-    validate_plan(&plan)?;
-    result_capacity(&plan, bytes)?;
+    let canonical = encode_plan_with_result_capacity(&plan)?;
+    // Canonical input already passed complete-row/result capacity admission.
+    // Accept alternate legal spellings only if their ACTUAL stored bytes also
+    // fit; never normalize the stored plan or substitute its canonical hash.
+    if canonical != bytes {
+        result_capacity(&plan, bytes)?;
+    }
     Ok(plan)
 }
 
@@ -539,15 +544,6 @@ pub(crate) fn encode_row(row: &ActionRow) -> Result<String> {
     validate_row(row)?;
     encode(row)
 }
-pub(crate) fn decode_row(bytes: &str) -> Result<ActionRow> {
-    let row = strict(bytes)?;
-    validate_row(&row)?;
-    // Noncanonical JSON whitespace/escapes can alter size in either direction.
-    // Require BOTH supplied complete envelope and typed complete encoding fit.
-    encode(&row)?;
-    Ok(row)
-}
-
 /// Decode six borrowed SQLite values. No owned column or serde allocation until
 /// every raw type/length and the aggregate column budget has been checked.
 /// This is row metadata validation ONLY, never global/parent-history admission.

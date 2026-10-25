@@ -99,6 +99,54 @@ fn row(plan: &PhysicalPlan, encoded: &str, state: ActionState) -> ActionRow {
     }
 }
 
+// Outer JSON envelopes are test wire input only; runtime rows enter through
+// decode_columns. Keep the former envelope decoder's exact validation here.
+fn decode_row(bytes: &str) -> Result<ActionRow> {
+    let row = strict(bytes)?;
+    validate_row(&row)?;
+    // Noncanonical JSON whitespace/escapes can alter size in either direction.
+    // Require BOTH supplied complete envelope and typed complete encoding fit.
+    encode(&row)?;
+    Ok(row)
+}
+
+fn decode_stored_row(row: &ActionRow) -> Result<ActionRow> {
+    decode_columns([
+        ValueRef::Text(row.operation.as_bytes()),
+        ValueRef::Text(row.checkout.as_bytes()),
+        ValueRef::Integer(i64::try_from(row.revision).unwrap()),
+        ValueRef::Text(row.state.as_str().as_bytes()),
+        ValueRef::Text(row.plan.as_bytes()),
+        row.result
+            .as_deref()
+            .map_or(ValueRef::Null, |bytes| ValueRef::Text(bytes.as_bytes())),
+    ])
+}
+
+// Construct spellings independently of production encoding/admission.
+fn plan_spellings(plan: &PhysicalPlan) -> [(&'static str, String); 4] {
+    let canonical = serde_json::to_string(plan).unwrap();
+    let value = serde_json::to_value(plan).unwrap();
+    let fields: Vec<_> = value
+        .as_object()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|(key, value)| format!("{}:{value}", serde_json::to_string(key).unwrap()))
+        .collect();
+    [
+        ("canonical", canonical.clone()),
+        ("whitespace", format!(" \n\t{canonical}\r\n")),
+        ("reordered", format!("{{{}}}", fields.join(","))),
+        (
+            "escaped",
+            canonical
+                .replacen("\"operation\"", r#""oper\u0061tion""#, 1)
+                .replacen("\"ab", r#""\u0061b"#, 1),
+        ),
+    ]
+}
+
 #[test]
 fn metadata_roundtrips_without_an_owner_or_store() {
     let plan = plan();
@@ -431,6 +479,125 @@ fn widest_row(plan: &PhysicalPlan, encoded: &str) -> ActionRow {
         .into_iter()
         .max_by_key(|row| serde_json::to_string(row).unwrap().len())
         .unwrap()
+}
+
+#[test]
+fn stored_plan_spellings_preserve_bytes_and_require_exact_raw_hash() {
+    let plan = plan();
+    let canonical = serde_json::to_string(&plan).unwrap();
+    let canonical_hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    for (name, bytes) in plan_spellings(&plan) {
+        assert_eq!(serde_json::from_str::<PhysicalPlan>(&bytes).unwrap(), plan);
+        assert_eq!(bytes == canonical, name == "canonical", "{name}");
+        assert!(
+            serde_json::to_string(&widest_row(&plan, &bytes))
+                .unwrap()
+                .len()
+                < MAX_ROW_BYTES
+        );
+        let raw_hash = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        assert_eq!(decode_plan(&bytes).unwrap(), plan, "{name}");
+        for state in [
+            ActionState::MovePending,
+            ActionState::Quarantined,
+            ActionState::MoveUncertain,
+        ] {
+            let mut stored = row(&plan, &bytes, state);
+            if state != ActionState::MovePending {
+                let mut record = result(&plan, &bytes, state);
+                // Independent exact-byte hash, not production plan_hash's output.
+                record.plan_hash = raw_hash.clone();
+                stored.result = Some(serde_json::to_string(&record).unwrap());
+            }
+            assert_eq!(
+                decode_stored_row(&stored).unwrap(),
+                stored,
+                "{name}/{state:?}"
+            );
+            assert_eq!(
+                decode_row(&serde_json::to_string(&stored).unwrap()).unwrap(),
+                stored,
+                "{name}/{state:?}"
+            );
+            if bytes != canonical && state != ActionState::MovePending {
+                assert_ne!(raw_hash, canonical_hash, "{name}");
+                let mut record: ResultRecord =
+                    serde_json::from_str(stored.result.as_ref().unwrap()).unwrap();
+                record.plan_hash = canonical_hash.clone();
+                stored.result = Some(serde_json::to_string(&record).unwrap());
+                assert!(
+                    matches!(decode_stored_row(&stored), Err(StoreError::Invalid)),
+                    "{name}/{state:?}"
+                );
+                assert!(
+                    matches!(
+                        decode_row(&serde_json::to_string(&stored).unwrap()),
+                        Err(StoreError::Invalid)
+                    ),
+                    "{name}/{state:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stored_plan_spellings_enforce_independent_result_capacity_boundary() {
+    let plan = plan();
+    let canonical = serde_json::to_string(&plan).unwrap();
+    assert!(
+        serde_json::to_string(&widest_row(&plan, &canonical))
+            .unwrap()
+            .len()
+            < MAX_ROW_BYTES
+    );
+    for (name, bytes) in plan_spellings(&plan) {
+        let maximum = serde_json::to_string(&widest_row(&plan, &bytes))
+            .unwrap()
+            .len();
+        assert!(maximum < MAX_ROW_BYTES);
+        // Compute the boundary solely from the independent complete serializer,
+        // not a production admission result or a search for its acceptance point.
+        let padding = MAX_ROW_BYTES - maximum;
+        for (extra, accepted) in [(padding - 1, true), (padding, true), (padding + 1, false)] {
+            let raw = format!("{}{bytes}", " ".repeat(extra));
+            assert_ne!(raw, canonical, "{name}/{extra}");
+            assert_eq!(serde_json::from_str::<PhysicalPlan>(&raw).unwrap(), plan);
+            assert!(raw.len() < MAX_ROW_BYTES);
+            let widest = widest_row(&plan, &raw);
+            let full_bytes = serde_json::to_string(&widest).unwrap();
+            assert_eq!(full_bytes.len(), maximum + extra);
+            assert_eq!(full_bytes.len() <= MAX_ROW_BYTES, accepted);
+            assert_eq!(decode_plan(&raw).is_ok(), accepted, "{name}/{extra}");
+            let pending = row(&plan, &raw, ActionState::MovePending);
+            // Even the over-capacity plan fits a pending row and the raw SQL
+            // aggregate. Rejection must account for the future complete result.
+            assert!(serde_json::to_string(&pending).unwrap().len() < MAX_ROW_BYTES);
+            for candidate in [pending, widest] {
+                let aggregate = candidate.operation.len()
+                    + candidate.checkout.len()
+                    + 8
+                    + candidate.state.as_str().len()
+                    + candidate.plan.len()
+                    + candidate.result.as_ref().map_or(0, String::len);
+                assert!(aggregate < MAX_ROW_BYTES);
+                let decoded = decode_stored_row(&candidate);
+                if accepted {
+                    assert_eq!(decoded.unwrap(), candidate, "{name}/{extra}");
+                } else {
+                    assert!(
+                        matches!(decoded, Err(StoreError::Invalid)),
+                        "{name}/{extra}"
+                    );
+                }
+                assert_eq!(
+                    decode_row(&serde_json::to_string(&candidate).unwrap()).is_ok(),
+                    accepted,
+                    "{name}/{extra}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

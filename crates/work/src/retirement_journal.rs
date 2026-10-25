@@ -641,7 +641,14 @@ pub(crate) fn parent_checkouts(conn: &Connection) -> Result<Vec<Uuid>> {
 }
 
 pub(crate) fn validate_parent_namespace(conn: &Connection, row: &IntentRow) -> Result<()> {
-    crate::capture_journal::exclude_operation(conn, &row.operation)?;
+    // A retained row contradicting another journal is corrupt history, not a
+    // proposed operation colliding with a reserved identifier.
+    crate::capture_journal::exclude_operation(conn, &row.operation).map_err(
+        |error| match error {
+            StoreError::Conflict => StoreError::Invalid,
+            other => other,
+        },
+    )?;
     let collision: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1)
         OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)

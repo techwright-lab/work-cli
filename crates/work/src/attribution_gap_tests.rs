@@ -289,10 +289,12 @@ fn existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths() 
                 inject.take().unwrap()();
                 None
             };
-            assert!(matches!(
-                super::begin_in_store(&config, attempt_store, &root, &argv),
-                Err(crate::store::StoreError::Invalid)
-            ));
+            let result = super::begin_in_store(&config, attempt_store, &root, &argv);
+            assert!(
+                matches!(result.as_ref(), Err(crate::store::StoreError::Invalid)),
+                "aborted={aborted}, late={late}, error={:?}",
+                result.as_ref().err()
+            );
             let captured = snapshot.borrow();
             let (rows, events, history) = captured
                 .as_ref()
