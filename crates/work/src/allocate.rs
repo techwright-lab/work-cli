@@ -58,6 +58,8 @@ pub(crate) fn db<T>(r: crate::store::Result<T>) -> io::Result<T> {
     r.map_err(|e| {
         #[cfg(test)]
         crate::capture_diagnostics::store_error("allocate::db", &e);
+        #[cfg(test)]
+        crate::retirement_journal::tests::observe_mapped_error(&e);
         err(&e.to_string())
     })
 }
@@ -1122,7 +1124,10 @@ mod physical_tests {
                 );
                 match fault {
                     LateFault::Outbox => {
-                        assert!(error.to_string().contains("late outbox fault"), "{error}")
+                        // The public allocator error intentionally redacts SQL;
+                        // retain a separate exact pre-mapping trigger witness.
+                        injected.assert_outbox_fault_reached();
+                        assert_eq!(error.to_string(), "store database failure");
                     }
                     LateFault::Commit => injected.assert_commit_fault_reached(),
                     LateFault::None => unreachable!(),

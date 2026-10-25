@@ -51,6 +51,20 @@ pub(crate) enum LateFault {
 type LateCallback = Box<dyn FnOnce(&Store)>;
 thread_local! {
     static LATE_WRITER: std::cell::RefCell<Option<(LateBoundary, LateCallback)>> = const { std::cell::RefCell::new(None) };
+    static LATE_OUTBOX_FAILURE: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+// Observe only the known fixture failure before the allocator's public error
+// mapping deliberately redacts SQLite details. Never expose arbitrary SQL text.
+pub(crate) fn observe_mapped_error(error: &StoreError) {
+    if matches!(error, StoreError::Database(rusqlite::Error::SqliteFailure(code, Some(message)))
+        if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER && message == "late outbox fault")
+    {
+        LATE_OUTBOX_FAILURE.with(|slot| {
+            if let Some(reached) = slot.borrow().as_ref() {
+                reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+    }
 }
 pub(crate) fn observe_late(boundary: LateBoundary, store: &Store) {
     let callback = LATE_WRITER.with(|slot| {
@@ -77,6 +91,7 @@ pub(crate) struct LateFence {
     boundary: LateBoundary,
     snapshot: std::rc::Rc<std::cell::RefCell<Option<LateSnapshot>>>,
     commit_reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    outbox_reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl LateFence {
     pub(crate) fn install(boundary: LateBoundary, checkouts: Vec<Uuid>) -> Self {
@@ -92,6 +107,13 @@ impl LateFence {
         let captured = snapshot.clone();
         let commit_reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let commit_observer = commit_reached.clone();
+        let outbox_reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        LATE_OUTBOX_FAILURE.with(|slot| {
+            assert!(slot.borrow().is_none(), "overlapping outbox error observer");
+            if matches!(fault, LateFault::Outbox) {
+                *slot.borrow_mut() = Some(outbox_reached.clone());
+            }
+        });
         LATE_WRITER.with(|slot| {
             assert!(slot.borrow().is_none(), "overlapping negative writer observer");
             *slot.borrow_mut() = Some((boundary, Box::new(move |store| {
@@ -128,6 +150,7 @@ impl LateFence {
             boundary,
             snapshot,
             commit_reached,
+            outbox_reached,
         }
     }
     pub(crate) fn assert_held(&self, store: &Store, reason: &str) {
@@ -194,6 +217,13 @@ impl LateFence {
             );
         }
     }
+    pub(crate) fn assert_outbox_fault_reached(&self) {
+        assert!(
+            self.outbox_reached
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "actual outbox trigger failure must reach the allocator error mapping"
+        );
+    }
     pub(crate) fn assert_commit_fault_reached(&self) {
         assert!(
             self.commit_reached
@@ -204,6 +234,9 @@ impl LateFence {
 }
 impl Drop for LateFence {
     fn drop(&mut self) {
+        LATE_OUTBOX_FAILURE.with(|slot| {
+            slot.borrow_mut().take();
+        });
         LATE_WRITER.with(|slot| {
             slot.borrow_mut().take();
         });
