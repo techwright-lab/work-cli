@@ -27,6 +27,16 @@ pub(crate) struct CheckoutGuard {
     exclusive: bool,
 }
 
+impl Drop for CheckoutGuard {
+    fn drop(&mut self) {
+        // CLOEXEC does not close fork-inherited descriptors until exec. Revoke
+        // this owner's flock at its lifetime boundary even if such a duplicate
+        // still exists. Independently opened SH owners keep their own locks.
+        // Drop cannot report failure; normal descriptor close remains fallback.
+        let _ = rfs::flock(&self.file, rfs::FlockOperation::Unlock);
+    }
+}
+
 impl CheckoutGuard {
     pub(crate) fn shared(store: &Store, checkout: Uuid) -> Result<Self> {
         acquire(store, checkout, false)
@@ -276,6 +286,53 @@ mod tests {
         ));
         drop(shared);
         CheckoutGuard::exclusive(&other, checkout).unwrap();
+    }
+
+    #[test]
+    fn drop_unlocks_even_when_an_inherited_descriptor_remains_open() {
+        for exclusive in [false, true] {
+            let (_temp, store, other, checkout, _) = open_pair();
+            let guard = if exclusive {
+                CheckoutGuard::exclusive(&store, checkout).unwrap()
+            } else {
+                CheckoutGuard::shared(&store, checkout).unwrap()
+            };
+            // dup and fork inheritance retain the same open-file description.
+            // No second operation guard or permission is created by this handle.
+            let inherited = guard.file.try_clone().unwrap();
+            drop(guard);
+            let next = CheckoutGuard::exclusive(&other, checkout).unwrap();
+            assert!(inherited.metadata().unwrap().is_file());
+            drop(inherited);
+            assert!(matches!(
+                CheckoutGuard::shared(&store, checkout),
+                Err(StoreError::OperationsInFlight)
+            ));
+            drop(next);
+            CheckoutGuard::shared(&store, checkout).unwrap();
+        }
+    }
+
+    #[test]
+    fn dropping_one_shared_owner_does_not_unlock_another() {
+        let (_temp, store, other, checkout, _) = open_pair();
+        let first = CheckoutGuard::shared(&store, checkout).unwrap();
+        let second = CheckoutGuard::shared(&other, checkout).unwrap();
+        let inherited = first.file.try_clone().unwrap();
+        drop(first);
+        assert!(matches!(
+            CheckoutGuard::exclusive(&store, checkout),
+            Err(StoreError::OperationsInFlight)
+        ));
+        drop(second);
+        let exclusive = CheckoutGuard::exclusive(&store, checkout).unwrap();
+        assert!(inherited.metadata().unwrap().is_file());
+        drop(inherited);
+        assert!(matches!(
+            CheckoutGuard::shared(&other, checkout),
+            Err(StoreError::OperationsInFlight)
+        ));
+        drop(exclusive);
     }
 
     #[test]

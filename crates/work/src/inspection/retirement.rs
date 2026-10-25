@@ -820,7 +820,6 @@ fn require_prepare_predecessor(
 pub(super) struct FreshRetirementAssessment {
     retained: RetainedDecision,
     source_repository: SourceRepository,
-    local: LocalBinding,
     binding: crate::retirement_journal::ImmutableBinding,
 }
 
@@ -893,7 +892,6 @@ pub(super) fn collect_fresh_prepare_inner(
     let mut owner = FreshRetirementAssessment {
         retained,
         source_repository,
-        local,
         binding,
     };
     owner.recheck_before_transaction()?;
@@ -4564,7 +4562,7 @@ mod tests {
             let (_r, _b, os, config) = prepared_supervised(&mut f);
             let fresh = fresh_for_test(&f, &config, None, Some(&os.driver));
             let original = repeat_local(&fresh, &config).expect("actual offline recollection");
-            assert_eq!(&original, &fresh.local);
+            assert_eq!(original, LocalBinding::from_record(fresh.binding()));
             // Authority-dir/checkout-operation metadata churn is not source
             // identity. Creating an unrelated guard must not invalidate this.
             let unrelated =
