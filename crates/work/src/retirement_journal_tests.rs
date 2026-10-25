@@ -115,10 +115,12 @@ impl LateFence {
                 match fault {
                     LateFault::None => {}
                     LateFault::Outbox => store.conn.execute_batch("CREATE TEMP TRIGGER late_outbox_fault BEFORE INSERT ON outbox WHEN (SELECT count(*) FROM retirement_intents WHERE stage='held')>=2 BEGIN SELECT RAISE(ABORT,'late outbox fault'); END;").unwrap(),
-                    LateFault::Commit => store.conn.commit_hook(Some(move || {
-                        commit_observer.store(true, std::sync::atomic::Ordering::SeqCst);
-                        true
-                    })),
+                    LateFault::Commit => {
+                        store.conn.commit_hook(Some(move || {
+                            commit_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                            true
+                        }));
+                    }
                 }
             })));
         });
