@@ -252,6 +252,9 @@ fn fresh(observed: std::time::Instant) -> Result<()> {
     }
     Ok(())
 }
+// Standalone fixture adapter; production retains and borrows its outer guard
+// through restore_under_guard instead of acquiring another SH owner here.
+#[cfg(test)]
 pub(crate) fn restore(
     config: &crate::config::Config,
     seal: ClosureSeal,

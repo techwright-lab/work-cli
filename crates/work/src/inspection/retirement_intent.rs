@@ -1,4 +1,5 @@
-//! Public report shell. Preparation is private pending parent fence review.
+//! Public report shell over the owned prepare and validated offline abort paths.
+//! Reports are metadata only, never retirement or writer-release capabilities.
 use super::*;
 use crate::config::ConfigDocument;
 use crate::retirement_journal::{self, find_operation, parse_uuid, read_history, IntentRow};
@@ -60,42 +61,62 @@ impl RetirementIntentReport {
 }
 
 pub fn prepare_retirement(
-    _config_path: &Path,
+    config_path: &Path,
     checkout: Uuid,
-    _operation: Uuid,
-    _assertion: Option<Uuid>,
-    _task_complete: bool,
+    operation: Uuid,
+    assertion: Option<Uuid>,
+    task_complete: bool,
 ) -> RetirementIntentReport {
-    // Public prepare stays inert until checkout-guard lifetimes, §5.3 lease/I/O
-    // splits, and Assessment-backed abort bindings are complete. No Store, lock,
-    // or journal write. Remove this routing only after that fence is whole.
-    let mut report = RetirementIntentReport::base(checkout);
-    report.outcome = "disabled";
-    report.reason = "implementation_incomplete";
-    report.recorded = "none";
-    report.fresh_commit = false;
-    report.fence_active = false;
-    report.execution_enabled = false;
-    report.retirement_authority = false;
-    report
+    prepare_inner(
+        config_path,
+        checkout,
+        operation,
+        assertion,
+        task_complete,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        retirement::PrepareFault::None,
+    )
+    .unwrap_or_else(|reason| failed_operation(checkout, operation, reason))
 }
 
 pub fn abort_retirement(
-    _config_path: &Path,
+    config_path: &Path,
     checkout: Uuid,
-    _operation: Uuid,
-    _revision: u64,
+    operation: Uuid,
+    revision: u64,
 ) -> RetirementIntentReport {
-    // The private offline core is source-authored but unqualified. Public routing
-    // remains inert until parent full review. The former SQL-only placeholder
-    // stays in stage-b evidence, never callable as successful abort.
+    abort_inner(
+        config_path,
+        checkout,
+        operation,
+        revision,
+        #[cfg(test)]
+        retirement::AbortFault::None,
+    )
+    .unwrap_or_else(|reason| failed_operation(checkout, operation, reason))
+}
+
+fn failed_operation(
+    checkout: Uuid,
+    operation: Uuid,
+    reason: &'static str,
+) -> RetirementIntentReport {
+    // These are internal allowlisted reasons, not raw config, SQL or paths.
+    // A refusal is not an observation of absence: validation may have held the
+    // intent, or authority may be unreadable. Do not open another Store to format
+    // the error or label the caller's requested revision as an observed revision.
     let mut report = RetirementIntentReport::base(checkout);
-    report.outcome = "disabled";
-    report.reason = "implementation_incomplete";
+    report.operation = Some(operation);
+    report.reason = reason;
+    report.stage = "unknown";
+    report.recorded = "unknown";
+    report.fence_active = true;
     report
 }
 
-/// Faithful private offline path. Production routing remains deliberately inert.
+/// Faithful private offline path; no remote pipeline or SQL-only clearing.
 pub(super) fn abort_inner(
     config_path: &Path,
     checkout: Uuid,
@@ -419,12 +440,13 @@ mod tests {
         let checkout = Uuid::now_v7();
         let report = prepare_retirement(&path, checkout, Uuid::now_v7(), None, false);
         assert_eq!(report.outcome, "disabled");
+        assert_eq!(report.reason, "prepare_intents_disabled");
         assert!(!report.fresh_commit);
         assert!(!temp.path().join("private").exists());
     }
 
     #[test]
-    fn private_disabled_and_public_abort_are_zero_authority_io() {
+    fn private_disabled_and_public_abort_missing_authority_do_not_create_authority() {
         for flag in ["", "[retirement]\nprepare_intents=false\n"] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("config.toml");
@@ -470,11 +492,15 @@ mod tests {
             );
             assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
         }
-        let report = abort_retirement(Path::new("/does/not/exist"), Uuid::nil(), Uuid::nil(), 1);
-        assert_eq!(report.outcome(), "disabled");
-        assert_eq!(report.reason(), "implementation_incomplete");
+        let report = abort_retirement(&path, Uuid::now_v7(), Uuid::now_v7(), 1);
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "authority_unknown");
         assert!(!report.fresh_commit());
-        assert_eq!(serde_json::to_value(report).unwrap()["recorded"], "none");
+        assert!(report.fence_active());
+        let value = serde_json::to_value(report).unwrap();
+        assert_eq!(value["recorded"], "unknown");
+        assert_eq!(value["stage"], "unknown");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 
     #[test]
@@ -507,10 +533,11 @@ mod tests {
         let path = temp.path().join("config.toml");
         std::fs::write(&path, format!("store_dir = {:?}\ntrusted_registry = {:?}\nroots = [{:?}]\n[retirement]\nprepare_intents = true\n", store_dir, registry, root)).unwrap();
         let report = prepare_retirement(&path, checkout, Uuid::now_v7(), None, false);
-        assert_eq!(report.outcome, "disabled");
-        assert_eq!(report.reason, "implementation_incomplete");
+        assert_eq!(report.outcome, "held");
         assert!(!report.fresh_commit);
-        assert!(!report.fence_active);
+        assert!(report.fence_active);
+        assert_eq!(report.stage, "unknown");
+        assert_eq!(report.recorded, "unknown");
         assert!(!report.retirement_authority);
         let intents: i64 = rusqlite::Connection::open(store_dir.join("store.sqlite"))
             .unwrap()

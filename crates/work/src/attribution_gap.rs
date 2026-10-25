@@ -1008,6 +1008,9 @@ fn matching_committed(
     }
     read_record(conn, committed)
 }
+// Standalone fixture adapter; production borrows its outer guard through
+// begin_under_guard rather than acquiring a second SH owner here.
+#[cfg(test)]
 pub(crate) fn begin(
     config: &Config,
     root: &RootRunRequest,

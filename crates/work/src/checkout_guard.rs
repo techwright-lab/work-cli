@@ -51,9 +51,6 @@ impl CheckoutGuard {
             Ok(())
         }
     }
-    pub(crate) fn checkout(&self) -> Uuid {
-        self.checkout
-    }
     pub(crate) fn exclusive_held(&self) -> bool {
         self.exclusive
     }
@@ -98,9 +95,6 @@ impl CheckoutGuard {
             return Err(StoreError::Invalid);
         }
         Ok(())
-    }
-    pub(crate) fn matches_store(&self, store: &Store) -> Result<()> {
-        self.revalidate(store)
     }
     pub(crate) fn require_matching(&self, store: &Store, checkout: Uuid) -> Result<()> {
         self.matches_checkout(checkout)?;

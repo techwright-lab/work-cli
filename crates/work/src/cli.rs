@@ -504,20 +504,15 @@ fn retire(command: RetireCommand) {
         "{}",
         serde_json::to_string(&report).expect("retirement serialization")
     );
-    let ok = match command_kind(&report) {
-        "status" => report.outcome() != "held",
-        _ => report.outcome() == "prepared" || report.outcome() == "existing",
+    // Interpret the result under the actual requested command, not a heuristic
+    // inferred from the report. In particular a fresh validated abort succeeds.
+    let ok = match command {
+        RetireCommand::Prepare { .. } => matches!(report.outcome(), "prepared" | "existing"),
+        RetireCommand::Abort { .. } => matches!(report.outcome(), "aborted" | "existing"),
+        RetireCommand::Status { .. } => report.outcome() == "observed",
     };
     if !ok {
         std::process::exit(1);
-    }
-}
-
-fn command_kind(report: &crate::inspection::RetirementIntentReport) -> &'static str {
-    if report.outcome() == "observed" {
-        "status"
-    } else {
-        "mutate"
     }
 }
 

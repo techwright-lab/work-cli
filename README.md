@@ -16,7 +16,7 @@ not production activation. Adopted-only declarations (`work adopt begin/event/st
 available without process control. Explicit `work finish <checkout-id>` records task completion;
 retirement remains disabled by default and every finished checkout retains its tree and charge.
 Schema 16 adds a persistent retirement-intent fence: `work retire prepare|abort|status`.
-Prepare is inert unless `[retirement] prepare_intents = true` is set; abort and status never require that flag.
+Prepare is disabled by default (absent or false `[retirement] prepare_intents`); abort and status never require that flag.
 A prepared or held intent stays fenced across expiry, reboot and lost acknowledgments until an explicit validated abort.
 Historical matching prepared/held/aborted results are not fresh authority. Schema-15 approvals are ineligible and require a fresh assertion; they are not migrated.
 This slice does not move, delete, quarantine or activate production retirement. Independent CI selectors exist so Task8 parked failures cannot hide these tests.
@@ -285,8 +285,8 @@ execution, compiled correctness, passing CI or full Task10 completion is claimed
 
 ### Retirement assessment prerequisite (Task10 source, not retirement acceptance)
 
-There is **no** `work retire` command, flag, or automatic finish/reap invocation.
-The public library wrapper is:
+Assessment remains passive and separate from the explicit `work retire` intent commands
+below. There is no automatic finish/reap invocation. The public library wrapper is:
 
 ```rust
 inspection::assess_retirement(config_path, checkout, assertion) -> RetirementAssessmentReport
@@ -319,6 +319,59 @@ No lifecycle, receipt, ref, writer, charge, or outbox rows are written.
 Tests are source-authored for the Task10 GitHub job using owned Store/Git/local-bare
 and simulated manager/proc/cgroup fixtures. Simulated fixtures are not live user-systemd
 qualification. No local execution or full Task10 completion is claimed.
+
+### Retirement intent commands (source wiring; not activation or Task10 acceptance)
+
+```sh
+work retire prepare <checkout-uuidv7> --operation <uuidv7> [--assertion <uuidv7> --task-complete]
+work retire abort <checkout-uuidv7> --operation <uuidv7> --revision <n>
+work retire status <checkout-uuidv7>
+```
+
+The existing discovered `WORK_CONFIG` document controls prepare with a strict boolean:
+
+```toml
+[retirement]
+prepare_intents = false
+```
+
+Absent or false returns `prepare_intents_disabled` before any Store, guard or
+lock-directory open. Invalid retirement policy fails closed as `configuration_unknown`.
+This source change does not set or merge any host configuration or enable live use.
+An explicitly enabled prepare uses fresh owned assessment and exact context checks;
+adopted preparation requires both a current named operator assertion and the separate
+`--task-complete` declaration. An assertion alone is not task completion or OS quiescence.
+Neither declaration releases the adopted writer or creates a task-finish receipt.
+
+Prepared and held fences persist across expiry, reboot and lost acknowledgments.
+Cooperative mutators fail closed: an attempted write holds a prepared intent once,
+without performing its caller mutation; repeated held attempts add no hold event.
+Abort is explicit **validated offline** comparison of original local bindings, full
+history and requested revision, not force-clear, SQL-only reset or OS-quiescence proof.
+It performs no remote fetch. Changed source/configuration/boot or unreadable evidence
+leaves exclusion intact. Abort/status do not require the prepare flag, but changing
+that flag also changes bound configuration: it does not waive abort validation.
+Use the observed active revision (prepared 1, held 2); exact abort retries use the
+same originally requested revision and return historical metadata.
+
+Prepare exits zero for `prepared` or matching historical `existing`; abort for
+`aborted` or matching historical `existing`. Status exits zero for a valid `observed`
+result, including no intent or a held fence. Held/unknown/uncertain operation results
+exit nonzero; unknown configuration-path discovery exits 2. JSON distinguishes
+`fresh_commit` from recorded history. An old aborted operation can still report
+`fence_active:true` when a different operation fences the checkout. Unreadable or
+failed validation reports unknown stage/recording and conservatively active fencing,
+not a fabricated absence or release. A fresh assertion is needed after prepare/abort
+changes the bound history; retrying an old operation never prepares a new one.
+
+Every report retains `execution_enabled:false`, `retirement_authority:false`,
+`writer_charges_retained:true` and `protection_retained:true`. No movement, removal,
+writer/charge release, production activation or full-feature acceptance is implemented
+by these commands. The public adopted tests use actual local Git/protection/approval
+history in CI-owned persistent fixtures, not journal-seeded positive evidence.
+New wiring requires independent review and new exact-SHA CI including unchanged
+strict Clippy. Earlier scoped private-core passes are not qualification of this wiring;
+the full run's two parked Task8 failures and failed Clippy are not overall green.
 
 ### Capture construction (Tasks 8.1–8.4b; implementation, not acceptance)
 

@@ -3997,13 +3997,17 @@ mod tests {
             crate::checkout_guard::CheckoutGuard::shared(&f.store, f.allocation.checkout).is_ok()
         );
 
+        // Wrong revision must refuse without consuming this prepared fixture.
         let abort = super::retirement_intent::abort_retirement(
             &config,
             f.allocation.checkout,
             operation,
-            1,
+            2,
         );
-        assert_eq!(abort.reason(), "implementation_incomplete");
+        assert_eq!(abort.outcome(), "held");
+        assert_eq!(abort.reason(), "intent_conflict");
+        assert!(!abort.fresh_commit());
+        assert!(abort.fence_active());
         assert_eq!(
             crate::retirement_journal::load_operation(&f.store.conn, operation)
                 .unwrap()

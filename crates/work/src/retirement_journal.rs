@@ -4,7 +4,6 @@ use crate::events::Event;
 use crate::store::{emit, Result, Store, StoreError};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -82,11 +81,12 @@ impl Attempt {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Scope {
     Checkout(Uuid),
+    // Explicit checkout-set adapter for the late-alias batch fixture only.
+    // Production resolves the full composite set through Allocation.
+    #[cfg(test)]
     Checkouts(Vec<Uuid>),
     Run(Uuid),
-    Group(Uuid),
     Owner(String),
-    Repositories(BTreeSet<String>),
     Allocation {
         checkouts: BTreeSet<Uuid>,
         repositories: BTreeSet<String>,
@@ -347,26 +347,13 @@ pub(crate) fn checkpoint(
     Ok(())
 }
 
-pub(crate) fn begin_fenced<'s>(
-    store: &'s mut Store,
-    lease: &AuthorityLease,
-    scope: Scope,
-    attempt: Attempt,
-) -> Result<Transaction<'s>> {
-    lease.check(store)?;
-    let authority = store.authority_identity().clone();
-    let tx = store
-        .conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)?;
-    fence(tx, lease, &authority, scope, attempt)
-}
-
 fn resolve_scope(tx: &Connection, scope: &Scope) -> Result<Vec<Uuid>> {
     let mut ids = BTreeSet::new();
     match scope {
         Scope::Checkout(id) => {
             ids.insert(*id);
         }
+        #[cfg(test)]
         Scope::Checkouts(list) => ids.extend(list.iter().copied()),
         Scope::Run(id) => {
             let key = id.to_string();
@@ -379,16 +366,6 @@ fn resolve_scope(tx: &Connection, scope: &Scope) -> Result<Vec<Uuid>> {
                 ids.insert(parse_uuid(&row?)?);
             }
         }
-        Scope::Group(id) => {
-            let key = id.to_string();
-            let mut stmt = tx.prepare(
-                "SELECT checkout FROM run_groups WHERE id=?1
-                 UNION SELECT checkout FROM adopted_groups WHERE id=?1",
-            )?;
-            for row in stmt.query_map([&key], |r| r.get::<_, String>(0))? {
-                ids.insert(parse_uuid(&row?)?);
-            }
-        }
         Scope::Owner(owner) => {
             let mut stmt = tx.prepare(
                 "SELECT id FROM checkouts WHERE owner=?1 AND state!='retired' ORDER BY id",
@@ -396,9 +373,6 @@ fn resolve_scope(tx: &Connection, scope: &Scope) -> Result<Vec<Uuid>> {
             for row in stmt.query_map([owner.as_str()], |r| r.get::<_, String>(0))? {
                 ids.insert(parse_uuid(&row?)?);
             }
-        }
-        Scope::Repositories(repos) => {
-            ids.extend(repository_checkouts(tx, repos)?);
         }
         Scope::Allocation {
             checkouts,
@@ -580,10 +554,6 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid> {
         return Err(StoreError::Invalid);
     }
     Ok(id)
-}
-
-pub(crate) fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -1059,6 +1029,8 @@ pub(crate) fn load_operation(conn: &Connection, operation: Uuid) -> Result<Inten
     find_operation(conn, operation)?.ok_or(StoreError::Invalid)
 }
 
+// Journal fixture convenience only; production consumers read strict full history.
+#[cfg(test)]
 pub(crate) fn active_operation(conn: &Connection, checkout: Uuid) -> Result<Option<IntentRow>> {
     Ok(read_history(conn, checkout)?
         .into_iter()
