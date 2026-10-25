@@ -2743,24 +2743,18 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
         );
     }
     fn seed_prepared_fence(store: &crate::store::Store, checkout: uuid::Uuid) {
-        let operation = uuid::Uuid::now_v7();
-        store
-            .conn
-            .execute(
-                "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-                rusqlite::params![
-                    operation.to_string(),
-                    checkout.to_string(),
-                    [3u8; 32].as_slice(),
-                    [4u8; 32].as_slice()
-                ],
-            )
-            .unwrap();
+        crate::retirement_journal::tests::seed_prepared(store, checkout, uuid::Uuid::now_v7());
+        let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+        assert_eq!(
+            (rows.len(), rows[0].revision, rows[0].stage.as_str()),
+            (1, 1, "prepared")
+        );
     }
     #[test]
     fn restore_holds_prepared_intent_before_certificate() {
         let (_temp, cfg, store, a, _root, closure, acknowledgement) = closed();
         seed_prepared_fence(&store, a.checkout);
+        let before = crate::retirement_journal::tests::source_rows(&store);
         assert!(matches!(
             restore(&cfg, closure, acknowledgement),
             Err(crate::store::StoreError::RetirementFenced)
@@ -2784,6 +2778,15 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             )
             .unwrap();
         assert_eq!(reason, "capture_readiness");
+        assert_eq!(
+            crate::retirement_journal::tests::source_rows(&store),
+            before
+        );
+        let rows = crate::retirement_journal::read_history(&store.conn, a.checkout).unwrap();
+        assert_eq!((rows[0].revision, rows[0].stage.as_str()), (2, "held"));
+        assert_eq!(store.pending_events(1000).unwrap().iter().filter(|e|
+            matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+        ).count(), 1);
     }
     #[test]
     fn restore_under_guard_refuses_mismatched_checkout() {

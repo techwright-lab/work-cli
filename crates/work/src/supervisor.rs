@@ -439,14 +439,20 @@ fn supervise_captured(
     if let Some(report) = captured_existing_report(config, &command, true)? {
         return Ok(report);
     }
+    let guard = acquire_checkout_guard(config, command.checkout)?;
+    let (mut store, lock) = allocate::locked(config)?;
+    db(guard.require_matching(&store, command.checkout))?;
+    db(crate::retirement_journal::checkpoint(
+        &mut store,
+        &lock,
+        crate::retirement_journal::Scope::Checkout(command.checkout),
+        crate::retirement_journal::Attempt::ExecutionPermit,
+    ))?;
     let settings = config
         .supervisor
         .as_ref()
         .ok_or_else(|| err("supervisor not configured"))?;
     settings.policy()?;
-    let guard = acquire_checkout_guard(config, command.checkout)?;
-    let (store, lock) = allocate::locked(config)?;
-    db(guard.revalidate(&store))?;
     let allocation: allocate::Allocation = {
         let _phase = store.sql_phase();
         let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
@@ -511,14 +517,20 @@ pub(crate) fn supervise_off(
     if let Some(report) = off_existing_report(config, &command)? {
         return Ok(report);
     }
+    let guard = acquire_checkout_guard(config, command.checkout)?;
+    let (mut store, lock) = allocate::locked(config)?;
+    db(guard.require_matching(&store, command.checkout))?;
+    db(crate::retirement_journal::checkpoint(
+        &mut store,
+        &lock,
+        crate::retirement_journal::Scope::Checkout(command.checkout),
+        crate::retirement_journal::Attempt::ExecutionPermit,
+    ))?;
     let settings = config
         .supervisor
         .as_ref()
         .ok_or_else(|| err("supervisor not configured"))?;
     settings.policy()?;
-    let guard = acquire_checkout_guard(config, command.checkout)?;
-    let (store, lock) = allocate::locked(config)?;
-    db(guard.revalidate(&store))?;
     let allocation: allocate::Allocation = {
         let _phase = store.sql_phase();
         let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
@@ -544,7 +556,12 @@ pub(crate) fn supervise_off(
     let mut input = default.input().clone();
     input.attribution = Some(crate::run_journal::AttributionDecision::Off);
     let root = db(RootRunRequest::new(default.identity().clone(), input))?;
-    let (store, began) = db(crate::attribution_gap::begin(config, &root, &command.argv))?;
+    let (store, began) = db(crate::attribution_gap::begin_under_guard(
+        config,
+        &root,
+        &command.argv,
+        &guard,
+    ))?;
     db(guard.revalidate(&store))?;
     let live = match began {
         crate::attribution_gap::BeginGap::Created(live) => live,
@@ -703,6 +720,16 @@ fn execute(
     // commits, subsequent capture/readiness errors must never rewrite that fact.
     let mut physically_closed = false;
     let result = (|| {
+        db(guard.require_matching(&store, command.checkout))?;
+        let lock = allocate::lifecycle_lock(&store)?;
+        db(crate::retirement_journal::checkpoint(
+            &mut store,
+            &lock,
+            crate::retirement_journal::Scope::Checkout(command.checkout),
+            crate::retirement_journal::Attempt::ExecutionPermit,
+        ))?;
+        // The borrowed checkout guard, not the global lease, spans external work.
+        drop(lock);
         let runs = config
             .store_dir
             .as_ref()
@@ -927,7 +954,9 @@ fn execute(
                         // Physical closure already committed. Publication consumes
                         // this one seal outside all SQL/allocator guards; errors
                         // cannot reopen the Root or install a recovery outcome.
-                        db(crate::gap_continuation::publish(config, seal))?;
+                        db(crate::gap_continuation::publish_under_guard(
+                            config, seal, &guard,
+                        ))?;
                     }
                     if let Some(seal) = seal {
                         // Physical closure is already committed. Neither FINISH

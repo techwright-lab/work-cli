@@ -487,7 +487,10 @@ fn exclude_new_event(conn: &Connection, event: &str) -> Result<()> {
         [event],
         |r| r.get(0),
     )?;
-    if reserved || event_reserved(conn, event)? {
+    if reserved
+        || event_reserved(conn, event)?
+        || crate::retirement_journal::operation_reserved(conn, event)?
+    {
         return Err(StoreError::Conflict);
     }
     Ok(())
@@ -998,21 +1001,38 @@ pub(crate) fn begin(
     }
     let checkout = id(&root.identity().checkout.to_string())?;
     let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)?;
+    begin_under_guard(config, root, argv, &guard)
+}
+pub(crate) fn begin_under_guard(
+    config: &Config,
+    root: &RootRunRequest,
+    argv: &[OsString],
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<(Store, BeginGap)> {
     let (store, lock) = crate::allocate::locked(config)?;
-    guard.revalidate(&store)?;
     drop(lock);
-    let result = begin_in_store(config, store, root, argv)?;
-    guard.revalidate(&result.0)?;
-    Ok(result)
+    begin_in_store_under_guard(config, store, root, argv, guard)
 }
 // Private common core also lets owned contender tests preopen two native Stores
 // before their timed observations. No public bypass, alternate authority, or
 // caller-created proof is accepted.
+#[cfg(test)]
 fn begin_in_store(
+    config: &Config,
+    store: Store,
+    root: &RootRunRequest,
+    argv: &[OsString],
+) -> Result<(Store, BeginGap)> {
+    let checkout = id(&root.identity().checkout.to_string())?;
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&store, checkout)?;
+    begin_in_store_under_guard(config, store, root, argv, &guard)
+}
+fn begin_in_store_under_guard(
     config: &Config,
     mut store: Store,
     root: &RootRunRequest,
     argv: &[OsString],
+    guard: &crate::checkout_guard::CheckoutGuard,
 ) -> Result<(Store, BeginGap)> {
     if root.input().attribution != Some(AttributionDecision::Off)
         || config.store_dir.as_deref() != Some(store.authority_identity().directory.as_path())
@@ -1021,6 +1041,15 @@ fn begin_in_store(
         return Err(StoreError::Invalid);
     }
     let checkout = id(&root.identity().checkout.to_string())?;
+    guard.require_matching(&store, checkout)?;
+    let lock = store.authority_lease()?;
+    crate::retirement_journal::checkpoint(
+        &mut store,
+        &lock,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        crate::retirement_journal::Attempt::GapAdmission,
+    )?;
+    drop(lock);
     let context = {
         let _phase = store.sql_phase();
         let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
@@ -1207,6 +1236,7 @@ fn begin_in_store(
     if let Some(registry) = &proof.registry {
         registry.revalidate().map_err(|_| StoreError::Conflict)?;
     }
+    guard.require_matching(&store, checkout)?;
     let lock = store.authority_lease()?;
     let authority = store.authority_identity().clone();
     {

@@ -662,7 +662,7 @@ fn resume_published(
         &plan.key,
         identity.common_git_dir.as_os_str().as_bytes(),
     )?;
-    intent_redundant_bindings(&intent, &plan)?;
+    intent_redundant_bindings(&intent, plan)?;
     let planned_names = sync::planned_names(&plan.plan);
     let planned_new =
         preservation::planned_new_from_witness(&intent.source_witness, &planned_names)?;

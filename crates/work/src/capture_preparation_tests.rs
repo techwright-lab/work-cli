@@ -255,7 +255,12 @@ fn generic_owned_release_refuses_captured_launch_without_fresh_private_proof() {
                 panic!("new live")
             };
             assert!(launch
-                .release_captured(&driver, other_live.release_proof().unwrap())
+                .observe_release(
+                    &driver,
+                    crate::scope_spawn::ReleaseProof::Captured(
+                        &other_live.release_proof().unwrap()
+                    )
+                )
                 .is_err());
         } else {
             assert!(
@@ -272,19 +277,12 @@ fn generic_owned_release_refuses_captured_launch_without_fresh_private_proof() {
     }
 }
 fn seed_prepared_fence(store: &Store, checkout: uuid::Uuid) {
-    let operation = uuid::Uuid::now_v7();
-    store
-        .conn
-        .execute(
-            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-            rusqlite::params![
-                operation.to_string(),
-                checkout.to_string(),
-                [3u8; 32].as_slice(),
-                [4u8; 32].as_slice()
-            ],
-        )
-        .unwrap();
+    crate::retirement_journal::tests::seed_prepared(store, checkout, uuid::Uuid::now_v7());
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (rows.len(), rows[0].revision, rows[0].stage.as_str()),
+        (1, 1, "prepared")
+    );
 }
 fn fixture_store(cfg: &Config) -> Store {
     Store::open_existing_registered_mut(
@@ -318,7 +316,11 @@ fn prepare_holds_prepared_intent_before_receiver() {
     let store = fixture_store(&cfg);
     let checkout = root_checkout(&root);
     seed_prepared_fence(&store, checkout);
-    let error = match prepare(&cfg, &root, &spec) {
+    let before = crate::retirement_journal::tests::source_rows(&store);
+    let mut receiver_reached = false;
+    let error = match prepare_observed(&cfg, &root, &spec, |at, _| {
+        receiver_reached |= at == Boundary::Receiver;
+    }) {
         Ok(_) => panic!("fenced capture preparation unexpectedly succeeded"),
         Err(error) => error,
     };
@@ -338,7 +340,15 @@ fn prepare_holds_prepared_intent_before_receiver() {
         (revision, stage.as_str(), reason.as_deref()),
         (2, "held", Some("capture_admission"))
     );
+    assert!(!receiver_reached);
     assert!(!temp.path().join("calls").exists());
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&store),
+        before
+    );
+    assert_eq!(store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
     assert_eq!(
         store
             .conn
@@ -347,6 +357,42 @@ fn prepare_holds_prepared_intent_before_receiver() {
             .unwrap(),
         0
     );
+}
+#[test]
+fn preparation_commit_fences_after_actual_begin_without_mutating_caller_rows() {
+    let (_temp, cfg, _a, root, spec) = qualified_fixture();
+    let checkout = root_checkout(&root);
+    let mut before = None;
+    let mut receiver_reached = false;
+    let result = prepare_observed(&cfg, &root, &spec, |at, store| {
+        receiver_reached |= at == Boundary::Receiver;
+        if at == Boundary::BeforeCommit {
+            seed_prepared_fence(store, checkout);
+            before = Some(crate::retirement_journal::tests::source_rows(store));
+        }
+    });
+    assert!(
+        receiver_reached && before.is_some(),
+        "actual BEGIN/qualification boundary not reached"
+    );
+    assert!(result.is_err());
+    let store = fixture_store(&cfg);
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&store),
+        before.unwrap()
+    );
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (
+            rows[0].revision,
+            rows[0].stage.as_str(),
+            rows[0].held_reason.as_deref()
+        ),
+        (2, "held", Some("capture_preparation"))
+    );
+    assert_eq!(store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
 }
 #[test]
 fn prepare_shared_guard_excludes_exclusive_until_drain() {
@@ -358,7 +404,9 @@ fn prepare_shared_guard_excludes_exclusive_until_drain() {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
-        ready_rx.recv().unwrap();
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("preparation never reached RegistryRecheck");
         let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
         assert!(matches!(
             crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout),
@@ -374,14 +422,21 @@ fn prepare_shared_guard_excludes_exclusive_until_drain() {
         drop(lock);
         release_tx.send(()).unwrap();
     });
-    let (_store, result) = prepare_observed(&cfg, &root, &spec, |at, _store| {
+    let mut reached = false;
+    let result = prepare_observed(&cfg, &root, &spec, |at, _store| {
         if at == Boundary::RegistryRecheck {
+            reached = true;
             ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("preparation guard worker did not acknowledge");
         }
-    })
-    .unwrap();
-    handle.join().unwrap();
+    });
+    drop(ready_tx);
+    let worker = handle.join();
+    assert!(reached, "preparation boundary not reached");
+    worker.unwrap();
+    let (_store, result) = result.unwrap();
     assert!(matches!(result, PreparationResult::Live(_)));
     let store = fixture_store(&cfg);
     crate::checkout_guard::CheckoutGuard::exclusive(&store, checkout).unwrap();

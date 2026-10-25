@@ -279,8 +279,10 @@ pub(crate) fn fence<'c>(
     attempt: Attempt,
 ) -> Result<Transaction<'c>> {
     lease.check_authority(authority)?;
-    if schema_version(&tx)? < 16 {
-        return Ok(tx);
+    // Compatibility reads on old schemas cannot grant mutation permission,
+    // including on an already-open Store whose version changed externally.
+    if schema_version(&tx)? != 16 {
+        return Err(StoreError::Invalid);
     }
     let checkouts = resolve_scope(&tx, &scope)?;
     let mut prepared = Vec::new();
@@ -1065,4 +1067,4 @@ pub(crate) fn active_operation(conn: &Connection, checkout: Uuid) -> Result<Opti
 
 #[cfg(test)]
 #[path = "retirement_journal_tests.rs"]
-mod tests;
+pub(crate) mod tests;

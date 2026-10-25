@@ -112,9 +112,7 @@ pub(super) fn abort_inner(
         fault,
     ) {
         Ok(retirement::AbortCommit::Historical(row, count, fence_active)) => {
-            let mut report = historical(&row, count);
-            report.fence_active = fence_active;
-            Ok(report)
+            Ok(historical(&row, count, fence_active))
         }
         Ok(retirement::AbortCommit::Aborted(aborted)) => Ok(aborted.into_report()),
         Err("commit_unknown") => {
@@ -182,8 +180,10 @@ pub(super) fn prepare_inner(
         .map_err(|_| "authority_unknown")?;
     {
         let _phase = readonly.sql_phase();
-        if let Some((row, count)) = historical_operation(&readonly.conn, checkout, operation)? {
-            return Ok(historical(&row, count));
+        if let Some((row, count, fence_active)) =
+            historical_operation(&readonly.conn, checkout, operation)?
+        {
+            return Ok(historical(&row, count, fence_active));
         }
         retirement_journal::exclude_prepare_operation(&readonly.conn, operation)
             .map_err(prepare_store_error)?;
@@ -211,8 +211,8 @@ pub(super) fn prepare_inner(
             .map_err(|_| "history_unknown")?;
         let retry = historical_operation(&tx, checkout, operation)?;
         tx.rollback().map_err(|_| "history_unknown")?;
-        if let Some((row, count)) = retry {
-            return Ok(historical(&row, count));
+        if let Some((row, count, fence_active)) = retry {
+            return Ok(historical(&row, count, fence_active));
         }
     }
     // Declaration is not quiescence proof. The actual mode/operator/task come
@@ -247,7 +247,9 @@ pub(super) fn prepare_inner(
         fault,
     ) {
         Ok(retirement::PrepareCommit::Prepared(prepared)) => Ok(prepared.into_report()),
-        Ok(retirement::PrepareCommit::Historical(row, count)) => Ok(historical(&row, count)),
+        Ok(retirement::PrepareCommit::Historical(row, count, fence_active)) => {
+            Ok(historical(&row, count, fence_active))
+        }
         Err("commit_unknown") => {
             // Never inspect a row and manufacture a fresh capability after an
             // uncertain acknowledgment. Exclusion is conservatively retained.
@@ -270,15 +272,21 @@ pub(super) fn historical_operation(
     conn: &rusqlite::Connection,
     checkout: Uuid,
     operation: Uuid,
-) -> Result<Option<(IntentRow, u64)>, &'static str> {
+) -> Result<Option<(IntentRow, u64, bool)>, &'static str> {
     let history = read_history(conn, checkout).map_err(|_| "history_unknown")?;
+    let fence_active = history.iter().any(|row| row.stage != "aborted");
     if let Some(row) = find_operation(conn, operation).map_err(|_| "history_unknown")? {
         if row.checkout != checkout {
             return Err("intent_conflict");
         }
-        return Ok(Some((row, history.len() as u64)));
+        if !history.iter().any(|entry| entry == &row) {
+            return Err("history_unknown");
+        }
+        // Historical A may be aborted while B fences this same checkout.
+        // Report the full strictly decoded history, never just A's stage.
+        return Ok(Some((row, history.len() as u64, fence_active)));
     }
-    if history.iter().any(|row| row.stage != "aborted") {
+    if fence_active {
         return Err("intent_conflict");
     }
     Ok(None)
@@ -310,7 +318,7 @@ fn status_inner(
     let _phase = store.sql_phase();
     let history = read_history(&store.conn, checkout).map_err(|_| "history_unknown")?;
     if let Some(active) = history.iter().find(|row| row.stage != "aborted") {
-        let mut report = historical(active, history.len() as u64);
+        let mut report = historical(active, history.len() as u64, true);
         report.outcome = "observed";
         report.reason = "status";
         Ok(report)
@@ -340,7 +348,7 @@ fn disabled(checkout: Uuid) -> RetirementIntentReport {
     report
 }
 
-fn historical(row: &IntentRow, count: u64) -> RetirementIntentReport {
+fn historical(row: &IntentRow, count: u64, fence_active: bool) -> RetirementIntentReport {
     let mut report = RetirementIntentReport::base(row.checkout);
     report.operation = Some(row.operation);
     report.revision = Some(row.revision as u64);
@@ -358,14 +366,14 @@ fn historical(row: &IntentRow, count: u64) -> RetirementIntentReport {
     report.outcome = "existing";
     report.reason = "historical";
     report.recorded = "committed";
-    report.fence_active = row.stage != "aborted";
+    report.fence_active = fence_active;
     report.history_count = count;
     report
 }
 
 // Only the acknowledged private abort owner calls this, while retaining EX.
 pub(super) fn aborted_report(row: &IntentRow, count: u64) -> RetirementIntentReport {
-    let mut report = historical(row, count);
+    let mut report = historical(row, count, false);
     report.outcome = "aborted";
     report.reason = "validated_abort";
     report.fresh_commit = true;

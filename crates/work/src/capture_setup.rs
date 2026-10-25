@@ -100,9 +100,13 @@ pub(crate) fn begin_under_guard(
         drop(lock);
         return Ok((store, result));
     }
+    drop(lock);
     let proof = crate::allocate::db(MaterializationProof::inspect(&store, request, spec))?;
+    let inspected = crate::allocate::db(proof.reinspect(&store))?;
+    crate::allocate::db(guard.require_matching(&store, checkout))?;
+    let lock = crate::allocate::lifecycle_lock(&store)?;
     let result = crate::allocate::db(
-        store.begin_materialized_capture_under_lease(request, spec, &proof, &lock),
+        store.begin_materialized_capture_under_lease(request, spec, inspected, &lock),
     )?;
     drop(lock);
     Ok((store, result))
@@ -308,12 +312,32 @@ impl PreparationContext {
 // No Clone/Serde, private fields and a single real-inspection constructor. A
 // stored flag, root declaration or preparation response cannot mint this proof.
 pub(crate) struct MaterializationProof {
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
     root: RootRunRequest,
     allocation: Allocation,
     pending: PendingPreparation,
     physical: Physical,
     observed: Instant,
     spec_digest: [u8; 32],
+}
+/// Only actual out-of-lease reinspection creates this non-Clone admission stage.
+/// It borrows the original observation (including its timestamp and exact context).
+pub(crate) struct InspectedMaterialization<'a> {
+    proof: &'a MaterializationProof,
+}
+impl InspectedMaterialization<'_> {
+    pub(crate) fn checked(
+        &self,
+        store: &Store,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<&MaterializationProof> {
+        lease.check(store)?;
+        if !std::sync::Arc::ptr_eq(&self.proof.authority, store.authority_identity()) {
+            return Err(StoreError::Conflict);
+        }
+        self.proof.fresh()?;
+        Ok(self.proof)
+    }
 }
 #[derive(PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -402,6 +426,7 @@ impl MaterializationProof {
         let spec_digest =
             Sha256::digest(serde_json::to_vec(spec).map_err(|_| StoreError::Invalid)?).into();
         let proof = Self {
+            authority: store.authority_identity().clone(),
             root: root.clone(),
             allocation: a,
             pending,
@@ -415,8 +440,10 @@ impl MaterializationProof {
     }
     /// Reobserve physical evidence immediately before entering the SQL-only
     /// admission transaction. Never renews the original proof's timestamp.
-    pub(crate) fn reinspect(&self, store: &Store) -> Result<()> {
-        if !store.conn.is_autocommit() {
+    pub(crate) fn reinspect(&self, store: &Store) -> Result<InspectedMaterialization<'_>> {
+        if !store.conn.is_autocommit()
+            || !std::sync::Arc::ptr_eq(&self.authority, store.authority_identity())
+        {
             return Err(StoreError::Invalid);
         }
         self.fresh()?;
@@ -425,7 +452,8 @@ impl MaterializationProof {
         if physical(&self.allocation, &self.pending.source_common)? != self.physical {
             return Err(StoreError::Conflict);
         }
-        self.fresh()
+        self.fresh()?;
+        Ok(InspectedMaterialization { proof: self })
     }
     fn validate_declaration(&self, root: &RootRunRequest) -> Result<()> {
         if &self.root != root

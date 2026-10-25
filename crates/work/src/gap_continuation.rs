@@ -450,9 +450,14 @@ fn validate_qualification(
     Ok(())
 }
 
-/// Consumes the sole Changed-close seal. All filesystem/registry observations,
-/// candidate bytes and their fingerprint are prepared before acquiring a lease.
-pub(crate) fn publish(config: &crate::config::Config, seal: GapClosureSeal) -> Result<()> {
+/// Consumes the sole Changed-close seal under the supervisor's borrowed SH.
+/// The entry checkpoint drops its lease before filesystem/registry observation;
+/// candidate bytes and their fingerprint precede the final SQL-only lease.
+pub(crate) fn publish_under_guard(
+    config: &crate::config::Config,
+    seal: GapClosureSeal,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<()> {
     let mut store = crate::store::Store::open_existing_registered_mut(
         config
             .trusted_registry
@@ -461,6 +466,17 @@ pub(crate) fn publish(config: &crate::config::Config, seal: GapClosureSeal) -> R
         config.store_dir.as_deref().ok_or(StoreError::Invalid)?,
         &config.roots,
     )?;
+    let checkout = uuid::Uuid::parse_str(&seal.closed.request.identity().checkout.to_string())
+        .map_err(|_| StoreError::Invalid)?;
+    guard.require_matching(&store, checkout)?;
+    let lease = store.authority_lease()?;
+    crate::retirement_journal::checkpoint(
+        &mut store,
+        &lease,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        crate::retirement_journal::Attempt::GapPublication,
+    )?;
+    drop(lease);
     if store.authority_identity().as_ref() != seal.context.authority() {
         return Err(StoreError::Conflict);
     }
@@ -519,6 +535,7 @@ pub(crate) fn publish(config: &crate::config::Config, seal: GapClosureSeal) -> R
     let fingerprint: [u8; 32] = Sha256::digest(bytes.as_bytes()).into();
     #[cfg(test)]
     observe_publication("before_lease");
+    guard.require_matching(&store, checkout)?;
     let lease = store.authority_lease()?;
     lease.check(&store)?;
     let authority = store.authority_identity().clone();

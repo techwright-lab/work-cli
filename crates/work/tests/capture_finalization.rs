@@ -912,24 +912,62 @@ fn terminal_retains_bounded_optional_facts() {
         "terminal facts discarded"
     );
 }
-fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: &str) {
+// Structural negative-fence fixture, never a successful prepare capability.
+fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: &str, cfg: &work_cli::config::Config) {
     let operation = Uuid::now_v7();
+    let hex = |tag: u8| format!("{tag:02x}").repeat(32);
+    let record = serde_json::json!({
+        "version":1, "operation":operation, "checkout":checkout, "mode":"supervised",
+        "revision":1, "stage":"prepared", "assertion":null, "declaration":null,
+        "predecessor_hex":hex(1), "source_hex":hex(2), "history_predecessor_hex":hex(3),
+        "prior_history_count":0,
+        "immutable_binding":{
+            "version":1, "authority_allocation":hex(4), "source_sql":hex(2),
+            "managed_physical":hex(6), "census":hex(7), "git_private":hex(8),
+            "local_git":hex(9), "git_inputs":hex(10), "source_commitment":hex(11),
+            "approval_semantic":hex(12), "approval_invalidation":hex(13),
+            "protection":hex(14), "protection_count":0, "config_manifests":[hex(15),hex(16)],
+            "inspection_policy":hex(17), "combined_policy":hex(18),
+            "operator":hex(19), "source_repository":hex(20)
+        },
+        "quiescence":"empty", "task_completion":"supervised_empty", "policy_digest":hex(17),
+        "combined_policy_digest":hex(18), "prepared_wall_ms":1, "remote_cleanup":"not_required"
+    })
+    .to_string();
     sql.execute(
-        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-        rusqlite::params![
-            operation.to_string(),
-            checkout,
-            [3u8; 32].as_slice(),
-            [4u8; 32].as_slice()
-        ],
+        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,?5,NULL,NULL)",
+        rusqlite::params![operation.to_string(),checkout,[1u8;32].as_slice(),[2u8;32].as_slice(),record],
+    ).unwrap();
+    // Public passive status traverses the production strict read_history decoder.
+    let config = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        config.path(),
+        format!(
+            "store_dir={:?}\ntrusted_registry={:?}\nroots={:?}\n",
+            cfg.store_dir.as_ref().unwrap(),
+            cfg.trusted_registry.as_ref().unwrap(),
+            cfg.roots
+        ),
     )
     .unwrap();
+    let report = serde_json::to_value(work_cli::inspection::retirement_status(
+        config.path(),
+        Uuid::parse_str(checkout).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        report["stage"], "prepared",
+        "strict history did not decode: {report}"
+    );
+    assert_eq!(report["revision"], 1);
+    assert_eq!(report["history_count"], 1);
+    assert_eq!(report["fresh_commit"], false);
 }
 #[test]
 fn prepared_intent_refuses_finalize_without_finish() {
     let f = Fixture::new(true, Some(RootOutcome::Completed));
     let checkout = f.root.identity().checkout.to_string();
-    seed_prepared_fence(&f.sql(), &checkout);
+    seed_prepared_fence(&f.sql(), &checkout, &f.config);
     assert!(
         finalize(&f.config, &f.root.identity().run).is_err(),
         "fenced finalize must refuse"
@@ -947,13 +985,30 @@ fn prepared_intent_refuses_finalize_without_finish() {
         (revision, stage.as_str(), reason.as_deref()),
         (2, "held", Some("capture_finalization"))
     );
+    assert_eq!(f.store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, work_cli::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
+    assert_eq!(
+        f.sql()
+            .query_row("SELECT count(*) FROM capture_finalizations", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 #[test]
 fn prepared_intent_refuses_retry_without_receiver() {
     let f = Fixture::new(true, Some(RootOutcome::Completed));
     finalize(&f.config, &f.root.identity().run).unwrap();
     let checkout = f.root.identity().checkout.to_string();
-    seed_prepared_fence(&f.sql(), &checkout);
+    seed_prepared_fence(&f.sql(), &checkout, &f.config);
+    let before = serde_json::to_value(
+        f.store
+            .capture_finalization_snapshot(&f.root.identity().run)
+            .unwrap(),
+    )
+    .unwrap();
+    let calls_before = std::fs::read(f.dir.path().join("calls")).unwrap();
     f.respond("pending", serde_json::json!({}), false);
     assert!(
         work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run).is_err()
@@ -967,4 +1022,28 @@ fn prepared_intent_refuses_retry_without_receiver() {
         )
         .unwrap();
     assert_eq!(reason, "capture_delivery");
+    assert_eq!(
+        std::fs::read(f.dir.path().join("calls")).unwrap(),
+        calls_before
+    );
+    assert_eq!(
+        serde_json::to_value(
+            f.store
+                .capture_finalization_snapshot(&f.root.identity().run)
+                .unwrap()
+        )
+        .unwrap(),
+        before
+    );
+    assert_eq!(
+        f.sql()
+            .query_row("SELECT revision,stage FROM retirement_intents", [], |r| Ok(
+                (r.get::<_, i64>(0)?, r.get::<_, String>(1)?)
+            ))
+            .unwrap(),
+        (2, "held".into())
+    );
+    assert_eq!(f.store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, work_cli::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
 }

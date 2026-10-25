@@ -512,7 +512,7 @@ Only after final artifact revalidation does a private verified-observation metho
 consume the Created handle through the existing exact preparation CAS. It atomically
 promotes allocation JSON/readiness and adds an optional typed context digest/stat
 observation. That preparation increment required no change beyond schema 11;
-older preparation JSON omits this field unchanged. Current authority requires schema 15.
+older preparation JSON omits this field unchanged. Current authority requires schema 16.
 The public `record_capture_prepared` remains a metadata observer without an artifact
 claim. Failures retain tree, charge and exact writer, record the root recovery hold
 (without inventing outcome/capture ID), and return no live result. If hold persistence
@@ -768,7 +768,7 @@ work inspect CHECKOUT_UUIDV7 --record
 
 Inspection uses one bounded configuration snapshot: `store_dir`, `trusted_registry`,
 `roots` and only the optional `[inspection]` policy subtree. It requires an existing
-registered schema-15 authority with an existing qualified `allocation.lock`;
+registered schema-16 authority with an existing qualified `allocation.lock`;
 plain inspection and `--record` refuse a missing lock rather than repair it.
 A no-create lock descriptor is retained across Store opening and checked against
 the named lock and cached authority afterward. This cooperative check does not
@@ -1035,7 +1035,7 @@ Recovery never launches, signals, kills, finishes a task, deletes, uncharges or 
 
 `work status --run <uuidv7>` reports validated historical request/stage/outcome, group,
 hold and charge metadata with runtime `not_inspected`, not an actual exit-code or
-runtime qualification claim. It requires an existing initialized trusted schema-15 authority;
+runtime qualification claim. It requires an existing initialized trusted schema-16 authority;
 missing/corrupt/older authority is unknown or upgrade-required, never empty accounting.
 Like doctor, strict read-only access refuses WAL databases lacking existing WAL/SHM
 bookkeeping rather than creating files or ignoring committed WAL. Normal lifecycle
@@ -1147,7 +1147,7 @@ retirement, deletion, uncharging, operational activation or whole-Task-8 complet
 
 `work finish <checkout-id>` requires a UUIDv7 and existing trusted, managed allocation.
 It never initializes missing authority. A read-only established-authority preflight can
-upgrade a valid v8/v9/v10/v11/v12/v13/v14 store to schema 15; malformed schemas, missing tables, views, incorrect
+upgrade a valid v8/v9/v10/v11/v12/v13/v14/v15 store to schema 16; malformed schemas, missing tables, views, incorrect
 claims and non-WAL authority fail closed, without repair. Other historical commands
 remain read-only and report upgrade-required for older schemas.
 
@@ -1431,7 +1431,7 @@ not individual authorship inferred from timestamps or email.
 Status reads revision, writer and validated roster in one database snapshot. All
 retry paths validate durable declarations before returning success; corruption is
 an error, never absence or authority to reverify/update the allocation.
-Status is read-only existing-schema-15-authority metadata, with
+Status is read-only existing-schema-16-authority metadata, with
 `adopted_basis="checkout/session declaration"`, `git_identity_controlled=false`,
 `automatic_quiescence=false`, `runtime="unknown"`. Declared closed is **not verified
 exited**. Reads, silence, reboot, missing SessionEnd, reconciliation, and even all
@@ -1440,7 +1440,7 @@ state or uncharge it. The writer remains explicitly held until a future qualifie
 handoff path (the Task10 adopted assertion pilot above never releases it). `work status --run`
 and `work recover` remain supervised-only; the full contained supervised roster requires
 fresh whole-group kernel proof, while pending/unverified children block handoff.
-Use `work adopt status` for adopted metadata. Existing-authority reads require schema 15.
+Use `work adopt status` for adopted metadata. Existing-authority reads require schema 16.
 Schema v7 added the supervised child ledger and retained child count; v8 adds positive
 host audit metadata without rebuilding the v6 adopted/supervised proof tables;
 old charges/history/outbox/aliases/unknown writers are retained, missing versioned

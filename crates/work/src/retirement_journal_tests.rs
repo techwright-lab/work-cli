@@ -6,6 +6,521 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+type SqlRows = Vec<Vec<rusqlite::types::Value>>;
+type SourceRows = Vec<(String, SqlRows)>;
+
+// Structural negative-fence fixtures, never owned retirement capabilities.
+pub(crate) fn source_rows(store: &Store) -> SourceRows {
+    let names = store.conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('retirement_intents','outbox') ORDER BY name")
+        .unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    names
+        .into_iter()
+        .map(|name| {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("SELECT * FROM \"{name}\" ORDER BY rowid"))
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |r| (0..columns).map(|c| r.get(c)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            (name, rows)
+        })
+        .collect()
+}
+
+fn assert_writer_fenced(
+    store: &mut Store,
+    checkout: Uuid,
+    mut writer: impl FnMut(&mut Store) -> crate::store::Result<()>,
+) {
+    let operation = Uuid::now_v7();
+    let record = seed_prepared(store, checkout, operation);
+    let before = source_rows(store);
+    let events = store.pending_events(1000).unwrap().len();
+    for _ in 0..2 {
+        assert!(matches!(writer(store), Err(StoreError::RetirementFenced)));
+        assert_eq!(source_rows(store), before);
+        let row = load_operation(&store.conn, operation).unwrap();
+        assert_eq!(
+            (row.stage.as_str(), row.revision, row.record.as_str()),
+            ("held", 2, record.as_str())
+        );
+        assert_eq!(
+            held_events(store, checkout),
+            vec![Event::RetirementIntentChanged {
+                checkout,
+                operation,
+                revision: 2,
+                stage: "held".into(),
+                reason: row.held_reason.clone(),
+            }]
+        );
+        assert_eq!(store.pending_events(1000).unwrap().len(), events + 1);
+    }
+    // A distinct ordinary attempt against already-held state emits nothing.
+    assert!(matches!(
+        store.transfer(checkout, "different-owner", limits()),
+        Err(StoreError::RetirementFenced)
+    ));
+    assert_eq!(source_rows(store), before);
+    assert_eq!(store.pending_events(1000).unwrap().len(), events + 1);
+}
+
+fn adopted_request(root: &crate::run_journal::RootRunRequest) -> crate::adopted::AdoptedRequest {
+    crate::adopted::AdoptedRequest {
+        operation: Uuid::now_v7(),
+        identity: root.identity().clone(),
+        source: crate::participants::Ref::new("source".into()).unwrap(),
+        session: crate::participants::Ref::new("session".into()).unwrap(),
+        agent: None,
+    }
+}
+
+fn child_request(
+    root: &crate::run_journal::RootRunRequest,
+    run: Uuid,
+) -> crate::run_participants::ChildRequest {
+    crate::run_participants::ChildRequest {
+        checkout: root.identity().checkout.clone(),
+        group: root.identity().group.clone(),
+        run: work_contract::RunId::parse(&run.to_string()).unwrap(),
+        run_ref: work_contract::RunRef::parse(&format!("child:{run}")).unwrap(),
+        parent_run: root.identity().run.clone(),
+        parent_run_ref: root.identity().run_ref.clone(),
+        execution_chain: root.identity().execution_chain.clone(),
+        source: None,
+        session: None,
+        agent: None,
+        actor: None,
+        expected_host: None,
+    }
+}
+
+#[test]
+fn opened_store_rejects_schema_downgrade_and_future_on_retry_and_mutation() {
+    for version in [15, 17] {
+        for retry in [false, true] {
+            let (temp, mut store, root) = open_store();
+            let request = Reservation {
+                operation: Uuid::now_v7(),
+                repository: root,
+                actor: "allocator".into(),
+                owner: "owner".into(),
+                task: "task".into(),
+            };
+            let checkout = store.reserve(&request, limits()).unwrap();
+            let intent = Uuid::now_v7();
+            seed_prepared(&store, checkout, intent);
+            let before = source_rows(&store);
+            let history = load_operation(&store.conn, intent).unwrap();
+            let events = store.pending_events(1000).unwrap();
+            // Only the pragma changes; all retirement DDL and canonical evidence remain.
+            let other = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
+            other.pragma_update(None, "user_version", version).unwrap();
+            let result = if retry {
+                store.reserve(&request, limits()).map(|_| ())
+            } else {
+                store.transfer(checkout, "other", limits())
+            };
+            assert!(
+                matches!(result, Err(StoreError::Invalid)),
+                "version {version}, retry {retry}"
+            );
+            assert_eq!(schema_version(&store.conn).unwrap(), version);
+            assert_eq!(source_rows(&store), before);
+            assert_eq!(load_operation(&store.conn, intent).unwrap(), history);
+            assert_eq!(store.pending_events(1000).unwrap(), events);
+        }
+    }
+}
+
+#[test]
+fn child_namespace_reserves_active_and_aborted_retirement_operations_on_other_checkout() {
+    for aborted in [false, true] {
+        let (_temp, mut store, _) = open_store();
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        insert_checkout(&store, a, Uuid::now_v7(), "owner");
+        insert_checkout(&store, b, Uuid::now_v7(), "owner");
+        let operation = Uuid::now_v7();
+        seed_prepared(&store, a, operation);
+        if aborted {
+            abort_cas(&store.conn, a, operation, 1).unwrap();
+        }
+        let root = crate::test_run_fixture::request(b);
+        let binding = crate::test_run_fixture::binding(&root);
+        store.begin_run(&root).unwrap();
+        store.record_bound(&root, &binding).unwrap();
+        store.record_permit_attempt(&root, &binding).unwrap();
+        // A control proves B is otherwise eligible, including Existing ACK.
+        let control = child_request(&root, Uuid::now_v7());
+        assert_eq!(
+            store.register_child(&root, &control).unwrap(),
+            crate::run_journal::BeginRun::Created
+        );
+        assert_eq!(
+            store.register_child(&root, &control).unwrap(),
+            crate::run_journal::BeginRun::Existing
+        );
+        let before = source_rows(&store);
+        let history = load_operation(&store.conn, operation).unwrap();
+        let events = store.pending_events(1000).unwrap();
+        let collision = child_request(&root, operation);
+        for _ in 0..2 {
+            assert!(matches!(
+                store.register_child(&root, &collision),
+                Err(StoreError::Conflict)
+            ));
+            assert_eq!(source_rows(&store), before);
+            assert_eq!(load_operation(&store.conn, operation).unwrap(), history);
+            assert_eq!(store.pending_events(1000).unwrap(), events);
+        }
+    }
+}
+
+#[test]
+fn child_existing_ack_rejects_retirement_namespace_collision() {
+    for aborted in [false, true] {
+        let (_temp, mut store, _) = open_store();
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        insert_checkout(&store, a, Uuid::now_v7(), "owner");
+        insert_checkout(&store, b, Uuid::now_v7(), "owner");
+        let root = crate::test_run_fixture::request(b);
+        let binding = crate::test_run_fixture::binding(&root);
+        store.begin_run(&root).unwrap();
+        store.record_bound(&root, &binding).unwrap();
+        store.record_permit_attempt(&root, &binding).unwrap();
+        let operation = Uuid::now_v7();
+        let child = child_request(&root, operation);
+        store.register_child(&root, &child).unwrap();
+        // Model conflicting historical SQL, not a public prepare capability.
+        seed_prepared(&store, a, operation);
+        if aborted {
+            abort_cas(&store.conn, a, operation, 1).unwrap();
+        }
+        let before = source_rows(&store);
+        let history = load_operation(&store.conn, operation).unwrap();
+        let events = store.pending_events(1000).unwrap();
+        assert!(matches!(
+            store.register_child(&root, &child),
+            Err(StoreError::Invalid)
+        ));
+        assert_eq!(source_rows(&store), before);
+        assert_eq!(load_operation(&store.conn, operation).unwrap(), history);
+        assert_eq!(store.pending_events(1000).unwrap(), events);
+    }
+}
+
+#[test]
+fn public_reserve_new_checkout_does_not_fence_independent_same_repository() {
+    let (_temp, mut store, root) = open_store();
+    let mut request = Reservation {
+        operation: Uuid::now_v7(),
+        repository: root,
+        actor: "allocator".into(),
+        owner: "owner".into(),
+        task: "a".into(),
+    };
+    let a = store.reserve(&request, limits()).unwrap();
+    let intent = Uuid::now_v7();
+    seed_prepared(&store, a, intent);
+    let before = load_operation(&store.conn, intent).unwrap();
+    request.operation = Uuid::now_v7();
+    request.task = "b".into();
+    let b = store.reserve(&request, limits()).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(store.reserve(&request, limits()).unwrap(), b);
+    assert_eq!(load_operation(&store.conn, intent).unwrap(), before);
+    assert!(held_events(&store, a).is_empty());
+}
+
+#[test]
+fn run_transitions_and_existing_acknowledgments_are_fenced() {
+    for variant in ["bound", "permit", "outcome", "hold"] {
+        for existing in [false, true] {
+            let (_temp, mut store, _) = open_store();
+            let checkout = Uuid::now_v7();
+            insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+            let root = crate::test_run_fixture::request(checkout);
+            let binding = crate::test_run_fixture::binding(&root);
+            store.begin_run(&root).unwrap();
+            if variant != "bound" {
+                store.record_bound(&root, &binding).unwrap();
+            }
+            if variant == "outcome" {
+                store.record_permit_attempt(&root, &binding).unwrap();
+            }
+            let change = |store: &mut Store| match variant {
+                "bound" => store.record_bound(&root, &binding),
+                "permit" => store.record_permit_attempt(&root, &binding),
+                "outcome" => {
+                    store.record_root_outcome(&root, crate::run_journal::RootOutcome::Completed)
+                }
+                "hold" => store.record_recovery_hold(&root),
+                _ => unreachable!(),
+            };
+            if existing {
+                change(&mut store).unwrap();
+            }
+            assert_writer_fenced(&mut store, checkout, |store| change(store).map(|_| ()));
+        }
+    }
+}
+
+#[test]
+fn child_register_outcome_hold_and_existing_are_fenced() {
+    for variant in ["register", "outcome", "hold"] {
+        for existing in [false, true] {
+            let (_temp, mut store, _) = open_store();
+            let checkout = Uuid::now_v7();
+            insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+            let root = crate::test_run_fixture::request(checkout);
+            let binding = crate::test_run_fixture::binding(&root);
+            store.begin_run(&root).unwrap();
+            store.record_bound(&root, &binding).unwrap();
+            store.record_permit_attempt(&root, &binding).unwrap();
+            let mut child = child_request(&root, Uuid::now_v7());
+            child.expected_host = Some(crate::run_participants::ExpectedHost {
+                boot: root.input().boot.clone(),
+                pid: 42,
+                start_ticks: 10,
+            });
+            if variant != "register" {
+                store.register_child(&root, &child).unwrap();
+            }
+            let change = |store: &mut Store| match variant {
+                "register" => store.register_child(&root, &child).map(|_| ()),
+                "outcome" => store
+                    .record_child_outcome(
+                        &root,
+                        &child,
+                        crate::run_participants::ChildOutcome::Completed,
+                    )
+                    .map(|_| ()),
+                "hold" => store.record_child_hold(&root, &child).map(|_| ()),
+                _ => unreachable!(),
+            };
+            if existing {
+                change(&mut store).unwrap();
+            }
+            assert_writer_fenced(&mut store, checkout, change);
+        }
+    }
+}
+
+#[test]
+fn supervised_closure_is_fenced_with_owned_empty_proof() {
+    let (_temp, mut store, _) = open_store();
+    let checkout = Uuid::now_v7();
+    insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+    let root = crate::test_run_fixture::request(checkout);
+    let binding = crate::test_run_fixture::binding(&root);
+    store.begin_run(&root).unwrap();
+    store.record_bound(&root, &binding).unwrap();
+    store.record_permit_attempt(&root, &binding).unwrap();
+    store
+        .record_root_outcome(&root, crate::run_journal::RootOutcome::Completed)
+        .unwrap();
+    let os = crate::test_run_fixture::ClosureOs::new(&root, &binding);
+    let snapshot = store.group_snapshot(&root.identity().run).unwrap();
+    let proof = snapshot.certify_empty(&os.driver, &binding).unwrap();
+    assert_writer_fenced(&mut store, checkout, |store| {
+        store.close_supervised_group(&snapshot, &proof).map(|_| ())
+    });
+}
+
+#[test]
+fn child_enrollment_is_fenced_with_owned_fixture_observation() {
+    for existing in [false, true] {
+        let (_temp, mut store, _) = open_store();
+        let checkout = Uuid::now_v7();
+        insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+        let root = crate::test_run_fixture::request(checkout);
+        let binding = crate::test_run_fixture::binding(&root);
+        store.begin_run(&root).unwrap();
+        store.record_bound(&root, &binding).unwrap();
+        store.record_permit_attempt(&root, &binding).unwrap();
+        let mut child = child_request(&root, Uuid::now_v7());
+        child.expected_host = Some(crate::run_participants::ExpectedHost {
+            boot: root.input().boot.clone(),
+            pid: 42,
+            start_ticks: 10,
+        });
+        store.register_child(&root, &child).unwrap();
+        let os = crate::test_run_fixture::ClosureOs::new(&root, &binding);
+        os.process(&binding, 10, &binding.identity().cgroup);
+        let properties = os.tmp.path().join("properties");
+        let body = std::fs::read_to_string(&properties)
+            .unwrap()
+            .replace("ActiveState=inactive", "ActiveState=active");
+        std::fs::write(properties, body).unwrap();
+        std::fs::write(
+            os.tmp
+                .path()
+                .join("cg")
+                .join(binding.identity().cgroup.trim_start_matches('/'))
+                .join("cgroup.procs"),
+            "42\n",
+        )
+        .unwrap();
+        let snapshot = store.group_snapshot(&root.identity().run).unwrap();
+        let proof = snapshot
+            .certify_child_enrollment(&os.driver, &child.run, Some(&binding))
+            .unwrap();
+        if existing {
+            store
+                .record_child_enrollment(&root, &child, &proof)
+                .unwrap();
+        }
+        assert_writer_fenced(&mut store, checkout, |store| {
+            store
+                .record_child_enrollment(&root, &child, &proof)
+                .map(|_| ())
+        });
+    }
+}
+
+#[test]
+fn adopted_activity_variants_and_existing_are_fenced() {
+    use crate::participants::{Activity, ActivityKind, ParticipantKey, Ref};
+    for kind in [
+        ActivityKind::Stop,
+        ActivityKind::SubagentStart,
+        ActivityKind::SubagentStop,
+        ActivityKind::SessionEnd,
+        ActivityKind::Reconcile,
+    ] {
+        for existing in [false, true] {
+            let (_temp, mut store, _) = open_store();
+            let checkout = Uuid::now_v7();
+            insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+            let request = adopted_request(&crate::test_run_fixture::request(checkout));
+            store.begin_adopted(&request).unwrap();
+            let parent = ParticipantKey {
+                session: request.session.clone(),
+                agent: None,
+            };
+            let child = ParticipantKey {
+                session: request.session.clone(),
+                agent: Some(Ref::new("child".into()).unwrap()),
+            };
+            let mut event = Activity {
+                run: request.identity.run.clone(),
+                group: request.identity.group.clone(),
+                source: request.source.clone(),
+                participant: parent.clone(),
+                parent: None,
+                actor: None,
+                prompt: None,
+                tool: None,
+                event_ref: Ref::new("event".into()).unwrap(),
+                kind,
+                observed_at: 1,
+            };
+            if matches!(
+                kind,
+                ActivityKind::SubagentStart | ActivityKind::SubagentStop
+            ) {
+                event.participant = child;
+                event.parent = Some(parent);
+            }
+            if kind == ActivityKind::SubagentStop {
+                let mut start = event.clone();
+                start.kind = ActivityKind::SubagentStart;
+                start.event_ref = Ref::new("start".into()).unwrap();
+                store.record_activity(&start).unwrap();
+            }
+            if existing {
+                store.record_activity(&event).unwrap();
+            }
+            assert_writer_fenced(&mut store, checkout, |store| {
+                store.record_activity(&event).map(|_| ())
+            });
+        }
+    }
+}
+
+#[test]
+fn malformed_allocation_load_commits_hold_without_rewriting_corrupt_source() {
+    let (_temp, mut store, _) = open_store();
+    let checkout = Uuid::now_v7();
+    let operation = Uuid::now_v7();
+    insert_checkout(&store, checkout, operation, "owner");
+    store
+        .conn
+        .execute(
+            "INSERT INTO allocations VALUES(?1,'{}','{malformed')",
+            [checkout.to_string()],
+        )
+        .unwrap();
+    let intent = Uuid::now_v7();
+    let record = seed_prepared(&store, checkout, intent);
+    let before = source_rows(&store);
+    let events = store.pending_events(1000).unwrap().len();
+    for _ in 0..2 {
+        let error = crate::allocate::load(&mut store, operation).unwrap_err();
+        assert!(error.to_string().contains("retirement intent"));
+        assert_eq!(source_rows(&store), before);
+        let row = load_operation(&store.conn, intent).unwrap();
+        assert_eq!(
+            (row.stage.as_str(), row.revision, row.record.as_str()),
+            ("held", 2, record.as_str())
+        );
+        assert_eq!(store.pending_events(1000).unwrap().len(), events + 1);
+    }
+}
+
+#[test]
+fn reserve_retry_hold_write_and_commit_failures_roll_back_and_still_exclude() {
+    for commit in [false, true] {
+        let (_temp, mut store, root) = open_store();
+        let request = Reservation {
+            operation: Uuid::now_v7(),
+            repository: root,
+            actor: "allocator".into(),
+            owner: "owner".into(),
+            task: "task".into(),
+        };
+        let checkout = store.reserve(&request, limits()).unwrap();
+        let intent = Uuid::now_v7();
+        seed_prepared(&store, checkout, intent);
+        let before = source_rows(&store);
+        let history = load_operation(&store.conn, intent).unwrap();
+        let events = store.pending_events(1000).unwrap();
+        if commit {
+            store.conn.commit_hook(Some(|| true)).unwrap();
+        } else {
+            store.conn.execute_batch("CREATE TRIGGER refuse_event BEFORE INSERT ON outbox BEGIN SELECT RAISE(ABORT,'retirement event fault'); END;").unwrap();
+        }
+        let error = store.reserve(&request, limits()).unwrap_err();
+        assert!(matches!(error, StoreError::Database(_)), "{error:?}");
+        store.conn.commit_hook(None::<fn() -> bool>).unwrap();
+        if !commit {
+            store
+                .conn
+                .execute_batch("DROP TRIGGER refuse_event;")
+                .unwrap();
+        }
+        assert_eq!(source_rows(&store), before);
+        assert_eq!(load_operation(&store.conn, intent).unwrap(), history);
+        assert_eq!(store.pending_events(1000).unwrap(), events);
+        for _ in 0..2 {
+            assert!(matches!(
+                store.reserve(&request, limits()),
+                Err(StoreError::RetirementFenced)
+            ));
+            assert_eq!(source_rows(&store), before);
+            assert_eq!(held_events(&store, checkout).len(), 1);
+            assert_eq!(store.pending_events(1000).unwrap().len(), events.len() + 1);
+        }
+    }
+}
+
 fn digest32(tag: u8) -> [u8; 32] {
     let mut bytes = [tag; 32];
     bytes[0] = tag;
@@ -78,7 +593,7 @@ fn insert_checkout(store: &Store, checkout: Uuid, operation: Uuid, owner: &str) 
         .unwrap();
 }
 
-fn seed_prepared(store: &Store, checkout: Uuid, operation: Uuid) -> String {
+pub(crate) fn seed_prepared(store: &Store, checkout: Uuid, operation: Uuid) -> String {
     let record = encode_record(&sample_record(operation, checkout)).unwrap();
     store
         .conn
@@ -445,32 +960,53 @@ fn leftover_retirement_objects_fail_migration() {
 
 #[test]
 fn interrupted_migration_rolls_back() {
-    let (temp, store, root) = open_store();
+    let (temp, mut store, root) = open_store();
+    insert_checkout(&store, Uuid::now_v7(), Uuid::now_v7(), "owner");
     store
         .conn
         .execute_batch("DROP TABLE retirement_intents; PRAGMA user_version=15;")
         .unwrap();
-    store
-        .conn
-        .execute_batch("CREATE TRIGGER block_retirement BEFORE INSERT ON sqlite_schema BEGIN SELECT RAISE(ABORT,'fixture'); END;")
-        .ok();
-    drop(store);
-    let _ = Store::open(&temp.path().join("private"), std::slice::from_ref(&root));
-    let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
-    let version: i64 = sql
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .unwrap();
-    assert!(version == 15 || version == 16);
-    if version == 15 {
-        let present: i64 = sql
-            .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name='retirement_intents' AND type='table'",
-                [],
-                |r| r.get(0),
-            )
+    let before = source_rows(&store);
+    let events = store.pending_events(1000).unwrap();
+    {
+        let _phase = store.sql_phase();
+        let tx = store
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        assert_eq!(present, 0);
+        // The identical production DDL, including all indexes and user_version,
+        // executes successfully BEFORE the cumulative production VM budget fires.
+        tx.execute_batch(SCHEMA).unwrap();
+        assert_eq!(schema_version(&tx).unwrap(), 16);
+        validate_schema(&tx).unwrap();
+        let error = tx.query_row(
+            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<20000) SELECT sum(x) FROM n",
+            [], |r| r.get::<_, i64>(0),
+        ).unwrap_err();
+        assert!(
+            matches!(error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::OperationInterrupted)
+        );
+        // Dropping an uncommitted transaction rolls back even if interruption
+        // already caused SQLite to abort it. Do not retry or commit this tx.
     }
+    assert_eq!(schema_version(&store.conn).unwrap(), 15);
+    let objects: i64 = store
+        .conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'retirement_intents%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(objects, 0);
+    assert_eq!(source_rows(&store), before);
+    assert_eq!(store.pending_events(1000).unwrap(), events);
+    drop(store);
+    let store = Store::open(&temp.path().join("private"), &[root]).unwrap();
+    assert_eq!(schema_version(&store.conn).unwrap(), 16);
+    validate_schema(&store.conn).unwrap();
+    assert_eq!(source_rows(&store), before);
+    assert_eq!(store.pending_events(1000).unwrap(), events);
 }
 
 #[test]
@@ -755,20 +1291,25 @@ fn reserve_retry_commits_hold_before_existing() {
 
 #[test]
 fn writer_acquire_and_owner_transfer_are_fenced() {
-    let (_temp, mut store, _) = open_store();
-    let checkout = Uuid::now_v7();
-    insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
-    seed_prepared(&store, checkout, Uuid::now_v7());
-    assert!(matches!(
-        store.acquire_writer(checkout, Uuid::now_v7()),
-        Err(StoreError::RetirementFenced)
-    ));
-    assert!(matches!(
-        store.transfer(checkout, "other", limits()),
-        Err(StoreError::RetirementFenced)
-    ));
-    let row = active_operation(&store.conn, checkout).unwrap().unwrap();
-    assert_eq!(row.stage, "held");
+    for acquire in [false, true] {
+        for existing in [false, true] {
+            let (_temp, mut store, _) = open_store();
+            let checkout = Uuid::now_v7();
+            insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+            let group = Uuid::now_v7();
+            if acquire && existing {
+                store.acquire_writer(checkout, group).unwrap();
+            }
+            let recipient = if existing { "owner" } else { "other" };
+            assert_writer_fenced(&mut store, checkout, |store| {
+                if acquire {
+                    store.acquire_writer(checkout, group)
+                } else {
+                    store.transfer(checkout, recipient, limits())
+                }
+            });
+        }
+    }
 }
 
 #[test]
@@ -801,15 +1342,26 @@ fn owner_retire_holds_every_prepared_intent() {
 
 #[test]
 fn run_begin_and_adopted_begin_are_fenced() {
-    let (_temp, mut store, _) = open_store();
-    let checkout = Uuid::now_v7();
-    insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
-    seed_prepared(&store, checkout, Uuid::now_v7());
-    let request = crate::test_run_fixture::request(checkout);
-    assert!(matches!(
-        store.begin_run(&request),
-        Err(StoreError::RetirementFenced)
-    ));
+    for adopted in [false, true] {
+        for existing in [false, true] {
+            let (_temp, mut store, _) = open_store();
+            let checkout = Uuid::now_v7();
+            insert_checkout(&store, checkout, Uuid::now_v7(), "owner");
+            let root = crate::test_run_fixture::request(checkout);
+            let request = adopted_request(&root);
+            let begin = |store: &mut Store| {
+                if adopted {
+                    store.begin_adopted(&request)
+                } else {
+                    store.begin_run(&root)
+                }
+            };
+            if existing {
+                begin(&mut store).unwrap();
+            }
+            assert_writer_fenced(&mut store, checkout, |store| begin(store).map(|_| ()));
+        }
+    }
 }
 
 #[test]
@@ -869,7 +1421,7 @@ fn abort_cas_is_idempotent_and_does_not_hold_competitor() {
 }
 
 #[test]
-fn writer_matrix_attempts_commit_hold() {
+fn central_helper_attempt_labels_commit_hold() {
     let attempts = [
         Attempt::Reserve,
         Attempt::AllocationStage,

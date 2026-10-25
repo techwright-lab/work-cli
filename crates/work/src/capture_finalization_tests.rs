@@ -27,19 +27,12 @@ fn observing(f: impl FnMut(&str, &crate::store::Store) + 'static) -> ObserveGuar
 }
 
 fn seed_prepared_fence(store: &crate::store::Store, checkout: uuid::Uuid) {
-    let operation = uuid::Uuid::now_v7();
-    store
-        .conn
-        .execute(
-            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-            rusqlite::params![
-                operation.to_string(),
-                checkout.to_string(),
-                [3u8; 32].as_slice(),
-                [4u8; 32].as_slice()
-            ],
-        )
-        .unwrap();
+    crate::retirement_journal::tests::seed_prepared(store, checkout, uuid::Uuid::now_v7());
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (rows.len(), rows[0].revision, rows[0].stage.as_str()),
+        (1, 1, "prepared")
+    );
 }
 
 fn run_checkout(root: &crate::run_journal::RootRunRequest) -> uuid::Uuid {
@@ -117,6 +110,7 @@ fn finalize_holds_prepared_intent_before_finish() {
     let f = capture_fixture::Fixture::new(true, Some(crate::run_journal::RootOutcome::Completed));
     let checkout = run_checkout(&f.root);
     seed_prepared_fence(&f.store, checkout);
+    let source_before = crate::retirement_journal::tests::source_rows(&f.store);
     let before: i64 = f
         .sql()
         .query_row("SELECT count(*) FROM capture_finalizations", [], |r| {
@@ -148,6 +142,13 @@ fn finalize_holds_prepared_intent_before_finish() {
         })
         .unwrap();
     assert_eq!(after, before);
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&f.store),
+        source_before
+    );
+    assert_eq!(f.store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
 }
 #[test]
 fn retry_holds_prepared_intent_before_receiver() {
@@ -155,6 +156,8 @@ fn retry_holds_prepared_intent_before_receiver() {
     super::finalize(&f.config, &f.root.identity().run).unwrap();
     let checkout = run_checkout(&f.root);
     seed_prepared_fence(&f.store, checkout);
+    let source_before = crate::retirement_journal::tests::source_rows(&f.store);
+    let calls_before = std::fs::read(f.dir.path().join("calls")).unwrap();
     f.respond("pending", serde_json::json!({}), false);
     let saw = std::rc::Rc::new(std::cell::Cell::new(false));
     let flag = saw.clone();
@@ -178,6 +181,58 @@ fn retry_holds_prepared_intent_before_receiver() {
         )
         .unwrap();
     assert_eq!(reason, "capture_delivery");
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&f.store),
+        source_before
+    );
+    assert_eq!(
+        std::fs::read(f.dir.path().join("calls")).unwrap(),
+        calls_before
+    );
+    let rows = crate::retirement_journal::read_history(&f.store.conn, checkout).unwrap();
+    assert_eq!((rows[0].revision, rows[0].stage.as_str()), (2, "held"));
+    assert_eq!(f.store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
+}
+#[test]
+fn delivery_commit_fences_after_receiver_without_mutating_caller_rows() {
+    let f = capture_fixture::Fixture::new(true, Some(crate::run_journal::RootOutcome::Completed));
+    super::finalize(&f.config, &f.root.identity().run).unwrap();
+    f.respond("pending", serde_json::json!({}), false);
+    let checkout = run_checkout(&f.root);
+    let before = std::rc::Rc::new(RefCell::new(None));
+    let observed = before.clone();
+    let _observer = observing(move |stage, store| {
+        if stage == "pre_retry" {
+            seed_prepared_fence(store, checkout);
+            *observed.borrow_mut() = Some(crate::retirement_journal::tests::source_rows(store));
+        }
+    });
+    let calls_before = std::fs::read(f.dir.path().join("calls")).unwrap();
+    assert!(super::retry_delivery(&f.config, &f.root.identity().run).is_err());
+    assert!(before.borrow().is_some(), "retry boundary not reached");
+    assert_ne!(
+        std::fs::read(f.dir.path().join("calls")).unwrap(),
+        calls_before,
+        "receiver retry must actually precede confirmation fencing"
+    );
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&f.store),
+        before.borrow().as_ref().unwrap().clone()
+    );
+    let rows = crate::retirement_journal::read_history(&f.store.conn, checkout).unwrap();
+    assert_eq!(
+        (
+            rows[0].revision,
+            rows[0].stage.as_str(),
+            rows[0].held_reason.as_deref()
+        ),
+        (2, "held", Some("capture_delivery"))
+    );
+    assert_eq!(f.store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
 }
 #[test]
 fn finalize_shared_guard_excludes_exclusive_until_drain() {
@@ -189,7 +244,9 @@ fn finalize_shared_guard_excludes_exclusive_until_drain() {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let handle = std::thread::spawn(move || {
-        ready_rx.recv().unwrap();
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("finalization never reached pre-dispatch boundary");
         let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
         assert!(matches!(
             crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout),
@@ -205,11 +262,18 @@ fn finalize_shared_guard_excludes_exclusive_until_drain() {
         drop(lock);
         release_tx.send(()).unwrap();
     });
+    let mut reached = false;
     let result = super::finalize_observed(&f.config, &f.root.identity().run, || {
+        reached = true;
         ready_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("finalization guard worker did not acknowledge");
     });
-    handle.join().unwrap();
+    drop(ready_tx);
+    let worker = handle.join();
+    assert!(reached, "finalization boundary not reached");
+    worker.unwrap();
     assert!(result.is_ok());
     let other = Store::open_existing_registered_mut(
         f.config.trusted_registry.as_ref().unwrap(),

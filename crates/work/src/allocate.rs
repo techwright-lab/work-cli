@@ -586,6 +586,17 @@ fn observe_allocation(
     ))?;
     let started = std::time::Instant::now();
     refuse_finished(store, checkout)?;
+    {
+        let _phase = store.sql_phase();
+        db(crate::attribution_gap::guard_legacy_allocation(
+            &store.conn,
+            checkout,
+        ))?;
+        db(crate::capture_journal::guard_allocation_identity(
+            &store.conn,
+            checkout,
+        ))?;
+    }
     let (charged, operation, state, ready): (String, String, String, bool) =
         sql(store.conn.query_row(
             "SELECT repository,operation,state,ready FROM checkouts WHERE id=?1",
@@ -638,6 +649,17 @@ fn observe_allocation(
         crate::retirement_journal::Attempt::AllocationIdentity,
     ))?;
     refuse_finished(store, checkout)?;
+    {
+        let _phase = store.sql_phase();
+        db(crate::attribution_gap::guard_legacy_allocation(
+            &store.conn,
+            checkout,
+        ))?;
+        db(crate::capture_journal::guard_allocation_identity(
+            &store.conn,
+            checkout,
+        ))?;
+    }
     let (operation, current_charged, state, ready): (String, String, String, bool) =
         sql(store.conn.query_row(
             "SELECT operation,repository,state,ready FROM checkouts WHERE id=?1",
@@ -821,6 +843,9 @@ fn refresh_ready_identity_under_lease(
     if let Some(expected) = predecessor {
         expected.compare(&tx, &authority)?;
     }
+    db(crate::attribution_gap::guard_legacy_allocation(
+        &tx, a.checkout,
+    ))?;
     db(crate::capture_journal::guard_allocation_identity(
         &tx, a.checkout,
     ))?;
@@ -910,6 +935,135 @@ mod physical_tests {
         .unwrap();
         (temp, config, allocation)
     }
+    #[test]
+    fn allocation_and_reuse_with_published_aliases_leave_other_checkout_prepared() {
+        let (_temp, config, a) = fixture();
+        let (store, lease) = locked(&config).unwrap();
+        drop(lease);
+        let operation = Uuid::now_v7();
+        crate::retirement_journal::tests::seed_prepared(&store, a.checkout, operation);
+        let before = crate::retirement_journal::load_operation(&store.conn, operation).unwrap();
+        let mut request = a.request.clone();
+        request.operation = Uuid::now_v7();
+        request.task = "independent".into();
+        request.branch = Some("independent".into());
+        let b = start(&config, request.clone()).unwrap();
+        assert_ne!(a.checkout, b.checkout);
+        assert_eq!(
+            start(&config, request.clone()).unwrap().checkout,
+            b.checkout
+        );
+        request.operation = Uuid::now_v7();
+        assert_eq!(start(&config, request).unwrap().checkout, b.checkout);
+        assert_eq!(
+            crate::retirement_journal::load_operation(&store.conn, operation).unwrap(),
+            before
+        );
+        assert!(!store.pending_events(1000).unwrap().iter().any(|e| matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")));
+    }
+
+    #[test]
+    fn legacy_verification_refuses_gap_history_before_physical_observation() {
+        let (_temp, config, a) = fixture();
+        let (mut store, lease) = locked(&config).unwrap();
+        drop(lease);
+        let root = crate::test_run_fixture::request(a.checkout);
+        store.begin_run(&root).unwrap();
+        // Raw malformed Gap presence is uncertainty, not an ordinary allocation.
+        // The existing required_gap_continuation tests cover both valid origins.
+        store
+            .conn
+            .execute(
+                "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?4,'{}',zeroblob(32))",
+                (
+                    root.identity().run.to_string(),
+                    root.identity().group.to_string(),
+                    a.checkout.to_string(),
+                    Uuid::now_v7().to_string(),
+                ),
+            )
+            .unwrap();
+        let before = crate::retirement_journal::tests::source_rows(&store);
+        let events = store.pending_events(1000).unwrap();
+        physical_fixture::AFTER_FIRST.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|_| {
+                panic!("legacy Gap rejection must precede physical observation")
+            }))
+        });
+        assert!(verified_checkout(&mut store, a.checkout).is_err());
+        assert!(physical_fixture::AFTER_FIRST.with(|hook| hook.borrow_mut().take().is_some()));
+        assert_eq!(
+            crate::retirement_journal::tests::source_rows(&store),
+            before
+        );
+        assert_eq!(store.pending_events(1000).unwrap(), events);
+    }
+
+    #[test]
+    fn finish_post_sink_fence_preserves_committed_completion_and_blocks_existing_retry() {
+        use crate::retirement_journal::{
+            load_operation,
+            tests::{seed_prepared, source_rows},
+        };
+        struct Sink(std::cell::Cell<usize>);
+        impl crate::finish::LocalSink for Sink {
+            fn freeze(&self, _: &crate::finish::CaptureContext) -> crate::finish::CaptureResult {
+                self.0.set(self.0.get() + 1);
+                crate::finish::CaptureResult::Frozen { delivery: None }
+            }
+        }
+        let (_temp, mut config, a) = fixture();
+        config.allocation.as_mut().unwrap().capture_sink = Some("fixture".into());
+        let (store, lease) = locked(&config).unwrap();
+        drop(lease);
+        let operation = Uuid::now_v7();
+        let sink = Sink(std::cell::Cell::new(0));
+        let mut before = None;
+        let mut events = 0;
+        let mut record = String::new();
+        let result = crate::finish::finish_with_sink_observed(
+            &config,
+            a.checkout,
+            Some(&sink),
+            |boundary| {
+                if boundary == "external_frozen" {
+                    record = seed_prepared(&store, a.checkout, operation);
+                    before = Some(source_rows(&store));
+                    events = store.pending_events(1000).unwrap().len();
+                }
+                assert_ne!(boundary, "outcome_committed");
+                assert_ne!(boundary, "before_ack");
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(crate::store::StoreError::RetirementFenced)
+        ));
+        assert_eq!(sink.0.get(), 1);
+        let before = before.expect("real sink boundary reached after completion commit");
+        let row = load_operation(&store.conn, operation).unwrap();
+        assert_eq!(
+            (
+                row.stage.as_str(),
+                row.revision,
+                row.held_reason.as_deref(),
+                row.record.as_str()
+            ),
+            ("held", 2, Some("finish_capture_result"), record.as_str())
+        );
+        assert_eq!(source_rows(&store), before);
+        assert_eq!(store.pending_events(1000).unwrap().len(), events + 1);
+        assert!(matches!(
+            crate::finish::finish_with_sink_observed(&config, a.checkout, Some(&sink), |_| panic!(
+                "held Existing must not dispatch"
+            )),
+            Err(crate::store::StoreError::RetirementFenced)
+        ));
+        assert_eq!(sink.0.get(), 1);
+        assert_eq!(source_rows(&store), before);
+        assert_eq!(store.pending_events(1000).unwrap().len(), events + 1);
+    }
+
     #[test]
     fn physical_observation_has_no_global_lease_or_sql_and_rechecks_original_evidence() {
         for change in ["none", "marker", "head", "context"] {
@@ -1302,14 +1456,20 @@ pub fn start_observed(
         let tx = sql(store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let current = db(crate::admission::allocation_selection(
+            &tx,
+            &reservation,
+            &aliases,
+        ))?;
+        let mut affected = matches.clone();
+        affected.extend(current.matches.iter().copied());
         let tx = db(crate::retirement_journal::fence(
             tx,
             &lease,
             &authority,
             db(crate::admission::allocation_scope(
-                common,
-                &aliases,
-                matches.clone(),
+                &current.missing_aliases,
+                affected,
             ))?,
             if matches.len() == 1 {
                 crate::retirement_journal::Attempt::AliasPublication
@@ -1317,15 +1477,13 @@ pub fn start_observed(
                 crate::retirement_journal::Attempt::AllocationHold
             },
         ))?;
-        if db(crate::admission::allocation_selection(
-            &tx,
-            &reservation,
-            &aliases,
-        ))? != selection
-        {
+        if current != selection {
             return Err(err("allocation alias/target selection changed"));
         }
-        db(crate::admission::publish_aliases(&tx, &aliases))?;
+        db(crate::admission::publish_aliases(
+            &tx,
+            &current.missing_aliases,
+        ))?;
         // Preserve the original unresolved-legacy fail-closed count semantics,
         // with staged mappings visible only inside the still-uncommitted tx.
         db(crate::store::count(&tx, common.to_str().unwrap(), None))?;

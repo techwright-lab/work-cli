@@ -46,20 +46,49 @@ pub fn replace_directory(path: &std::path::Path) {
     std::fs::rename(path, &old).unwrap();
     copy(&old, path);
 }
-pub fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut result = Vec::new();
-    for sub in [".work-authorities", "private"] {
-        for entry in std::fs::read_dir(dir.join(sub)).unwrap() {
-            let path = entry.unwrap().path();
+pub fn files(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    fn collect(path: std::path::PathBuf, result: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>) {
+        let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+        if kind.is_dir() {
+            result.push((path.clone(), None));
+            for entry in std::fs::read_dir(path).unwrap() {
+                collect(entry.unwrap().path(), result);
+            }
+        } else {
+            assert!(kind.is_file(), "unexpected authority entry: {path:?}");
             // SHM contains SQLite's normal reader lock bookkeeping.
             let bytes = if path.to_string_lossy().ends_with("-shm") {
                 Vec::new()
             } else {
                 std::fs::read(&path).unwrap()
             };
-            result.push((path, bytes));
+            result.push((path, Some(bytes)));
         }
+    }
+    let mut result = Vec::new();
+    for sub in [".work-authorities", "private"] {
+        collect(dir.join(sub), &mut result);
     }
     result.sort();
     result
+}
+
+#[test]
+fn authority_snapshot_preserves_nested_lock_files_and_entry_types() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".work-authorities")).unwrap();
+    let locks = dir.path().join("private/checkout-locks");
+    std::fs::create_dir_all(&locks).unwrap();
+    let lock = locks.join("checkout.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let original = files(dir.path());
+    assert!(original.contains(&(locks.clone(), None)));
+    assert!(original.contains(&(lock.clone(), Some(Vec::new()))));
+    assert_eq!(original, files(dir.path()));
+    std::fs::write(&lock, b"changed").unwrap();
+    assert_ne!(original, files(dir.path()));
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::remove_dir(&locks).unwrap();
+    std::fs::write(&locks, b"").unwrap();
+    assert_ne!(original, files(dir.path()));
 }

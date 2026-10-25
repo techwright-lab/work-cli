@@ -18,18 +18,27 @@ fn config(f: &Fixture) -> work_cli::config::Config {
     )
     .unwrap()
 }
-fn authority_files(f: &Fixture) -> Vec<(std::path::PathBuf, Vec<u8>)> {
-    let mut files = Vec::new();
-    for sub in ["registry", "private"] {
-        for entry in std::fs::read_dir(f.temp.path().join(sub)).unwrap() {
-            let path = entry.unwrap().path();
+fn authority_files(f: &Fixture) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
+    fn collect(path: std::path::PathBuf, files: &mut Vec<(std::path::PathBuf, Option<Vec<u8>>)>) {
+        let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+        if kind.is_dir() {
+            files.push((path.clone(), None));
+            for entry in std::fs::read_dir(path).unwrap() {
+                collect(entry.unwrap().path(), files);
+            }
+        } else {
+            assert!(kind.is_file(), "unexpected authority entry: {path:?}");
             let bytes = if path.to_string_lossy().ends_with("-shm") {
                 Vec::new()
             } else {
                 std::fs::read(&path).unwrap()
             };
-            files.push((path, bytes));
+            files.push((path, Some(bytes)));
         }
+    }
+    let mut files = Vec::new();
+    for sub in ["registry", "private"] {
+        collect(f.temp.path().join(sub), &mut files);
     }
     files.sort();
     files

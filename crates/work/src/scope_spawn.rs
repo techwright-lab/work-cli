@@ -146,9 +146,29 @@ impl ReleaseProof<'_> {
         }
     }
 }
-/// Private, non-Clone driver observation retained through permit publication.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReleaseMode {
+    Ordinary,
+    Captured,
+    Gap,
+}
+impl LaunchGuard {
+    fn mode(&self) -> ReleaseMode {
+        match self {
+            Self::Ordinary => ReleaseMode::Ordinary,
+            Self::Captured(_) => ReleaseMode::Captured,
+            Self::Gap(_) => ReleaseMode::Gap,
+        }
+    }
+}
+/// Private, non-Clone observation tied to one owned launch and exact Binding.
 pub(crate) struct PreparedRelease {
     observed: Instant,
+    identity: std::sync::Arc<()>,
+    mode: ReleaseMode,
+    binding: crate::runtime_scope::ScopeIdentity,
+    child: crate::runtime_scope::ChildIdentity,
+    boot: String,
 }
 pub struct OwnedLaunch {
     gate: GuardedLaunch,
@@ -158,6 +178,7 @@ pub struct OwnedLaunch {
     /// Set BEFORE publication: an fsync failure may still have exposed a permit.
     permit_attempted: bool,
     guard: LaunchGuard,
+    release_identity: std::sync::Arc<()>,
 }
 impl OwnedLaunch {
     /// Fixed production tools and real controller birth/boot identity. Inherited
@@ -383,6 +404,7 @@ impl OwnedLaunch {
             pid,
             deadline,
             permit_attempted: false,
+            release_identity: std::sync::Arc::new(()),
             guard: capture
                 .map(|live| LaunchGuard::Captured(live.guard()))
                 .unwrap_or(LaunchGuard::Ordinary),
@@ -425,24 +447,6 @@ impl OwnedLaunch {
         let prepared = self.observe_release(driver, ReleaseProof::Ordinary)?;
         self.publish_prepared_release(prepared, PublishProof::Ordinary)
     }
-    pub(crate) fn release_captured(
-        &mut self,
-        driver: &Driver,
-        proof: crate::capture_preparation::CapturedReleaseProof,
-    ) -> Result<()> {
-        let prepared = self.observe_release(driver, ReleaseProof::Captured(&proof))?;
-        self.publish_prepared_release(prepared, PublishProof::Captured(&proof))
-    }
-    pub(crate) fn release_gap(
-        &mut self,
-        driver: &Driver,
-        proof: crate::attribution_gap::GapReleaseProof,
-        store: &crate::store::Store,
-        lease: &crate::allocate::AuthorityLease,
-    ) -> Result<()> {
-        let prepared = self.observe_release(driver, ReleaseProof::Gap(&proof))?;
-        self.publish_prepared_release(prepared, PublishProof::Gap(&proof, store, lease))
-    }
     pub(crate) fn observe_release(
         &mut self,
         driver: &Driver,
@@ -463,7 +467,15 @@ impl OwnedLaunch {
         self.check_owned()?;
         let checked = proof.validate_guard(&self.guard);
         self.preexec_result(checked)?;
-        Ok(PreparedRelease { observed })
+        let binding = self.binding().ok_or(HOLD)?;
+        Ok(PreparedRelease {
+            observed,
+            identity: self.release_identity.clone(),
+            mode: self.guard.mode(),
+            binding: binding.identity().clone(),
+            child: binding.trusted_child().clone(),
+            boot: binding.boot_id().into(),
+        })
     }
     pub(crate) fn publish_prepared_release(
         &mut self,
@@ -473,24 +485,50 @@ impl OwnedLaunch {
         if self.permit_attempted {
             return Err(HOLD);
         }
-        if Instant::now()
-            .checked_duration_since(prepared.observed)
-            .is_none_or(|age| age > Duration::from_secs(2))
-        {
+        let checked = (|| {
+            self.check_prepared(&prepared)?;
+            match proof {
+                PublishProof::Ordinary => ReleaseProof::Ordinary.validate_guard(&self.guard)?,
+                PublishProof::Captured(captured) => {
+                    ReleaseProof::Captured(captured).validate_guard(&self.guard)?;
+                }
+                PublishProof::Gap(gap, store, lease) => {
+                    ReleaseProof::Gap(gap).validate_guard(&self.guard)?;
+                    gap.validate_current(store, self.binding().ok_or(HOLD)?, lease)
+                        .map_err(|_| HOLD)?;
+                }
+            }
+            // SQL comparison above may consume the remainder of the ORIGINAL
+            // pre-exec/observation budget. Recheck at the actual publication edge.
+            self.check_prepared(&prepared)
+        })();
+        if checked.is_err() {
+            // No driver call or blocking child reap while the caller holds a lease.
+            self.gate.recovery_hold();
             return Err(HOLD);
-        }
-        match proof {
-            PublishProof::Ordinary => {}
-            PublishProof::Captured(captured) => {
-                captured.fresh().map_err(|_| HOLD)?;
-            }
-            PublishProof::Gap(gap, store, lease) => {
-                gap.validate_current(store, self.binding().ok_or(HOLD)?, lease)
-                    .map_err(|_| HOLD)?;
-            }
         }
         self.permit_attempted = true;
         self.gate.publish_release()
+    }
+    fn check_prepared(&self, prepared: &PreparedRelease) -> Result<()> {
+        let now = Instant::now();
+        let binding = self.binding().ok_or(HOLD)?;
+        if self.permit_attempted
+            || self.phase() != Phase::Bound
+            || self.outcome() != Outcome::Pending
+            || now >= self.deadline
+            || !std::sync::Arc::ptr_eq(&prepared.identity, &self.release_identity)
+            || prepared.mode != self.guard.mode()
+            || &prepared.binding != binding.identity()
+            || &prepared.child != binding.trusted_child()
+            || prepared.boot != binding.boot_id()
+            || now
+                .checked_duration_since(prepared.observed)
+                .is_none_or(|age| age > Duration::from_secs(2))
+        {
+            return Err(HOLD);
+        }
+        Ok(())
     }
     /// Fresh exact-unit manager request only; success is NOT scope quiescence.
     pub fn cancel(&mut self, driver: &Driver) -> Result<()> {
@@ -621,10 +659,195 @@ impl Drop for OwnedLaunch {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::runtime_scope::ChildIdentity;
+    use crate::scope_driver::{LibraryIo, Limits, RuntimeContext};
+    use std::{
+        fs,
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+    };
+
+    // Real prepared gate and driver parsing, fixture-only membership evidence.
+    // No containment or retirement capability is manufactured by this fixture.
+    struct Fixture {
+        temp: tempfile::TempDir,
+        _bus: UnixListener,
+        driver: Driver,
+        launch: OwnedLaunch,
+    }
+    impl Fixture {
+        fn bound() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let p = temp.path();
+            for name in ["runtime", "gate"] {
+                fs::create_dir(p.join(name)).unwrap();
+                fs::set_permissions(p.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let bus = UnixListener::bind(p.join("runtime/bus")).unwrap();
+            let boot = "f312459a-9346-4d02-9139-c80a7017d962";
+            let intent = LaunchIntent::new(
+                work_contract::RunId::parse(&uuid::Uuid::now_v7().to_string()).unwrap(),
+                boot,
+            )
+            .unwrap();
+            let unit = intent.unit_name().to_owned();
+            let mut identity = ChildIdentity {
+                pid: std::process::id(),
+                start_ticks: 123,
+                boot: boot.into(),
+                cgroup: format!("/user.slice/{unit}"),
+            };
+            let gate = prepare(
+                &p.join("gate"),
+                &intent,
+                &identity,
+                p,
+                OriginalRuntime::new(None, None),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+            // Install ownership immediately after spawn, before any fallible fixture
+            // setup, so a failed assertion cannot orphan the blocked process.
+            let child = Command::new("/usr/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            identity.pid = pid;
+            let mut launch = OwnedLaunch {
+                gate: GuardedLaunch::adopt_prepared(intent, gate),
+                child: Some(child),
+                pid,
+                deadline: Instant::now() + Duration::from_secs(30),
+                permit_attempted: false,
+                guard: LaunchGuard::Ordinary,
+                release_identity: std::sync::Arc::new(()),
+            };
+            let context: serde_json::Value =
+                serde_json::from_slice(&fs::read(p.join("gate/context.json")).unwrap()).unwrap();
+            fs::write(p.join("gate/ready.json"), serde_json::to_vec(&serde_json::json!({
+                "nonce": context["nonce"], "cwd": context["cwd"],
+                "child": {"pid": pid, "start_ticks": 123, "boot": boot, "cgroup": identity.cgroup}
+            })).unwrap()).unwrap();
+            fs::set_permissions(p.join("gate/ready.json"), fs::Permissions::from_mode(0o600))
+                .unwrap();
+            fs::create_dir_all(p.join("proc/sys/kernel/random")).unwrap();
+            fs::write(p.join("proc/sys/kernel/random/boot_id"), boot).unwrap();
+            fs::create_dir_all(p.join(format!("proc/{pid}"))).unwrap();
+            fs::write(
+                p.join(format!("proc/{pid}/stat")),
+                format!("{pid} (fixture) S {} 123 0\n", vec!["0"; 18].join(" ")),
+            )
+            .unwrap();
+            fs::write(
+                p.join(format!("proc/{pid}/cgroup")),
+                format!("0::{}\n", identity.cgroup),
+            )
+            .unwrap();
+            let group = p.join("cg").join(identity.cgroup.trim_start_matches('/'));
+            fs::create_dir_all(&group).unwrap();
+            fs::write(group.join("cgroup.type"), "domain\n").unwrap();
+            fs::write(group.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            fs::write(p.join("properties"), format!(
+                "Id={}\nInvocationID=b312459a93464d029139c80a7017d962\nControlGroup={}\nLoadState=loaded\nActiveState=active\n",
+                unit, identity.cgroup)).unwrap();
+            fs::write(
+                p.join("manager"),
+                format!(
+                    "#!/bin/sh\nexec /usr/bin/cat '{}/properties'\n",
+                    p.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(p.join("manager"), fs::Permissions::from_mode(0o700)).unwrap();
+            let driver = Driver::with_io(
+                RuntimeContext::new(
+                    p.join("runtime"),
+                    format!("unix:path={}/runtime/bus", p.display()),
+                )
+                .unwrap(),
+                LibraryIo {
+                    systemctl: p.join("manager"),
+                    proc_root: p.join("proc"),
+                    cgroup_root: p.join("cg"),
+                    between_censuses: None,
+                },
+                Limits::default(),
+            )
+            .unwrap();
+            assert_eq!(launch.poll_blocked(), Ok(true));
+            launch.bind(&driver).unwrap();
+            Self {
+                temp,
+                _bus: bus,
+                driver,
+                launch,
+            }
+        }
+        fn observe(&mut self) -> PreparedRelease {
+            self.launch
+                .observe_release(&self.driver, ReleaseProof::Ordinary)
+                .unwrap()
+        }
+        fn refused(&mut self, prepared: PreparedRelease) {
+            // Publication must not invoke the driver again, even on a refusal.
+            fs::remove_file(self.temp.path().join("manager")).unwrap();
+            assert!(self
+                .launch
+                .publish_prepared_release(prepared, PublishProof::Ordinary)
+                .is_err());
+            assert!(!self.launch.permit_attempted);
+            assert!(!self.temp.path().join("gate/permit.json").exists());
+            assert_eq!(self.launch.outcome(), Outcome::RecoveryHold);
+        }
+    }
     #[test]
-    fn prepared_release_is_private_observation_not_bool_proof() {
-        let name = std::any::type_name::<super::PreparedRelease>();
-        assert!(name.contains("PreparedRelease"));
-        assert!(!name.contains("bool"));
+    fn prepared_release_cannot_cross_launches() {
+        let mut a = Fixture::bound();
+        let mut b = Fixture::bound();
+        let prepared = a.observe();
+        b.refused(prepared);
+        assert!(!a.temp.path().join("gate/permit.json").exists());
+    }
+    #[test]
+    fn prepared_release_refuses_changed_mode_deadline_or_hold_after_observation() {
+        for case in ["mode", "deadline", "hold", "cancel", "age"] {
+            let mut f = Fixture::bound();
+            let mut prepared = f.observe();
+            match case {
+                "mode" => prepared.mode = ReleaseMode::Captured,
+                // Model crossing the ORIGINAL deadline, without sleeping or renewing observation.
+                "deadline" => f.launch.deadline = prepared.observed,
+                "hold" => f.launch.gate.recovery_hold(),
+                "cancel" => {
+                    let _ = f.launch.cancel(&f.driver);
+                }
+                "age" => prepared.observed -= Duration::from_secs(3),
+                _ => unreachable!(),
+            }
+            f.refused(prepared);
+        }
+    }
+    #[test]
+    fn prepared_release_publishes_once_without_reobserving_driver() {
+        let mut f = Fixture::bound();
+        let earlier = f.observe();
+        let prepared = f.observe();
+        fs::remove_file(f.temp.path().join("manager")).unwrap();
+        f.launch
+            .publish_prepared_release(prepared, PublishProof::Ordinary)
+            .unwrap();
+        assert!(f.launch.permit_attempted);
+        assert!(f.temp.path().join("gate/permit.json").exists());
+        assert_eq!(f.launch.outcome(), Outcome::WriterReleased);
+        assert!(f
+            .launch
+            .publish_prepared_release(earlier, PublishProof::Ordinary)
+            .is_err());
+        assert_eq!(f.launch.outcome(), Outcome::WriterReleased);
+        // This fixture's blocked process is not a scope child. Explicitly end/reap it.
+        f.launch.child.as_mut().unwrap().stdin.take();
+        f.launch.wait().unwrap();
     }
 }

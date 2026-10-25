@@ -658,7 +658,7 @@ pub(super) struct Context {
     pub(super) history: Vec<u8>,
     pub(super) history_count: u64,
 }
-pub(super) fn snapshot(
+fn snapshot(
     store: &mut Store,
     checkout: Uuid,
     b: &mut Budget,

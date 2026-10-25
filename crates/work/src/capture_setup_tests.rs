@@ -72,8 +72,8 @@ pub(crate) fn materialized_with_timeout(
     (temp, config, store, a, root, spec)
 }
 #[test]
-fn actual_physical_inspection_never_holds_sql_transaction_or_writer_lock() {
-    let (temp, cfg, _store, _a, r, s) = materialized();
+fn actual_physical_inspection_never_holds_sql_or_global_lease_but_retains_checkout_guard() {
+    let (temp, cfg, store, a, r, s) = materialized();
     let sql = Connection::open(temp.path().join("private/store.sqlite")).unwrap();
     sql.busy_timeout(Duration::ZERO).unwrap();
     let observations = Rc::new(RefCell::new(Vec::new()));
@@ -83,7 +83,19 @@ fn actual_physical_inspection_never_holds_sql_transaction_or_writer_lock() {
         if writer {
             sql.execute_batch("ROLLBACK").unwrap();
         }
-        seen.borrow_mut().push((conn.is_autocommit(), writer));
+        let lock = crate::store::AuthorityIdentity::open_lock(
+            &store.authority_identity().directory,
+            false,
+        )
+        .unwrap();
+        let global_free =
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok();
+        let checkout_excluded = matches!(
+            crate::checkout_guard::CheckoutGuard::exclusive(&store, a.checkout),
+            Err(StoreError::OperationsInFlight)
+        );
+        seen.borrow_mut()
+            .push((conn.is_autocommit(), writer, global_free, checkout_excluded));
     });
     let (_store, result) = begin(&cfg, &r, &s).unwrap();
     assert!(matches!(result, BeginCapturedRun::Created(_)));
@@ -94,7 +106,9 @@ fn actual_physical_inspection_never_holds_sql_transaction_or_writer_lock() {
     );
     assert!(
         seen.iter()
-            .all(|&(autocommit, writer)| autocommit && writer),
+            .all(|&(autocommit, writer, global_free, checkout_excluded)| {
+                autocommit && writer && global_free && checkout_excluded
+            }),
         "physical boundary held SQL authority: {seen:?}"
     );
 }
@@ -430,19 +444,45 @@ fn physical_proof_expiration_is_checked_after_immediate_lock_and_before_handoff(
     }
 }
 fn seed_prepared_fence(store: &Store, checkout: Uuid) {
-    let operation = Uuid::now_v7();
-    store
-        .conn
-        .execute(
-            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-            rusqlite::params![
-                operation.to_string(),
-                checkout.to_string(),
-                [3u8; 32].as_slice(),
-                [4u8; 32].as_slice()
-            ],
-        )
-        .unwrap();
+    crate::retirement_journal::tests::seed_prepared(store, checkout, Uuid::now_v7());
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (rows.len(), rows[0].revision, rows[0].stage.as_str()),
+        (1, 1, "prepared")
+    );
+}
+#[test]
+fn materialization_reinspection_stage_is_bound_to_original_store_and_request() {
+    let (_temp, cfg, mut store, _a, root, spec) = materialized();
+    let proof = MaterializationProof::inspect(&store, &root, &spec).unwrap();
+    let other = Store::open_existing_registered_mut(
+        cfg.trusted_registry.as_ref().unwrap(),
+        cfg.store_dir.as_ref().unwrap(),
+        &cfg.roots,
+    )
+    .unwrap();
+    assert!(
+        proof.reinspect(&other).is_err(),
+        "reopened Store must not borrow another instance's inspection"
+    );
+    let inspected = proof.reinspect(&store).unwrap();
+    let foreign = other.authority_lease().unwrap();
+    assert!(inspected.checked(&store, &foreign).is_err());
+    drop(foreign);
+    let mut changed = serde_json::to_value(&root).unwrap();
+    changed["identity"]["run"] = Uuid::now_v7().to_string().into();
+    let changed: RootRunRequest = serde_json::from_value(changed).unwrap();
+    let lease = store.authority_lease().unwrap();
+    assert!(store
+        .begin_materialized_capture_under_lease(&changed, &spec, inspected, &lease)
+        .is_err());
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 #[test]
 fn begin_under_guard_refuses_unrelated_checkout_guard() {
@@ -462,6 +502,7 @@ fn begin_under_guard_refuses_unrelated_checkout_guard() {
 fn begin_holds_prepared_intent_before_admission_rows() {
     let (_temp, cfg, store, a, r, s) = materialized();
     seed_prepared_fence(&store, a.checkout);
+    let before = crate::retirement_journal::tests::source_rows(&store);
     let error = match super::begin(&cfg, &r, &s) {
         Ok(_) => panic!("fenced capture setup unexpectedly succeeded"),
         Err(error) => error,
@@ -501,4 +542,42 @@ fn begin_holds_prepared_intent_before_admission_rows() {
         })
         .count();
     assert_eq!(events, 1);
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&store),
+        before
+    );
+}
+
+#[test]
+fn malformed_intent_refuses_without_fabricating_a_hold() {
+    let (_temp, cfg, store, a, root, spec) = materialized();
+    seed_prepared_fence(&store, a.checkout);
+    store
+        .conn
+        .execute("UPDATE retirement_intents SET record='{}'", [])
+        .unwrap();
+    assert!(crate::retirement_journal::read_history(&store.conn, a.checkout).is_err());
+    let before = crate::retirement_journal::tests::source_rows(&store);
+    let events = store.pending_events(1000).unwrap();
+    assert!(super::begin(&cfg, &root, &spec).is_err());
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&store),
+        before
+    );
+    assert_eq!(store.pending_events(1000).unwrap(), events);
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT revision,stage,record FROM retirement_intents",
+                [],
+                |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+        (1, "prepared".into(), "{}".into())
+    );
 }

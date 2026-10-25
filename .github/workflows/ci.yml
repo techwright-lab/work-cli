@@ -92,6 +92,10 @@ jobs:
           - kind: lib
             selector: capture_recovery::tests::reconcile_shared_guard_excludes_exclusive_until_drain
           - kind: lib
+            selector: capture_readiness::tests::restore_holds_prepared_intent_before_certificate
+          - kind: lib
+            selector: capture_readiness::tests::restore_under_guard_refuses_mismatched_checkout
+          - kind: lib
             selector: 'capture_finalization::tests::'
           - kind: lib
             selector: 'store::tests::'

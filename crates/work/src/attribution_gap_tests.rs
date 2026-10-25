@@ -103,6 +103,124 @@ fn materialized_mode(
     )
 }
 
+fn seed_retirement_fence(store: &Store, checkout: uuid::Uuid) -> uuid::Uuid {
+    let operation = uuid::Uuid::now_v7();
+    crate::retirement_journal::tests::seed_prepared(store, checkout, operation);
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (rows.len(), rows[0].revision, rows[0].stage.as_str()),
+        (1, 1, "prepared")
+    );
+    operation
+}
+#[test]
+fn gap_entry_holds_before_existing_or_early_refusal_without_physical_dispatch() {
+    for case in ["existing", "eligibility", "profile"] {
+        let (_temp, mut config, allocation, root, argv) = ordinary();
+        let store = if case == "existing" {
+            let (store, created) = super::begin(&config, &root, &argv).unwrap();
+            assert!(matches!(created, super::BeginGap::Created(_)));
+            store
+        } else {
+            let (store, lease) = crate::allocate::locked(&config).unwrap();
+            drop(lease);
+            if case == "eligibility" {
+                store
+                    .conn
+                    .execute("UPDATE checkouts SET state='held',ready=0", [])
+                    .unwrap();
+            } else {
+                config.supervisor.as_mut().unwrap().actors.clear();
+            }
+            store
+        };
+        seed_retirement_fence(&store, allocation.checkout);
+        let source_before = crate::retirement_journal::tests::source_rows(&store);
+        let before = store.conn.query_row(
+            "SELECT (SELECT count(*) FROM runs),(SELECT count(*) FROM writers),(SELECT count(*) FROM attribution_gaps)",
+            [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        ).unwrap();
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = calls.clone();
+        let _observer = observing_admission(move |_, _| observed.set(observed.get() + 1));
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    super::begin(&config, &root, &argv),
+                    Err(crate::store::StoreError::RetirementFenced)
+                ),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "{case}: physical dispatch preceded entry fence"
+        );
+        assert_eq!(store.conn.query_row(
+            "SELECT (SELECT count(*) FROM runs),(SELECT count(*) FROM writers),(SELECT count(*) FROM attribution_gaps)",
+            [], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+        ).unwrap(), before);
+        assert_eq!(
+            crate::retirement_journal::tests::source_rows(&store),
+            source_before
+        );
+        let rows =
+            crate::retirement_journal::read_history(&store.conn, allocation.checkout).unwrap();
+        assert_eq!(
+            (
+                rows[0].revision,
+                rows[0].stage.as_str(),
+                rows[0].held_reason.as_deref()
+            ),
+            (2, "held", Some("gap_admission"))
+        );
+        assert_eq!(store.pending_events(100).unwrap().iter().filter(|e|
+            matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+        ).count(), 1);
+    }
+}
+
+#[test]
+fn borrowed_gap_admission_rejects_wrong_checkout_without_mutation() {
+    let (_temp, config, _a, root, argv) = ordinary();
+    let (store, lease) = crate::allocate::locked(&config).unwrap();
+    drop(lease);
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&store, uuid::Uuid::now_v7()).unwrap();
+    let before = durable_rows(&store);
+    assert!(super::begin_under_guard(&config, &root, &argv, &guard).is_err());
+    assert_eq!(durable_rows(&store), before);
+}
+
+#[test]
+fn new_gap_event_cannot_reuse_active_or_aborted_retirement_operation() {
+    for aborted in [false, true] {
+        let (_temp, config, a, _root, _argv) = ordinary();
+        let (store, lease) = crate::allocate::locked(&config).unwrap();
+        drop(lease);
+        let operation = seed_retirement_fence(&store, a.checkout);
+        if aborted {
+            // Structural tombstone only; this does not fabricate abort authority.
+            store
+                .conn
+                .execute(
+                    "UPDATE retirement_intents SET stage='aborted',revision=2,aborted_from=1",
+                    [],
+                )
+                .unwrap();
+        }
+        crate::retirement_journal::read_history(&store.conn, a.checkout).unwrap();
+        let changes = store.conn.total_changes();
+        let events = store.pending_events(100).unwrap();
+        assert!(matches!(
+            super::exclude_new_event(&store.conn, &operation.to_string()),
+            Err(crate::store::StoreError::Conflict)
+        ));
+        assert_eq!(store.conn.total_changes(), changes);
+        assert_eq!(store.pending_events(100).unwrap(), events);
+    }
+}
+
 // Public capture declarations/codecs only. Injection below is deliberately
 // contradictory persisted history, never a preparation or execution capability.
 fn mixed_history_spec(
@@ -1168,10 +1286,101 @@ impl ScopeHarness {
     }
 }
 #[test]
+fn gap_publication_reopened_store_keeps_outer_guard_until_acknowledgement() {
+    let h = ScopeHarness::new(true);
+    let (store, lease) = crate::allocate::locked(&h.config).unwrap();
+    drop(lease);
+    let checkout = h.command.checkout;
+    let reached = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = reached.clone();
+    let observer = crate::gap_continuation::observing_publication(move |stage| {
+        if stage == "before_second_physical" || stage == "after_commit" {
+            assert!(matches!(
+                crate::checkout_guard::CheckoutGuard::exclusive(&store, checkout),
+                Err(crate::store::StoreError::OperationsInFlight)
+            ));
+            let lock = crate::store::AuthorityIdentity::open_lock(
+                &store.authority_identity().directory,
+                false,
+            )
+            .unwrap();
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+            observed.borrow_mut().push(stage.to_owned());
+        }
+    });
+    let result = crate::supervisor::supervise_off(
+        &h.config,
+        h.command.clone(),
+        &h.driver,
+        Some(h.io()),
+        &crate::supervisor::CancelToken::default(),
+        |boundary, root| {
+            if boundary == crate::supervisor::Boundary::RootTerminal {
+                h.empty(root);
+            }
+        },
+    );
+    drop(observer);
+    assert!(result.is_ok());
+    assert_eq!(
+        *reached.borrow(),
+        ["before_second_physical", "after_commit"]
+    );
+    let (store, lease) = crate::allocate::locked(&h.config).unwrap();
+    drop(lease);
+    crate::checkout_guard::CheckoutGuard::exclusive(&store, checkout).unwrap();
+}
+
+#[test]
+fn off_entry_and_intent_checkpoint_hold_before_control_publication() {
+    for case in ["profile", "intent"] {
+        let mut h = ScopeHarness::new(false);
+        let (store, lease) = crate::allocate::locked(&h.config).unwrap();
+        drop(lease);
+        if case == "profile" {
+            seed_retirement_fence(&store, h.command.checkout);
+            h.config.supervisor.as_mut().unwrap().actors.clear();
+        }
+        let mut reached = false;
+        let result = crate::supervisor::supervise_off(
+            &h.config,
+            h.command.clone(),
+            &h.driver,
+            Some(h.io()),
+            &crate::supervisor::CancelToken::default(),
+            |boundary, _| {
+                if boundary == crate::supervisor::Boundary::Intent {
+                    reached = true;
+                    seed_retirement_fence(&store, h.command.checkout);
+                }
+            },
+        );
+        assert!(result.is_err(), "{case}");
+        assert_eq!(reached, case == "intent");
+        let rows =
+            crate::retirement_journal::read_history(&store.conn, h.command.checkout).unwrap();
+        assert_eq!(
+            (
+                rows[0].revision,
+                rows[0].stage.as_str(),
+                rows[0].held_reason.as_deref()
+            ),
+            (2, "held", Some("execution_permit"))
+        );
+        assert_eq!(store.pending_events(100).unwrap().iter().filter(|e|
+            matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+        ).count(), 1);
+        assert!(!h.config.store_dir.as_ref().unwrap().join("runs").exists());
+        assert!(!h.temp.path().join("executed").exists());
+    }
+}
+#[test]
 fn gap_guard_cannot_use_generic_or_captured_release() {
     for case in [
         "generic",
         "captured",
+        "publish_ordinary",
+        "publish_captured",
         "cross_root",
         "wrong_store",
         "nonce",
@@ -1237,7 +1446,16 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
         store
             .record_bound(&root, launch.binding().unwrap())
             .unwrap();
-        if case == "captured" {
+        if case == "publish_ordinary" {
+            let proof = live.release_proof().unwrap();
+            let observed = launch
+                .observe_release(&driver, crate::scope_spawn::ReleaseProof::Gap(&proof))
+                .unwrap();
+            assert!(launch
+                .publish_prepared_release(observed, crate::scope_spawn::PublishProof::Ordinary)
+                .is_err());
+            assert!(!directory.join("permit.json").exists());
+        } else if case == "captured" || case == "publish_captured" {
             let (_temp, cfg, _a, other, spec) =
                 crate::capture_preparation::tests::qualified_fixture();
             let (_, crate::capture_preparation::PreparationResult::Live(capture)) =
@@ -1245,9 +1463,30 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
             else {
                 panic!("actual capture preparation required")
             };
-            assert!(launch
-                .release_captured(&driver, capture.release_proof().unwrap())
-                .is_err());
+            if case == "publish_captured" {
+                let proof = live.release_proof().unwrap();
+                let observed = launch
+                    .observe_release(&driver, crate::scope_spawn::ReleaseProof::Gap(&proof))
+                    .unwrap();
+                assert!(launch
+                    .publish_prepared_release(
+                        observed,
+                        crate::scope_spawn::PublishProof::Captured(
+                            &capture.release_proof().unwrap()
+                        )
+                    )
+                    .is_err());
+                assert!(!directory.join("permit.json").exists());
+            } else {
+                assert!(launch
+                    .observe_release(
+                        &driver,
+                        crate::scope_spawn::ReleaseProof::Captured(
+                            &capture.release_proof().unwrap()
+                        )
+                    )
+                    .is_err());
+            }
         } else if case == "generic" {
             assert!(launch.release(&driver).is_err());
         } else if case == "wrong_store" {
@@ -1258,8 +1497,16 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
             )
             .unwrap();
             let proof = live.release_proof().unwrap();
+            let observed = launch
+                .observe_release(&driver, crate::scope_spawn::ReleaseProof::Gap(&proof))
+                .unwrap();
             let lease = crate::allocate::lifecycle_lock(&other).unwrap();
-            assert!(launch.release_gap(&driver, proof, &store, &lease).is_err());
+            assert!(launch
+                .publish_prepared_release(
+                    observed,
+                    crate::scope_spawn::PublishProof::Gap(&proof, &store, &lease)
+                )
+                .is_err());
         } else if case == "cross_root" {
             let (_temp, cfg, _a, other, argv) = ordinary();
             let (_store, super::BeginGap::Created(other_live)) =
@@ -1268,8 +1515,9 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
                 panic!("actual other live required")
             };
             let proof = other_live.release_proof().unwrap();
-            let lease = crate::allocate::lifecycle_lock(&store).unwrap();
-            assert!(launch.release_gap(&driver, proof, &store, &lease).is_err());
+            assert!(launch
+                .observe_release(&driver, crate::scope_spawn::ReleaseProof::Gap(&proof))
+                .is_err());
         } else {
             // Test-only tampering with an actually observed proof checks private
             // guard bindings, not successful physical authority from synthetic data.
@@ -1289,9 +1537,10 @@ fn gap_guard_cannot_use_generic_or_captured_release() {
                 }
                 _ => unreachable!(),
             }
-            let lease = crate::allocate::lifecycle_lock(&store).unwrap();
             assert!(
-                launch.release_gap(&driver, proof, &store, &lease).is_err(),
+                launch
+                    .observe_release(&driver, crate::scope_spawn::ReleaseProof::Gap(&proof))
+                    .is_err(),
                 "{case} swapped guard permitted release"
             );
         }

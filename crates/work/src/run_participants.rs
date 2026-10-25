@@ -350,6 +350,7 @@ fn namespace_conflict(conn: &rusqlite::Connection, request: &ChildRequest) -> Re
     if crate::attribution_gap::event_reserved(conn, &request.run.to_string())?
         || crate::finish::operation_reserved(conn, &request.run.to_string())?
         || crate::capture_journal::operation_reserved(conn, &request.run.to_string())?
+        || crate::retirement_journal::operation_reserved(conn, &request.run.to_string())?
     {
         return Ok(true);
     }

@@ -1122,24 +1122,62 @@ fn receiver_failure_records_intent_writer_hold_without_starting_launcher() {
         .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
         .unwrap());
 }
-fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: Uuid) {
+// Structural negative-fence fixture, never a successful prepare capability.
+fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: Uuid, cfg: &Config) {
     let operation = Uuid::now_v7();
+    let hex = |tag: u8| format!("{tag:02x}").repeat(32);
+    let record = serde_json::json!({
+        "version":1, "operation":operation, "checkout":checkout, "mode":"supervised",
+        "revision":1, "stage":"prepared", "assertion":null, "declaration":null,
+        "predecessor_hex":hex(1), "source_hex":hex(2), "history_predecessor_hex":hex(3),
+        "prior_history_count":0,
+        "immutable_binding":{
+            "version":1, "authority_allocation":hex(4), "source_sql":hex(2),
+            "managed_physical":hex(6), "census":hex(7), "git_private":hex(8),
+            "local_git":hex(9), "git_inputs":hex(10), "source_commitment":hex(11),
+            "approval_semantic":hex(12), "approval_invalidation":hex(13),
+            "protection":hex(14), "protection_count":0, "config_manifests":[hex(15),hex(16)],
+            "inspection_policy":hex(17), "combined_policy":hex(18),
+            "operator":hex(19), "source_repository":hex(20)
+        },
+        "quiescence":"empty", "task_completion":"supervised_empty", "policy_digest":hex(17),
+        "combined_policy_digest":hex(18), "prepared_wall_ms":1, "remote_cleanup":"not_required"
+    })
+    .to_string();
     sql.execute(
-        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-        rusqlite::params![
-            operation.to_string(),
-            checkout.to_string(),
-            [3u8; 32].as_slice(),
-            [4u8; 32].as_slice()
-        ],
+        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,?5,NULL,NULL)",
+        rusqlite::params![operation.to_string(),checkout.to_string(),[1u8;32].as_slice(),[2u8;32].as_slice(),record],
+    ).unwrap();
+    // Public passive status traverses the production strict read_history decoder.
+    let config = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        config.path(),
+        format!(
+            "store_dir={:?}\ntrusted_registry={:?}\nroots={:?}\n",
+            cfg.store_dir.as_ref().unwrap(),
+            cfg.trusted_registry.as_ref().unwrap(),
+            cfg.roots
+        ),
     )
     .unwrap();
+    let report = serde_json::to_value(work_cli::inspection::retirement_status(
+        config.path(),
+        checkout,
+    ))
+    .unwrap();
+    assert_eq!(
+        report["stage"], "prepared",
+        "strict history did not decode: {report}"
+    );
+    assert_eq!(report["revision"], 1);
+    assert_eq!(report["history_count"], 1);
+    assert_eq!(report["fresh_commit"], false);
 }
 #[test]
 fn prepared_intent_refuses_captured_supervise_without_receiver() {
     let h = Harness::new();
     let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
-    seed_prepared_fence(&sql, h.command.checkout);
+    seed_prepared_fence(&sql, h.command.checkout, &h.cfg);
     assert!(h.execute().is_err());
     assert!(!h.f.temp.path().join("calls").exists());
     let (revision, stage, reason): (i64, String, Option<String>) = sql
@@ -1151,6 +1189,87 @@ fn prepared_intent_refuses_captured_supervise_without_receiver() {
         .unwrap();
     assert_eq!(
         (revision, stage.as_str(), reason.as_deref()),
-        (2, "held", Some("capture_admission"))
+        (2, "held", Some("execution_permit"))
     );
+    assert_eq!(h.f.store().pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, work_cli::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
+}
+
+#[test]
+fn captured_entry_holds_before_bad_profile_or_spec() {
+    for case in ["profile", "spec"] {
+        let mut h = Harness::new();
+        if case == "profile" {
+            h.cfg.supervisor.as_mut().unwrap().actors.clear();
+        } else {
+            h.cfg.capture.as_mut().unwrap().actor_refs.clear();
+        }
+        let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+        seed_prepared_fence(&sql, h.command.checkout, &h.cfg);
+        assert!(h.execute().is_err(), "{case}");
+        assert_eq!(
+            sql.query_row(
+                "SELECT revision,stage,held_reason FROM retirement_intents",
+                [],
+                |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?
+                ))
+            )
+            .unwrap(),
+            (2, "held".into(), "execution_permit".into())
+        );
+        assert!(!h.f.temp.path().join("calls").exists());
+        assert!(!h.f.temp.path().join("manager-started").exists());
+        assert!(!h.f.temp.path().join("private/runs").exists());
+        assert_eq!(
+            sql.query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn captured_intent_checkpoint_precedes_control_directory_and_launcher() {
+    let h = Harness::new();
+    let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    let mut reached = false;
+    let result = h.observed(|boundary, _| {
+        if boundary == Boundary::Intent {
+            reached = true;
+            seed_prepared_fence(&sql, h.command.checkout, &h.cfg);
+        }
+    });
+    assert!(reached, "capture never reached Intent");
+    assert!(result.is_err());
+    assert_eq!(
+        sql.query_row(
+            "SELECT revision,stage,held_reason FROM retirement_intents",
+            [],
+            |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+            ))
+        )
+        .unwrap(),
+        (2, "held".into(), "execution_permit".into())
+    );
+    assert!(!h.f.temp.path().join("manager-started").exists());
+    assert!(!h.f.temp.path().join("private/runs").exists());
+    assert_eq!(
+        sql.query_row(
+            "SELECT count(*) FROM runs WHERE binding IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(h.f.store().pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, work_cli::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
 }

@@ -274,9 +274,6 @@ impl Collector {
         if gap {
             return Err("gap_history_unsupported");
         }
-        if self.guard.is_some() {
-            require_prepare_predecessor(&tx, &context)?;
-        }
         if adopted && supervised {
             return Err("mixed_mode");
         }
@@ -322,6 +319,9 @@ impl Collector {
                 self.terminals = Some(terminals);
                 self.task_completed = Some(completed);
             }
+        }
+        if self.guard.is_some() {
+            require_prepare_predecessor(&tx, &context, mode)?;
         }
         self.mode = Some(mode);
         tx.rollback().map_err(|_| "context_unknown")?;
@@ -727,7 +727,7 @@ fn decide(
             .reserve(current.history.len() as u64)
             .map_err(|_| "deadline")?;
         if assessment.guard.is_some() {
-            require_prepare_predecessor(&tx, &current)?;
+            require_prepare_predecessor(&tx, &current, assessment.mode)?;
         }
         match assessment.mode {
             ModeKind::Adopted => {
@@ -778,7 +778,11 @@ fn decide(
     })
 }
 
-fn require_prepare_predecessor(tx: &rusqlite::Connection, context: &Context) -> Held<()> {
+fn require_prepare_predecessor(
+    tx: &rusqlite::Connection,
+    context: &Context,
+    mode: ModeKind,
+) -> Held<()> {
     crate::retirement_journal::require_unfenced(tx, context.allocation.checkout).map_err(
         |error| {
             if matches!(error, crate::store::StoreError::RetirementFenced) {
@@ -788,14 +792,23 @@ fn require_prepare_predecessor(tx: &rusqlite::Connection, context: &Context) -> 
             }
         },
     )?;
-    let state: String = tx
+    let (state, ready): (String, bool) = tx
         .query_row(
-            "SELECT state FROM checkouts WHERE id=?1",
+            "SELECT state,ready FROM checkouts WHERE id=?1",
             [context.allocation.checkout.to_string()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| "context_unknown")?;
-    if state != "active" || context.allocation.stage != "ready" {
+    // Public finish retains a ready Allocation record but deliberately holds
+    // the checkout and clears readiness. This is a retirement-only predecessor
+    // check, not ordinary allocation/execution eligibility or quiescence proof.
+    // Supervised callers also validate the actual finish receipt and closed
+    // roster in this snapshot, then retain/check original driver observations.
+    let eligible = match mode {
+        ModeKind::Adopted => state == "active" && ready,
+        ModeKind::Supervised => state == "held" && !ready,
+    };
+    if !eligible || context.allocation.stage != "ready" {
         return Err("allocation_not_active");
     }
     Ok(())
@@ -1104,9 +1117,15 @@ impl FreshRetirementAssessment {
             lease
                 .check_authority(&authority)
                 .map_err(|_| "authority_unknown")?;
-            if let Some((row, count)) = historical_operation(&tx, checkout, operation)? {
+            if let Some((row, count, fence_active)) =
+                historical_operation(&tx, checkout, operation)?
+            {
                 tx.rollback().map_err(|_| "commit_unknown")?;
-                return Ok(PrepareCommit::Historical(Box::new(row), count));
+                return Ok(PrepareCommit::Historical(
+                    Box::new(row),
+                    count,
+                    fence_active,
+                ));
             }
             journal::exclude_prepare_operation(&tx, operation).map_err(prepare_store_error)?;
             #[cfg(test)]
@@ -1125,7 +1144,7 @@ impl FreshRetirementAssessment {
             if current.canonical != context.canonical {
                 return Err("context_changed");
             }
-            require_prepare_predecessor(&tx, &current)?;
+            require_prepare_predecessor(&tx, &current, *mode)?;
             match mode {
                 ModeKind::Adopted => {
                     let current_mode = approval::AdoptedMode::read(&tx, &current)?;
@@ -1251,7 +1270,7 @@ fn check_commit_freshness(
 
 pub(super) enum PrepareCommit {
     Prepared(Box<PreparedRetirement>),
-    Historical(Box<crate::retirement_journal::IntentRow>, u64),
+    Historical(Box<crate::retirement_journal::IntentRow>, u64, bool),
 }
 
 /// Non-Clone/non-Serialize/non-Deserialize. Its fresh owner transitively owns EX,
@@ -2053,6 +2072,16 @@ fn capture_local_binding(
     Ok((result, source_repository))
 }
 
+/// Forward .git markers name administrative directories, not reverse /.git
+/// endpoints. Parse one LF-terminated canonical absolute byte path only; the
+/// caller's retained Manifest/Endpoints open and recheck every route no-follow.
+fn absolute_admin_directory(bytes: &[u8]) -> Result<PathBuf, IncompleteReason> {
+    let raw = line(bytes)?;
+    let path = Path::new(std::ffi::OsStr::from_bytes(raw));
+    native_anchor_path(path)?;
+    Ok(path.to_path_buf())
+}
+
 /// Original request.repository, not the managed checkout. Selective identity and
 /// link/marker metadata only: no source payload walk or source object traversal.
 struct SourceRepository {
@@ -2099,9 +2128,13 @@ impl SourceRepository {
             common
         } else {
             let marker = root
-                .required(b".git", budget)
+                .required_limited(
+                    b".git",
+                    (MAX_PATH_BYTES + b"gitdir: ".len() + 1) as u64,
+                    budget,
+                )
                 .map_err(|_| "source_repository_unknown")?;
-            absolute_gitdir(
+            absolute_admin_directory(
                 marker
                     .strip_prefix(b"gitdir: ")
                     .ok_or("source_repository_unknown")?,
@@ -2853,6 +2886,134 @@ mod tests {
     }
 
     #[test]
+    fn linked_source_admin_path_is_a_bounded_canonical_byte_path_not_a_reverse_endpoint() {
+        for raw in [
+            b"/repo/.git/worktrees/source\n".as_slice(),
+            b"/repo/.git/worktrees/\xff\n".as_slice(),
+        ] {
+            assert_eq!(
+                absolute_admin_directory(raw)
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes(),
+                &raw[..raw.len() - 1]
+            );
+            assert!(
+                absolute_gitdir(raw).is_err(),
+                "reverse endpoint stays strict"
+            );
+        }
+        for raw in [
+            b"/repo/.git/worktrees/source".as_slice(),
+            b"/repo/.git/worktrees/source\n\n",
+            b"/repo/.git/worktrees/source\r\n",
+            b"/repo/.git/worktrees/so\nrce\n",
+            b"/repo/.git/worktrees/so\0rce\n",
+            b"repo/.git/worktrees/source\n",
+            b"//repo/.git/worktrees/source\n",
+            b"/repo//.git/worktrees/source\n",
+            b"/repo/.git/worktrees/../source\n",
+            b"/repo/.git/worktrees/./source\n",
+            b"/repo/.git/worktrees/source/\n",
+            b"/repo/.git/worktrees/source \n",
+            b"/\n",
+        ] {
+            assert!(absolute_admin_directory(raw).is_err(), "{raw:?}");
+        }
+        let mut oversized = vec![b'/'];
+        oversized.extend(std::iter::repeat_n(b'a', MAX_PATH_BYTES));
+        oversized.push(b'\n');
+        assert!(absolute_admin_directory(&oversized).is_err());
+    }
+
+    #[test]
+    fn private_linked_source_alias_prepare_and_offline_abort_use_real_allocation() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let source = f.sibling();
+        let config = crate::config::Config {
+            store_dir: Some(f.temp.path().join("authority")),
+            trusted_registry: Some(f.temp.path().join("registry")),
+            repositories: vec![source.clone()],
+            roots: vec![f.root.clone()],
+            allocation: Some(crate::config::AllocationPolicy {
+                repository_limit: 10,
+                owner_limit: 10,
+                floor_bytes: 0,
+                warn_bytes: 0,
+                capture_sink: None,
+            }),
+            ..Default::default()
+        };
+        // Allocate through the linked alias itself, not a rewritten identity DTO.
+        f.allocation = crate::allocate::start(
+            &config,
+            crate::allocate::Start {
+                operation: Uuid::now_v7(),
+                repository: Some(source.clone()),
+                root: Some(f.root.clone()),
+                actor: Some("fixture".into()),
+                owner: None,
+                task: "linked-source-retirement".into(),
+                branch: Some("linked-source-retirement".into()),
+                base: "HEAD".into(),
+                reuse_branch: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            f.allocation.request.repository.as_deref(),
+            Some(source.as_path())
+        );
+        assert_eq!(f.common(), f.repo.join(".git"));
+        assert_eq!(
+            fs::read(source.join(".git")).unwrap(),
+            format!("gitdir: {}/worktrees/sibling\n", f.common().display()).as_bytes()
+        );
+        let (path, _) = f.approval();
+        enable_prepare(&path);
+        assert!(recovery_refs::prepare_for_assessment(&path, f.allocation.checkout).prepared());
+        let assertion = approval::assertion_for_retirement_test(&path, f.allocation.checkout);
+        let rows = abort_source_rows(&f.store);
+        let operation = Uuid::now_v7();
+        let events = f.store.pending_events(1000).unwrap().len();
+        let prepared = prepare_test(
+            &path,
+            f.allocation.checkout,
+            operation,
+            Some(assertion),
+            true,
+            None,
+            PrepareFault::None,
+        )
+        .unwrap();
+        assert!(prepared.fresh_commit());
+        assert!(prepared.fence_active());
+        let original = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+        let files = abort_files(&f);
+        let refs = recovery_ref_rows(&f);
+        let remote_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = remote_calls.clone();
+        remote_proof::set_retirement_observer(move |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let aborted =
+            abort_test(&path, f.allocation.checkout, operation, 1, AbortFault::None).unwrap();
+        remote_proof::set_retirement_observer(|_, _| {});
+        assert_eq!(aborted.outcome(), "aborted");
+        assert!(aborted.fresh_commit());
+        assert!(!aborted.fence_active());
+        assert_eq!(remote_calls.load(Ordering::SeqCst), 0);
+        let row = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+        assert_eq!(row.record, original.record);
+        assert_eq!(row.aborted_from, Some(1));
+        assert_eq!(row.revision, 2);
+        assert_eq!(rows, abort_source_rows(&f.store));
+        assert_eq!(files, abort_files(&f));
+        assert_eq!(refs, recovery_ref_rows(&f));
+        assert_eq!(events + 2, f.store.pending_events(1000).unwrap().len());
+    }
+
+    #[test]
     fn private_abort_prepared_and_held_restart_exact_retry_and_writer_reconciliation() {
         for attempted_writer in [false, true] {
             let (mut f, config, operation) = prepared_adopted_intent();
@@ -3197,7 +3358,7 @@ mod tests {
             "record",
             "oversize",
         ] {
-            let (f, config, operation) = prepared_adopted_intent();
+            let (mut f, config, operation) = prepared_adopted_intent();
             let checkout = f.allocation.checkout;
             match change {
                 "payload" => {
@@ -3237,11 +3398,28 @@ mod tests {
                     );
                 }
                 "protection" => {
-                    let reference = first_recovery_ref(&f);
                     let tree = git_text(&f, &["rev-parse", "HEAD^{tree}"]);
+                    let (reference, original_oid) = recovery_ref_rows(&f)
+                        .into_iter()
+                        .find(|(_, oid)| oid != &tree)
+                        .expect("distinct protected target");
+                    assert!(reference.ends_with(&format!("/{original_oid}")));
                     git_at(
                         &f.allocation.destination,
                         &["update-ref", &reference, &tree],
+                    );
+                    assert_eq!(git_text(&f, &["rev-parse", &reference]), tree);
+                    // Recovery names bind their leaf OID to the physical target.
+                    // This target mutation is rejected by the native namespace
+                    // validator BEFORE the narrower existing-target comparison.
+                    let mut budget = Budget::new();
+                    let context = snapshot(&mut f.store, checkout, &mut budget).unwrap();
+                    let (census, _, _) =
+                        preservation::RecoveryCensus::recapture(&context, &mut budget).unwrap();
+                    assert!(census.reserved_namespace_held());
+                    assert_eq!(
+                        recovery_refs::verify_existing_protection(&census, checkout).unwrap_err(),
+                        "recovery_namespace_unknown"
                     );
                 }
                 "object" => {
@@ -3311,7 +3489,7 @@ mod tests {
                     "record" | "oversize" => "history_unknown",
                     "source-sql" => "context_changed",
                     "object" => "recovery_target_unknown",
-                    "protection" => "recovery_ref_conflict",
+                    "protection" => "recovery_namespace_unknown",
                     _ => "local_binding_changed",
                 },
                 "{change}"
@@ -3379,6 +3557,20 @@ mod tests {
 
     #[test]
     fn private_abort_preserves_all_prior_history_not_only_active_row() {
+        fn outbox(store: &Store) -> Vec<(i64, i64, String, i64)> {
+            let mut statement = store
+                .conn
+                .prepare(
+                    "SELECT sequence,version,payload,acknowledged FROM outbox ORDER BY sequence",
+                )
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        }
         for change in [
             "unchanged",
             "delete",
@@ -3388,32 +3580,166 @@ mod tests {
             "history-bound",
             "immutable-column",
         ] {
-            let (f, config, first) = prepared_adopted_intent();
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
             let checkout = f.allocation.checkout;
+            let (config, _) = f.approval();
+            enable_prepare(&config);
+            assert!(recovery_refs::prepare_for_assessment(&config, checkout).prepared());
+            // Retain the actual published ID before prepare A and abort A,
+            // without replacing its claim, expiry or context afterward.
+            let original_assertion = approval::assertion_for_retirement_test(&config, checkout);
+            let original_receipt = receipts::read_receipt(&f.store, original_assertion).unwrap();
+            let original_claim = original_receipt
+                .approval_record()
+                .unwrap()
+                .encode()
+                .unwrap();
+            let first = Uuid::now_v7();
+            assert!(prepare_test(
+                &config,
+                checkout,
+                first,
+                Some(original_assertion),
+                true,
+                None,
+                PrepareFault::None,
+            )
+            .unwrap()
+            .fresh_commit());
+            let first_row =
+                crate::retirement_journal::load_operation(&f.store.conn, first).unwrap();
             assert_eq!(
                 abort_test(&config, checkout, first, 1, AbortFault::None)
                     .unwrap()
                     .outcome(),
                 "aborted"
             );
+            if change == "unchanged" {
+                let history =
+                    crate::retirement_journal::read_history(&f.store.conn, checkout).unwrap();
+                let source = abort_source_rows(&f.store);
+                let events = outbox(&f.store);
+                let files = abort_files(&f);
+                let context = snapshot(&mut f.store, checkout, &mut Budget::new()).unwrap();
+                assert_eq!(context.history_count, 1);
+                assert_eq!(
+                    first_row.decoded.source_hex,
+                    hex(&Sha256::digest(&context.source))
+                );
+                assert_ne!(
+                    first_row.decoded.predecessor_hex,
+                    hex(&Sha256::digest(&context.canonical))
+                );
+                let stale_operation = Uuid::now_v7();
+                assert_eq!(
+                    prepare_test(
+                        &config,
+                        checkout,
+                        stale_operation,
+                        Some(original_assertion),
+                        true,
+                        None,
+                        PrepareFault::None,
+                    )
+                    .unwrap_err(),
+                    "assertion_invalidated"
+                );
+                // Real wall/boottime samples AFTER rejection prove this is an
+                // otherwise-unexpired published claim, not the expiry fault test.
+                let claim: serde_json::Value = serde_json::from_slice(&original_claim).unwrap();
+                let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+                let now_ns = u64::try_from(now.tv_sec).unwrap() * 1_000_000_000
+                    + u64::try_from(now.tv_nsec).unwrap();
+                assert!(wall_time().unwrap() < claim["claim_expiry"]["wall_ms"].as_u64().unwrap());
+                assert!(now_ns < claim["claim_expiry"]["boottime_ns"].as_u64().unwrap());
+                assert_eq!(
+                    original_claim,
+                    receipts::read_receipt(&f.store, original_assertion)
+                        .unwrap()
+                        .approval_record()
+                        .unwrap()
+                        .encode()
+                        .unwrap()
+                );
+                assert_eq!(
+                    history,
+                    crate::retirement_journal::read_history(&f.store.conn, checkout).unwrap()
+                );
+                assert!(!crate::retirement_journal::operation_reserved(
+                    &f.store.conn,
+                    &stale_operation.to_string()
+                )
+                .unwrap());
+                assert_eq!(source, abort_source_rows(&f.store));
+                assert_eq!(events, outbox(&f.store));
+                assert_eq!(files, abort_files(&f));
+                assert_eq!(
+                    context.canonical,
+                    snapshot(&mut f.store, checkout, &mut Budget::new())
+                        .unwrap()
+                        .canonical
+                );
+            }
+            // Only now publish a genuinely new begin/confirm assertion for B.
             let assertion = approval::assertion_for_retirement_test(&config, checkout);
+            assert_ne!(assertion, original_assertion);
             let second = Uuid::now_v7();
-            assert!(prepare_test(
+            let fresh = fresh_for_test(&f, &config, Some(assertion), None);
+            let PrepareCommit::Prepared(prepared) = fresh
+                .commit_prepared(second, true, PrepareFault::None)
+                .unwrap()
+            else {
+                panic!("genuine fresh B commit required");
+            };
+            let before_retry =
+                crate::retirement_journal::read_history(&f.store.conn, checkout).unwrap();
+            let retry_source = abort_source_rows(&f.store);
+            let retry_events = outbox(&f.store);
+            // Reuse B's actual retained owner solely to reach the final IMMEDIATE
+            // historical branch. No fabricated Assessment or new capability.
+            let PrepareCommit::Historical(row, count, active) = prepared
+                .owner
+                .commit_prepared(first, true, PrepareFault::None)
+                .unwrap()
+            else {
+                panic!("historical A cannot mint another prepared owner");
+            };
+            assert_eq!(row.operation, first);
+            assert_eq!(row.stage, "aborted");
+            assert_eq!(count, 2);
+            assert!(active);
+            let historical_prepare = prepare_test(
                 &config,
                 checkout,
-                second,
-                Some(assertion),
+                first,
+                Some(original_assertion),
                 true,
                 None,
-                PrepareFault::None
+                PrepareFault::None,
             )
-            .unwrap()
-            .fresh_commit());
+            .unwrap();
+            assert_eq!(historical_prepare.reason(), "historical");
+            assert!(!historical_prepare.fresh_commit());
+            assert!(historical_prepare.fence_active());
+            let wire = serde_json::to_value(historical_prepare).unwrap();
+            assert_eq!(wire["stage"], "aborted");
+            assert_eq!(wire["history_count"], 2);
             // Exact historical retry never claims a later competing fence cleared.
             let historical = abort_test(&config, checkout, first, 1, AbortFault::None).unwrap();
             assert_eq!(historical.reason(), "historical");
             assert!(!historical.fresh_commit());
             assert!(historical.fence_active());
+            assert_eq!(
+                before_retry,
+                crate::retirement_journal::read_history(&f.store.conn, checkout).unwrap()
+            );
+            assert_eq!(retry_source, abort_source_rows(&f.store));
+            assert_eq!(retry_events, outbox(&f.store));
+            let second_row =
+                crate::retirement_journal::load_operation(&f.store.conn, second).unwrap();
+            assert_eq!(second_row.stage, "prepared");
+            assert_eq!(second_row.revision, 1);
+            assert!(second_row.held_reason.is_none());
             match change {
                 "delete" => {
                     f.store
@@ -3464,6 +3790,23 @@ mod tests {
             let source = abort_source_rows(&f.store);
             let files = abort_files(&f);
             let events = f.store.pending_events(1000).unwrap().len();
+            if matches!(change, "corrupt" | "immutable-column" | "history-bound") {
+                let before = outbox(&f.store);
+                assert_eq!(
+                    prepare_test(
+                        &config,
+                        checkout,
+                        second,
+                        Some(assertion),
+                        true,
+                        None,
+                        PrepareFault::None,
+                    )
+                    .unwrap_err(),
+                    "history_unknown"
+                );
+                assert_eq!(before, outbox(&f.store));
+            }
             let result = abort_test(&config, checkout, second, 1, AbortFault::None);
             if change == "unchanged" {
                 assert_eq!(result.unwrap().outcome(), "aborted");
@@ -3777,6 +4120,21 @@ mod tests {
             let mut f = fixture::ManagedFixture::recovery("sha1", "2");
             let (_r, _b, os, config) = prepared_supervised(&mut f);
             enable_prepare(&config);
+            // Actual public finish leaves the allocation record ready, but its
+            // checkout held and non-ready. Never rewrite it to active to prepare.
+            let (state, ready): (String, bool) = f
+                .store
+                .conn
+                .query_row(
+                    "SELECT state,ready FROM checkouts WHERE id=?1",
+                    [f.allocation.checkout.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, "held");
+            assert!(!ready);
+            assert!(!crate::finish::task_open(&f.store.conn, f.allocation.checkout).unwrap());
+            let source_rows = abort_source_rows(&f.store);
             let source = receipts::collector_source(&mut f.store, f.allocation.checkout);
             let events = f.store.pending_events(1000).unwrap().len();
             let operation = Uuid::now_v7();
@@ -3808,6 +4166,58 @@ mod tests {
             assert_eq!(
                 source,
                 receipts::collector_source(&mut f.store, f.allocation.checkout)
+            );
+            assert_eq!(source_rows, abort_source_rows(&f.store));
+        }
+    }
+
+    #[test]
+    fn private_prepare_rejects_invalid_finished_supervised_predecessors() {
+        for change in ["missing-finish", "corrupt-finish", "reactivated"] {
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+            let (_r, _b, os, config) = prepared_supervised(&mut f);
+            enable_prepare(&config);
+            let checkout = f.allocation.checkout;
+            // Negative-only corruption of a genuinely finished checkout. None
+            // of these edits is used to manufacture a successful fresh owner.
+            f.store
+                .conn
+                .execute(
+                    match change {
+                        "missing-finish" => "DELETE FROM task_finishes WHERE checkout=?1",
+                        "corrupt-finish" => {
+                            "UPDATE task_finishes SET record='{}' WHERE checkout=?1"
+                        }
+                        _ => "UPDATE checkouts SET state='active',ready=1 WHERE id=?1",
+                    },
+                    [checkout.to_string()],
+                )
+                .unwrap();
+            let rows = abort_source_rows(&f.store);
+            let events = f.store.pending_events(1000).unwrap().len();
+            assert_eq!(
+                prepare_test(
+                    &config,
+                    checkout,
+                    Uuid::now_v7(),
+                    None,
+                    false,
+                    Some(&os.driver),
+                    PrepareFault::None,
+                )
+                .unwrap_err(),
+                if change == "missing-finish" {
+                    "task_completion_missing"
+                } else {
+                    "task_completion_unknown"
+                }
+            );
+            assert_eq!(rows, abort_source_rows(&f.store));
+            assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            assert!(
+                crate::retirement_journal::read_history(&f.store.conn, checkout)
+                    .unwrap()
+                    .is_empty()
             );
         }
     }

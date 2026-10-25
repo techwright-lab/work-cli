@@ -826,26 +826,18 @@ impl Store {
     ) -> Result<BeginCapturedRun> {
         // Physical reinspection is outside every SQL phase/transaction. Only
         // sealed context and original-age checks run after IMMEDIATE locking.
-        proof.reinspect(self)?;
-        let body = CaptureAdmissionBody::new(request, spec)?;
+        let inspected = proof.reinspect(self)?;
         let lease = self.authority_lease()?;
-        self.begin_capture_context_under_lease(
-            request,
-            spec,
-            Some(&crate::capture_setup::AdmissionProof::Pending(proof)),
-            body,
-            &lease,
-        )
+        self.begin_materialized_capture_under_lease(request, spec, inspected, &lease)
     }
     pub(crate) fn begin_materialized_capture_under_lease(
         &mut self,
         request: &RootRunRequest,
         spec: &CaptureSpec,
-        proof: &crate::capture_setup::MaterializationProof,
+        inspected: crate::capture_setup::InspectedMaterialization<'_>,
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<BeginCapturedRun> {
-        lease.check(self)?;
-        proof.reinspect(self)?;
+        let proof = inspected.checked(self, lease)?;
         self.begin_capture_context_under_lease(
             request,
             spec,

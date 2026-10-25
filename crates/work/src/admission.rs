@@ -42,11 +42,14 @@ pub(crate) struct RecordedReservation {
     pub(crate) guard: Option<crate::checkout_guard::CheckoutGuard>,
 }
 
-/// Read-only selection against the union of durable and staged aliases. The
-/// complete effective map is retained for the final transaction comparison.
+/// Read-only selection against the union of durable and staged aliases. Retain
+/// both the effective map and missing delta for the final transaction comparison;
+/// an equal union alone cannot detect publication racing the guarded selection.
 #[derive(PartialEq, Eq)]
 pub(crate) struct AllocationSelection {
     aliases: std::collections::BTreeMap<String, String>,
+    // Computed from the durable map, never accepted as caller-provided truth.
+    pub(crate) missing_aliases: Vec<(PathBuf, PathBuf)>,
     prior: Option<Uuid>,
     pub(crate) matches: Vec<Uuid>,
 }
@@ -62,11 +65,15 @@ pub(crate) fn allocation_selection(
         let (alias, common) = row?;
         aliases.insert(alias, common);
     }
+    let mut missing_aliases = Vec::new();
     for (alias, common) in staged {
         let alias = alias.to_str().ok_or(StoreError::Invalid)?;
         let common = common.to_str().ok_or(StoreError::Invalid)?;
         if aliases.get(alias).is_some_and(|stored| stored != common) {
             return Err(StoreError::Conflict);
+        }
+        if !aliases.contains_key(alias) {
+            missing_aliases.push((PathBuf::from(alias), PathBuf::from(common)));
         }
         aliases.insert(alias.to_owned(), common.to_owned());
     }
@@ -96,6 +103,7 @@ pub(crate) fn allocation_selection(
     }
     Ok(AllocationSelection {
         aliases,
+        missing_aliases,
         prior: prior
             .as_deref()
             .map(crate::retirement_journal::parse_uuid)
@@ -105,13 +113,11 @@ pub(crate) fn allocation_selection(
 }
 
 pub(crate) fn allocation_scope(
-    repository: &std::path::Path,
-    staged: &[(PathBuf, PathBuf)],
+    missing_aliases: &[(PathBuf, PathBuf)],
     checkouts: Vec<Uuid>,
 ) -> Result<crate::retirement_journal::Scope> {
     let mut repositories = std::collections::BTreeSet::new();
-    repositories.insert(repository.to_str().ok_or(StoreError::Invalid)?.to_owned());
-    for (alias, common) in staged {
+    for (alias, common) in missing_aliases {
         repositories.insert(alias.to_str().ok_or(StoreError::Invalid)?.to_owned());
         repositories.insert(common.to_str().ok_or(StoreError::Invalid)?.to_owned());
     }
@@ -265,16 +271,26 @@ impl Store {
         if let Some((id, _)) = &prior {
             selected.push(crate::retirement_journal::parse_uuid(id)?);
         }
-        let scope = if selection.is_none() {
-            if let Some((id, _)) = &prior {
-                crate::retirement_journal::Scope::Checkout(crate::retirement_journal::parse_uuid(
-                    id,
-                )?)
-            } else {
-                allocation_scope(std::path::Path::new(&repo), staged, selected)?
-            }
+        let current = selection
+            .as_ref()
+            .map(|_| allocation_selection(&tx, request, staged))
+            .transpose()?;
+        if let Some(current) = &current {
+            selected.extend(current.matches.iter().copied());
+        }
+        // Exact retries publish no aliases. New allocation publication fences
+        // only its actual missing delta, resolved again in this same transaction.
+        let missing = current
+            .as_ref()
+            .filter(|value| value.prior.is_none())
+            .map(|value| value.missing_aliases.as_slice())
+            .unwrap_or_default();
+        let scope = if let Some((id, _)) = &prior {
+            crate::retirement_journal::Scope::Checkout(crate::retirement_journal::parse_uuid(id)?)
+        } else if selection.is_none() {
+            crate::retirement_journal::Scope::Checkout(checkout)
         } else {
-            allocation_scope(std::path::Path::new(&repo), staged, selected)?
+            allocation_scope(missing, selected)?
         };
         let tx = crate::retirement_journal::fence(
             tx,
@@ -284,7 +300,7 @@ impl Store {
             crate::retirement_journal::Attempt::Reserve,
         )?;
         if let Some(expected) = &selection {
-            if &allocation_selection(&tx, request, staged)? != expected
+            if current.as_ref() != Some(expected)
                 || (expected.prior.is_none() && !expected.matches.is_empty())
             {
                 return Err(StoreError::Conflict);
@@ -327,7 +343,7 @@ impl Store {
         // Staged aliases become visible only with the successful charge. The
         // existing count implementation now sees legacy charges through them;
         // capacity/collision/callback failures roll the aliases back as well.
-        publish_aliases(&tx, staged)?;
+        publish_aliases(&tx, missing)?;
         let retired: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM retired_owners WHERE owner=?1)",
             [&request.owner],
@@ -529,6 +545,92 @@ mod allocation_tests {
                 assert_eq!(after[4].len(), before[4].len() + 1);
             }
         }
+    }
+
+    #[test]
+    fn published_aliases_do_not_fence_independent_allocation() {
+        let (_dir, mut store, request, aliases) = fixture();
+        publish_aliases(&store.conn, &aliases).unwrap();
+        let legacy = Reservation {
+            operation: Uuid::now_v7(),
+            actor: "other".into(),
+            task: "other".into(),
+            ..request.clone()
+        };
+        let a = store.reserve(&legacy, limits()).unwrap();
+        let operation = seed_prepared(&store, a);
+        let history = crate::retirement_journal::load_operation(&store.conn, operation).unwrap();
+        let lease = store.authority_lease().unwrap();
+        let result = store
+            .reserve_recorded_under_lease(
+                &request,
+                limits(),
+                |_| Ok(None),
+                &lease,
+                ReservationPurpose::Allocation(&aliases),
+            )
+            .unwrap();
+        assert_ne!(result.checkout, a);
+        assert_eq!(
+            crate::retirement_journal::load_operation(&store.conn, operation).unwrap(),
+            history
+        );
+        let after = rows(&store);
+        let retry = store
+            .reserve_recorded_under_lease(
+                &request,
+                limits(),
+                |_| panic!("Existing does not call intent"),
+                &lease,
+                ReservationPurpose::Allocation(&aliases),
+            )
+            .unwrap();
+        assert_eq!(retry.checkout, result.checkout);
+        assert_eq!(rows(&store), after);
+    }
+
+    #[test]
+    fn allocation_retry_scopes_actual_checkout_without_publishing_missing_aliases() {
+        let (_dir, mut store, request, aliases) = fixture();
+        let other = Reservation {
+            operation: Uuid::now_v7(),
+            ..request.clone()
+        };
+        let a = store.reserve(&other, limits()).unwrap();
+        let b = store.reserve(&request, limits()).unwrap();
+        let operation = seed_prepared(&store, a);
+        let history = crate::retirement_journal::load_operation(&store.conn, operation).unwrap();
+        let before = rows(&store);
+        let lease = store.authority_lease().unwrap();
+        let retry = store
+            .reserve_recorded_under_lease(
+                &request,
+                limits(),
+                |_| panic!("retry must not publish intent"),
+                &lease,
+                ReservationPurpose::Allocation(&aliases),
+            )
+            .unwrap();
+        assert_eq!(retry.checkout, b);
+        assert_eq!(rows(&store), before);
+        assert_eq!(
+            crate::retirement_journal::load_operation(&store.conn, operation).unwrap(),
+            history
+        );
+    }
+
+    #[test]
+    fn selection_detects_published_delta_even_when_effective_alias_map_is_identical() {
+        let (_dir, store, request, aliases) = fixture();
+        let lease = store.authority_lease().unwrap();
+        lease.check(&store).unwrap();
+        let before = allocation_selection(&store.conn, &request, &aliases).unwrap();
+        publish_aliases(&store.conn, &aliases).unwrap();
+        let after = allocation_selection(&store.conn, &request, &aliases).unwrap();
+        assert!(
+            before != after,
+            "final CAS must bind durable map as well as its effective union"
+        );
     }
 
     #[test]

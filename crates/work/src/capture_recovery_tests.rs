@@ -844,19 +844,12 @@ fn missing_preparation_replays_exact_begin_and_stays_held() {
     );
 }
 fn seed_prepared_fence(store: &Store, checkout: uuid::Uuid) {
-    let operation = uuid::Uuid::now_v7();
-    store
-        .conn
-        .execute(
-            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
-            rusqlite::params![
-                operation.to_string(),
-                checkout.to_string(),
-                [3u8; 32].as_slice(),
-                [4u8; 32].as_slice()
-            ],
-        )
-        .unwrap();
+    crate::retirement_journal::tests::seed_prepared(store, checkout, uuid::Uuid::now_v7());
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (rows.len(), rows[0].revision, rows[0].stage.as_str()),
+        (1, 1, "prepared")
+    );
 }
 fn root_checkout(root: &crate::run_journal::RootRunRequest) -> uuid::Uuid {
     uuid::Uuid::parse_str(&root.identity().checkout.to_string()).unwrap()
@@ -884,6 +877,7 @@ fn reconcile_holds_prepared_intent_before_receiver() {
     drop(created);
     let checkout = root_checkout(&root);
     seed_prepared_fence(&store, checkout);
+    let source_before = crate::retirement_journal::tests::source_rows(&store);
     let before = raw(&store);
     let saw = std::rc::Rc::new(std::cell::Cell::new(false));
     let flag = saw.clone();
@@ -898,6 +892,13 @@ fn reconcile_holds_prepared_intent_before_receiver() {
     ));
     assert!(!saw.get());
     assert_eq!(raw(&store), before);
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&store),
+        source_before
+    );
+    assert_eq!(store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
     assert!(!temp.path().join("calls").exists());
     let (revision, stage, reason): (i64, String, Option<String>) = store
         .conn
@@ -913,6 +914,68 @@ fn reconcile_holds_prepared_intent_before_receiver() {
     );
 }
 #[test]
+fn reconcile_commit_fences_after_actual_begin_without_mutating_caller_rows() {
+    let (_temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+    let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+    drop(created);
+    let checkout = root_checkout(&root);
+    let before = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let observed = before.clone();
+    let _observer = observing(move |stage, store| {
+        if stage == "post_process" {
+            seed_prepared_fence(store, checkout);
+            *observed.borrow_mut() = Some(crate::retirement_journal::tests::source_rows(store));
+        }
+    });
+    assert!(reconcile(&cfg, &root.identity().run).is_err());
+    assert!(
+        before.borrow().is_some(),
+        "actual BEGIN result boundary not reached"
+    );
+    assert_eq!(
+        crate::retirement_journal::tests::source_rows(&store),
+        before.borrow().as_ref().unwrap().clone()
+    );
+    let rows = crate::retirement_journal::read_history(&store.conn, checkout).unwrap();
+    assert_eq!(
+        (
+            rows[0].revision,
+            rows[0].stage.as_str(),
+            rows[0].held_reason.as_deref()
+        ),
+        (2, "held", Some("capture_reconcile"))
+    );
+    assert_eq!(store.pending_events(1000).unwrap().iter().filter(|e|
+        matches!(&e.event, crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held")
+    ).count(), 1);
+}
+#[test]
+fn reconcile_preboundary_refusal_disconnects_guard_waiter_before_join() {
+    let (_temp, cfg, _a, _root, _spec) = crate::capture_preparation::tests::qualified_fixture();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = reached.clone();
+    let observer = observing(move |stage, _| {
+        if stage == "post_process" {
+            flag.set(true);
+            ready_tx.send(()).unwrap();
+        }
+    });
+    let worker =
+        std::thread::spawn(move || ready_rx.recv_timeout(std::time::Duration::from_secs(5)));
+    let unknown = work_contract::RunId::parse(&uuid::Uuid::now_v7().to_string()).unwrap();
+    assert!(matches!(
+        reconcile(&cfg, &unknown),
+        Err(StoreError::Invalid)
+    ));
+    drop(observer);
+    assert_eq!(
+        worker.join().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    assert!(!reached.get());
+}
+#[test]
 fn reconcile_shared_guard_excludes_exclusive_until_drain() {
     let (_temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
     let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
@@ -924,10 +987,15 @@ fn reconcile_shared_guard_excludes_exclusive_until_drain() {
     let roots = cfg.roots.clone();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let _guard = observing(move |stage, _| {
+    let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = reached.clone();
+    let observer = observing(move |stage, _| {
         if stage == "post_process" {
-            ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            observed.set(true);
+            ready_tx.send(()).expect("guard worker disappeared");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("guard worker did not acknowledge post_process");
         }
     });
     let handle = std::thread::spawn({
@@ -935,7 +1003,9 @@ fn reconcile_shared_guard_excludes_exclusive_until_drain() {
         let dir = dir.clone();
         let roots = roots.clone();
         move || {
-            ready_rx.recv().unwrap();
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("reconcile never reached post_process");
             let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
             assert!(matches!(
                 crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout),
@@ -953,7 +1023,11 @@ fn reconcile_shared_guard_excludes_exclusive_until_drain() {
         }
     });
     let result = reconcile(&cfg, &root.identity().run);
-    handle.join().unwrap();
+    // Drop the retained sender before join even when reconcile refused early.
+    drop(observer);
+    let worker = handle.join();
+    assert!(reached.get(), "post_process not reached: {result:?}");
+    worker.unwrap();
     assert_eq!(result.unwrap(), "metadata_reconciled");
     let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
     crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout).unwrap();
