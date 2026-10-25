@@ -969,7 +969,11 @@ pub(crate) mod tests {
     }
     #[test]
     fn live_closure_cannot_switch_trusted_registry_for_the_same_store() {
-        let (temp, cfg, _store, _a, _root, seal, ack) = closed();
+        let (temp, cfg, store, a, _root, seal, ack) = closed();
+        let before = durable_rows(&store.conn);
+        let charged = store
+            .charged(a.request.repository.as_ref().unwrap(), None)
+            .unwrap();
         let mut other = cfg.clone();
         other.trusted_registry = Some(temp.path().join("second-registry"));
         use std::os::unix::fs::PermissionsExt;
@@ -990,18 +994,55 @@ pub(crate) mod tests {
             .execute("VACUUM INTO ?1", [database.to_str().unwrap()])
             .unwrap();
         std::fs::set_permissions(database, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let _keeper = Store::open_registered(
+        assert!(Store::open_registered(
             other.trusted_registry.as_ref().unwrap(),
             other.store_dir.as_ref().unwrap(),
             &other.roots,
         )
-        .unwrap();
+        .is_err());
+        assert_eq!(
+            std::fs::symlink_metadata(registry.join("initialization.lock"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(durable_rows(&store.conn), before);
+
+        // Use the genuine original owner, not copied metadata, to reach the
+        // registry-binding check independently of the incomplete copy's refusal.
+        assert!(store.conn.is_autocommit());
+        let guard = crate::checkout_guard::CheckoutGuard::shared(&store, a.checkout).unwrap();
         assert!(
             matches!(
-                restore(&other, seal, ack),
+                restore_under_guard(&other, seal, ack, &guard),
                 Err(crate::store::StoreError::Conflict)
             ),
             "live closure switched trusted authority registry"
+        );
+        assert_eq!(durable_rows(&store.conn), before);
+        assert!(!store
+            .conn
+            .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
+            .unwrap());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM capture_readiness", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .charged(a.request.repository.as_ref().unwrap(), None)
+                .unwrap(),
+            charged
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(registry.join("initialization.lock"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
         );
     }
     #[test]

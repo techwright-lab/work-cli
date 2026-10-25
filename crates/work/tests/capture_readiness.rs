@@ -48,6 +48,7 @@ fn schema_thirteen_is_additive_and_does_not_backfill_readiness() {
             .collect::<Vec<_>>()
     };
     let before = snapshot();
+    drop(f.store);
     let reopened = fixture_support::reopen(&f.dir).unwrap();
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))

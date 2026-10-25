@@ -920,8 +920,10 @@ fn closed_child_v8_history_upgrades_and_stays_readable_after_finish() {
         ),
         Err(work_cli::store::StoreError::UpgradeRequired)
     ));
+    drop(store);
     let output = finish(&f, id);
     assert!(output.status.success(), "{:?}", output);
+    let mut store = f.store();
     assert_eq!(prior, store.run_snapshot(&r.identity().run).unwrap());
     assert_eq!(
         store.register_child(&r, &child).unwrap(),

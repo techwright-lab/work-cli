@@ -682,6 +682,7 @@ fn schema_twelve_migration_preserves_old_bytes_and_requires_explicit_upgrade() {
         Err(work_cli::store::StoreError::UpgradeRequired)
     ));
     assert!(!f.dir.path().join("calls").exists());
+    drop(f.store);
     let store = fixture_support::reopen(&f.dir).unwrap();
     assert_eq!(store.pending_events(100).unwrap(), events);
     let after = sql

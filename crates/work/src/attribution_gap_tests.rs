@@ -4907,7 +4907,14 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         "CREATE VIEW attribution_gaps AS SELECT id AS run FROM runs",
         "CREATE TABLE attribution_gaps(run TEXT PRIMARY KEY, group_id TEXT, checkout TEXT, event_id TEXT, record TEXT, fingerprint BLOB)",
     ] {
+        let sidecars = ["store.sqlite-wal", "store.sqlite-shm"]
+            .map(|name| dir.path().join("private").join(name));
         let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+        sql.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
         sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
         sql.execute_batch(malformed).unwrap();
         assert!(Store::open(&dir.path().join("private"), &[dir.path().join("root")]).is_err());
@@ -4918,7 +4925,13 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         } else {
             sql.execute_batch("DROP TABLE attribution_gaps").unwrap();
         }
+        for sidecar in &sidecars {
+            assert!(std::fs::symlink_metadata(sidecar).unwrap().file_type().is_file());
+        }
         drop(sql);
+        for sidecar in &sidecars {
+            assert!(std::fs::symlink_metadata(sidecar).unwrap().file_type().is_file());
+        }
         drop(test_run_fixture::reopen(&dir).unwrap());
     }
 }

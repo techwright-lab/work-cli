@@ -1146,10 +1146,24 @@ fn fresh_lease_damage_refuses_before_intent_and_never_revives_holds() {
                 fs::rename(h.f.root.join("task"), h.f.root.join("moved")).unwrap();
             }
             "held" => {
+                let sidecars = ["store.sqlite-wal", "store.sqlite-shm"]
+                    .map(|name| h.f.temp.path().join("private").join(name));
                 let conn = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite"))
                     .unwrap();
+                conn.set_db_config(
+                    rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    true,
+                )
+                .unwrap();
                 conn.execute("UPDATE checkouts SET state='held',ready=0", [])
                     .unwrap();
+                for sidecar in &sidecars {
+                    assert!(fs::symlink_metadata(sidecar).unwrap().file_type().is_file());
+                }
+                drop(conn);
+                for sidecar in &sidecars {
+                    assert!(fs::symlink_metadata(sidecar).unwrap().file_type().is_file());
+                }
             }
             "source" => {
                 fs::rename(h.f.repo.join(".git"), h.f.repo.join("gone")).unwrap();

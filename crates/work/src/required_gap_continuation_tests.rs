@@ -2135,14 +2135,26 @@ fn key_rotation_and_unqualified_tails() {
     // Authentic v14 no-reference reconstruction of an actually closed v1 Root:
     // empty additive migration preserves history but never backfills authority.
     let (h, store, prefix) = genuinely_published_initial();
+    let prior_events = store.pending_events(100).unwrap();
+    let prior_root = store
+        .run_snapshot(&prefix.record.request.identity().run)
+        .unwrap();
     store
         .conn
         .execute_batch(
             "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14",
         )
         .unwrap();
+    drop(store);
     let (migrated, lease) = crate::allocate::locked(&h.config).unwrap();
     drop(lease);
+    assert_eq!(migrated.pending_events(100).unwrap(), prior_events);
+    assert_eq!(
+        migrated
+            .run_snapshot(&prefix.record.request.identity().run)
+            .unwrap(),
+        prior_root
+    );
     let before = durable_rows(&migrated);
     let receipt = crate::supervisor::supervise_off(
         &h.config,
@@ -4465,7 +4477,8 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
             "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;",
         )
         .unwrap();
-    let (migrated, lease) = crate::allocate::locked(&config).unwrap();
+    drop(store);
+    let (mut migrated, lease) = crate::allocate::locked(&config).unwrap();
     drop(lease);
     for table in ["gap_qualifications", "gap_eligibility"] {
         assert_eq!(
@@ -4623,37 +4636,76 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
         "CREATE VIEW gap_eligibility AS SELECT 1 AS checkout",
         "CREATE TABLE gap_eligibility(checkout TEXT)",
     ] {
+        let directory = config.store_dir.as_ref().unwrap();
+        let sidecars = ["store.sqlite-wal", "store.sqlite-shm"].map(|name| directory.join(name));
+        // This raw client is only for inspection/repair, not schema ownership.
+        let sql = rusqlite::Connection::open(directory.join("store.sqlite")).unwrap();
+        sql.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
         migrated.conn.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;").unwrap();
         migrated.conn.execute_batch(ddl).unwrap();
+        drop(migrated);
+        for sidecar in &sidecars {
+            assert!(std::fs::symlink_metadata(sidecar)
+                .unwrap()
+                .file_type()
+                .is_file());
+        }
+        // Independent existing-lock free control: SH self-contention must not
+        // masquerade as rejection of the malformed schema. Drop this probe
+        // before asking the real opener to acquire its own initialization lock.
+        {
+            let probe = std::fs::File::open(
+                config
+                    .trusted_registry
+                    .as_ref()
+                    .unwrap()
+                    .join("initialization.lock"),
+            )
+            .unwrap();
+            rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .unwrap();
+        }
         assert!(crate::allocate::locked(&config).is_err());
         assert_eq!(
-            migrated
-                .conn
-                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            sql.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             14
         );
         assert_eq!(
-            migrated
-                .conn
-                .query_row(
-                    "SELECT count(*) FROM sqlite_schema WHERE name='gap_qualifications'",
-                    [],
-                    |r| r.get::<_, i64>(0)
-                )
-                .unwrap(),
+            sql.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='gap_qualifications'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
             0
         );
-        migrated
-            .conn
-            .execute_batch(if ddl.contains("VIEW") {
-                "DROP VIEW gap_eligibility"
-            } else {
-                "DROP TABLE gap_eligibility"
-            })
-            .unwrap();
-        let (_, lease) = crate::allocate::locked(&config).unwrap();
+        sql.execute_batch(if ddl.contains("VIEW") {
+            "DROP VIEW gap_eligibility"
+        } else {
+            "DROP TABLE gap_eligibility"
+        })
+        .unwrap();
+        for sidecar in &sidecars {
+            assert!(std::fs::symlink_metadata(sidecar)
+                .unwrap()
+                .file_type()
+                .is_file());
+        }
+        drop(sql);
+        for sidecar in &sidecars {
+            assert!(std::fs::symlink_metadata(sidecar)
+                .unwrap()
+                .file_type()
+                .is_file());
+        }
+        let (reopened, lease) = crate::allocate::locked(&config).unwrap();
         drop(lease);
+        migrated = reopened;
     }
 
     // Exact new DDL under the unchanged native cumulative SQL budget: an
@@ -4686,6 +4738,7 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
         14
     );
     assert_eq!(migrated.conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('gap_eligibility','gap_qualifications')", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    drop(migrated);
     let (_, lease) = crate::allocate::locked(&config).unwrap();
     drop(lease);
 
@@ -4713,7 +4766,7 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
     // Existing bounded captured-history fixture, not a fabricated Gap/Q chain.
     // Pilot functional coverage retains two Roots, contained children, FINISH
     // and receipt-v1 bytes; the separate stress wrapper retains 2/48 Roots.
-    crate::capture_readiness::tests::many_closed_history(|config, store, allocation, _| {
+    crate::capture_readiness::tests::many_closed_history_owned(|config, store, allocation, _| {
         crate::finish::finish(config, allocation.checkout).unwrap();
         let receipt: String = store
             .conn
@@ -4723,8 +4776,9 @@ fn schema15_and_strict_v2_preserve_legacy_bytes_without_backfill() {
             serde_json::from_str::<serde_json::Value>(&receipt).unwrap()["version"],
             1
         );
-        let before = durable_rows(store);
+        let before = durable_rows(&store);
         store.conn.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; PRAGMA user_version=14;").unwrap();
+        drop(store);
         let (opened, lease) = crate::allocate::locked(config).unwrap();
         drop(lease);
         assert_eq!(

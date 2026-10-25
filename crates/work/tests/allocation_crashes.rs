@@ -582,12 +582,31 @@ fn version_one_migration_preserves_charge_without_inventing_ready() {
         )
         .unwrap();
     drop(s);
+    let sidecars = ["store.sqlite-wal", "store.sqlite-shm"]
+        .map(|name| f.temp.path().join("private").join(name));
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .unwrap();
     conn.execute_batch(
         "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
     )
     .unwrap();
+    for sidecar in &sidecars {
+        assert!(std::fs::symlink_metadata(sidecar)
+            .unwrap()
+            .file_type()
+            .is_file());
+    }
     drop(conn);
+    for sidecar in &sidecars {
+        assert!(std::fs::symlink_metadata(sidecar)
+            .unwrap()
+            .file_type()
+            .is_file());
+    }
     let mut s = f.store();
     assert_eq!(s.charged(&f.repo, None).unwrap(), 1);
     assert!(s.acquire_writer(id, Uuid::now_v7()).is_err());
