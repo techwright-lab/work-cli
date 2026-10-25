@@ -31,8 +31,8 @@ jobs:
           cargo test -p work-cli --locked --test run_journal closed_group_snapshot_and_empty_certify_still_reject
       - name: Owned local remote integration tests
         run: cargo test -p work-cli --locked --test remote_proof --test preservation --test approval --test recovery_refs --test retirement_assessment
-      - name: Library and remote observation Clippy
-        run: cargo clippy -p work-cli --locked --lib --test remote_proof --test preservation --test approval --test recovery_refs --test retirement_assessment -- -D warnings
+      - name: Workspace all-target strict Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
   # Independent qualification: full-suite failures remain visible in `ci` below.
   task9-inspection:
     runs-on: ubuntu-latest
