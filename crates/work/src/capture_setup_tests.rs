@@ -495,7 +495,7 @@ fn begin_holds_prepared_intent_before_admission_rows() {
         .into_iter()
         .filter(|pending| {
             matches!(
-                pending.event,
+                &pending.event,
                 crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held"
             )
         })

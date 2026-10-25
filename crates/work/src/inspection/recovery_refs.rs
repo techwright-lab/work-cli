@@ -281,7 +281,8 @@ impl AllocationCommonLock {
             .map_err(|_| crate::allocate::err("unsafe allocation common path"))?;
         let manifest = filesystem::Manifest::new(path, &mut budget)
             .map_err(|_| crate::allocate::err("allocation common identity unavailable"))?;
-        sync::persistent_manifest(&manifest).map_err(crate::allocate::err)?;
+        // Allocation needs cooperative identity exclusion, not a recovery-storage
+        // durability acknowledgment. Keep the original supported filesystems.
         let (dev, ino) = manifest.root_dev_ino();
         let key = CommonKey {
             path: path.as_os_str().as_bytes().to_vec(),
@@ -317,8 +318,6 @@ impl AllocationCommonLock {
         {
             return Err(crate::allocate::err("allocation common identity changed"));
         }
-        sync::persistent_manifest(&self.manifest).map_err(crate::allocate::err)?;
-        sync::persistent_manifest(&current).map_err(crate::allocate::err)?;
         self.lock
             .revalidate(store, &self.key, &self.key.path)
             .map_err(crate::allocate::err)

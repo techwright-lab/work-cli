@@ -868,7 +868,10 @@ fn prepared_intent_refuses_prepare_without_receiver() {
     let h = Harness::new();
     let checkout = h.root.identity().checkout.to_string();
     seed_prepared_fence(&h.sql(), &checkout);
-    let error = capture_preparation::prepare(&h.cfg, &h.root, &h.spec).unwrap_err();
+    let error = match capture_preparation::prepare(&h.cfg, &h.root, &h.spec) {
+        Ok(_) => panic!("fenced capture preparation unexpectedly succeeded"),
+        Err(error) => error,
+    };
     assert_eq!(
         error.to_string(),
         "retirement intent fences cooperative writes"
