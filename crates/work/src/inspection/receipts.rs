@@ -374,6 +374,7 @@ fn publish(
     let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     reservation.check(store, true)?;
+    let role = store.schema_role();
     let authority = std::sync::Arc::clone(store.authority_identity());
     let schema = store.schema_participation();
     {
@@ -396,6 +397,7 @@ fn publish(
             &tx,
             &authority,
             &schema,
+            role,
             context.allocation.checkout,
             &mut captured.budget,
         )
@@ -914,6 +916,7 @@ fn publish_reserved(
     let file = open_relative(&location.dir, &pending, OFlags::RDONLY)?;
     check_named(&location.dir, &pending, &file, length, true)?;
     budget.check().map_err(|_| ReceiptError::Conflict)?;
+    let role = store.schema_role();
     let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     let authority = std::sync::Arc::clone(store.authority_identity());
@@ -936,6 +939,7 @@ fn publish_reserved(
             &tx,
             &authority,
             &schema,
+            role,
             context.allocation.checkout,
             budget,
         )

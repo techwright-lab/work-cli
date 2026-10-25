@@ -365,11 +365,9 @@ fn finish_internal(
         .trusted_registry
         .as_deref()
         .ok_or(StoreError::Unsafe)?;
-    let preflight =
-        Store::preflight_existing_identity(registry, dir, &config.roots, |v| matches!(v, 8..=16))?;
-    // Identity-only preflight carries no proof/sink work through the EX gap.
-    // Finish upgrading first, then take checkout SH under the fresh Store SH.
-    drop(preflight);
+    Store::preflight_existing_identity(registry, dir, &config.roots, |v| matches!(v, 8..=17))?;
+    // Identity-only preflight has ended SQL/connection/SH; no proof or sink work
+    // crosses the EX gap. Upgrade first, then checkout SH under fresh Store SH.
     let mut store = Store::open_finish_authority(registry, dir, &config.roots)?;
     let guard = crate::checkout_guard::CheckoutGuard::shared(&store, checkout)?;
     guard.revalidate(&store)?;

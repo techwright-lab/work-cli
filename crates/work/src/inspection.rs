@@ -665,11 +665,14 @@ fn finish_observation(
 pub(super) struct Context {
     // Runtime ownership only; deliberately absent from canonical/source/history.
     pub(super) schema: crate::store::SchemaParticipation,
+    pub(super) role: crate::store::SchemaRole,
     pub(super) allocation: crate::allocate::Allocation,
     pub(super) canonical: Vec<u8>,
     pub(super) source: Vec<u8>,
     pub(super) history: Vec<u8>,
     pub(super) history_count: u64,
+    pub(super) physical_history: Vec<u8>,
+    pub(super) physical_count: u64,
 }
 fn snapshot(
     store: &mut Store,
@@ -683,12 +686,13 @@ fn snapshot(
         .map_err(|_| IncompleteReason::ContextUnavailable)?;
     let authority = std::sync::Arc::clone(store.authority_identity());
     let schema = store.schema_participation();
+    let role = store.schema_role();
     let phase = store.sql_phase();
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
         .map_err(|_| IncompleteReason::ContextUnavailable)?;
-    let context = snapshot_in_transaction(&tx, &authority, &schema, checkout, b)?;
+    let context = snapshot_in_transaction(&tx, &authority, &schema, role, checkout, b)?;
     tx.rollback()
         .map_err(|_| IncompleteReason::ContextUnavailable)?;
     drop(phase);
@@ -700,6 +704,7 @@ fn snapshot_in_transaction(
     tx: &rusqlite::Connection,
     authority: &crate::store::AuthorityIdentity,
     schema: &crate::store::SchemaParticipation,
+    role: crate::store::SchemaRole,
     checkout: Uuid,
     b: &mut Budget,
 ) -> Result<Context, IncompleteReason> {
@@ -736,9 +741,8 @@ fn snapshot_in_transaction(
     let version: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(unavailable)?;
-    if version != 16 {
-        return Err(IncompleteReason::ContextUnavailable);
-    }
+    role.validate(tx).map_err(unavailable)?;
+    crate::retirement_journal::validate_all(tx).map_err(unavailable)?;
     frame(&mut canonical, 4, &version.to_be_bytes());
     let schema: i64 = tx
         .query_row("PRAGMA schema_version", [], |r| r.get(0))
@@ -846,16 +850,30 @@ fn snapshot_in_transaction(
         return Err(IncompleteReason::ContextUnavailable);
     }
     let source = canonical.clone();
-    let (history, history_count) =
+    let (mut history, history_count) =
         crate::retirement_journal::frame_history(tx, checkout, &mut canonical)
             .map_err(|_| IncompleteReason::ContextUnavailable)?;
+    let (physical_history, physical_count) = if role.version() == 17 {
+        crate::quarantine_journal::frame_history(tx, checkout, &mut canonical)
+            .map_err(unavailable)?
+    } else {
+        (Vec::new(), 0)
+    };
+    if physical_count > history_count {
+        return Err(IncompleteReason::ContextUnavailable);
+    }
+    b.reserve(physical_history.len() as u64)?;
+    history.extend_from_slice(&physical_history);
     Ok(Context {
         schema: participation,
+        role,
         allocation,
         canonical,
         source,
         history,
         history_count,
+        physical_history,
+        physical_count,
     })
 }
 

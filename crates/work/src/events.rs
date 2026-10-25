@@ -68,6 +68,13 @@ pub enum Event {
         to: String,
         over_quota: bool,
     },
+    QuarantineActionChanged {
+        checkout: Uuid,
+        operation: Uuid,
+        revision: u64,
+        state: String,
+        reason: Option<String>,
+    },
     RetirementIntentChanged {
         checkout: Uuid,
         operation: Uuid,

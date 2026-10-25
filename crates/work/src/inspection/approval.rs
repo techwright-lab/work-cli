@@ -596,12 +596,13 @@ impl Collector {
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
         let schema = store.schema_participation();
+        let role = store.schema_role();
         let phase = store.sql_phase();
         let tx = store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "authority_unknown")?;
-        let context = snapshot_in_transaction(&tx, &authority, &schema, self.checkout, b)
+        let context = snapshot_in_transaction(&tx, &authority, &schema, role, self.checkout, b)
             .map_err(|_| "context_unknown")?;
         if self.start.as_ref().ok_or("clock_anomaly")?.boot
             != context
@@ -1728,6 +1729,7 @@ mod tests {
         let mut f = fixture::ManagedFixture::new("sha1", "2");
         let authority = std::sync::Arc::clone(f.store.authority_identity());
         let schema = f.store.schema_participation();
+        let role = f.store.schema_role();
         let phase = f.store.sql_phase();
         let tx = f
             .store
@@ -1738,6 +1740,7 @@ mod tests {
             &tx,
             &authority,
             &schema,
+            role,
             f.allocation.checkout,
             &mut Budget::new(),
         )

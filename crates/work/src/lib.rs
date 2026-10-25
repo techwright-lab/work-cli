@@ -44,6 +44,7 @@ pub mod linux_scope;
 pub mod ownership;
 pub mod participant_cli;
 pub mod participants;
+mod quarantine_journal;
 pub mod recovery;
 mod retirement_journal;
 pub mod run_journal;

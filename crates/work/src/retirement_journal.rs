@@ -185,6 +185,14 @@ pub(crate) struct IntentRow {
 }
 
 pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
+    let objects: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_schema WHERE tbl_name='retirement_intents'",
+        [],
+        |r| r.get(0),
+    )?;
+    if objects != 4 {
+        return Err(StoreError::Invalid);
+    }
     for ((name, kind), expected) in [
         ("retirement_intents", "table"),
         ("retirement_intents_checkout", "index"),
@@ -256,9 +264,8 @@ pub(crate) fn exclude_operation(conn: &Connection, id: Uuid) -> Result<()> {
 }
 
 pub(crate) fn require_unfenced(conn: &Connection, checkout: Uuid) -> Result<()> {
-    if schema_version(conn)? < 16 {
-        return Ok(());
-    }
+    crate::store::SchemaRole::Current17.validate(conn)?;
+    crate::quarantine_journal::validate_all(conn)?;
     let active: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE checkout=?1 AND stage IN ('prepared','held'))",
         [checkout.to_string()],
@@ -281,16 +288,17 @@ pub(crate) fn fence<'c>(
     lease.check_authority(authority)?;
     // Compatibility reads on old schemas cannot grant mutation permission,
     // including on an already-open Store whose version changed externally.
-    if schema_version(&tx)? != 16 {
-        return Err(StoreError::Invalid);
-    }
+    crate::store::SchemaRole::Current17.validate(&tx)?;
+    crate::quarantine_journal::validate_all(&tx)?;
     let checkouts = resolve_scope(&tx, &scope)?;
     let mut prepared = Vec::new();
     let mut held = false;
     for checkout in &checkouts {
-        // Validate the complete bounded history before ANY update, including
-        // tombstones and immutable-column bindings of already-held rows.
-        for row in read_history(&tx, *checkout)? {
+        // Global admission above has completed in this same IMMEDIATE
+        // transaction, with no intervening writes. Strictly decode each scoped
+        // history (including tombstones/held rows) before ANY update, without
+        // repeating the complete global scan for every checkout in the batch.
+        for row in read_history_rows(&tx, *checkout)? {
             match row.stage.as_str() {
                 "prepared" => prepared.push((*checkout, row.operation.to_string())),
                 "held" => held = true,
@@ -570,6 +578,12 @@ pub(crate) fn read_history(conn: &Connection, checkout: Uuid) -> Result<Vec<Inte
     if schema_version(conn)? < 16 {
         return Ok(Vec::new());
     }
+    validate_all(conn)?;
+    read_history_rows(conn, checkout)
+}
+
+// Nonrecursive strict parent decoder for the complete global validator.
+pub(crate) fn read_history_rows(conn: &Connection, checkout: Uuid) -> Result<Vec<IntentRow>> {
     let mut stmt = conn.prepare(
         "SELECT operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from,length(CAST(record AS BLOB)) FROM retirement_intents WHERE checkout=?1 ORDER BY operation LIMIT 65",
     )?;
@@ -581,6 +595,10 @@ pub(crate) fn read_history(conn: &Connection, checkout: Uuid) -> Result<Vec<Inte
             return Err(StoreError::Invalid);
         }
         let row = bounded_row(raw)?;
+        if schema_version(conn)? == 16 && row.held_reason.as_deref() == Some("quarantine_in_flight")
+        {
+            return Err(StoreError::Invalid);
+        }
         if row.checkout != checkout {
             return Err(StoreError::Invalid);
         }
@@ -593,6 +611,69 @@ pub(crate) fn read_history(conn: &Connection, checkout: Uuid) -> Result<Vec<Inte
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// Complete parent namespace/orphan admission, shared with the physical validator.
+/// This never calls a public scoped/global reader recursively.
+pub(crate) fn parent_checkouts(conn: &Connection) -> Result<Vec<Uuid>> {
+    validate_schema(conn)?;
+    let orphan: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM retirement_intents r LEFT JOIN checkouts c ON c.id=r.checkout WHERE c.id IS NULL)", [], |r| r.get(0))?;
+    if orphan {
+        return Err(StoreError::Invalid);
+    }
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT checkout FROM retirement_intents ORDER BY checkout LIMIT 4097")?;
+    let mut cursor = stmt.query([])?;
+    let mut ids = Vec::new();
+    while let Some(row) = cursor.next()? {
+        if ids.len() == 4096 {
+            return Err(StoreError::Invalid);
+        }
+        let id = match row.get_ref(0)? {
+            rusqlite::types::ValueRef::Text(bytes) if bytes.len() == 36 => {
+                parse_uuid(std::str::from_utf8(bytes).map_err(|_| StoreError::Invalid)?)?
+            }
+            _ => return Err(StoreError::Invalid),
+        };
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+pub(crate) fn validate_parent_namespace(conn: &Connection, row: &IntentRow) -> Result<()> {
+    crate::capture_journal::exclude_operation(conn, &row.operation)?;
+    let collision: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1 OR operation=?1)
+        OR EXISTS(SELECT 1 FROM writers WHERE group_id=?1)
+        OR EXISTS(SELECT 1 FROM runs WHERE id=?1 OR group_id=?1)
+        OR EXISTS(SELECT 1 FROM run_groups WHERE id=?1)
+        OR EXISTS(SELECT 1 FROM adopted_groups WHERE id=?1 OR run_id=?1 OR operation=?1)
+        OR EXISTS(SELECT 1 FROM run_participants WHERE id=?1)
+        OR EXISTS(SELECT 1 FROM task_finishes WHERE operation=?1)",
+        [row.operation.to_string()],
+        |r| r.get(0),
+    )?;
+    if collision {
+        return Err(StoreError::Invalid);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_all(conn: &Connection) -> Result<()> {
+    match schema_version(conn)? {
+        17 => crate::quarantine_journal::validate_all(conn),
+        16 => {
+            crate::store::SchemaRole::HistoricalRead(crate::store::SupportedRetirementVersion::V16)
+                .validate(conn)?;
+            for checkout in parent_checkouts(conn)? {
+                for row in read_history_rows(conn, checkout)? {
+                    validate_parent_namespace(conn, &row)?;
+                }
+            }
+            Ok(())
+        }
+        _ => Err(StoreError::Invalid),
+    }
 }
 
 // Never get::<String/Vec<u8>> on an unbounded SQLite value. Check SQL byte
@@ -623,6 +704,35 @@ fn bounded_row(raw: &rusqlite::Row<'_>) -> Result<IntentRow> {
             ValueRef::Blob(bytes) if bytes.len() == 32 => Ok(bytes.to_vec()),
             _ => Err(StoreError::Invalid),
         }
+    }
+    // Admit every borrowed storage class/length before allocating ANY column.
+    for (column, limit, nullable) in [
+        (0, 36, false),
+        (1, 36, false),
+        (3, 8, false),
+        (4, 10, false),
+        (5, 36, true),
+        (6, 1024, true),
+        (7, 1024, true),
+        (10, MAX_RECORD_BYTES, false),
+        (11, 32, true),
+    ] {
+        match raw.get_ref(column)? {
+            ValueRef::Text(bytes) if bytes.len() <= limit && std::str::from_utf8(bytes).is_ok() => {
+            }
+            ValueRef::Null if nullable => {}
+            _ => return Err(StoreError::Invalid),
+        }
+    }
+    for column in [8, 9] {
+        if !matches!(raw.get_ref(column)?, ValueRef::Blob(bytes) if bytes.len() == 32) {
+            return Err(StoreError::Invalid);
+        }
+    }
+    if !matches!(raw.get_ref(2)?, ValueRef::Integer(_))
+        || !matches!(raw.get_ref(12)?, ValueRef::Null | ValueRef::Integer(_))
+    {
+        return Err(StoreError::Invalid);
     }
     let record = text(raw, 10, MAX_RECORD_BYTES)?;
     if record.len() as i64 != length {
@@ -715,6 +825,7 @@ fn validate_row(row: &IntentRow) -> Result<()> {
                 "receipt_publication",
                 "recovery_refs",
                 "abort_validation_failed",
+                "quarantine_in_flight",
             ],
         )?;
     }
@@ -767,10 +878,18 @@ pub(crate) fn frame_history_without(
         .position(|row| row.operation == operation)
         .ok_or(StoreError::Conflict)?;
     rows.remove(index);
-    frame_history_rows(&rows, canonical)
+    let (mut history, count) = frame_history_rows(&rows, canonical)?;
+    if schema_version(tx)? == 17 {
+        let (physical, _) = crate::quarantine_journal::frame_history(tx, checkout, canonical)?;
+        history.extend_from_slice(&physical);
+    }
+    Ok((history, count))
 }
 
-fn frame_history_rows(rows: &[IntentRow], canonical: &mut Vec<u8>) -> Result<(Vec<u8>, u64)> {
+pub(crate) fn frame_history_rows(
+    rows: &[IntentRow],
+    canonical: &mut Vec<u8>,
+) -> Result<(Vec<u8>, u64)> {
     let mut history = Vec::new();
     frame(&mut history, 13, b"retirement_history_v1");
     frame(&mut history, 14, &(rows.len() as u64).to_be_bytes());
@@ -847,7 +966,15 @@ pub(crate) fn exclude_prepare_operation(conn: &Connection, operation: Uuid) -> R
     }
 }
 
-pub(crate) fn insert_prepared(tx: &Connection, insert: &PreparedInsert) -> Result<()> {
+pub(crate) fn insert_prepared(
+    tx: &Connection,
+    insert: &PreparedInsert,
+    lease: &AuthorityLease,
+    authority: &Arc<crate::store::AuthorityIdentity>,
+) -> Result<()> {
+    lease.check_authority(authority)?;
+    crate::store::SchemaRole::Current17.validate(tx)?;
+    crate::quarantine_journal::validate_all(tx)?;
     exclude_prepare_operation(tx, insert.operation)?;
     let decoded = decode_record(&insert.record)?;
     let prior_count = decoded.prior_history_count;
@@ -916,12 +1043,40 @@ pub(crate) fn insert_prepared(tx: &Connection, insert: &PreparedInsert) -> Resul
     Ok(())
 }
 
-pub(crate) fn abort_cas(
+pub(crate) fn abort_validated(
+    tx: &Connection,
+    checkout: Uuid,
+    operation: Uuid,
+    revision: u64,
+    lease: &AuthorityLease,
+    authority: &Arc<crate::store::AuthorityIdentity>,
+) -> Result<u64> {
+    lease.check_abort_transaction(tx, authority)?;
+    abort_cas(tx, checkout, operation, revision)
+}
+
+pub(crate) fn require_no_physical_action(conn: &Connection, operation: Uuid) -> Result<()> {
+    validate_all(conn)?;
+    if schema_version(conn)? == 17 {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM quarantine_actions WHERE operation=?1)",
+            [operation.to_string()],
+            |r| r.get(0),
+        )?;
+        if present {
+            return Err(StoreError::RetirementFenced);
+        }
+    }
+    Ok(())
+}
+
+fn abort_cas(
     tx: &Connection,
     checkout: Uuid,
     operation: Uuid,
     requested_revision: u64,
 ) -> Result<u64> {
+    require_no_physical_action(tx, operation)?;
     let history = read_history(tx, checkout)?;
     let row = history
         .into_iter()
@@ -977,11 +1132,19 @@ pub(crate) fn abort_cas(
     }
 }
 
-pub(crate) fn hold_abort_validation(
+pub(crate) fn hold_abort_validated(
     tx: &Connection,
     checkout: Uuid,
     operation: Uuid,
+    lease: &AuthorityLease,
+    authority: &Arc<crate::store::AuthorityIdentity>,
 ) -> Result<()> {
+    lease.check_abort_transaction(tx, authority)?;
+    hold_abort_validation(tx, checkout, operation)
+}
+
+fn hold_abort_validation(tx: &Connection, checkout: Uuid, operation: Uuid) -> Result<()> {
+    require_no_physical_action(tx, operation)?;
     let history = read_history(tx, checkout)?;
     let row = history
         .iter()
@@ -1015,6 +1178,7 @@ pub(crate) fn hold_abort_validation(
 }
 
 pub(crate) fn find_operation(conn: &Connection, operation: Uuid) -> Result<Option<IntentRow>> {
+    validate_all(conn)?;
     let mut stmt = conn.prepare(
         "SELECT operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from,length(CAST(record AS BLOB)) FROM retirement_intents WHERE operation=?1",
     )?;

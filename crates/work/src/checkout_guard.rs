@@ -25,7 +25,7 @@ pub(crate) struct CheckoutGuard {
     database_id: (u64, u64),
     lock_id: Option<(u64, u64)>,
     exclusive: bool,
-    schema: crate::store::SchemaParticipation,
+    schema: crate::store::InitializationRetention,
 }
 
 impl Drop for CheckoutGuard {
@@ -57,7 +57,22 @@ impl CheckoutGuard {
         lease.check(store)?;
         let schema = store.schema_participation();
         schema.matches_authority(store.authority_identity())?;
-        acquire_validated(store, checkout, false, schema)
+        acquire_validated(
+            store.authority_identity(),
+            checkout,
+            false,
+            crate::store::InitializationRetention::Shared(schema),
+        )
+    }
+    pub(crate) fn exclusive_for_migration(
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+        initialization: &crate::store::ExclusiveInitialization,
+        checkout: Uuid,
+    ) -> Result<Self> {
+        let schema = crate::store::InitializationRetention::Migration(initialization.retain());
+        schema.revalidate()?;
+        schema.matches_authority(authority)?;
+        acquire_validated(authority, checkout, true, schema)
     }
     pub(crate) fn shared_known(config: &crate::config::Config, checkout: Uuid) -> Result<Self> {
         let registry = config
@@ -65,8 +80,7 @@ impl CheckoutGuard {
             .as_deref()
             .ok_or(StoreError::Invalid)?;
         let dir = config.store_dir.as_deref().ok_or(StoreError::Invalid)?;
-        let readonly =
-            Store::preflight_existing_identity(registry, dir, &config.roots, |v| v == 16)?;
+        let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
         // End BEGIN before acquiring filesystem guards, retaining the actual
         // schema owner across that boundary and after this temporary Store dies.
         {
@@ -118,7 +132,7 @@ impl CheckoutGuard {
         if identity.directory_id != self.authority_id {
             return Err(StoreError::Invalid);
         }
-        let authority = open_authority(store)?;
+        let authority = open_authority(store.authority_identity())?;
         lock_directory_meta(&self.authority)?;
         lock_directory_meta(&authority)?;
         if lock_identity(&self.authority)? != self.authority_id
@@ -162,19 +176,23 @@ fn acquire(store: &Store, checkout: Uuid, exclusive: bool) -> Result<CheckoutGua
     let schema = store.schema_participation();
     schema.revalidate()?;
     schema.matches_authority(store.authority_identity())?;
-    acquire_validated(store, checkout, exclusive, schema)
+    acquire_validated(
+        store.authority_identity(),
+        checkout,
+        exclusive,
+        crate::store::InitializationRetention::Shared(schema),
+    )
 }
 // Private shared mechanism receives the actual owner validated by one of the
 // two purpose-specific entry points above, never a validation-bypass flag.
 fn acquire_validated(
-    store: &Store,
+    identity: &crate::store::AuthorityIdentity,
     checkout: Uuid,
     exclusive: bool,
-    schema: crate::store::SchemaParticipation,
+    schema: crate::store::InitializationRetention,
 ) -> Result<CheckoutGuard> {
     crate::retirement_journal::parse_uuid(&checkout.to_string())?;
-    let identity = store.authority_identity();
-    let authority = open_authority(store)?;
+    let authority = open_authority(identity)?;
     let authority_id = lock_identity(&authority)?;
     match rfs::mkdirat(&authority, LOCK_DIR, Mode::from_raw_mode(0o700)) {
         Ok(()) => {}
@@ -260,8 +278,7 @@ fn lock_file_meta(file: &File) -> Result<()> {
     Ok(())
 }
 
-fn open_authority(store: &Store) -> Result<File> {
-    let identity = store.authority_identity();
+fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
     let directory = rfs::openat2(
         rfs::CWD,
         identity.directory.as_path(),

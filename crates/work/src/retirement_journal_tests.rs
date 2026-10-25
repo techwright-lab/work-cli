@@ -831,7 +831,11 @@ fn abort_history_removes_only_own_frame_and_keeps_prior_tombstones() {
     seed_prepared(&store, checkout, first);
     abort_cas(&store.conn, checkout, first, 1).unwrap();
     let mut predecessor = b"exact-source-frame".to_vec();
-    let (history, count) = frame_history(&store.conn, checkout, &mut predecessor).unwrap();
+    let (mut history, count) = frame_history(&store.conn, checkout, &mut predecessor).unwrap();
+    let (physical, physical_count) =
+        crate::quarantine_journal::frame_history(&store.conn, checkout, &mut predecessor).unwrap();
+    assert_eq!(physical_count, 0);
+    history.extend_from_slice(&physical);
     let second = Uuid::now_v7();
     seed_prepared(&store, checkout, second);
     for held in [false, true] {
@@ -1451,6 +1455,124 @@ fn batch_holds_all_prepared_before_any_caller_write() {
     assert_eq!(held_events(&store, first).len(), 1);
     assert_eq!(held_events(&store, second).len(), 1);
     assert_eq!(held_events(&store, held).len(), 0);
+}
+
+#[test]
+fn bounded_mixed_batch_validates_global_history_before_scoped_holds() {
+    for corrupt_unscoped in [false, true] {
+        let (_temp, mut store, root) = open_store();
+        let mut histories = Vec::new();
+        for index in 0..9 {
+            // Real reservations, never seeded readiness or a positive retirement
+            // owner. The following intent DATA only exercises negative fencing.
+            let checkout = store
+                .reserve(
+                    &Reservation {
+                        operation: Uuid::now_v7(),
+                        repository: root.clone(),
+                        actor: "actor".into(),
+                        task: format!("batch-{index}"),
+                        owner: if index == 8 { "other" } else { "owner" }.into(),
+                    },
+                    limits(),
+                )
+                .unwrap();
+            let operation = Uuid::now_v7();
+            seed_prepared(&store, checkout, operation);
+            if index >= 6 {
+                store.conn.execute(
+                    "UPDATE retirement_intents SET revision=2,stage='aborted',aborted_from=1 WHERE operation=?1",
+                    [operation.to_string()],
+                ).unwrap();
+            } else if index >= 4 {
+                store.conn.execute(
+                    "UPDATE retirement_intents SET revision=2,stage='held',held_reason='reserve' WHERE operation=?1",
+                    [operation.to_string()],
+                ).unwrap();
+            }
+            histories.push((checkout, read_history_rows(&store.conn, checkout).unwrap()));
+        }
+        if corrupt_unscoped {
+            store
+                .conn
+                .execute(
+                    "UPDATE retirement_intents SET record='{}' WHERE checkout=?1",
+                    [histories[8].0.to_string()],
+                )
+                .unwrap();
+        }
+        let source = source_rows(&store);
+        let events = store.pending_events(1000).unwrap();
+        let lease = store.authority_lease().unwrap();
+        let authority = store.authority_identity().clone();
+        let phase = store.sql_phase();
+        let tx = store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let result = fence(
+            tx,
+            &lease,
+            &authority,
+            Scope::Owner("owner".into()),
+            Attempt::OwnerRetire,
+        );
+        assert!(if corrupt_unscoped {
+            matches!(result, Err(StoreError::Invalid))
+        } else {
+            matches!(result, Err(StoreError::RetirementFenced))
+        });
+        drop(result);
+        drop(phase);
+        assert_eq!(source_rows(&store), source);
+        let after_events = store.pending_events(1000).unwrap();
+        assert_eq!(&after_events[..events.len()], events.as_slice());
+        assert_eq!(
+            after_events.len(),
+            events.len() + if corrupt_unscoped { 0 } else { 4 }
+        );
+        for (index, (checkout, before)) in histories.iter().enumerate().take(8) {
+            let after = read_history_rows(&store.conn, *checkout).unwrap();
+            if corrupt_unscoped || index >= 4 {
+                assert_eq!(
+                    &after, before,
+                    "held/tombstone or refused batch must not change"
+                );
+            } else {
+                let mut expected = before.clone();
+                expected[0].revision = 2;
+                expected[0].stage = "held".into();
+                expected[0].held_reason = Some("owner_retire".into());
+                assert_eq!(after, expected);
+                assert_eq!(
+                    held_events(&store, *checkout),
+                    vec![Event::RetirementIntentChanged {
+                        checkout: *checkout,
+                        operation: before[0].operation,
+                        revision: 2,
+                        stage: "held".into(),
+                        reason: Some("owner_retire".into()),
+                    }]
+                );
+            }
+        }
+        if corrupt_unscoped {
+            let record: String = store
+                .conn
+                .query_row(
+                    "SELECT record FROM retirement_intents WHERE checkout=?1",
+                    [histories[8].0.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(record, "{}");
+        } else {
+            assert_eq!(
+                read_history_rows(&store.conn, histories[8].0).unwrap(),
+                histories[8].1
+            );
+        }
+    }
 }
 
 #[test]

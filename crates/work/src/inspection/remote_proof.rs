@@ -142,6 +142,7 @@ fn readonly_context(config: &Config, checkout: Uuid, b: &mut Budget) -> Held<Con
             &store.conn,
             &authority,
             &schema,
+            store.schema_role(),
             checkout,
             b,
         ))

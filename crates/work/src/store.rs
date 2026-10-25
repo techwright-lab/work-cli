@@ -50,6 +50,41 @@ pub struct Store {
     authority: Arc<AuthorityIdentity>,
     schema: SchemaParticipation,
     access: StoreAccess,
+    role: SchemaRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupportedRetirementVersion {
+    V16,
+    V17,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SchemaRole {
+    Current17,
+    Legacy16Abort,
+    HistoricalRead(SupportedRetirementVersion),
+}
+impl SchemaRole {
+    pub(crate) fn version(self) -> i64 {
+        match self {
+            Self::Current17 | Self::HistoricalRead(SupportedRetirementVersion::V17) => 17,
+            Self::Legacy16Abort | Self::HistoricalRead(SupportedRetirementVersion::V16) => 16,
+        }
+    }
+    pub(crate) fn validate(self, conn: &Connection) -> Result<()> {
+        let actual: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if actual != self.version() {
+            return Err(StoreError::Invalid);
+        }
+        validate_existing_schema(conn, actual)?;
+        if actual == 16 {
+            let modern: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('quarantine_actions','quarantine_actions_checkout') OR tbl_name='quarantine_actions')", [], |r| r.get(0))?;
+            if modern {
+                return Err(StoreError::Invalid);
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StoreAccess {
@@ -79,7 +114,7 @@ impl AuthorityIdentity {
         let dir = fs::symlink_metadata(directory)?;
         let db = fs::symlink_metadata(directory.join("store.sqlite"))?;
         let lock_id = if writable {
-            let file = Self::open_lock(directory, true)?;
+            let file = Self::open_lock(directory, false)?;
             let m = file.metadata()?;
             Some((m.dev(), m.ino()))
         } else {
@@ -92,6 +127,17 @@ impl AuthorityIdentity {
             database_id: (db.dev(), db.ino()),
             lock_id,
         }))
+    }
+    pub(crate) fn revalidate_migration(&self) -> Result<()> {
+        existing_directory(&self.registry)?;
+        existing_directory(&self.directory)?;
+        check_file(&self.directory.join("store.sqlite"))?;
+        let dir = fs::symlink_metadata(&self.directory)?;
+        let db = fs::symlink_metadata(self.directory.join("store.sqlite"))?;
+        if (dir.dev(), dir.ino()) != self.directory_id || (db.dev(), db.ino()) != self.database_id {
+            return Err(StoreError::Unsafe);
+        }
+        Ok(())
     }
     pub(crate) fn open_lock(directory: &Path, create: bool) -> Result<fs::File> {
         let path = directory.join("allocation.lock");
@@ -216,7 +262,7 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
     conn.busy_timeout(Duration::from_millis(500))?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
-        || (name == "store.sqlite" && matches!(version, 2..=16))
+        || (name == "store.sqlite" && matches!(version, 2..=17))
         || (pending && version == 0))
     {
         return Err(StoreError::Unsafe);
@@ -435,11 +481,31 @@ impl SchemaParticipation {
         Ok(())
     }
 }
-// EX is a separate, non-Clone owner, used only before normal operation guards.
-struct ExclusiveInitialization {
+// Non-Clone facade; migration children retain this actual EX, never acquire SH.
+pub(crate) struct ExclusiveInitialization(Arc<ExclusiveInitializationOwner>);
+pub(crate) struct ExclusiveInitializationOwner {
     file: fs::File,
     registry: PathBuf,
     directory: fs::File,
+}
+pub(crate) enum InitializationRetention {
+    Shared(SchemaParticipation),
+    Migration(Arc<ExclusiveInitializationOwner>),
+}
+impl InitializationRetention {
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        match self {
+            Self::Shared(owner) => owner.revalidate(),
+            Self::Migration(owner) => owner.revalidate(),
+        }
+    }
+    pub(crate) fn matches_authority(&self, authority: &AuthorityIdentity) -> Result<()> {
+        match self {
+            Self::Shared(owner) => owner.matches_authority(authority),
+            Self::Migration(owner) if owner.registry == authority.registry => Ok(()),
+            Self::Migration(_) => Err(StoreError::Unsafe),
+        }
+    }
 }
 impl ExclusiveInitialization {
     fn acquire(registry: &Path, create: bool) -> Result<Self> {
@@ -460,25 +526,33 @@ impl ExclusiveInitialization {
         }
         let file = open_initialization_file(registry, create)?;
         lock_initialization(&file, true)?;
-        let owner = Self {
+        let owner = Self(Arc::new(ExclusiveInitializationOwner {
             file,
             registry: registry.to_path_buf(),
             directory,
-        };
+        }));
         owner.revalidate()?;
         if create {
-            owner.file.sync_all()?;
+            owner.0.file.sync_all()?;
             sync_dir(registry)?;
             sync_dir(registry.parent().ok_or(StoreError::Unsafe)?)?;
         }
         Ok(owner)
     }
+    pub(crate) fn retain(&self) -> Arc<ExclusiveInitializationOwner> {
+        self.0.clone()
+    }
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        self.0.revalidate()
+    }
+}
+impl ExclusiveInitializationOwner {
     fn revalidate(&self) -> Result<()> {
         revalidate_schema_directory(&self.registry, &self.directory)?;
         checked_schema_file(&self.registry.join("initialization.lock"), &self.file)
     }
 }
-impl Drop for ExclusiveInitialization {
+impl Drop for ExclusiveInitializationOwner {
     fn drop(&mut self) {
         let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
     }
@@ -622,6 +696,15 @@ impl Store {
     pub(crate) fn sql_phase(&self) -> SqlPhase {
         self.budget.enter()
     }
+    pub(crate) fn schema_role(&self) -> SchemaRole {
+        self.role
+    }
+    pub(crate) fn require_current(&self) -> Result<()> {
+        if self.access != StoreAccess::ReadWrite || self.role != SchemaRole::Current17 {
+            return Err(StoreError::Unsafe);
+        }
+        Ok(())
+    }
     pub(crate) fn schema_participation(&self) -> SchemaParticipation {
         self.schema.clone()
     }
@@ -660,16 +743,17 @@ impl Store {
             existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 16 {
+        if version != 17 {
             return Err(StoreError::UpgradeRequired);
         }
-        validate_existing_schema(&conn, version)?;
+        SchemaRole::Current17.validate(&conn)?;
         drop(_phase);
         Ok(Self {
             conn,
             budget,
             authority,
             schema,
+            role: SchemaRole::Current17,
             access: StoreAccess::ReadOnly,
         })
     }
@@ -684,42 +768,230 @@ impl Store {
             existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 16 {
+        if version != 17 {
             return Err(StoreError::UpgradeRequired);
         }
-        validate_existing_schema(&conn, version)?;
+        SchemaRole::Current17.validate(&conn)?;
         drop(_phase);
         Ok(Self {
             conn,
             budget,
             authority,
             schema,
+            role: SchemaRole::Current17,
             access: StoreAccess::ReadWrite,
         })
     }
-    /// No-create identity preflight. Never migrates; returns a readonly Store.
-    pub(crate) fn preflight_existing_identity(
+    pub(crate) fn open_retirement_readonly(
         registry: &Path,
         dir: &Path,
         managed: &[PathBuf],
-        accepted: impl Fn(i64) -> bool,
     ) -> Result<Self> {
         let (schema, conn, budget, _, authority) =
             existing_authority(registry, dir, managed, false)?;
-        let _phase = budget.enter();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !accepted(version) {
-            return Err(StoreError::UpgradeRequired);
-        }
-        validate_existing_schema(&conn, version)?;
-        drop(_phase);
+        let phase = budget.enter();
+        let role = match crate::retirement_journal::schema_version(&conn)? {
+            16 => SchemaRole::HistoricalRead(SupportedRetirementVersion::V16),
+            17 => SchemaRole::HistoricalRead(SupportedRetirementVersion::V17),
+            _ => return Err(StoreError::UpgradeRequired),
+        };
+        role.validate(&conn)?;
+        crate::retirement_journal::validate_all(&conn)?;
+        drop(phase);
         Ok(Self {
             conn,
             budget,
             authority,
             schema,
             access: StoreAccess::ReadOnly,
+            role,
         })
+    }
+    pub(crate) fn open_retirement_abort_existing(
+        registry: &Path,
+        dir: &Path,
+        managed: &[PathBuf],
+    ) -> Result<Self> {
+        let reader = Self::open_retirement_readonly(registry, dir, managed)?;
+        let role = match reader.role {
+            SchemaRole::HistoricalRead(SupportedRetirementVersion::V16) => {
+                SchemaRole::Legacy16Abort
+            }
+            SchemaRole::HistoricalRead(SupportedRetirementVersion::V17) => SchemaRole::Current17,
+            _ => return Err(StoreError::Invalid),
+        };
+        {
+            let _phase = reader.sql_phase();
+            reader.conn.execute_batch("ROLLBACK;")?;
+        }
+        let schema = reader.schema_participation();
+        drop(reader);
+        roots(managed)?;
+        schema.revalidate()?;
+        let conn = database(dir, "store.sqlite", false, false)?;
+        let budget = SqlBudget::install(&conn)?;
+        let phase = budget.enter();
+        query_protections(&conn)?;
+        role.validate(&conn)?;
+        crate::retirement_journal::validate_all(&conn)?;
+        drop(phase);
+        let authority = AuthorityIdentity::collect(registry, dir, true)?;
+        schema.revalidate()?;
+        schema.matches_authority(&authority)?;
+        Ok(Self {
+            conn,
+            budget,
+            authority,
+            schema,
+            access: StoreAccess::ReadWrite,
+            role,
+        })
+    }
+    /// Disposable test-format construction BEFORE any retirement observation.
+    /// This returns only the ordinary abort-only Store, never a preparation
+    /// owner or an authorization override. All setup participants must be gone.
+    #[cfg(test)]
+    pub(crate) fn construct_legacy16_preobservation_fixture(
+        registry: &Path,
+        dir: &Path,
+        managed: &[PathBuf],
+    ) -> Result<Self> {
+        fn require_empty_current(conn: &Connection) -> Result<()> {
+            SchemaRole::Current17.validate(conn)?;
+            // GLOBAL emptiness, not merely absence of an active scoped row.
+            // Refuse tombstones and orphans rather than erase or reinterpret.
+            let nonempty: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM retirement_intents) OR EXISTS(SELECT 1 FROM quarantine_actions)",
+                [],
+                |row| row.get(0),
+            )?;
+            if nonempty {
+                return Err(StoreError::Invalid);
+            }
+            crate::retirement_journal::validate_all(conn)
+        }
+
+        let initialization = ExclusiveInitialization::acquire(registry, false)?;
+        let managed = roots(managed)?;
+        let marker = SchemaFile::open(registry.join("initialization.json"))?;
+        let marker_bytes = marker.bytes()?;
+        let record: Initialization =
+            serde_json::from_slice(&marker_bytes).map_err(|_| StoreError::Unsafe)?;
+        if record.version != 1 || !record.initialized || record.store != dir {
+            return Err(StoreError::Unsafe);
+        }
+        let database_file = SchemaFile::open(dir.join("store.sqlite"))?;
+        let registration_file = SchemaFile::open(registry.join("authorities.sqlite"))?;
+        let allocation_lock = SchemaFile::open(dir.join("allocation.lock"))?;
+        let authority = AuthorityIdentity::collect(registry, dir, true)?;
+        {
+            let (reg, reg_budget) = existing_database(registry, "authorities.sqlite")?;
+            let _phase = reg_budget.enter();
+            validate_registry_claims(&reg, dir, &managed)?;
+            let claims: i64 =
+                reg.query_row("SELECT count(*) FROM authorities", [], |r| r.get(0))?;
+            let mode: String = reg.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+            if claims != managed.len() as i64 || mode != "wal" {
+                return Err(StoreError::Unsafe);
+            }
+        }
+        let selected = {
+            let (reader, budget) = existing_database(dir, "store.sqlite")?;
+            let _phase = budget.enter();
+            reader.execute_batch("BEGIN;")?;
+            require_empty_current(&reader)?;
+            let mode: String = reader.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+            if mode != "wal" {
+                return Err(StoreError::Unsafe);
+            }
+            let selected = migration_checkouts(&reader)?;
+            reader.execute_batch("ROLLBACK;")?;
+            selected
+        };
+        // End all preliminary SQL before the complete sorted checkout EX set.
+        let mut guards = Vec::new();
+        for checkout in &selected {
+            guards.push(
+                crate::checkout_guard::CheckoutGuard::exclusive_for_migration(
+                    &authority,
+                    &initialization,
+                    *checkout,
+                )?,
+            );
+        }
+        let mut conn = database(dir, "store.sqlite", false, false)?;
+        let budget = SqlBudget::install(&conn)?;
+        initialization.revalidate()?;
+        database_file.revalidate()?;
+        registration_file.revalidate()?;
+        allocation_lock.revalidate()?;
+        if marker.bytes()? != marker_bytes {
+            return Err(StoreError::Unsafe);
+        }
+        let lease = crate::allocate::migration_lease(&authority, &initialization)?;
+        {
+            let _phase = budget.enter();
+            query_protections(&conn)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            lease.check_migration(&authority)?;
+            if migration_checkouts(&tx)? != selected {
+                return Err(StoreError::Conflict);
+            }
+            require_empty_current(&tx)?;
+            // The actual 16->17 migration adds ONLY this table and its indexes;
+            // DROP TABLE removes its implicit PK and explicit checkout index.
+            // Never assign schema_version: SQLite produces the new native cookie.
+            tx.execute_batch("DROP TABLE quarantine_actions; PRAGMA user_version=16;")?;
+            SchemaRole::Legacy16Abort.validate(&tx)?;
+            crate::retirement_journal::validate_all(&tx)?;
+            tx.commit()?;
+        }
+        drop(lease);
+        // No filesystem/sync under authority or SQL. Retain EX and all children
+        // through synchronization, then drain them before the actual fresh SH.
+        database_file.revalidate()?;
+        registration_file.revalidate()?;
+        allocation_lock.revalidate()?;
+        authority.revalidate_migration()?;
+        if marker.bytes()? != marker_bytes {
+            return Err(StoreError::Unsafe);
+        }
+        sync_dir(dir)?;
+        sync_dir(registry)?;
+        initialization.revalidate()?;
+        drop(conn);
+        drop(guards);
+        drop(initialization);
+        let store = Self::open_retirement_abort_existing(registry, dir, &managed)?;
+        if store.schema_role() != SchemaRole::Legacy16Abort
+            || store.authority_identity().as_ref() != authority.as_ref()
+        {
+            return Err(StoreError::Unsafe);
+        }
+        Ok(store)
+    }
+
+    /// No-create identity check only. Ends SQL, the connection and its actual
+    /// schema participation before returning; never exports a historical Store.
+    pub(crate) fn preflight_existing_identity(
+        registry: &Path,
+        dir: &Path,
+        managed: &[PathBuf],
+        accepted: impl Fn(i64) -> bool,
+    ) -> Result<()> {
+        let (schema, conn, budget, _, _authority) =
+            existing_authority(registry, dir, managed, false)?;
+        let phase = budget.enter();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !accepted(version) {
+            return Err(StoreError::UpgradeRequired);
+        }
+        validate_existing_schema(&conn, version)?;
+        conn.execute_batch("ROLLBACK;")?;
+        drop(phase);
+        drop(conn);
+        drop(schema);
+        Ok(())
     }
     /// Finish may upgrade a proven established v8 authority, never bootstrap or
     /// repair an invalid authority. The read-only preflight precedes mutable open.
@@ -741,7 +1013,7 @@ impl Store {
                 }
             }
             let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if !matches!(version, 8..=16) {
+            if !matches!(version, 8..=17) {
                 return Err(StoreError::UpgradeRequired);
             }
             validate_existing_schema(&conn, version)?;
@@ -789,6 +1061,7 @@ impl Store {
                         authority,
                         schema,
                         access: StoreAccess::ReadWrite,
+                        role: SchemaRole::Current17,
                     })
                 }
                 Err(StoreError::UpgradeRequired) => {}
@@ -837,53 +1110,98 @@ impl Store {
         let dir = private_dir(dir)?;
         sync_dir(parent)?;
         initialization_boundary("store_dir");
-        let mut reg = database(&registry, "authorities.sqlite", pending, true)?;
+        // A pending marker is not evidence that an existing database is empty.
+        // Classify BOTH databases without transitions under actual init EX;
+        // an old/corrupt store must fail before even the registry journal changes.
+        let (new_database, initialize_store) =
+            match initialization_database(&initialization, &dir, "store.sqlite", pending)? {
+                InitializationDatabase::Absent => (true, true),
+                InitializationDatabase::Empty => (false, true),
+                InitializationDatabase::Versioned(conn, budget, version) => {
+                    let _phase = budget.enter();
+                    validate_migration_source(&conn, version)?;
+                    (false, false)
+                }
+            };
+        let initialize_registry = match initialization_database(
+            &initialization,
+            &registry,
+            "authorities.sqlite",
+            pending,
+        )? {
+            InitializationDatabase::Absent | InitializationDatabase::Empty => true,
+            InitializationDatabase::Versioned(conn, budget, _) => {
+                let _phase = budget.enter();
+                validate_registry_claims(&conn, &dir, &managed)?;
+                false
+            }
+        };
+        // All preflight connections/SQL have ended. Only actual absent/empty
+        // pending bootstrap storage may initialize its journal.
+        let mut reg = database(
+            &registry,
+            "authorities.sqlite",
+            initialize_registry,
+            initialize_registry,
+        )?;
         initialization_boundary("registry_db");
         let reg_budget = SqlBudget::install(&reg)?;
-        let reg_phase = reg_budget.enter();
-        let version: i64 = reg.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0 | 1) {
-            return Err(StoreError::Unsafe);
+        // Preserve bootstrap's durable-claims-before-database crash boundary.
+        // This branch has no database/history to migrate; an existing database
+        // ALWAYS waits for the complete authoritative history gate below.
+        if new_database {
+            register_roots(&mut reg, &reg_budget, &dir, &managed)?;
         }
-        let tx = reg.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if version == 0 {
-            tx.execute_batch("CREATE TABLE authorities(root TEXT PRIMARY KEY, store TEXT NOT NULL); PRAGMA user_version=1;")?;
-        }
-        initialization_boundary("registry_schema");
-        let claims: Vec<(String, String)> = {
-            let mut s = tx.prepare("SELECT root,store FROM authorities")?;
-            let rows = s
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            rows
-        };
-        for (root, owner) in &claims {
-            if owner != dir.to_str().ok_or(StoreError::Invalid)?
-                || !managed.contains(&PathBuf::from(root))
-            {
+        let mut conn = database(&dir, "store.sqlite", initialize_store, initialize_store)?;
+        initialization_boundary("store_db");
+        let budget = SqlBudget::install(&conn)?;
+        let (version, selected) = {
+            let phase = budget.enter();
+            conn.execute_batch("BEGIN;")?;
+            let version = crate::retirement_journal::schema_version(&conn)?;
+            if !(0..=17).contains(&version) {
                 return Err(StoreError::Unsafe);
             }
+            let selected = if version == 0 {
+                Vec::new()
+            } else {
+                migration_checkouts(&conn)?
+            };
+            conn.execute_batch("ROLLBACK;")?;
+            drop(phase);
+            (version, selected)
+        };
+        initialization.revalidate()?;
+        if initialize_store {
+            let infrastructure = AuthorityIdentity::open_lock(&dir, true)?;
+            infrastructure.sync_all()?;
         }
-        for root in &managed {
-            tx.execute(
-                "INSERT OR IGNORE INTO authorities VALUES (?1,?2)",
-                (root.to_str(), dir.to_str()),
-            )?;
+        let authority = AuthorityIdentity::collect(&registry, &dir, true)?;
+        let mut guards = Vec::new();
+        for checkout in &selected {
+            guards.push(
+                crate::checkout_guard::CheckoutGuard::exclusive_for_migration(
+                    &authority,
+                    &initialization,
+                    *checkout,
+                )?,
+            );
         }
-        tx.commit()?;
-        drop(reg_phase);
-        initialization_boundary("claims");
-        let mut conn = database(&dir, "store.sqlite", pending, true)?;
-        initialization_boundary("store_db");
-        // Bound mutable validation/migration before taking the SQLite writer
-        // lock. The same Store-owned callback remains installed on return.
-        let budget = SqlBudget::install(&conn)?;
+        let lease = crate::allocate::migration_lease(&authority, &initialization)?;
         let phase = budget.enter();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(version, 0..=16) {
-            return Err(StoreError::Unsafe);
-        }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        lease.check_migration(&authority)?;
+        if crate::retirement_journal::schema_version(&tx)? != version
+            || (version != 0 && migration_checkouts(&tx)? != selected)
+        {
+            return Err(StoreError::Conflict);
+        }
+        validate_migration_source(&tx, version)?;
+        // Only now may registry DDL/claims change. No filesystem work occurs
+        // while either transaction or the actual migration authority is held.
+        if !new_database {
+            register_roots(&mut reg, &reg_budget, &dir, &managed)?;
+        }
         if version == 0 {
             tx.execute_batch("CREATE TABLE checkouts(
     id TEXT PRIMARY KEY, operation TEXT NOT NULL UNIQUE, digest BLOB NOT NULL,
@@ -1005,6 +1323,12 @@ impl Store {
             tx.execute_batch(crate::retirement_journal::SCHEMA)?;
         }
         validate_existing_schema(&tx, 16)?;
+        if version < 17 {
+            tx.execute_batch(crate::quarantine_journal::SCHEMA)?;
+            tx.pragma_update(None, "user_version", 17)?;
+        }
+        SchemaRole::Current17.validate(&tx)?;
+        crate::quarantine_journal::validate_all(&tx)?;
         if version < 8 {
             crate::run_journal::validate_enrollment_rosters(&tx)?;
         }
@@ -1020,10 +1344,11 @@ impl Store {
         tx.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
         tx.commit()?;
         drop(phase);
+        drop(lease);
         initialization_boundary("store_schema");
         // Complete ordinary authority guard infrastructure under bootstrap EX;
         // discard the descriptor before the fresh shared observation below.
-        let allocation_lock = AuthorityIdentity::open_lock(&dir, true)?;
+        let allocation_lock = AuthorityIdentity::open_lock(&dir, false)?;
         allocation_lock.sync_all()?;
         drop(allocation_lock);
         // FULL SQLite commits make schema and claims durable, including their
@@ -1038,6 +1363,7 @@ impl Store {
         initialization.revalidate()?;
         drop(conn);
         drop(reg);
+        drop(guards);
         drop(initialization);
         #[cfg(test)]
         schema_handoff_fixture::reached();
@@ -1048,6 +1374,7 @@ impl Store {
     pub fn charged(&self, repository: &Path, owner: Option<&str>) -> Result<u64> {
         let repo = canonical(repository)?;
         let _phase = self.sql_phase();
+        self.role.validate(&self.conn)?;
         count(&self.conn, &repo, owner)
     }
     pub fn find_reusable(&self, actor: &str, repository: &Path, task: &str) -> Result<Vec<Uuid>> {
@@ -1085,6 +1412,7 @@ impl Store {
     }
     pub fn pending_events(&self, limit: usize) -> Result<Vec<PendingEvent>> {
         let _phase = self.sql_phase();
+        self.role.validate(&self.conn)?;
         let mut stmt = self.conn.prepare(
             "SELECT sequence,payload FROM outbox WHERE acknowledged=0 ORDER BY sequence LIMIT ?1",
         )?;
@@ -1099,11 +1427,22 @@ impl Store {
         .collect()
     }
     pub fn acknowledge(&mut self, sequence: i64) -> Result<()> {
+        self.require_current()?;
+        let lease = self.authority_lease()?;
+        lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
-        self.conn.execute(
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        lease.check_authority(&authority)?;
+        SchemaRole::Current17.validate(&tx)?;
+        crate::quarantine_journal::validate_all(&tx)?;
+        tx.execute(
             "UPDATE outbox SET acknowledged=1 WHERE sequence=?1",
             [sequence],
         )?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -1124,6 +1463,220 @@ const REPORT_GROUPS: usize = 256;
 const REPORT_ROWS: i64 = 4096;
 const REPORT_OUTPUT_BYTES: usize = 256 * 1024;
 
+// Called only within open_registered's retained initialization EX. No I/O.
+fn register_roots(
+    reg: &mut Connection,
+    budget: &SqlBudget,
+    dir: &Path,
+    managed: &[PathBuf],
+) -> Result<()> {
+    let phase = budget.enter();
+    let version: i64 = reg.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if !matches!(version, 0 | 1) {
+        return Err(StoreError::Unsafe);
+    }
+    let tx = reg.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if version == 0 {
+        tx.execute_batch("CREATE TABLE authorities(root TEXT PRIMARY KEY, store TEXT NOT NULL); PRAGMA user_version=1;")?;
+    }
+    initialization_boundary("registry_schema");
+    validate_registry_claims(&tx, dir, managed)?;
+    for root in managed {
+        tx.execute(
+            "INSERT OR IGNORE INTO authorities VALUES (?1,?2)",
+            (root.to_str(), dir.to_str()),
+        )?;
+    }
+    tx.commit()?;
+    drop(phase);
+    initialization_boundary("claims");
+    Ok(())
+}
+
+// Read-only admission, repeated under the authoritative IMMEDIATE transaction.
+// Neither helper grants a Store role, lease, or migration permission.
+fn validate_registry_claims(conn: &Connection, dir: &Path, managed: &[PathBuf]) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT root,store FROM authorities LIMIT 1025")?;
+    let claims = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if claims.len() > REPORT_CLAIMS {
+        return Err(StoreError::Unsafe);
+    }
+    for (root, owner) in &claims {
+        if owner != dir.to_str().ok_or(StoreError::Invalid)?
+            || !managed.contains(&PathBuf::from(root))
+        {
+            return Err(StoreError::Unsafe);
+        }
+    }
+    Ok(())
+}
+
+fn validate_migration_source(conn: &Connection, version: i64) -> Result<()> {
+    if version == 0 {
+        return validate_empty_initialization_database(conn);
+    }
+    validate_existing_schema(conn, version)?;
+    if version == 16 {
+        SchemaRole::Legacy16Abort.validate(conn)?;
+        crate::retirement_journal::validate_all(conn)?;
+        let active: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE stage IN ('prepared','held'))",
+            [],
+            |r| r.get(0),
+        )?;
+        if active {
+            return Err(StoreError::RetirementFenced);
+        }
+    } else if version == 17 {
+        crate::quarantine_journal::validate_all(conn)?;
+    } else {
+        let modern: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE tbl_name IN ('retirement_intents','quarantine_actions'))", [], |r| r.get(0))?;
+        if modern {
+            return Err(StoreError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+// Only open_registered, while holding actual initialization EX, consumes this
+// classification. An Empty database is not a legacy/versioned Store capability.
+enum InitializationDatabase {
+    Absent,
+    Empty,
+    Versioned(Connection, SqlBudget, i64),
+}
+
+fn validate_empty_initialization_database(conn: &Connection) -> Result<()> {
+    let objects: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema)", [], |r| {
+        r.get(0)
+    })?;
+    let cookie: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0))?;
+    if objects || cookie != 0 || crate::retirement_journal::schema_version(conn)? != 0 {
+        return Err(StoreError::Unsafe);
+    }
+    Ok(())
+}
+
+fn initialization_database(
+    initialization: &ExclusiveInitialization,
+    dir: &Path,
+    name: &str,
+    pending: bool,
+) -> Result<InitializationDatabase> {
+    initialization.revalidate()?;
+    existing_directory(dir)?;
+    let path = dir.join(name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            check_file(&path)?;
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && pending => None,
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.as_ref().is_none_or(|m| m.len() == 0) {
+        if !pending {
+            return Err(StoreError::Unsafe);
+        }
+        // An absent/zero-byte file cannot authorize adoption of stale sidecars.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            match fs::symlink_metadata(dir.join(format!("{name}{suffix}"))) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                _ => return Err(StoreError::Unsafe),
+            }
+        }
+        return Ok(if metadata.is_none() {
+            InitializationDatabase::Absent
+        } else {
+            InitializationDatabase::Empty
+        });
+    }
+    if pending {
+        let mut sidecar_present = false;
+        for suffix in ["-wal", "-shm", "-journal"] {
+            match fs::symlink_metadata(dir.join(format!("{name}{suffix}"))) {
+                Ok(_) => sidecar_present = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !sidecar_present {
+            // A crash immediately after first journal_mode=WAL can leave a
+            // genuine empty SQLite header with NO WAL/SHM yet. A normal readonly
+            // WAL open could create them before proving emptiness. Only here,
+            // under actual init EX with ALL sidecars absent, inspect immutably.
+            // Never ignore an existing WAL, and NEVER admit versioned data via
+            // this branch: both native schema contents and cookies must be empty.
+            if fs::symlink_metadata(&path)?.len() > REPORT_DATABASE_BYTES {
+                return Err(StoreError::Unsafe);
+            }
+            let mut uri = String::from("file:");
+            for byte in path.as_os_str().as_encoded_bytes() {
+                use std::fmt::Write;
+                write!(&mut uri, "%{byte:02X}").map_err(|_| StoreError::Invalid)?;
+            }
+            uri.push_str("?immutable=1");
+            let conn = Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            conn.busy_timeout(Duration::from_millis(500))?;
+            let budget = SqlBudget::install(&conn)?;
+            let _phase = budget.enter();
+            query_protections(&conn)?;
+            conn.execute_batch("PRAGMA query_only=ON;")?;
+            validate_empty_initialization_database(&conn)?;
+            let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+            if integrity != "ok" {
+                return Err(StoreError::Unsafe);
+            }
+            return Ok(InitializationDatabase::Empty);
+        }
+    }
+    let (conn, budget, version) = inspect_database_readonly(dir, name)?;
+    let phase = budget.enter();
+    if version == 0 {
+        if !pending {
+            return Err(StoreError::Unsafe);
+        }
+        validate_empty_initialization_database(&conn)?;
+        return Ok(InitializationDatabase::Empty);
+    }
+    // Versioned databases never acquire WAL simply because a marker is pending.
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if mode != "wal" {
+        return Err(StoreError::Unsafe);
+    }
+    drop(phase);
+    Ok(InitializationDatabase::Versioned(conn, budget, version))
+}
+
+fn migration_checkouts(conn: &Connection) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare("SELECT id FROM checkouts ORDER BY id LIMIT 4097")?;
+    let mut cursor = stmt.query([])?;
+    let mut selected = Vec::new();
+    while let Some(row) = cursor.next()? {
+        if selected.len() == REPORT_ROWS as usize {
+            return Err(StoreError::Invalid);
+        }
+        let id = match row.get_ref(0)? {
+            rusqlite::types::ValueRef::Text(bytes) if bytes.len() == 36 => {
+                crate::retirement_journal::parse_uuid(
+                    std::str::from_utf8(bytes).map_err(|_| StoreError::Invalid)?,
+                )?
+            }
+            _ => return Err(StoreError::Invalid),
+        };
+        selected.push(id);
+    }
+    Ok(selected)
+}
+
 fn existing_directory(dir: &Path) -> Result<()> {
     crate::config::validate_path(dir, true).map_err(|_| StoreError::Unsafe)?;
     let m = fs::symlink_metadata(dir)?;
@@ -1133,6 +1686,17 @@ fn existing_directory(dir: &Path) -> Result<()> {
     Ok(())
 }
 fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> {
+    let (conn, budget, version) = inspect_database_readonly(dir, name)?;
+    if version == 0 {
+        return Err(StoreError::Unsafe);
+    }
+    Ok((conn, budget))
+}
+
+// Storage inspection only: no create/journal transition and no Store admission.
+// Version0 is exclusively classified by initialization_database under init EX;
+// every established reader above continues to refuse it.
+fn inspect_database_readonly(dir: &Path, name: &str) -> Result<(Connection, SqlBudget, i64)> {
     existing_directory(dir)?;
     let path = dir.join(name);
     check_file(&path)?;
@@ -1187,11 +1751,12 @@ fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> 
     conn.execute_batch("PRAGMA query_only=ON;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if !(version == 1 || (name == "store.sqlite" && matches!(version, 2..=16))) || integrity != "ok"
+    if !(matches!(version, 0 | 1) || (name == "store.sqlite" && matches!(version, 2..=17)))
+        || integrity != "ok"
     {
         return Err(StoreError::Unsafe);
     }
-    Ok((conn, budget))
+    Ok((conn, budget, version))
 }
 
 // The installed callback is inert outside a SQL operation. Guards own cloned
@@ -1373,7 +1938,7 @@ fn existing_authority_for_open(
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     validate_existing_schema(&conn, version)?;
-    if writable && (version != 16 || registration_needed) {
+    if writable && (version != 17 || registration_needed) {
         return Err(StoreError::UpgradeRequired);
     }
     if writable {
@@ -1391,7 +1956,7 @@ fn existing_authority_for_open(
         let _writer_phase = writer_budget.enter();
         query_protections(&writer)?;
         let version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 16 {
+        if version != 17 {
             return Err(StoreError::Unsafe);
         }
         validate_existing_schema(&writer, version)?;
@@ -1405,6 +1970,9 @@ fn existing_authority_for_open(
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
+    if version >= 17 {
+        crate::quarantine_journal::validate_schema(conn)?;
+    }
     if version >= 16 {
         crate::retirement_journal::validate_schema(conn)?;
     }

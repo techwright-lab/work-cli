@@ -267,6 +267,7 @@ impl Collector {
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
         let schema = store.schema_participation();
+        let role = store.schema_role();
         let phase = store.sql_phase();
         let tx = store
             .conn
@@ -280,7 +281,7 @@ impl Collector {
                 receipts::store_error(error).label()
             }
         })?;
-        let context = snapshot_in_transaction(&tx, &authority, &schema, self.checkout, b)
+        let context = snapshot_in_transaction(&tx, &authority, &schema, role, self.checkout, b)
             .map_err(|_| "context_unknown")?;
         b.reserve(context.history.len() as u64)
             .map_err(|_| "deadline")?;
@@ -754,6 +755,7 @@ fn decide(
             .map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(assessment.store.authority_identity());
         let schema = assessment.store.schema_participation();
+        let role = assessment.store.schema_role();
         let phase = assessment.store.sql_phase();
         let tx = assessment
             .store
@@ -764,6 +766,7 @@ fn decide(
             &tx,
             &authority,
             &schema,
+            role,
             assessment.context.allocation.checkout,
             &mut assessment.budget,
         )
@@ -1154,6 +1157,7 @@ impl FreshRetirementAssessment {
             lease.check(store).map_err(|_| "authority_unknown")?;
             let authority = std::sync::Arc::clone(store.authority_identity());
             let schema = store.schema_participation();
+            let role = store.schema_role();
             let _phase = store.sql_phase();
             let tx = store
                 .conn
@@ -1162,6 +1166,7 @@ impl FreshRetirementAssessment {
             lease
                 .check_authority(&authority)
                 .map_err(|_| "authority_unknown")?;
+            role.validate(&tx).map_err(|_| "authority_unknown")?;
             if let Some((row, count, fence_active)) =
                 historical_operation(&tx, checkout, operation)?
             {
@@ -1181,7 +1186,7 @@ impl FreshRetirementAssessment {
                 )
                 .unwrap();
             }
-            let current = snapshot_in_transaction(&tx, &authority, &schema, checkout, budget)
+            let current = snapshot_in_transaction(&tx, &authority, &schema, role, checkout, budget)
                 .map_err(|_| "context_changed")?;
             budget
                 .reserve(current.history.len() as u64)
@@ -1250,6 +1255,8 @@ impl FreshRetirementAssessment {
                     source,
                     record: encoded.clone(),
                 },
+                &lease,
+                &authority,
             )
             .map_err(prepare_store_error)?;
             // Read back every immutable binding/declaration column. The new row
@@ -1421,6 +1428,7 @@ fn abort_target(
     revision: u64,
 ) -> Held<(crate::retirement_journal::IntentRow, u64, bool)> {
     use crate::retirement_journal as journal;
+    journal::require_no_physical_action(conn, operation).map_err(|_| "physical_action_present")?;
     let history = journal::read_history(conn, checkout).map_err(|_| "history_unknown")?;
     let row = journal::find_operation(conn, operation)
         .map_err(|_| "history_unknown")?
@@ -1465,7 +1473,7 @@ pub(super) fn abort_offline(
         .as_deref()
         .ok_or("authority_unknown")?;
     let dir = config.store_dir.as_deref().ok_or("authority_unknown")?;
-    let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)
+    let readonly = Store::open_retirement_readonly(registry, dir, &config.roots)
         .map_err(|_| "authority_unknown")?;
     let (original, count, fence_active) = {
         let _phase = readonly.sql_phase();
@@ -1494,7 +1502,7 @@ pub(super) fn abort_offline(
                 _ => "lock_unknown",
             }
         })?;
-    let store = Store::open_existing_registered_mut(registry, dir, &config.roots)
+    let store = Store::open_retirement_abort_existing(registry, dir, &config.roots)
         .map_err(|_| "authority_unknown")?;
     guard
         .require_matching(&store, checkout)
@@ -1508,12 +1516,14 @@ pub(super) fn abort_offline(
     };
     // Close the preflight/EX race before treating anything as failed evidence.
     {
+        let role = owner.store.schema_role();
         let _phase = owner.store.sql_phase();
         let tx = owner
             .store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "history_unknown")?;
+        role.validate(&tx).map_err(|_| "history_unknown")?;
         let (current, count, fence_active) = abort_target(&tx, checkout, operation, revision)?;
         if current.stage == "aborted" {
             tx.rollback().map_err(|_| "history_unknown")?;
@@ -1623,12 +1633,14 @@ impl OfflineAbort {
         let context = {
             let authority = self.guard_authority();
             let schema = self.store.schema_participation();
+            let role = self.store.schema_role();
             let _phase = self.store.sql_phase();
             let tx = self
                 .store
                 .conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
                 .map_err(|_| "history_unknown")?;
+            role.validate(&tx).map_err(|_| "history_unknown")?;
             let (target, _, _) = abort_target(
                 &tx,
                 self.original.checkout,
@@ -1642,6 +1654,7 @@ impl OfflineAbort {
                 &tx,
                 &authority,
                 &schema,
+                role,
                 self.original.checkout,
                 &mut self.budget,
             )
@@ -1807,11 +1820,12 @@ impl OfflineAbort {
         // No FS/boot/Git/config/driver calls from here through commit. The owned
         // guard and common descriptors remain retained, not reacquired in SQL.
         let schema = self.store.schema_participation();
-        let lease = self
-            .store
-            .authority_lease()
+        let role = self.store.schema_role();
+        let lease = crate::allocate::retirement_abort_lease(&self.store)
             .map_err(|_| "authority_unknown")?;
-        lease.check(&self.store).map_err(|_| "authority_unknown")?;
+        lease
+            .check_abort(&self.store)
+            .map_err(|_| "authority_unknown")?;
         let authority = self.guard_authority();
         let _phase = self.store.sql_phase();
         let tx = self
@@ -1820,7 +1834,7 @@ impl OfflineAbort {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| "commit_unknown")?;
         lease
-            .check_authority(&authority)
+            .check_abort_transaction(&tx, &authority)
             .map_err(|_| "authority_unknown")?;
         let (current, count, _) = abort_target(
             &tx,
@@ -1835,6 +1849,7 @@ impl OfflineAbort {
             &tx,
             &authority,
             &schema,
+            role,
             self.original.checkout,
             &mut self.budget,
         )
@@ -1846,11 +1861,13 @@ impl OfflineAbort {
             return Err("context_changed");
         }
         validate_abort_context(&tx, &context, &self.original, &mut self.budget)?;
-        journal::abort_cas(
+        journal::abort_validated(
             &tx,
             self.original.checkout,
             self.original.operation,
             self.original.revision as u64,
+            &lease,
+            &authority,
         )
         .map_err(super::retirement_intent::prepare_store_error)?;
         let aborted =
@@ -1876,11 +1893,11 @@ impl OfflineAbort {
         self.guard
             .require_matching(&self.store, self.original.checkout)
             .map_err(|_| "checkout_guard_unavailable")?;
-        let lease = self
-            .store
-            .authority_lease()
+        let lease = crate::allocate::retirement_abort_lease(&self.store)
             .map_err(|_| "authority_unknown")?;
-        lease.check(&self.store).map_err(|_| "authority_unknown")?;
+        lease
+            .check_abort(&self.store)
+            .map_err(|_| "authority_unknown")?;
         let authority = self.guard_authority();
         let _phase = self.store.sql_phase();
         let tx = self
@@ -1889,7 +1906,7 @@ impl OfflineAbort {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| "commit_unknown")?;
         lease
-            .check_authority(&authority)
+            .check_abort_transaction(&tx, &authority)
             .map_err(|_| "authority_unknown")?;
         let (current, _, _) =
             abort_target(&tx, self.original.checkout, self.original.operation, 1)?;
@@ -1898,8 +1915,14 @@ impl OfflineAbort {
         if current != self.original {
             return Err("intent_conflict");
         }
-        crate::retirement_journal::hold_abort_validation(&tx, current.checkout, current.operation)
-            .map_err(super::retirement_intent::prepare_store_error)?;
+        crate::retirement_journal::hold_abort_validated(
+            &tx,
+            current.checkout,
+            current.operation,
+            &lease,
+            &authority,
+        )
+        .map_err(super::retirement_intent::prepare_store_error)?;
         self.budget.check().map_err(|_| "deadline")?;
         tx.commit().map_err(|_| "commit_unknown")
     }
@@ -1911,6 +1934,15 @@ fn validate_abort_context(
     original: &crate::retirement_journal::IntentRow,
     budget: &mut Budget,
 ) -> Held<()> {
+    context.role.validate(conn).map_err(|_| "context_changed")?;
+    // Offline abort never projects away a physical fence; even an otherwise
+    // well-formed action requires the separate unresolved-physical protocol.
+    if context.physical_count != 0 {
+        return Err("physical_action_present");
+    }
+    budget
+        .reserve(context.physical_history.len() as u64)
+        .map_err(|_| "deadline")?;
     if hex(&Sha256::digest(&context.source)) != original.decoded.source_hex {
         return Err("context_changed");
     }
@@ -2780,6 +2812,265 @@ mod tests {
         let prepared = recovery_refs::prepare_for_assessment(&config, f.allocation.checkout);
         assert!(prepared.prepared(), "{prepared:?}");
         (r, b, os, config)
+    }
+
+    // Constructor-only evidence. This deliberately stops before any retirement
+    // observation; it is not a positive legacy prepare/abort fixture.
+    #[test]
+    fn legacy16_preobservation_constructor_preserves_native_prerequisites() {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        fn rows(conn: &rusqlite::Connection) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+            let mut statement = conn.prepare(
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name!='quarantine_actions' ORDER BY name",
+            ).unwrap();
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            names
+                .into_iter()
+                .map(|name| {
+                    let quoted = name.replace('"', "\"\"");
+                    let statement = conn
+                        .prepare(&format!("SELECT * FROM \"{quoted}\""))
+                        .unwrap();
+                    let columns = statement.column_count();
+                    let ordering = (1..=columns)
+                        .map(|n| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mut statement = conn
+                        .prepare(&format!("SELECT * FROM \"{quoted}\" ORDER BY {ordering}"))
+                        .unwrap();
+                    let values = statement
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|n| row.get(n))
+                                .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                        })
+                        .unwrap()
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .unwrap();
+                    (name, values)
+                })
+                .collect()
+        }
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (request, binding, os) = close_completed(&mut f);
+        finish_task(&f);
+        let config = remote_config(&f, &os.tmp.path().join("runtime"));
+        enable_prepare(&config);
+        assert!(recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared());
+        let registry = f.temp.path().join("registry");
+        let directory = f.temp.path().join("authority");
+        let configuration = fs::read(&config).unwrap();
+        let native = abort_files(&f);
+        let marker = fs::read(registry.join("initialization.json")).unwrap();
+        let mut identity_paths = vec![
+            directory.clone(),
+            directory.join("store.sqlite"),
+            directory.join("allocation.lock"),
+            directory.join("checkout-operations-v1"),
+            directory.join(format!(
+                "checkout-operations-v1/{}.lock",
+                f.allocation.checkout
+            )),
+            registry.clone(),
+            registry.join("initialization.lock"),
+            registry.join("initialization.json"),
+            registry.join("authorities.sqlite"),
+            f.allocation.destination.clone(),
+            f.common().to_path_buf(),
+            f.private().to_path_buf(),
+        ];
+        let common_locks = directory.join("recovery-preparation-locks-v1");
+        let mut common_lock_paths = fs::read_dir(&common_locks)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        common_lock_paths.sort();
+        assert!(
+            !common_lock_paths.is_empty(),
+            "real native protection must retain its common lock metadata"
+        );
+        identity_paths.push(common_locks);
+        identity_paths.extend(common_lock_paths);
+        let registry_rows = || {
+            let conn = rusqlite::Connection::open_with_flags(
+                registry.join("authorities.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .unwrap();
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+            rows(&conn)
+        };
+        let before_claims = registry_rows();
+        let identities = || {
+            identity_paths
+                .iter()
+                .map(|path| {
+                    let meta = fs::symlink_metadata(path).unwrap();
+                    (
+                        meta.dev(),
+                        meta.ino(),
+                        meta.mode(),
+                        meta.uid(),
+                        meta.gid(),
+                        meta.nlink(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before_ids = identities();
+        let legacy_ddl = |conn: &rusqlite::Connection| {
+            let mut statement = conn.prepare(
+                "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE tbl_name!='quarantine_actions' ORDER BY type,name",
+            ).unwrap();
+            let ddl = statement
+                .query_map([], |row| {
+                    (0..4)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            ddl
+        };
+        let (before_rows, before_cookie, before_ddl) = {
+            let _phase = f.store.sql_phase();
+            crate::store::SchemaRole::Current17
+                .validate(&f.store.conn)
+                .unwrap();
+            let empty: bool = f.store.conn.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM retirement_intents) AND NOT EXISTS(SELECT 1 FROM quarantine_actions)",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert!(empty);
+            let (state, ready): (String, bool) = f
+                .store
+                .conn
+                .query_row(
+                    "SELECT state,ready FROM checkouts WHERE id=?1",
+                    [f.allocation.checkout.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, "held");
+            assert!(!ready);
+            assert!(!crate::finish::task_open(&f.store.conn, f.allocation.checkout).unwrap());
+            assert!(!terminal_candidates(&f.store.conn, f.allocation.checkout)
+                .unwrap()
+                .is_empty());
+            assert!(
+                f.store
+                    .conn
+                    .query_row("SELECT count(*) FROM outbox", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap()
+                    > 0
+            );
+            (
+                rows(&f.store.conn),
+                f.store
+                    .conn
+                    .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                legacy_ddl(&f.store.conn),
+            )
+        };
+        // Keep only owning native resources and historical DATA. No old Driver,
+        // terminal proof, Context, Store, checkout or common guard crosses EX.
+        let fixture::ManagedFixture {
+            temp,
+            repo,
+            root,
+            allocation,
+            store,
+        } = f;
+        let Manager { tmp, _bus, driver } = os;
+        drop(driver);
+        drop(request);
+        drop(binding);
+        drop(store);
+        let manager_resources = (tmp, _bus);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired
+        );
+        let store = Store::construct_legacy16_preobservation_fixture(
+            &registry,
+            &directory,
+            std::slice::from_ref(&root),
+        )
+        .unwrap();
+        assert_eq!(store.schema_role(), crate::store::SchemaRole::Legacy16Abort);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Blocked
+        );
+        assert!(
+            store.authority_lease().is_err(),
+            "construction grants no ordinary prepare authority"
+        );
+        {
+            let _phase = store.sql_phase();
+            store.schema_role().validate(&store.conn).unwrap();
+            assert_eq!(legacy_ddl(&store.conn), before_ddl, "no16 DDL changed");
+            assert_eq!(
+                rows(&store.conn),
+                before_rows,
+                "every prerequisite, outbox and sequence row survives"
+            );
+            let cookie: i64 = store
+                .conn
+                .query_row("PRAGMA schema_version", [], |row| row.get(0))
+                .unwrap();
+            assert_ne!(
+                cookie, before_cookie,
+                "native DROP changes the cookie; it must never be restored"
+            );
+            let modern: i64 = store.conn.query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name IN ('quarantine_actions','quarantine_actions_checkout') OR tbl_name='quarantine_actions'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(modern, 0);
+        }
+        let f = fixture::ManagedFixture {
+            temp,
+            repo,
+            root,
+            allocation,
+            store,
+        };
+        assert_eq!(identities(), before_ids);
+        assert_eq!(registry_rows(), before_claims);
+        assert_eq!(fs::read(&config).unwrap(), configuration);
+        assert_eq!(
+            fs::read(registry.join("initialization.json")).unwrap(),
+            marker
+        );
+        assert_eq!(
+            abort_files(&f),
+            native,
+            "native checkout, refs and historical recovery receipts unchanged"
+        );
+        drop(f.store);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired
+        );
+        drop(manager_resources);
     }
 
     fn fresh_for_test(
@@ -4097,13 +4388,22 @@ mod tests {
                 ));
             } else if stage == "aborted" {
                 // Structural CAS only: explicitly NOT public/offline abort proof.
+                let lease = f.store.authority_lease().unwrap();
+                let authority = f.store.authority_identity().clone();
                 let tx = f
                     .store
                     .conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .unwrap();
-                crate::retirement_journal::abort_cas(&tx, f.allocation.checkout, operation, 2)
-                    .unwrap();
+                crate::retirement_journal::abort_validated(
+                    &tx,
+                    f.allocation.checkout,
+                    operation,
+                    2,
+                    &lease,
+                    &authority,
+                )
+                .unwrap();
                 tx.commit().unwrap();
             }
             let events = f.store.pending_events(1000).unwrap().len();
@@ -4236,6 +4536,218 @@ mod tests {
             );
             assert_eq!(source_rows, abort_source_rows(&f.store));
         }
+    }
+
+    #[test]
+    fn post_open_prepare_retry_rejects_counterfeit_legacy_drift() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_request, _binding, os, config) = prepared_supervised(&mut f);
+        enable_prepare(&config);
+        let checkout = f.allocation.checkout;
+        let operation = Uuid::now_v7();
+        assert!(prepare_test(
+            &config,
+            checkout,
+            operation,
+            None,
+            false,
+            Some(&os.driver),
+            PrepareFault::None
+        )
+        .unwrap()
+        .fresh_commit());
+        let mut retry_store = Store::open_existing_registered_mut(
+            &f.temp.path().join("registry"),
+            &f.temp.path().join("authority"),
+            std::slice::from_ref(&f.root),
+        )
+        .unwrap();
+        assert_eq!(
+            retry_store.schema_role(),
+            crate::store::SchemaRole::Current17
+        );
+        let original = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+        let source = abort_source_rows(&f.store);
+        let outbox = |conn: &rusqlite::Connection| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT sequence,version,payload,acknowledged FROM outbox ORDER BY sequence",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        // Raw negative-fixture observation remains available after pin drift;
+        // the normal Store outbox reader must itself reject that drift.
+        let events = outbox(&f.store.conn);
+        let files = abort_files(&f);
+        let native_cookie: i64 = f
+            .store
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        // This is the same helper called after the production mutable open.
+        let control = super::retirement_intent::post_open_prepare_retry(
+            &mut retry_store,
+            checkout,
+            operation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(control, (original.clone(), 1, true));
+        assert!(retry_store.conn.is_autocommit());
+        assert_eq!(abort_source_rows(&f.store), source);
+        assert_eq!(outbox(&f.store.conn), events);
+        assert_eq!(
+            f.store
+                .conn
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            native_cookie
+        );
+
+        // COUNTERFEIT negative drift only: this record was prepared on17. Drop
+        // only17 DDL so metadata readers accept16, without restoring the native
+        // cookie or claiming genuine16 preparation/offline-abort permission.
+        f.store
+            .conn
+            .execute_batch("DROP TABLE quarantine_actions; PRAGMA user_version=16;")
+            .unwrap();
+        let drift_cookie: i64 = f
+            .store
+            .conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(drift_cookie, native_cookie);
+        let source = abort_source_rows(&f.store);
+        // A generic version-aware history read really can take the shortcut;
+        // only the actual Store pin must prevent the post-open retry here.
+        assert_eq!(
+            super::retirement_intent::historical_operation(&f.store.conn, checkout, operation)
+                .unwrap(),
+            Some((original.clone(), 1, true))
+        );
+        let result = super::retirement_intent::post_open_prepare_retry(
+            &mut retry_store,
+            checkout,
+            operation,
+        );
+        assert_eq!(result.unwrap_err(), "history_unknown");
+        assert!(retry_store.conn.is_autocommit());
+        assert_eq!(
+            crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap(),
+            original
+        );
+        assert_eq!(abort_source_rows(&f.store), source);
+        assert_eq!(outbox(&f.store.conn), events);
+        assert_eq!(abort_files(&f), files);
+        assert_eq!(
+            f.store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            16
+        );
+        assert_eq!(
+            f.store
+                .conn
+                .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            drift_cookie
+        );
+    }
+
+    #[test]
+    fn global_missing_action_refuses_ack_abort_and_scoped_shortcuts() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_request, _binding, os, config) = prepared_supervised(&mut f);
+        enable_prepare(&config);
+        let operation = Uuid::now_v7();
+        let prepared = prepare_test(
+            &config,
+            f.allocation.checkout,
+            operation,
+            None,
+            false,
+            Some(&os.driver),
+            PrepareFault::None,
+        )
+        .unwrap();
+        assert!(prepared.fresh_commit());
+        let events = f.store.pending_events(1000).unwrap();
+        let sequence = events.last().unwrap().sequence;
+        let original = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+        f.store.acknowledge(sequence).unwrap();
+        assert_eq!(
+            crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap(),
+            original,
+            "notification ACK must never hold a prepared intent"
+        );
+        let events = f.store.pending_events(1000).unwrap();
+        // Negative corruption of a genuinely prepared17 parent. There is NO
+        // action owner, and quarantine_in_flight alone must never grant one.
+        f.store.conn.execute("UPDATE retirement_intents SET revision=2,stage='held',held_reason='quarantine_in_flight' WHERE operation=?1", [operation.to_string()]).unwrap();
+        fn raw_intents(conn: &rusqlite::Connection) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = conn
+                .prepare("SELECT * FROM retirement_intents ORDER BY operation")
+                .unwrap();
+            let columns = stmt.column_count();
+            let rows = stmt
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        }
+        let before = abort_source_rows(&f.store);
+        let intent_before = raw_intents(&f.store.conn);
+        assert!(f.store.acknowledge(sequence).is_err());
+        assert_eq!(f.store.pending_events(1000).unwrap(), events);
+        assert!(crate::retirement_journal::read_history(&f.store.conn, Uuid::now_v7()).is_err());
+        let mut canonical = b"untouched".to_vec();
+        assert!(crate::retirement_journal::frame_history_without(
+            &f.store.conn,
+            f.allocation.checkout,
+            operation,
+            &mut canonical
+        )
+        .is_err());
+        assert_eq!(canonical, b"untouched");
+        assert!(abort_offline(
+            &config,
+            f.allocation.checkout,
+            operation,
+            2,
+            AbortFault::None
+        )
+        .is_err());
+        assert_eq!(abort_source_rows(&f.store), before);
+        assert_eq!(raw_intents(&f.store.conn), intent_before);
+        let reason: String = f
+            .store
+            .conn
+            .query_row(
+                "SELECT held_reason FROM retirement_intents WHERE operation=?1",
+                [operation.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "quarantine_in_flight");
     }
 
     #[test]

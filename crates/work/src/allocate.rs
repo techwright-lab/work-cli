@@ -1676,8 +1676,14 @@ mod physical_tests {
 /// A live, Store-instance-bound exclusion capability, never a wire value.
 pub(crate) struct AuthorityLease {
     _file: fs::File,
-    schema: crate::store::SchemaParticipation,
+    schema: crate::store::InitializationRetention,
     authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+    purpose: AuthorityPurpose,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthorityPurpose {
+    Store(crate::store::SchemaRole),
+    Migration,
 }
 impl Drop for AuthorityLease {
     fn drop(&mut self) {
@@ -1690,12 +1696,56 @@ impl Drop for AuthorityLease {
 }
 impl AuthorityLease {
     pub(crate) fn check(&self, store: &Store) -> crate::store::Result<()> {
-        if !store.writable_authority() {
-            return Err(crate::store::StoreError::Unsafe);
-        }
+        store.require_current()?;
         self.check_authority(store.authority_identity())
     }
     pub(crate) fn check_authority(
+        &self,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> crate::store::Result<()> {
+        if self.purpose != AuthorityPurpose::Store(crate::store::SchemaRole::Current17) {
+            return Err(crate::store::StoreError::Invalid);
+        }
+        self.check_binding(authority)
+    }
+    pub(crate) fn check_abort(&self, store: &Store) -> crate::store::Result<()> {
+        if !store.writable_authority()
+            || self.purpose != AuthorityPurpose::Store(store.schema_role())
+            || !matches!(
+                store.schema_role(),
+                crate::store::SchemaRole::Current17 | crate::store::SchemaRole::Legacy16Abort
+            )
+        {
+            return Err(crate::store::StoreError::Unsafe);
+        }
+        self.check_binding(store.authority_identity())
+    }
+    pub(crate) fn check_abort_transaction(
+        &self,
+        conn: &rusqlite::Connection,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> crate::store::Result<()> {
+        let role = match self.purpose {
+            AuthorityPurpose::Store(
+                role @ (crate::store::SchemaRole::Current17
+                | crate::store::SchemaRole::Legacy16Abort),
+            ) => role,
+            _ => return Err(crate::store::StoreError::Invalid),
+        };
+        self.check_binding(authority)?;
+        role.validate(conn)?;
+        crate::retirement_journal::validate_all(conn)
+    }
+    pub(crate) fn check_migration(
+        &self,
+        authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    ) -> crate::store::Result<()> {
+        if self.purpose != AuthorityPurpose::Migration {
+            return Err(crate::store::StoreError::Invalid);
+        }
+        self.check_binding(authority)
+    }
+    fn check_binding(
         &self,
         authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
     ) -> crate::store::Result<()> {
@@ -1723,11 +1773,45 @@ pub(crate) fn locked(config: &Config) -> io::Result<(Store, AuthorityLease)> {
     Ok((store, lock))
 }
 pub(crate) fn lifecycle_lock(store: &Store) -> io::Result<AuthorityLease> {
-    use std::os::unix::fs::MetadataExt;
+    db(store.require_current())?;
+    store_lease(store)
+}
+pub(crate) fn retirement_abort_lease(store: &Store) -> io::Result<AuthorityLease> {
+    if !matches!(
+        store.schema_role(),
+        crate::store::SchemaRole::Legacy16Abort | crate::store::SchemaRole::Current17
+    ) {
+        return Err(err("invalid abort role"));
+    }
+    store_lease(store)
+}
+fn store_lease(store: &Store) -> io::Result<AuthorityLease> {
     db(store.may_acquire_lease())?;
-    let schema = store.schema_participation();
+    let schema = crate::store::InitializationRetention::Shared(store.schema_participation());
+    acquire_authority(
+        store.authority_identity(),
+        schema,
+        AuthorityPurpose::Store(store.schema_role()),
+    )
+}
+pub(crate) fn migration_lease(
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    initialization: &crate::store::ExclusiveInitialization,
+) -> io::Result<AuthorityLease> {
+    initialization
+        .revalidate()
+        .map_err(|_| err("initialization changed"))?;
+    db(authority.revalidate_migration())?;
+    let schema = crate::store::InitializationRetention::Migration(initialization.retain());
+    acquire_authority(authority, schema, AuthorityPurpose::Migration)
+}
+fn acquire_authority(
+    authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
+    schema: crate::store::InitializationRetention,
+    purpose: AuthorityPurpose,
+) -> io::Result<AuthorityLease> {
+    use std::os::unix::fs::MetadataExt;
     db(schema.revalidate())?;
-    let authority = store.authority_identity();
     db(schema.matches_authority(authority))?;
     let directory = fs::symlink_metadata(&authority.directory)?;
     if !directory.is_dir()
@@ -1762,6 +1846,7 @@ pub(crate) fn lifecycle_lock(store: &Store) -> io::Result<AuthorityLease> {
         _file: lock,
         schema,
         authority: std::sync::Arc::clone(authority),
+        purpose,
     })
 }
 fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {

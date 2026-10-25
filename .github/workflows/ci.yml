@@ -115,6 +115,9 @@ jobs:
           # W2 tests-first: existing-API schema/ACK behavior, not movement.
           - kind: lib
             selector: 'store::schema17_migration_tests::'
+          # Strict physical metadata only; no native movement authority.
+          - kind: lib
+            selector: 'quarantine_journal::tests::'
           - kind: lib
             selector: 'run_participants::tests::'
           - kind: lib

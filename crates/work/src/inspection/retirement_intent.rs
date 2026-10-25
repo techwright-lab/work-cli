@@ -230,17 +230,10 @@ pub(super) fn prepare_inner(
     drop(readonly);
     // A prepare may have completed between the first readonly snapshot and EX.
     // Re-read without a lease/write before collecting any fresh evidence.
+    if let Some((row, count, fence_active)) =
+        post_open_prepare_retry(&mut store, checkout, operation)?
     {
-        let _phase = store.sql_phase();
-        let tx = store
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
-            .map_err(|_| "history_unknown")?;
-        let retry = historical_operation(&tx, checkout, operation)?;
-        tx.rollback().map_err(|_| "history_unknown")?;
-        if let Some((row, count, fence_active)) = retry {
-            return Ok(historical(&row, count, fence_active));
-        }
+        return Ok(historical(&row, count, fence_active));
     }
     // Declaration is not quiescence proof. The actual mode/operator/task come
     // from the validated fresh owner, never from the allocation owner's name.
@@ -293,6 +286,25 @@ pub(super) fn prepare_inner(
     }
 }
 
+// A new transaction must enforce the actual Store pin before a historical
+// early return. Version-aware metadata readers alone cannot enforce that pin.
+pub(super) fn post_open_prepare_retry(
+    store: &mut Store,
+    checkout: Uuid,
+    operation: Uuid,
+) -> Result<Option<(IntentRow, u64, bool)>, &'static str> {
+    let role = store.schema_role();
+    let _phase = store.sql_phase();
+    let tx = store
+        .conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|_| "history_unknown")?;
+    role.validate(&tx).map_err(|_| "history_unknown")?;
+    let retry = historical_operation(&tx, checkout, operation)?;
+    tx.rollback().map_err(|_| "history_unknown")?;
+    Ok(retry)
+}
+
 /// Strict absence is distinct from corruption. Called both in the retained
 /// readonly snapshot and again inside the dedicated IMMEDIATE transaction.
 pub(super) fn historical_operation(
@@ -340,9 +352,13 @@ fn status_inner(
         .as_deref()
         .ok_or("authority_unknown")?;
     let dir = config.store_dir.as_deref().ok_or("authority_unknown")?;
-    let store = Store::open_existing_registered_readonly(registry, dir, &config.roots)
+    let store = Store::open_retirement_readonly(registry, dir, &config.roots)
         .map_err(|_| "authority_unknown")?;
     let _phase = store.sql_phase();
+    store
+        .schema_role()
+        .validate(&store.conn)
+        .map_err(|_| "history_unknown")?;
     let history = read_history(&store.conn, checkout).map_err(|_| "history_unknown")?;
     if let Some(active) = history.iter().find(|row| row.stage != "aborted") {
         let mut report = historical(active, history.len() as u64, true);
