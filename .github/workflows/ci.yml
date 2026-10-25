@@ -72,6 +72,12 @@ jobs:
           - kind: lib
             selector: 'scope_spawn::'
           - kind: lib
+            selector: attribution_gap::tests::lease_tests::public_revokers_cannot_commit_during_gap_kernel_gate
+          - kind: lib
+            selector: attribution_gap::tests::continuation::supported_holds_revoke_epochs_without_reversing_physical_closure
+          - kind: lib
+            selector: attribution_gap::tests::lease_tests::public_revokers_winning_during_gap_driver_observation_prevent_publication
+          - kind: lib
             selector: 'admission::allocation_tests::'
           - kind: lib
             selector: 'allocate::physical_tests::'
@@ -89,6 +95,8 @@ jobs:
             selector: capture_recovery::tests::unknown_run_refuses_without_invented_fence
           - kind: lib
             selector: capture_recovery::tests::reconcile_holds_prepared_intent_before_receiver
+          - kind: lib
+            selector: capture_recovery::tests::reconcile_commit_fences_after_actual_begin_without_mutating_caller_rows
           - kind: lib
             selector: capture_recovery::tests::reconcile_shared_guard_excludes_exclusive_until_drain
           - kind: lib

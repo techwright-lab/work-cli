@@ -149,9 +149,23 @@ fn missing_allocation_lock_holds() {
 #[test]
 fn missing_recovery_lock_holds_without_prepare() {
     // Reach the missing-lock gate on persistent storage, not the tmpfs guard.
+    // Allocation now uses the same cooperative common-lock namespace: remove
+    // this disposable fixture's actual lock rather than assuming it is absent.
     let f = fixture::ManagedFixture::recovery("sha1", "2");
+    let locks = f
+        .temp
+        .path()
+        .join("authority/recovery-preparation-locks-v1");
+    let entries = fs::read_dir(&locks)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1, "one actual common lock required");
+    assert!(fs::symlink_metadata(&entries[0]).unwrap().is_file());
     let (config, _) = f.approval();
     let assertion = confirm_assertion(&config, f.allocation.checkout);
+    fs::remove_file(&entries[0]).unwrap();
+    assert_eq!(fs::read_dir(&locks).unwrap().count(), 0);
     let before_sql = sql_bytes(&f);
     let before_writers = writer_count(&f);
     let before_refs = recovery_refs(&f);
@@ -159,6 +173,7 @@ fn missing_recovery_lock_holds_without_prepare() {
     assert_eq!(report.outcome(), "held");
     assert_eq!(report.reason(), "preparation_required");
     assert_disabled(&report);
+    assert_eq!(fs::read_dir(&locks).unwrap().count(), 0);
     assert_eq!(sql_bytes(&f), before_sql);
     assert_eq!(writer_count(&f), before_writers);
     assert_eq!(recovery_refs(&f), before_refs);

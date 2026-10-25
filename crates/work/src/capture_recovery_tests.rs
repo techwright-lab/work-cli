@@ -927,7 +927,10 @@ fn reconcile_commit_fences_after_actual_begin_without_mutating_caller_rows() {
             *observed.borrow_mut() = Some(crate::retirement_journal::tests::source_rows(store));
         }
     });
-    assert!(reconcile(&cfg, &root.identity().run).is_err());
+    assert_eq!(
+        reconcile(&cfg, &root.identity().run).unwrap(),
+        "begin_uncertain"
+    );
     assert!(
         before.borrow().is_some(),
         "actual BEGIN result boundary not reached"
