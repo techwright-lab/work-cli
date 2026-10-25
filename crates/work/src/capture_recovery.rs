@@ -9,7 +9,7 @@ use crate::{
     run_journal::{self, RunRecord, RunStage},
     store::{Result, Store, StoreError},
 };
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -141,22 +141,53 @@ fn fresh(observed: Instant) -> Result<()> {
         Ok(())
     }
 }
+fn checkout_for_run(conn: &Connection, run: &RunId) -> Result<uuid::Uuid> {
+    let checkout: Option<String> = conn
+        .query_row(
+            "SELECT g.checkout FROM runs r JOIN run_groups g ON g.id=r.group_id WHERE r.id=?1",
+            [run.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    crate::retirement_journal::parse_uuid(&checkout.ok_or(StoreError::Invalid)?)
+}
+
 pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
     let registry = config
         .trusted_registry
         .as_deref()
         .ok_or(StoreError::Invalid)?;
     let dir = config.store_dir.as_deref().ok_or(StoreError::Invalid)?;
+    let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
+    let checkout = {
+        let _phase = readonly.sql_phase();
+        let _read = run_journal::read_transaction(&readonly.conn)?;
+        checkout_for_run(&readonly.conn, run)?
+    };
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&readonly, checkout)?;
+    drop(readonly);
+    let mut store = Store::open_existing_registered_mut(registry, dir, &config.roots)?;
+    guard.revalidate(&store)?;
+    {
+        let lease = store.authority_lease()?;
+        crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CaptureReconcile,
+        )?;
+    }
     let before = {
-        let store = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
         let _phase = store.sql_phase();
         let _read = run_journal::read_transaction(&store.conn)?;
         target(&store.conn, run)?
     };
+    if before.allocation.checkout != checkout {
+        return Err(StoreError::Conflict);
+    }
     if before.passive {
         return Ok("existing_preparation");
     }
-    let mut store = Store::open_existing_registered_mut(registry, dir, &config.roots)?;
     if before.capture.prepared.is_some() {
         let lease = store.authority_lease()?;
         lease.check(&store)?;
@@ -165,6 +196,13 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(before.allocation.checkout),
+            crate::retirement_journal::Attempt::CaptureReconcile,
+        )?;
         let current = target(&tx, run)?;
         if current.seal != before.seal {
             return Err(StoreError::Conflict);
@@ -196,6 +234,7 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
         }
         #[cfg(test)]
         tests::observe("post_physical", &store);
+        guard.revalidate(&store)?;
         let lease = store.authority_lease()?;
         lease.check(&store)?;
         let authority = store.authority_identity().clone();
@@ -204,6 +243,13 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(before.allocation.checkout),
+            crate::retirement_journal::Attempt::CaptureReconcile,
+        )?;
         let current = target(&tx, run)?;
         if current.seal != before.seal || current.capture.prepared.is_some() {
             return Err(StoreError::Conflict);

@@ -139,6 +139,8 @@ pub(crate) enum StoreCategory {
     FinishUncertain,
     DeliveryUncertain,
     UpgradeRequired,
+    RetirementFenced,
+    OperationsInFlight,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Operation {
@@ -349,6 +351,8 @@ pub(crate) fn store_error(phase: &'static str, error: &crate::store::StoreError)
         E::CaptureFinishUncertain => StoreCategory::FinishUncertain,
         E::CaptureDeliveryUncertain => StoreCategory::DeliveryUncertain,
         E::UpgradeRequired => StoreCategory::UpgradeRequired,
+        E::RetirementFenced => StoreCategory::RetirementFenced,
+        E::OperationsInFlight => StoreCategory::OperationsInFlight,
     };
     let extended = match error {
         E::Database(rusqlite::Error::SqliteFailure(e, _)) => Some(e.extended_code),

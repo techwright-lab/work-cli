@@ -55,6 +55,121 @@ jobs:
         run: cargo test -p work-cli --locked --test inspection --test disposal --test inspection_receipts --test inspection_cli
       - name: Library and inspection Clippy
         run: cargo clippy -p work-cli --locked --lib --test inspection --test disposal --test inspection_receipts --test inspection_cli -- -D warnings
+  task10-retirement-intent:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: lib
+            selector: retirement_journal::
+          - kind: lib
+            selector: checkout_guard::
+          - kind: lib
+            selector: inspection::retirement_intent::
+          - kind: lib
+            selector: inspection::receipts::tests::
+          - kind: lib
+            selector: scope_spawn::
+          - kind: lib
+            selector: admission::allocation_tests::
+          - kind: lib
+            selector: allocate::physical_tests::
+          - kind: lib
+            selector: capture_setup::tests::begin_under_guard_refuses_unrelated_checkout_guard
+          - kind: lib
+            selector: capture_setup::tests::begin_holds_prepared_intent_before_admission_rows
+          - kind: lib
+            selector: capture_preparation::tests::prepare_under_guard_refuses_mismatched_checkout
+          - kind: lib
+            selector: capture_preparation::tests::prepare_holds_prepared_intent_before_receiver
+          - kind: lib
+            selector: capture_preparation::tests::prepare_shared_guard_excludes_exclusive_until_drain
+          - kind: lib
+            selector: capture_recovery::tests::unknown_run_refuses_without_invented_fence
+          - kind: lib
+            selector: capture_recovery::tests::reconcile_holds_prepared_intent_before_receiver
+          - kind: lib
+            selector: capture_recovery::tests::reconcile_shared_guard_excludes_exclusive_until_drain
+          - kind: lib
+            selector: capture_finalization::tests::
+          - kind: lib
+            selector: store::tests::
+          - kind: lib
+            selector: run_participants::tests::
+          - kind: lib
+            selector: attribution_gap::tests::strict_gap_shape_binding_and_schema14_migration
+          - kind: lib
+            selector: attribution_gap::tests::continuation::schema15_validation_preserves_sql_literal_semantics
+          - kind: lib
+            selector: attribution_gap::tests::continuation::schema15_and_strict_v2_preserve_legacy_bytes_without_backfill
+          - kind: lib
+            selector: attribution_gap::tests::continuation::key_rotation_and_unqualified_tails
+          - kind: test
+            selector: retirement_intent
+          - kind: test
+            selector: adopted
+          - kind: test
+            selector: allocation
+          - kind: test
+            selector: allocation_crashes
+          - kind: test
+            selector: capture_finalization
+          - kind: test
+            selector: capture_preparation
+          - kind: test
+            selector: capture_supervisor
+          - kind: test
+            selector: capture_journal
+          - kind: test
+            selector: capture_materialization
+          - kind: test
+            selector: capture_readiness
+          - kind: test
+            selector: enrollment_migration
+          - kind: test
+            selector: finish
+          - kind: test
+            selector: run_journal
+          - kind: test
+            selector: run_participants
+          - kind: test
+            selector: participants
+          - kind: test
+            selector: supervisor
+          - kind: test
+            selector: capture_cli
+          - kind: test
+            selector: run_recovery
+          - kind: test
+            selector: inspection_receipts
+          - kind: test
+            selector: inspection_cli
+          - kind: test
+            selector: linux_scope
+          - kind: test
+            selector: scope_launch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Scoped tests
+        run: |
+          if [ "${{ matrix.kind }}" = "lib" ]; then
+            cargo test -p work-cli --locked --lib ${{ matrix.selector }}
+          else
+            cargo test -p work-cli --locked --test ${{ matrix.selector }}
+          fi
+      - name: Scoped Clippy
+        run: |
+          if [ "${{ matrix.kind }}" = "lib" ]; then
+            cargo clippy -p work-cli --locked --lib -- -D warnings
+          else
+            cargo clippy -p work-cli --locked --test ${{ matrix.selector }} -- -D warnings
+          fi
   ci:
     runs-on: ubuntu-latest
     steps:

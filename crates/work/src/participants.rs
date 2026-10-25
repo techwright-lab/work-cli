@@ -216,10 +216,19 @@ impl Store {
         // Keep the lease through commit (and unchanged-event rollback on return).
         let lease = self.authority_lease()?;
         lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let run = crate::retirement_journal::parse_uuid(&event.run.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Run(run),
+            crate::retirement_journal::Attempt::AdoptedActivity,
+        )?;
         let (request, revision, _) = read(&tx, &event.run)?.ok_or(StoreError::Invalid)?;
         if request.identity.group != event.group || request.source != event.source {
             return Err(StoreError::Conflict);

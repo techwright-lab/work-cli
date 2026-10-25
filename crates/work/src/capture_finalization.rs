@@ -375,8 +375,74 @@ fn open(config: &Config) -> Result<Store> {
         &config.roots,
     )
 }
+fn checkout_for_run(conn: &Connection, run: &RunId) -> Result<uuid::Uuid> {
+    let checkout: Option<String> = conn
+        .query_row(
+            "SELECT g.checkout FROM runs r JOIN run_groups g ON g.id=r.group_id WHERE r.id=?1",
+            [run.to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    crate::retirement_journal::parse_uuid(&checkout.ok_or(StoreError::Invalid)?)
+}
+fn acquire_run_guard(
+    config: &Config,
+    run: &RunId,
+) -> Result<(crate::checkout_guard::CheckoutGuard, uuid::Uuid)> {
+    let registry = config
+        .trusted_registry
+        .as_deref()
+        .ok_or(StoreError::Invalid)?;
+    let dir = config.store_dir.as_deref().ok_or(StoreError::Invalid)?;
+    let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
+    let checkout = {
+        let _phase = readonly.sql_phase();
+        let _read = crate::run_journal::read_transaction(&readonly.conn)?;
+        checkout_for_run(&readonly.conn, run)?
+    };
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&readonly, checkout)?;
+    Ok((guard, checkout))
+}
+fn bind_guarded_store(
+    config: &Config,
+    run: &RunId,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<(Store, uuid::Uuid)> {
+    let registry = config
+        .trusted_registry
+        .as_deref()
+        .ok_or(StoreError::Invalid)?;
+    let dir = config.store_dir.as_deref().ok_or(StoreError::Invalid)?;
+    let checkout = {
+        let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
+        let _phase = readonly.sql_phase();
+        let _read = crate::run_journal::read_transaction(&readonly.conn)?;
+        checkout_for_run(&readonly.conn, run)?
+    };
+    guard.matches_checkout(checkout)?;
+    let store = open(config)?;
+    guard.revalidate(&store)?;
+    Ok((store, checkout))
+}
 pub fn retry_delivery(config: &Config, run: &RunId) -> Result<(Store, Snapshot)> {
-    let mut store = open(config)?;
+    let (guard, _) = acquire_run_guard(config, run)?;
+    retry_delivery_under_guard(config, run, &guard)
+}
+pub(crate) fn retry_delivery_under_guard(
+    config: &Config,
+    run: &RunId,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<(Store, Snapshot)> {
+    let (mut store, checkout) = bind_guarded_store(config, run, guard)?;
+    {
+        let lease = store.authority_lease()?;
+        crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CaptureDelivery,
+        )?;
+    }
     let (spec, binding, intent) = {
         let _phase = store.sql_phase();
         let _read = crate::run_journal::read_transaction(&store.conn)?;
@@ -388,9 +454,12 @@ pub fn retry_delivery(config: &Config, run: &RunId) -> Result<(Store, Snapshot)>
         let binding = binding(&capture, &spec)?;
         (spec, binding, snapshot.intent)
     };
+    #[cfg(test)]
+    tests::observe("pre_retry", &store);
     let frozen = ProcessSink::new(spec.sink().process_settings()?)
         .retry(&binding)
         .map_err(|_| StoreError::CaptureDeliveryUncertain)?;
+    guard.revalidate(&store)?;
     let snapshot = confirm(&mut store, run, &intent, &spec, &frozen)
         .map_err(|_| StoreError::CaptureDeliveryUncertain)?;
     Ok((store, snapshot))
@@ -404,7 +473,17 @@ pub fn finalize_observed(
     run: &RunId,
     before_process: impl FnOnce(),
 ) -> Result<(Store, FinalizeResult)> {
-    finalize_after_preflight(config, run, before_process, || {})
+    let (guard, _) = acquire_run_guard(config, run)?;
+    finalize_under_guard(config, run, before_process, || {}, &guard)
+}
+pub(crate) fn finalize_under_guard(
+    config: &Config,
+    run: &RunId,
+    before_process: impl FnOnce(),
+    after_preflight: impl FnOnce(),
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<(Store, FinalizeResult)> {
+    finalize_after_preflight(config, run, before_process, after_preflight, guard)
 }
 // The private boundary makes a competing commit between preflight and dispatch
 // deterministic in tests. Both callbacks execute outside every SQL phase.
@@ -413,8 +492,18 @@ fn finalize_after_preflight(
     run: &RunId,
     before_process: impl FnOnce(),
     after_preflight: impl FnOnce(),
+    guard: &crate::checkout_guard::CheckoutGuard,
 ) -> Result<(Store, FinalizeResult)> {
-    let mut store = open(config)?;
+    let (mut store, checkout) = bind_guarded_store(config, run, guard)?;
+    {
+        let lease = store.authority_lease()?;
+        crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CaptureFinalization,
+        )?;
+    }
     let existing = {
         let _phase = store.sql_phase();
         let _read = crate::run_journal::read_transaction(&store.conn)?;
@@ -434,6 +523,15 @@ fn finalize_after_preflight(
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (root, capture, spec) = target(&tx, run)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&root.request.identity().checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CaptureFinalization,
+        )?;
         let snapshot = prepare_intent(&tx, &root, &capture, &spec, &lease, &authority)?;
         if snapshot.confirmation.is_some() {
             tx.commit()?;
@@ -461,6 +559,7 @@ fn finalize_after_preflight(
             crate::capture_diagnostics::record(crate::capture_diagnostics::Event::FinishRefused);
             StoreError::CaptureFinishUncertain
         })?;
+    guard.revalidate(&store)?;
     let snapshot = confirm(&mut store, run, &intent, &spec, &frozen).map_err(|_error| {
         #[cfg(test)]
         crate::capture_diagnostics::store_error("finalization::confirm", &_error);
@@ -533,11 +632,21 @@ fn confirm(
     let mut confirmation = facts(frozen, intent, spec)?;
     let lease = store.authority_lease()?;
     lease.check(store)?;
+    let authority = store.authority_identity().clone();
     let _phase = store.sql_phase();
     let tx = store
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let (root, capture, sealed) = target(&tx, run)?;
+    let checkout =
+        crate::retirement_journal::parse_uuid(&root.request.identity().checkout.to_string())?;
+    let tx = crate::retirement_journal::fence(
+        tx,
+        &lease,
+        &authority,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        crate::retirement_journal::Attempt::CaptureDelivery,
+    )?;
     let mut snapshot = validate(&tx, &root, &capture, &sealed)?.ok_or(StoreError::Invalid)?;
     if snapshot.intent != *intent
         || context(&root, &capture, spec)? != intent.context

@@ -1122,3 +1122,35 @@ fn receiver_failure_records_intent_writer_hold_without_starting_launcher() {
         .query_row("SELECT ready FROM checkouts", [], |r| r.get::<_, bool>(0))
         .unwrap());
 }
+fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: Uuid) {
+    let operation = Uuid::now_v7();
+    sql.execute(
+        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+        rusqlite::params![
+            operation.to_string(),
+            checkout.to_string(),
+            [3u8; 32].as_slice(),
+            [4u8; 32].as_slice()
+        ],
+    )
+    .unwrap();
+}
+#[test]
+fn prepared_intent_refuses_captured_supervise_without_receiver() {
+    let h = Harness::new();
+    let sql = rusqlite::Connection::open(h.f.temp.path().join("private/store.sqlite")).unwrap();
+    seed_prepared_fence(&sql, h.command.checkout);
+    assert!(h.execute().is_err());
+    assert!(!h.f.temp.path().join("calls").exists());
+    let (revision, stage, reason): (i64, String, Option<String>) = sql
+        .query_row(
+            "SELECT revision, stage, held_reason FROM retirement_intents WHERE checkout=?1",
+            [h.command.checkout.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, stage.as_str(), reason.as_deref()),
+        (2, "held", Some("capture_admission"))
+    );
+}

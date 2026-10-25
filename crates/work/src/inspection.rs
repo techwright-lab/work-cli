@@ -26,10 +26,15 @@ pub(crate) use approval::ApprovalCommand;
 pub use approval::{approve_begin, approve_confirm, ApprovalReport};
 
 mod recovery_refs;
+pub(crate) use recovery_refs::AllocationCommonLock;
 pub use recovery_refs::{prepare_recovery, prepare_recovery_refused, RecoveryReport};
 
 mod retirement;
 pub use retirement::{assess_retirement, RetirementAssessmentReport};
+mod retirement_intent;
+pub use retirement_intent::{
+    abort_retirement, prepare_retirement, retirement_status, RetirementIntentReport,
+};
 
 mod receipts;
 pub use receipts::{
@@ -306,7 +311,9 @@ pub(crate) fn configured_report(
 // allocation.lock. Participating lifecycle writers never unlink this lock.
 // Retaining/rechecking its descriptor detects rebinding, but cannot prevent a
 // hostile unlink race from reaching the general opener's create(true) path.
-fn open_configured_store(config: &crate::config::Config) -> Result<Store, InspectionError> {
+pub(super) fn open_configured_store(
+    config: &crate::config::Config,
+) -> Result<Store, InspectionError> {
     use std::os::unix::fs::MetadataExt;
     let registry = config.trusted_registry.as_deref().ok_or(InspectionError)?;
     let directory = config.store_dir.as_deref().ok_or(InspectionError)?;
@@ -644,11 +651,14 @@ fn finish_observation(
     })
 }
 
-struct Context {
-    allocation: crate::allocate::Allocation,
-    canonical: Vec<u8>,
+pub(super) struct Context {
+    pub(super) allocation: crate::allocate::Allocation,
+    pub(super) canonical: Vec<u8>,
+    pub(super) source: Vec<u8>,
+    pub(super) history: Vec<u8>,
+    pub(super) history_count: u64,
 }
-fn snapshot(
+pub(super) fn snapshot(
     store: &mut Store,
     checkout: Uuid,
     b: &mut Budget,
@@ -709,7 +719,7 @@ fn snapshot_in_transaction(
     let version: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(unavailable)?;
-    if version != 15 {
+    if version != 16 {
         return Err(IncompleteReason::ContextUnavailable);
     }
     frame(&mut canonical, 4, &version.to_be_bytes());
@@ -818,9 +828,16 @@ fn snapshot_in_transaction(
     {
         return Err(IncompleteReason::ContextUnavailable);
     }
+    let source = canonical.clone();
+    let (history, history_count) =
+        crate::retirement_journal::frame_history(tx, checkout, &mut canonical)
+            .map_err(|_| IncompleteReason::ContextUnavailable)?;
     Ok(Context {
         allocation,
         canonical,
+        source,
+        history,
+        history_count,
     })
 }
 
@@ -2605,7 +2622,7 @@ struct Budget {
     process_events: Vec<&'static str>,
 }
 impl Budget {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             start: Instant::now(),
             remote_home: None,

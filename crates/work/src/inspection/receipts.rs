@@ -41,6 +41,8 @@ pub enum ReceiptError {
     Corrupt,
     #[error("inspection receipt publication durability unknown")]
     DurabilityUnknown { id: Uuid, digest: [u8; 32] },
+    #[error("retirement intent fences receipt publication")]
+    RetirementIntentActive,
 }
 impl ReceiptError {
     pub(super) fn label(&self) -> &'static str {
@@ -54,6 +56,7 @@ impl ReceiptError {
             Self::Missing => "missing",
             Self::Corrupt => "corrupt",
             Self::DurabilityUnknown { .. } => "durability_unknown",
+            Self::RetirementIntentActive => "retirement_intent_active",
         }
     }
 }
@@ -124,6 +127,29 @@ pub fn inspect_and_record(
     checkout: Uuid,
     policies: &ValidatedPolicies,
 ) -> std::result::Result<RecordOutcome, InspectionError> {
+    let guard = crate::checkout_guard::CheckoutGuard::shared(store, checkout)
+        .map_err(|_| InspectionError)?;
+    if let Err(error) = guarded_checkpoint(
+        store,
+        &guard,
+        checkout,
+        crate::retirement_journal::Attempt::ReceiptPublication,
+    ) {
+        // No filesystem/Git collection on refusal, and no positive observation.
+        let observation = super::finish_observation(
+            policies,
+            checkout.as_bytes(),
+            &[],
+            vec![],
+            vec![],
+            Some(super::IncompleteReason::ContextConflict),
+            &super::Budget::new(),
+        )?;
+        return Ok(RecordOutcome {
+            observation,
+            receipt: Err(error),
+        });
+    }
     let mut captured = super::collect(
         store,
         checkout,
@@ -131,7 +157,7 @@ pub fn inspect_and_record(
         #[cfg(test)]
         None,
     )?;
-    let receipt = persist(store, &mut captured, Fault::None);
+    let receipt = persist_under_guard(store, &mut captured, &guard, Fault::None);
     Ok(RecordOutcome {
         observation: captured.observation,
         receipt,
@@ -149,27 +175,68 @@ enum Fault {
     #[cfg(test)]
     DirectorySync,
 }
+pub(super) fn store_error(error: crate::store::StoreError) -> ReceiptError {
+    match error {
+        crate::store::StoreError::RetirementFenced => ReceiptError::RetirementIntentActive,
+        _ => ReceiptError::Conflict,
+    }
+}
+
+pub(super) fn guarded_checkpoint(
+    store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    checkout: Uuid,
+    attempt: crate::retirement_journal::Attempt,
+) -> Result<()> {
+    guard
+        .require_matching(store, checkout)
+        .map_err(store_error)?;
+    let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
+    crate::retirement_journal::checkpoint(
+        store,
+        &lease,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        attempt,
+    )
+    .map_err(store_error)
+}
+
 // Closed actual-evidence cases only, never a byte-append or public storage API.
 enum Publication<'a> {
-    CapturedInspection(&'a mut Captured),
+    CapturedInspection(&'a mut Captured, &'a crate::checkout_guard::CheckoutGuard),
     SealedApproval(&'a mut super::approval::SealedApproval),
 }
 impl Publication<'_> {
+    fn require_guard(&self, store: &Store) -> Result<()> {
+        match self {
+            Self::CapturedInspection(c, guard) => guard
+                .require_matching(
+                    store,
+                    c.context
+                        .as_ref()
+                        .ok_or(ReceiptError::Conflict)?
+                        .allocation
+                        .checkout,
+                )
+                .map_err(store_error),
+            Self::SealedApproval(a) => a.require_guard(store),
+        }
+    }
     fn captured(&mut self) -> &mut Captured {
         match self {
-            Self::CapturedInspection(c) => c,
+            Self::CapturedInspection(c, _) => c,
             Self::SealedApproval(a) => a.captured(),
         }
     }
     fn id(&self) -> Uuid {
         match self {
-            Self::CapturedInspection(_) => Uuid::now_v7(),
+            Self::CapturedInspection(..) => Uuid::now_v7(),
             Self::SealedApproval(a) => a.id(),
         }
     }
     fn extension(&self) -> Result<Option<Vec<u8>>> {
         match self {
-            Self::CapturedInspection(_) => Ok(None),
+            Self::CapturedInspection(..) => Ok(None),
             Self::SealedApproval(a) => a
                 .extension()
                 .map(Some)
@@ -202,14 +269,53 @@ pub(super) fn publish_approval(
 ) -> Result<PersistedReceipt> {
     publish(store, Publication::SealedApproval(sealed), Fault::None)
 }
+#[cfg(test)]
 fn persist(store: &mut Store, captured: &mut Captured, fault: Fault) -> Result<PersistedReceipt> {
-    publish(store, Publication::CapturedInspection(captured), fault)
+    let checkout = captured
+        .context
+        .as_ref()
+        .ok_or(ReceiptError::Conflict)?
+        .allocation
+        .checkout;
+    let guard =
+        crate::checkout_guard::CheckoutGuard::shared(store, checkout).map_err(store_error)?;
+    persist_under_guard(store, captured, &guard, fault)
+}
+fn persist_under_guard(
+    store: &mut Store,
+    captured: &mut Captured,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    fault: Fault,
+) -> Result<PersistedReceipt> {
+    publish(
+        store,
+        Publication::CapturedInspection(captured, guard),
+        fault,
+    )
 }
 fn publish(
     store: &mut Store,
     mut publication: Publication<'_>,
     fault: Fault,
 ) -> Result<PersistedReceipt> {
+    publication.require_guard(store)?;
+    let checkout = publication
+        .captured()
+        .context
+        .as_ref()
+        .ok_or(ReceiptError::Conflict)?
+        .allocation
+        .checkout;
+    {
+        let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
+        crate::retirement_journal::checkpoint(
+            store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::ReceiptPublication,
+        )
+        .map_err(store_error)?;
+    }
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     let id = publication.id();
     let extension = publication.extension()?;
@@ -255,7 +361,8 @@ fn publish(
         return Err(ReceiptError::Io);
     }
     reservation.file.sync_all().map_err(|_| ReceiptError::Io)?;
-    // Retained descriptor/Git evidence and ORIGINAL Budget: outside both guards.
+    // Retained descriptor/Git evidence and ORIGINAL Budget: outside SQL/global
+    // lease, but still inside the caller's checkout SH guard.
     captured
         .physical
         .as_ref()
@@ -263,6 +370,7 @@ fn publish(
         .recheck(&mut captured.budget)
         .map_err(|_| ReceiptError::Conflict)?;
     publication.recheck()?;
+    publication.require_guard(store)?;
     let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     reservation.check(store, true)?;
@@ -271,8 +379,16 @@ fn publish(
         let phase = store.sql_phase();
         let tx = store
             .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| ReceiptError::Conflict)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::ReceiptPublication,
+        )
+        .map_err(store_error)?;
         let captured = publication.captured();
         let context = captured.context.as_ref().ok_or(ReceiptError::Conflict)?;
         let current = super::snapshot_in_transaction(
@@ -286,7 +402,7 @@ fn publish(
             return Err(ReceiptError::Conflict);
         }
         publication.context_matches(&tx, &current)?;
-        tx.rollback().map_err(|_| ReceiptError::Conflict)?;
+        tx.commit().map_err(|_| ReceiptError::Conflict)?;
         drop(phase);
     }
     publication
@@ -622,18 +738,30 @@ fn reject_volatile(file: &File) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn recovery_storage_persistent(store: &Store) -> Result<()> {
+pub(super) fn recovery_storage_persistent(
+    store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    checkout: Uuid,
+) -> Result<()> {
+    guarded_checkpoint(
+        store,
+        guard,
+        checkout,
+        crate::retirement_journal::Attempt::RecoveryRefs,
+    )?;
     let location = Location::open(store, false).or_else(|_| Location::open(store, true))?;
     reject_volatile(&location.dir)?;
     reject_volatile(&location.parent)?;
     Ok(())
 }
 pub(super) fn resync_recovery_published(
-    store: &Store,
+    store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    checkout: Uuid,
     id: Uuid,
     budget: &mut super::Budget,
 ) -> Result<()> {
-    recovery_storage_persistent(store)?;
+    recovery_storage_persistent(store, guard, checkout)?;
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     budget.check().map_err(|_| ReceiptError::Conflict)?;
     budget.entry().map_err(|_| ReceiptError::Conflict)?;
@@ -654,17 +782,31 @@ pub(super) fn resync_recovery_published(
 }
 pub(super) fn publish_recovery_intent(
     store: &mut Store,
-    publication: &super::recovery_refs::RecoveryIntentPublication,
+    publication: &super::recovery_refs::RecoveryIntentPublication<'_>,
     reservation: Reservation,
     context: &super::Context,
     budget: &mut super::Budget,
 ) -> Result<PersistedReceipt> {
+    publication
+        .guard()
+        .require_matching(store, context.allocation.checkout)
+        .map_err(store_error)?;
+    if publication.checkout() != context.allocation.checkout {
+        return Err(ReceiptError::Conflict);
+    }
+    guarded_checkpoint(
+        store,
+        publication.guard(),
+        publication.checkout(),
+        crate::retirement_journal::Attempt::RecoveryRefs,
+    )?;
     if reservation.id != publication.id() || reservation.length != publication.length() {
         return Err(ReceiptError::Conflict);
     }
     write_reserved(reservation, publication.bytes(), budget)?;
     publish_recovery_record(
         store,
+        publication.guard(),
         publication.id(),
         publication.length(),
         context,
@@ -673,15 +815,23 @@ pub(super) fn publish_recovery_intent(
 }
 pub(super) fn publish_recovery_result(
     store: &mut Store,
-    publication: &super::recovery_refs::RecoveryResultPublication,
+    publication: &super::recovery_refs::RecoveryResultPublication<'_>,
     context: &super::Context,
     budget: &mut super::Budget,
 ) -> Result<PersistedReceipt> {
+    publication
+        .guard()
+        .require_matching(store, context.allocation.checkout)
+        .map_err(store_error)?;
+    if publication.checkout() != context.allocation.checkout {
+        return Err(ReceiptError::Conflict);
+    }
     restart_recovery_result(store, publication, budget)?;
     #[cfg(test)]
     RESULT_PUBLISH.with(|flag| flag.set(true));
     let published = publish_recovery_record(
         store,
+        publication.guard(),
         publication.id(),
         publication.length(),
         context,
@@ -693,13 +843,14 @@ pub(super) fn publish_recovery_result(
 }
 fn publish_recovery_record(
     store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
     id: Uuid,
     length: u64,
     context: &super::Context,
     budget: &mut super::Budget,
 ) -> Result<PersistedReceipt> {
-    recovery_storage_persistent(store)?;
-    publish_reserved(store, id, length, context, budget)
+    recovery_storage_persistent(store, guard, context.allocation.checkout)?;
+    publish_reserved(store, guard, id, length, context, budget)
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RecoveryResultBinding {
@@ -743,11 +894,15 @@ fn write_reserved(
 
 fn publish_reserved(
     store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
     id: Uuid,
     length: u64,
     context: &super::Context,
     budget: &mut super::Budget,
 ) -> Result<PersistedReceipt> {
+    guard
+        .require_matching(store, context.allocation.checkout)
+        .map_err(store_error)?;
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     uuid(id.to_string().as_bytes()).map_err(|_| ReceiptError::Conflict)?;
     budget.check().map_err(|_| ReceiptError::Conflict)?;
@@ -764,15 +919,23 @@ fn publish_reserved(
         let phase = store.sql_phase();
         let tx = store
             .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| ReceiptError::Conflict)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(context.allocation.checkout),
+            crate::retirement_journal::Attempt::RecoveryRefs,
+        )
+        .map_err(store_error)?;
         let current =
             super::snapshot_in_transaction(&tx, &authority, context.allocation.checkout, budget)
                 .map_err(|_| ReceiptError::Conflict)?;
         if current.canonical != context.canonical {
             return Err(ReceiptError::Conflict);
         }
-        tx.rollback().map_err(|_| ReceiptError::Conflict)?;
+        tx.commit().map_err(|_| ReceiptError::Conflict)?;
         drop(phase);
     }
     let final_name = format!("{id}.receipt");
@@ -822,12 +985,12 @@ fn publish_reserved(
     Ok(PersistedReceipt { id, digest })
 }
 
-pub(super) fn restart_recovery_result(
-    store: &Store,
-    publication: &super::recovery_refs::RecoveryResultPublication,
+fn restart_recovery_result(
+    store: &mut Store,
+    publication: &super::recovery_refs::RecoveryResultPublication<'_>,
     budget: &mut super::Budget,
 ) -> Result<()> {
-    recovery_storage_persistent(store)?;
+    recovery_storage_persistent(store, publication.guard(), publication.checkout())?;
     let bound = publication.binding();
     let bytes = publication.bytes();
     if publication.id() != bound.id
@@ -889,11 +1052,28 @@ pub(super) fn restart_recovery_result(
     Ok(())
 }
 
-pub(super) fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservation> {
+fn reserve(store: &Store, id: Uuid, length: u64) -> Result<Reservation> {
     reserve_with_budget(store, id, length, None)
 }
 
-pub(super) fn reserve_with_budget(
+pub(super) fn reserve_recovery(
+    store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    checkout: Uuid,
+    id: Uuid,
+    length: u64,
+    budget: &mut super::Budget,
+) -> Result<Reservation> {
+    guarded_checkpoint(
+        store,
+        guard,
+        checkout,
+        crate::retirement_journal::Attempt::RecoveryRefs,
+    )?;
+    reserve_with_budget(store, id, length, Some(budget))
+}
+
+fn reserve_with_budget(
     store: &Store,
     id: Uuid,
     length: u64,
@@ -1441,6 +1621,91 @@ use crate as work_cli_api;
 #[path = "../../tests/support/inspection_fixture.rs"]
 mod fixture;
 
+// Private journal seed only: never a public prepare capability.
+#[cfg(test)]
+pub(super) fn seed_collector_intent(store: &Store, checkout: Uuid) -> Uuid {
+    use crate::retirement_journal::{encode_record, ImmutableBinding, IntentRecord, Mode, Stage};
+    let operation = Uuid::now_v7();
+    let digest = hex(&[1; 32]);
+    let record = IntentRecord {
+        version: 1,
+        operation: operation.to_string(),
+        checkout: checkout.to_string(),
+        mode: Mode::Supervised,
+        revision: 1,
+        stage: Stage::Prepared,
+        assertion: None,
+        declaration: None,
+        predecessor_hex: digest.clone(),
+        source_hex: digest.clone(),
+        history_predecessor_hex: digest.clone(),
+        prior_history_count: 0,
+        immutable_binding: ImmutableBinding {
+            version: 1,
+            authority_allocation: digest.clone(),
+            source_sql: digest.clone(),
+            managed_physical: digest.clone(),
+            census: digest.clone(),
+            git_private: digest.clone(),
+            local_git: digest.clone(),
+            git_inputs: digest.clone(),
+            source_commitment: digest.clone(),
+            approval_semantic: digest.clone(),
+            approval_invalidation: digest.clone(),
+            protection: digest.clone(),
+            protection_count: 0,
+            config_manifests: [digest.clone(), digest.clone()],
+            inspection_policy: digest.clone(),
+            combined_policy: digest.clone(),
+            operator: digest.clone(),
+            source_repository: digest.clone(),
+        },
+        quiescence: "empty".into(),
+        task_completion: "supervised_empty".into(),
+        policy_digest: digest.clone(),
+        combined_policy_digest: digest,
+        prepared_wall_ms: 1,
+        remote_cleanup: "not_required".into(),
+    };
+    store.conn.execute(
+        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,predecessor,source,record) VALUES(?1,?2,1,'prepared','supervised',?3,?3,?4)",
+        rusqlite::params![operation.to_string(), checkout.to_string(), [1u8; 32].as_slice(), encode_record(&record).unwrap()],
+    ).unwrap();
+    operation
+}
+
+#[cfg(test)]
+pub(super) fn collector_source(store: &mut Store, checkout: Uuid) -> Vec<u8> {
+    super::snapshot(store, checkout, &mut super::Budget::new())
+        .unwrap()
+        .source
+}
+
+#[cfg(test)]
+pub(super) fn assert_collector_held(store: &Store, checkout: Uuid, attempt: &str) {
+    let row: (String, i64, String) = store
+        .conn
+        .query_row(
+            "SELECT stage,revision,held_reason FROM retirement_intents WHERE checkout=?1",
+            [checkout.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("held".into(), 2, attempt.into()));
+    let events = store
+        .pending_events(1000)
+        .unwrap()
+        .into_iter()
+        .filter(|p| {
+            matches!(
+                &p.event, crate::events::Event::RetirementIntentChanged { checkout: id, stage, .. }
+                if *id == checkout && stage == "held"
+            )
+        })
+        .count();
+    assert_eq!(events, 1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1467,6 +1732,47 @@ mod tests {
             })
             .count()
     }
+    #[test]
+    fn recorded_inspection_holds_before_collection_or_pending_files() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        seed_collector_intent(&f.store, f.allocation.checkout);
+        let before = collector_source(&mut f.store, f.allocation.checkout);
+        for _ in 0..2 {
+            let outcome =
+                inspect_and_record(&mut f.store, f.allocation.checkout, &empty()).unwrap();
+            assert_eq!(
+                outcome.receipt.unwrap_err(),
+                ReceiptError::RetirementIntentActive
+            );
+            assert_ne!(outcome.observation.coverage(), Coverage::Complete);
+            assert_collector_held(&f.store, f.allocation.checkout, "receipt_publication");
+            assert_eq!(
+                before,
+                collector_source(&mut f.store, f.allocation.checkout)
+            );
+            assert!(!directory(&f).exists());
+        }
+    }
+
+    #[test]
+    fn borrowed_wrong_checkout_or_authority_refuses_before_reservation() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let other = fixture::ManagedFixture::new("sha1", "2");
+        for guard in [
+            crate::checkout_guard::CheckoutGuard::shared(&f.store, Uuid::now_v7()).unwrap(),
+            crate::checkout_guard::CheckoutGuard::shared(&other.store, f.allocation.checkout)
+                .unwrap(),
+        ] {
+            let mut captured =
+                super::super::collect(&mut f.store, f.allocation.checkout, &empty(), None).unwrap();
+            assert_eq!(
+                persist_under_guard(&mut f.store, &mut captured, &guard, Fault::None).unwrap_err(),
+                ReceiptError::Conflict
+            );
+            assert!(!directory(&f).exists());
+        }
+    }
+
     #[test]
     fn approval_v2_uses_same_pending_capacity_failure_and_unknown_durability_protocol() {
         let f = fixture::ManagedFixture::new("sha1", "2");
@@ -1496,10 +1802,19 @@ mod tests {
                     Err(ReceiptError::Missing)
                 ));
             }
+            assert!(matches!(
+                crate::checkout_guard::CheckoutGuard::exclusive(&store, f.allocation.checkout),
+                Err(crate::store::StoreError::OperationsInFlight)
+            ));
             // Same reserved UUID cannot overwrite or retry into a renewed assertion.
             assert_eq!(
                 publish_approval(&mut store, &mut sealed).unwrap_err(),
                 ReceiptError::Conflict
+            );
+            drop(sealed);
+            assert!(
+                crate::checkout_guard::CheckoutGuard::exclusive(&store, f.allocation.checkout)
+                    .is_ok()
             );
         }
         let (mut store, mut sealed) =

@@ -238,10 +238,17 @@ fn nested_allocator_and_direct_library_mutations_share_one_lease() {
     let retried = crate::allocate::start(&config, allocation.request.clone()).unwrap();
     assert_eq!(retried.checkout, allocation.checkout);
     let (mut store, lease) = crate::allocate::locked(&config).unwrap();
+    drop(lease);
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&store, allocation.checkout).unwrap();
+    let observed =
+        crate::allocate::observe_checkout(&mut store, allocation.checkout, &guard).unwrap();
+    let lease = crate::allocate::lifecycle_lock(&store).unwrap();
     let mut current =
-        crate::allocate::verified_checkout_under_lease(&mut store, allocation.checkout, &lease)
-            .unwrap();
-    crate::recovery::reconcile_under_lease(&mut store, &mut current, &lease).unwrap();
+        crate::allocate::verified_checkout_under_lease(&mut store, observed, &lease).unwrap();
+    drop(lease);
+    let observed = crate::allocate::observe_reconciliation(&mut store, &current, &guard).unwrap();
+    let lease = crate::allocate::lifecycle_lock(&store).unwrap();
+    crate::recovery::reconcile_under_lease(&mut store, &mut current, observed, &lease).unwrap();
     crate::recovery::hold_under_lease(&mut store, &mut current, "nested safety hold", &lease)
         .unwrap();
     assert_eq!(current.stage, "held");

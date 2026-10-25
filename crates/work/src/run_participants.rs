@@ -588,10 +588,20 @@ impl Store {
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<Transition> {
         lease.check(self)?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&root.identity().checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::ChildJournal,
+        )?;
         let current = crate::run_journal::exact(&tx, root)?;
         if &proof.record.request != root || &proof.child != child || current.closed {
             return Err(StoreError::Conflict);
@@ -663,10 +673,20 @@ impl Store {
     ) -> Result<BeginRun> {
         lease.check(self)?;
         request.validate()?;
+        let authority = self.authority_identity().clone();
         let _phase = self.sql_phase();
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&root.identity().checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::ChildJournal,
+        )?;
         let record = crate::run_journal::exact(&tx, root)?;
         if let Some(existing) = record
             .children
@@ -760,6 +780,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&root.identity().checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::ChildJournal,
+        )?;
         let record = crate::run_journal::exact(&tx, root)?;
         let child = record
             .children

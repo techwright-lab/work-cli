@@ -909,6 +909,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&request.identity.checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::RunJournal,
+        )?;
         let result = begin_run_tx(&tx, request, lease, &authority)?;
         tx.commit()?;
         Ok(result)
@@ -964,6 +973,9 @@ pub(crate) fn begin_run_context(
     }
     crate::capture_journal::exclude_operation(tx, &request.identity.run)?;
     crate::capture_journal::exclude_operation(tx, &request.identity.group)?;
+    crate::retirement_journal::exclude_operation(tx, uuid(&request.identity.run)?)?;
+    crate::retirement_journal::exclude_operation(tx, uuid(&request.identity.group)?)?;
+    crate::retirement_journal::require_unfenced(tx, uuid(&request.identity.checkout)?)?;
     if read(tx, &request.identity.run)?.is_some() {
         exact(tx, request)?;
         return Ok(BeginRun::Existing);
@@ -1193,6 +1205,16 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkout = crate::retirement_journal::parse_uuid(
+            &snapshot.record.request.identity.checkout.to_string(),
+        )?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::GroupClose,
+        )?;
         let expected = &snapshot.record;
         crate::capture_journal::validate_related(&tx, &expected.request.identity.checkout)?;
         let (current, related) = exact_for_close(&tx, &expected.request)?;
@@ -1344,6 +1366,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&request.identity.checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::RunJournal,
+        )?;
         let record = exact(&tx, request)?;
         if record.closed {
             return Err(StoreError::Invalid);

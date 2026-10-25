@@ -25,6 +25,13 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::OwnerTransfer,
+        )?;
         let (repo, owner): (String, String) = tx.query_row(
             "SELECT repository,owner FROM checkouts WHERE id=?1 AND state!='retired'",
             [checkout.to_string()],
@@ -78,6 +85,13 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Owner(owner.to_owned()),
+            crate::retirement_journal::Attempt::OwnerRetire,
+        )?;
         let retired: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM retired_owners WHERE owner=?1)",
             [operator],

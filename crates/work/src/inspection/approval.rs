@@ -509,6 +509,7 @@ pub(super) struct Collector {
     mode: Option<AdoptedMode>,
     baseline: Option<ApprovalRecord>,
     store: Option<Store>,
+    guard: Option<crate::checkout_guard::CheckoutGuard>,
     sealed: Option<SealedApproval>,
     failure: Option<&'static str>,
 }
@@ -525,6 +526,7 @@ impl Collector {
             mode: None,
             baseline: None,
             store: None,
+            guard: None,
             sealed: None,
             failure: None,
         }
@@ -534,6 +536,17 @@ impl Collector {
         Ok(())
     }
     pub(super) fn configure(&mut self, document: &ConfigDocument, config: &Config) -> Held<()> {
+        let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, self.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let mut store = open_configured_store(config).map_err(|_| "authority_unknown")?;
+        receipts::guarded_checkpoint(
+            &mut store,
+            &guard,
+            self.checkout,
+            crate::retirement_journal::Attempt::ReceiptPublication,
+        )
+        .map_err(|e| e.label())?;
+        self.guard = Some(guard);
         let policy = document.approval().map_err(|_| "approval_policy_unknown")?;
         let policies = document
             .inspection_policies()
@@ -556,7 +569,6 @@ impl Collector {
             )
             .map_err(|_| "policy_unknown")?,
         );
-        let store = open_configured_store(config).map_err(|_| "authority_unknown")?;
         if let Operation::Confirm { observation } = self.operation {
             let receipt = read_receipt(&store, observation).map_err(|_| "baseline_ineligible")?;
             let baseline = receipt.approval_record().ok_or("baseline_ineligible")?;
@@ -576,6 +588,11 @@ impl Collector {
     }
     pub(super) fn context(&mut self, b: &mut Budget) -> Held<Context> {
         let store = self.store.as_mut().ok_or("authority_unknown")?;
+        self.guard
+            .as_ref()
+            .ok_or("checkout_guard_unavailable")?
+            .require_matching(store, self.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
         let phase = store.sql_phase();
@@ -768,6 +785,7 @@ impl Collector {
             ended: record.collection_end.wall_ms,
         };
         self.sealed = Some(SealedApproval {
+            guard: self.guard.take().ok_or("checkout_guard_unavailable")?,
             captured,
             record,
             id,
@@ -778,6 +796,8 @@ impl Collector {
             latest_trusted,
             #[cfg(test)]
             before_publication: None,
+            #[cfg(test)]
+            before_recheck: None,
         });
         Ok(())
     }
@@ -813,6 +833,7 @@ fn entry_semantics(observation: &Observation) -> Vec<u8> {
 }
 /// No Clone/Deserialize or public constructor. Created only by completed audit collection.
 pub(super) struct SealedApproval {
+    guard: crate::checkout_guard::CheckoutGuard,
     captured: Captured,
     record: ApprovalRecord,
     id: Uuid,
@@ -823,8 +844,20 @@ pub(super) struct SealedApproval {
     latest_trusted: ApprovalStamp,
     #[cfg(test)]
     before_publication: Option<Box<dyn FnOnce()>>,
+    #[cfg(test)]
+    before_recheck: Option<Box<dyn FnOnce()>>,
 }
 impl SealedApproval {
+    pub(super) fn require_guard(&self, store: &Store) -> Result<(), ReceiptError> {
+        let context = self
+            .captured
+            .context
+            .as_ref()
+            .ok_or(ReceiptError::Conflict)?;
+        self.guard
+            .require_matching(store, context.allocation.checkout)
+            .map_err(|_| ReceiptError::Conflict)
+    }
     pub(super) fn captured(&mut self) -> &mut Captured {
         &mut self.captured
     }
@@ -835,6 +868,10 @@ impl SealedApproval {
         self.record.encode()
     }
     pub(super) fn recheck(&mut self) -> Held<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.before_recheck.take() {
+            hook();
+        }
         let b = &mut self.captured.budget;
         for manifest in &self.manifests {
             manifest.recheck(b).map_err(|_| "configuration_changed")?;
@@ -886,17 +923,93 @@ pub(super) struct AssertionAssessment {
 }
 impl AssertionAssessment {
     pub(super) fn recheck_expiry(&mut self, budget: &mut Budget) -> Held<()> {
+        budget.check().map_err(|_| "deadline")?;
         let now = self.clock.sample(&boot(budget)?)?;
+        self.accept_time(now, budget)
+    }
+    /// Final SQL boundary: clock syscalls only, using the boot already validated
+    /// by collection/recheck_expiry. Never opens /proc, receipts or configuration.
+    /// A successful check renews no claim, deadline, baseline or quiet window.
+    pub(super) fn commit_time(&mut self, budget: &mut Budget) -> Held<()> {
+        budget.check().map_err(|_| "deadline")?;
+        let now = self.clock.sample(&self.record.collection_end.boot)?;
+        self.accept_time(now, budget)
+    }
+    fn accept_time(&mut self, now: ApprovalStamp, budget: &mut Budget) -> Held<()> {
         elapsed(&self.latest_trusted, &now)?;
         elapsed(&self.record.collection_end, &now)?;
-        let expiry = self
+        let claim = self
             .record
-            .claim_expiry
+            .claim_time
             .as_ref()
             .ok_or("assertion_ineligible")?;
-        within(&self.record.baseline_end, &now, expiry)?;
+        quiet(
+            &self.record.baseline_end,
+            claim,
+            self.record.policy.quiet_window_seconds,
+        )?;
+        elapsed(claim, &now)?;
+        within(
+            &self.record.baseline_end,
+            &now,
+            &self.record.confirmation_deadline,
+        )?;
+        within(
+            &self.record.baseline_end,
+            &now,
+            self.record
+                .claim_expiry
+                .as_ref()
+                .ok_or("assertion_ineligible")?,
+        )?;
+        budget.check().map_err(|_| "deadline")?;
         self.latest_trusted = now;
         Ok(())
+    }
+    pub(super) fn operator(&self) -> &str {
+        &self.record.policy.operator_id
+    }
+    pub(super) fn assertion_id(&self) -> Uuid {
+        self.record.reserved_assertion_id
+    }
+    #[cfg(test)]
+    pub(super) fn script_commit_fault_for_test(&mut self, fault: &str) {
+        let mut now = self.latest_trusted.clone();
+        now.wall_ms += 2;
+        now.low_ns = now.high_ns + 2_000_000;
+        now.high_ns = now.low_ns;
+        match fault {
+            "none" => (),
+            "boot" => now.boot = "00000000-0000-4000-8000-000000000099".into(),
+            "expiry" => {
+                now.wall_ms += 120_000;
+                now.low_ns += 120_000_000_000;
+                now.high_ns = now.low_ns;
+            }
+            "wall" => now.wall_ms = self.latest_trusted.wall_ms - 1,
+            "boottime" => {
+                now.low_ns = self.latest_trusted.low_ns - 1;
+                now.high_ns = now.low_ns;
+            }
+            _ => panic!("unknown private clock fault"),
+        }
+        self.clock.sequence = Some(std::cell::RefCell::new([now].into_iter().collect()));
+    }
+    #[cfg(test)]
+    pub(super) fn claim_binding_for_test(&self) -> [u8; 32] {
+        Sha256::digest(self.record.encode().unwrap()).into()
+    }
+    #[cfg(test)]
+    pub(super) fn latest_for_test(&self) -> (u64, u64, u64) {
+        (
+            self.latest_trusted.wall_ms,
+            self.latest_trusted.low_ns,
+            self.latest_trusted.high_ns,
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn script_consumed_for_test(&self) -> bool {
+        self.clock.sequence.as_ref().unwrap().borrow().is_empty()
     }
     #[cfg(test)]
     pub(super) fn expire_for_test(&mut self) {
@@ -1009,6 +1122,34 @@ pub(super) fn confirm_path(path: &Path, checkout: Uuid, observation: Uuid) -> Ap
         Clock::default(),
     )
 }
+// Real collection/publication, only the instance-local baseline clock is aged.
+// No receipt/SQL proof seed and no sleep or process-global clock override.
+#[cfg(test)]
+pub(super) fn assertion_for_retirement_test(path: &Path, checkout: Uuid) -> Uuid {
+    let mut budget = Budget::new();
+    let mut stamp = Clock::default()
+        .sample(&boot(&mut budget).unwrap())
+        .unwrap();
+    stamp.wall_ms -= 2_000;
+    stamp.low_ns -= 2_000_000_000;
+    stamp.high_ns = stamp.low_ns;
+    let baseline = approve_path(
+        path,
+        checkout,
+        Operation::Begin,
+        Clock {
+            sequence: Some(std::cell::RefCell::new(
+                std::iter::repeat_n(stamp, 16).collect(),
+            )),
+            ..Clock::default()
+        },
+    );
+    assert!(baseline.recorded(), "{baseline:?}");
+    let assertion = confirm_path(path, checkout, baseline.test_receipt_id().unwrap());
+    assert!(assertion.recorded(), "{assertion:?}");
+    assertion.test_receipt_id().unwrap()
+}
+
 #[cfg(test)]
 pub(super) fn collect_for_receipt_test(path: &Path, checkout: Uuid) -> (Store, SealedApproval) {
     let mut collector = Collector::new(checkout, Operation::Begin, Clock::default());
@@ -1073,6 +1214,125 @@ mod tests {
         assert_eq!(sealed.latest_trusted, live_anchor(&sealed));
         (f, collector.store.take().unwrap(), sealed)
     }
+    #[test]
+    fn mutation_collectors_hold_once_before_baseline_or_full_assessment() {
+        let mut f = fixture::ManagedFixture::new("sha1", "2");
+        let (path, _) = f.approval();
+        receipts::seed_collector_intent(&f.store, f.allocation.checkout);
+        let before = receipts::collector_source(&mut f.store, f.allocation.checkout);
+        for op in [
+            Operation::Begin,
+            Operation::Confirm {
+                observation: Uuid::now_v7(),
+            },
+        ] {
+            let report = approve_path(&path, f.allocation.checkout, op, Clock::default());
+            assert_eq!(report.reason, "retirement_intent_active", "{report:?}");
+            assert!(!report.recorded);
+            receipts::assert_collector_held(&f.store, f.allocation.checkout, "receipt_publication");
+            assert_eq!(
+                before,
+                receipts::collector_source(&mut f.store, f.allocation.checkout)
+            );
+            assert!(!f
+                .temp
+                .path()
+                .join("authority/inspection-receipts-v1")
+                .exists());
+        }
+    }
+
+    #[test]
+    fn sealed_owner_keeps_shared_guard_through_receipt_ack() {
+        use crate::checkout_guard::CheckoutGuard;
+        let (f, mut store, mut sealed) = sequential_fixture(RecordKind::ApprovalObservation);
+        assert!(matches!(
+            CheckoutGuard::exclusive(&f.store, f.allocation.checkout),
+            Err(crate::store::StoreError::OperationsInFlight)
+        ));
+        let registry = f.temp.path().join("registry");
+        let directory = f.temp.path().join("authority");
+        let roots = vec![f.root.clone()];
+        let checkout = f.allocation.checkout;
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = reached.clone();
+        sealed.before_publication = Some(Box::new(move || {
+            let other = Store::open_existing_registered_mut(&registry, &directory, &roots).unwrap();
+            assert!(matches!(
+                CheckoutGuard::exclusive(&other, checkout),
+                Err(crate::store::StoreError::OperationsInFlight)
+            ));
+            observed.set(true);
+        }));
+        receipts::publish_approval(&mut store, &mut sealed).unwrap();
+        assert!(reached.get());
+        assert!(matches!(
+            CheckoutGuard::exclusive(&f.store, f.allocation.checkout),
+            Err(crate::store::StoreError::OperationsInFlight)
+        ));
+        drop(sealed);
+        assert!(CheckoutGuard::exclusive(&f.store, f.allocation.checkout).is_ok());
+    }
+
+    #[test]
+    fn sealed_publication_holds_new_intent_before_reservation() {
+        let (f, mut store, mut sealed) = sequential_fixture(RecordKind::ApprovalObservation);
+        receipts::seed_collector_intent(&f.store, f.allocation.checkout);
+        assert_eq!(
+            receipts::publish_approval(&mut store, &mut sealed).unwrap_err(),
+            ReceiptError::RetirementIntentActive
+        );
+        receipts::assert_collector_held(&f.store, f.allocation.checkout, "receipt_publication");
+        assert!(!f
+            .temp
+            .path()
+            .join("authority/inspection-receipts-v1")
+            .exists());
+    }
+
+    #[test]
+    fn final_publication_fence_precedes_context_comparison_and_rename() {
+        let (f, mut store, mut sealed) = sequential_fixture(RecordKind::ApprovalObservation);
+        let registry = f.temp.path().join("registry");
+        let directory = f.temp.path().join("authority");
+        let roots = vec![f.root.clone()];
+        let checkout = f.allocation.checkout;
+        let id = sealed.id();
+        sealed.before_recheck = Some(Box::new(move || {
+            let other = Store::open_existing_registered_mut(&registry, &directory, &roots).unwrap();
+            assert!(matches!(
+                crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout),
+                Err(crate::store::StoreError::OperationsInFlight)
+            ));
+            let unrelated =
+                crate::checkout_guard::CheckoutGuard::shared(&other, Uuid::now_v7()).unwrap();
+            let lease = std::fs::File::open(directory.join("allocation.lock")).unwrap();
+            rustix::fs::flock(&lease, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                .unwrap();
+            drop((lease, unrelated));
+            // Deliberately private SQL seed, not a cooperative prepare/EX bypass.
+            receipts::seed_collector_intent(&other, checkout);
+        }));
+        assert_eq!(
+            receipts::publish_approval(&mut store, &mut sealed).unwrap_err(),
+            ReceiptError::RetirementIntentActive
+        );
+        receipts::assert_collector_held(&store, checkout, "receipt_publication");
+        assert!(matches!(
+            read_receipt(&store, id),
+            Err(ReceiptError::Missing)
+        ));
+        assert!(
+            std::fs::read_dir(f.temp.path().join("authority/inspection-receipts-v1"))
+                .unwrap()
+                .any(|e| e
+                    .unwrap()
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b"pending-"))
+        );
+    }
+
     fn live_anchor(sealed: &SealedApproval) -> ApprovalStamp {
         sealed
             .record

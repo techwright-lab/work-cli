@@ -271,3 +271,115 @@ fn generic_owned_release_refuses_captured_launch_without_fresh_private_proof() {
         );
     }
 }
+fn seed_prepared_fence(store: &Store, checkout: uuid::Uuid) {
+    let operation = uuid::Uuid::now_v7();
+    store
+        .conn
+        .execute(
+            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+            rusqlite::params![
+                operation.to_string(),
+                checkout.to_string(),
+                [3u8; 32].as_slice(),
+                [4u8; 32].as_slice()
+            ],
+        )
+        .unwrap();
+}
+fn fixture_store(cfg: &Config) -> Store {
+    Store::open_existing_registered_mut(
+        cfg.trusted_registry.as_ref().unwrap(),
+        cfg.store_dir.as_ref().unwrap(),
+        &cfg.roots,
+    )
+    .unwrap()
+}
+fn root_checkout(root: &RootRunRequest) -> uuid::Uuid {
+    uuid::Uuid::parse_str(&root.identity().checkout.to_string()).unwrap()
+}
+#[test]
+fn prepare_under_guard_refuses_mismatched_checkout() {
+    let (_temp, cfg, _a, root, spec) = qualified_fixture();
+    let store = fixture_store(&cfg);
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&store, uuid::Uuid::now_v7()).unwrap();
+    assert!(prepare_under_guard(&cfg, &root, &spec, |_, _| {}, &guard).is_err());
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM capture_runs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn prepare_holds_prepared_intent_before_receiver() {
+    let (temp, cfg, _a, root, spec) = qualified_fixture();
+    let store = fixture_store(&cfg);
+    let checkout = root_checkout(&root);
+    seed_prepared_fence(&store, checkout);
+    let error = prepare(&cfg, &root, &spec).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::store::StoreError::RetirementFenced.to_string()
+    );
+    let (revision, stage, reason): (i64, String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT revision, stage, held_reason FROM retirement_intents WHERE checkout=?1",
+            [checkout.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, stage.as_str(), reason.as_deref()),
+        (2, "held", Some("capture_admission"))
+    );
+    assert!(!temp.path().join("calls").exists());
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM capture_runs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn prepare_shared_guard_excludes_exclusive_until_drain() {
+    let (_temp, cfg, _a, root, spec) = qualified_fixture();
+    let checkout = root_checkout(&root);
+    let registry = cfg.trusted_registry.clone().unwrap();
+    let dir = cfg.store_dir.clone().unwrap();
+    let roots = cfg.roots.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || {
+        ready_rx.recv().unwrap();
+        let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
+        assert!(matches!(
+            crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout),
+            Err(crate::store::StoreError::OperationsInFlight)
+        ));
+        crate::checkout_guard::CheckoutGuard::shared(&other, uuid::Uuid::now_v7()).unwrap();
+        let lock = crate::store::AuthorityIdentity::open_lock(
+            &other.authority_identity().directory,
+            false,
+        )
+        .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        drop(lock);
+        release_tx.send(()).unwrap();
+    });
+    let (_store, result) = prepare_observed(&cfg, &root, &spec, |at, _store| {
+        if at == Boundary::RegistryRecheck {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }
+    })
+    .unwrap();
+    handle.join().unwrap();
+    assert!(matches!(result, PreparationResult::Live(_)));
+    let store = fixture_store(&cfg);
+    crate::checkout_guard::CheckoutGuard::exclusive(&store, checkout).unwrap();
+}

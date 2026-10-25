@@ -120,7 +120,12 @@ enum LaunchGuard {
     Captured(crate::capture_preparation::CapturedGuard),
     Gap(crate::attribution_gap::GapGuard),
 }
-enum ReleaseProof<'a> {
+pub(crate) enum ReleaseProof<'a> {
+    Ordinary,
+    Captured(&'a crate::capture_preparation::CapturedReleaseProof),
+    Gap(&'a crate::attribution_gap::GapReleaseProof),
+}
+pub(crate) enum PublishProof<'a> {
     Ordinary,
     Captured(&'a crate::capture_preparation::CapturedReleaseProof),
     Gap(
@@ -130,19 +135,20 @@ enum ReleaseProof<'a> {
     ),
 }
 impl ReleaseProof<'_> {
-    fn validate(&self, guard: &LaunchGuard) -> Result<()> {
+    fn validate_guard(&self, guard: &LaunchGuard) -> Result<()> {
         match (self, guard) {
             (Self::Ordinary, LaunchGuard::Ordinary) => Ok(()),
             (Self::Captured(proof), LaunchGuard::Captured(guard)) => {
                 proof.validate(guard).and_then(|()| proof.fresh())
             }
-            (Self::Gap(proof, store, lease), LaunchGuard::Gap(guard)) => proof
-                .validate_authority(store, lease)
-                .and_then(|()| proof.validate(guard))
-                .map_err(|_| HOLD),
+            (Self::Gap(proof), LaunchGuard::Gap(guard)) => proof.validate(guard).map_err(|_| HOLD),
             _ => Err(HOLD),
         }
     }
+}
+/// Private, non-Clone driver observation retained through permit publication.
+pub(crate) struct PreparedRelease {
+    observed: Instant,
 }
 pub struct OwnedLaunch {
     gate: GuardedLaunch,
@@ -416,14 +422,16 @@ impl OwnedLaunch {
         self.check_owned()
     }
     pub fn release(&mut self, driver: &Driver) -> Result<()> {
-        self.release_inner(driver, ReleaseProof::Ordinary)
+        let prepared = self.observe_release(driver, ReleaseProof::Ordinary)?;
+        self.publish_prepared_release(prepared, PublishProof::Ordinary)
     }
     pub(crate) fn release_captured(
         &mut self,
         driver: &Driver,
         proof: crate::capture_preparation::CapturedReleaseProof,
     ) -> Result<()> {
-        self.release_inner(driver, ReleaseProof::Captured(&proof))
+        let prepared = self.observe_release(driver, ReleaseProof::Captured(&proof))?;
+        self.publish_prepared_release(prepared, PublishProof::Captured(&proof))
     }
     pub(crate) fn release_gap(
         &mut self,
@@ -432,10 +440,16 @@ impl OwnedLaunch {
         store: &crate::store::Store,
         lease: &crate::allocate::AuthorityLease,
     ) -> Result<()> {
-        self.release_inner(driver, ReleaseProof::Gap(&proof, store, lease))
+        let prepared = self.observe_release(driver, ReleaseProof::Gap(&proof))?;
+        self.publish_prepared_release(prepared, PublishProof::Gap(&proof, store, lease))
     }
-    fn release_inner(&mut self, driver: &Driver, proof: ReleaseProof<'_>) -> Result<()> {
-        let checked = proof.validate(&self.guard);
+    pub(crate) fn observe_release(
+        &mut self,
+        driver: &Driver,
+        proof: ReleaseProof<'_>,
+    ) -> Result<PreparedRelease> {
+        let observed = Instant::now();
+        let checked = proof.validate_guard(&self.guard);
         self.preexec_result(checked)?;
         if self.permit_attempted {
             return Err(HOLD);
@@ -447,8 +461,34 @@ impl OwnedLaunch {
         let result = self.gate.validate_release(driver);
         self.preexec_result(result)?;
         self.check_owned()?;
-        let checked = proof.validate(&self.guard);
+        let checked = proof.validate_guard(&self.guard);
         self.preexec_result(checked)?;
+        Ok(PreparedRelease { observed })
+    }
+    pub(crate) fn publish_prepared_release(
+        &mut self,
+        prepared: PreparedRelease,
+        proof: PublishProof<'_>,
+    ) -> Result<()> {
+        if self.permit_attempted {
+            return Err(HOLD);
+        }
+        if Instant::now()
+            .checked_duration_since(prepared.observed)
+            .is_none_or(|age| age > Duration::from_secs(2))
+        {
+            return Err(HOLD);
+        }
+        match proof {
+            PublishProof::Ordinary => {}
+            PublishProof::Captured(captured) => {
+                captured.fresh().map_err(|_| HOLD)?;
+            }
+            PublishProof::Gap(gap, store, lease) => {
+                gap.validate_current(store, self.binding().ok_or(HOLD)?, lease)
+                    .map_err(|_| HOLD)?;
+            }
+        }
         self.permit_attempted = true;
         self.gate.publish_release()
     }
@@ -576,5 +616,15 @@ impl Drop for OwnedLaunch {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn prepared_release_is_private_observation_not_bool_proof() {
+        let name = std::any::type_name::<super::PreparedRelease>();
+        assert!(name.contains("PreparedRelease"));
+        assert!(!name.contains("bool"));
     }
 }

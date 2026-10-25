@@ -99,7 +99,12 @@ pub fn verify_remote(checkout: Uuid) -> RemoteReport {
 fn input<T>(result: Result<T, IncompleteReason>) -> Held<T> {
     result.map_err(|_| "local_inputs_unknown")
 }
-fn load_document(path: &Path, b: &mut Budget) -> Held<(ConfigDocument, filesystem::Manifest)> {
+// Shared bounded LOCAL collection for retirement's offline binding projection.
+// This helper performs no remote work and never creates a fresh assessment.
+pub(super) fn load_document(
+    path: &Path,
+    b: &mut Budget,
+) -> Held<(ConfigDocument, filesystem::Manifest)> {
     input(native_anchor_path(path))?;
     let mut manifest = input(filesystem::Manifest::new(
         path.parent().ok_or("configuration_unknown")?,
@@ -304,16 +309,11 @@ fn verify_with_audit(
             return Err("invalid_checkout");
         }
         report.started_ms = wall_time().map_err(|_| "clock_unknown")?;
-        if let Some(collector) = approval.as_deref_mut() {
-            collector.start(&mut b)?;
-        }
         let (document, config_manifest) = load_document(path, &mut b)?;
         let config = document.authority().map_err(|_| "configuration_unknown")?;
-        let policy = document
-            .remote_preservation()
-            .map_err(|_| "policy_unknown")?;
         let context = if let Some(collector) = approval.as_deref_mut() {
             collector.configure(&document, &config)?;
+            collector.start(&mut b)?;
             collector.context(&mut b)?
         } else if let Some(collector) = recovery.as_deref_mut() {
             collector.configure(&document, &config)?;
@@ -324,6 +324,10 @@ fn verify_with_audit(
         } else {
             readonly_context(&config, checkout, &mut b)?
         };
+        // Mutation collectors own SH and checkpoint before policy or remote IO.
+        let policy = document
+            .remote_preservation()
+            .map_err(|_| "policy_unknown")?;
         let identity = context
             .allocation
             .identity

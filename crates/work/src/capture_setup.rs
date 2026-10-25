@@ -30,7 +30,36 @@ pub fn begin(
     if request.input().attribution.is_some() {
         return Err(crate::allocate::err("capture rejects Off declaration"));
     }
+    let checkout = crate::allocate::db(crate::retirement_journal::parse_uuid(
+        &request.identity().checkout.to_string(),
+    ))?;
+    let guard = crate::allocate::db(crate::checkout_guard::CheckoutGuard::shared_known(
+        config, checkout,
+    ))?;
+    begin_under_guard(config, request, spec, &guard)
+}
+
+/// Nested capture setup. The caller retains the matching SH guard.
+pub(crate) fn begin_under_guard(
+    config: &Config,
+    request: &RootRunRequest,
+    spec: &CaptureSpec,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> std::io::Result<(Store, BeginCapturedRun)> {
+    if request.input().attribution.is_some() {
+        return Err(crate::allocate::err("capture rejects Off declaration"));
+    }
+    let checkout = crate::allocate::db(crate::retirement_journal::parse_uuid(
+        &request.identity().checkout.to_string(),
+    ))?;
     let (mut store, lock) = crate::allocate::locked(config)?;
+    crate::allocate::db(guard.require_matching(&store, checkout))?;
+    crate::allocate::db(crate::retirement_journal::checkpoint(
+        &mut store,
+        &lock,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        crate::retirement_journal::Attempt::CaptureAdmission,
+    ))?;
     // Exact historical receipts use their sealed settings, with no FS refresh,
     // current actor/profile requirement or new preparation capability.
     if crate::allocate::db(store.run_snapshot(&request.identity().run))?.is_some() {
@@ -63,6 +92,7 @@ pub fn begin(
             &store, config, request, spec,
         ))?;
         crate::allocate::db(proof.reinspect(&store))?;
+        crate::allocate::db(guard.revalidate(&store))?;
         let lock = crate::allocate::lifecycle_lock(&store)?;
         let result = crate::allocate::db(
             store.begin_certified_capture_under_lease(request, spec, &proof, &lock),

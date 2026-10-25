@@ -68,6 +68,13 @@ pub enum Event {
         to: String,
         over_quota: bool,
     },
+    RetirementIntentChanged {
+        checkout: Uuid,
+        operation: Uuid,
+        revision: u64,
+        stage: String,
+        reason: Option<String>,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingEvent {

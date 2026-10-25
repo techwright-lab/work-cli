@@ -66,12 +66,20 @@ impl RecoveryReport {
     }
 }
 
-pub(super) struct RecoveryIntentPublication {
+pub(super) struct RecoveryIntentPublication<'g> {
+    guard: &'g crate::checkout_guard::CheckoutGuard,
+    checkout: Uuid,
     id: Uuid,
     length: u64,
     bytes: Vec<u8>,
 }
-impl RecoveryIntentPublication {
+impl RecoveryIntentPublication<'_> {
+    pub(super) fn guard(&self) -> &crate::checkout_guard::CheckoutGuard {
+        self.guard
+    }
+    pub(super) fn checkout(&self) -> Uuid {
+        self.checkout
+    }
     pub(super) fn id(&self) -> Uuid {
         self.id
     }
@@ -83,13 +91,21 @@ impl RecoveryIntentPublication {
     }
 }
 
-pub(super) struct RecoveryResultPublication {
+pub(super) struct RecoveryResultPublication<'g> {
+    guard: &'g crate::checkout_guard::CheckoutGuard,
+    checkout: Uuid,
     id: Uuid,
     length: u64,
     bytes: Vec<u8>,
     binding: receipts::RecoveryResultBinding,
 }
-impl RecoveryResultPublication {
+impl RecoveryResultPublication<'_> {
+    pub(super) fn guard(&self) -> &crate::checkout_guard::CheckoutGuard {
+        self.guard
+    }
+    pub(super) fn checkout(&self) -> Uuid {
+        self.checkout
+    }
     pub(super) fn id(&self) -> Uuid {
         self.id
     }
@@ -247,6 +263,74 @@ impl OperationLock {
     }
 }
 
+/// Allocation's narrow common-operation owner. The opened Manifest is retained
+/// across Git writes; only binding identity (not mutable directory timestamps)
+/// is compared when reopening the common root after those writes.
+pub(crate) struct AllocationCommonLock {
+    lock: OperationLock,
+    key: CommonKey,
+    manifest: filesystem::Manifest,
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+    budget: Budget,
+}
+impl AllocationCommonLock {
+    pub(crate) fn acquire(store: &Store, path: &std::path::Path) -> std::io::Result<Self> {
+        crate::allocate::db(store.may_acquire_lease())?;
+        let mut budget = Budget::new();
+        native_anchor_path(path)
+            .map_err(|_| crate::allocate::err("unsafe allocation common path"))?;
+        let manifest = filesystem::Manifest::new(path, &mut budget)
+            .map_err(|_| crate::allocate::err("allocation common identity unavailable"))?;
+        sync::persistent_manifest(&manifest).map_err(crate::allocate::err)?;
+        let (dev, ino) = manifest.root_dev_ino();
+        let key = CommonKey {
+            path: path.as_os_str().as_bytes().to_vec(),
+            dev,
+            ino,
+        };
+        let lock = acquire_lock(store, &key).map_err(|reason| {
+            if reason == "preparation_busy" {
+                std::io::Error::from(std::io::ErrorKind::WouldBlock)
+            } else {
+                crate::allocate::err(reason)
+            }
+        })?;
+        Ok(Self {
+            lock,
+            key,
+            manifest,
+            authority: store.authority_identity().clone(),
+            budget,
+        })
+    }
+    pub(crate) fn revalidate(&mut self, store: &Store) -> std::io::Result<()> {
+        crate::allocate::db(store.may_acquire_lease())?;
+        if self.authority.as_ref() != store.authority_identity().as_ref() {
+            return Err(crate::allocate::err("allocation common authority changed"));
+        }
+        self.check_budget()?;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(&self.key.path));
+        let current = filesystem::Manifest::new(path, &mut self.budget)
+            .map_err(|_| crate::allocate::err("allocation common identity changed"))?;
+        if current.root_dev_ino() != (self.key.dev, self.key.ino)
+            || self.manifest.root_dev_ino() != (self.key.dev, self.key.ino)
+        {
+            return Err(crate::allocate::err("allocation common identity changed"));
+        }
+        sync::persistent_manifest(&self.manifest).map_err(crate::allocate::err)?;
+        sync::persistent_manifest(&current).map_err(crate::allocate::err)?;
+        self.lock
+            .revalidate(store, &self.key, &self.key.path)
+            .map_err(crate::allocate::err)
+    }
+    /// Clock/counters only, safe at the SQL commit boundary. Never restart Budget.
+    pub(crate) fn check_budget(&mut self) -> std::io::Result<()> {
+        self.budget
+            .check()
+            .map_err(|_| crate::allocate::err("allocation observation budget expired"))
+    }
+}
+
 pub(super) struct Retained {
     pub(super) context: Context,
     pub(super) physical: Physical,
@@ -258,6 +342,7 @@ pub(super) struct Collector {
     checkout: Uuid,
     operation: Uuid,
     store: Option<Store>,
+    guard: Option<crate::checkout_guard::CheckoutGuard>,
     lock: Option<OperationLock>,
     key: Option<CommonKey>,
     plan: Option<FreshRecoveryPlan>,
@@ -272,6 +357,7 @@ impl Collector {
             checkout,
             operation,
             store: None,
+            guard: None,
             lock: None,
             key: None,
             plan: None,
@@ -285,12 +371,27 @@ impl Collector {
         self.failure = Some(reason);
     }
     pub(super) fn configure(&mut self, _document: &ConfigDocument, config: &Config) -> Held<()> {
-        let store = open_configured_store(config).map_err(|_| "authority_unknown")?;
+        let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, self.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let mut store = open_configured_store(config).map_err(|_| "authority_unknown")?;
+        receipts::guarded_checkpoint(
+            &mut store,
+            &guard,
+            self.checkout,
+            crate::retirement_journal::Attempt::RecoveryRefs,
+        )
+        .map_err(receipt_reason)?;
+        self.guard = Some(guard);
         self.store = Some(store);
         Ok(())
     }
     pub(super) fn context(&mut self, b: &mut Budget) -> Held<Context> {
         let store = self.store.as_mut().ok_or("authority_unknown")?;
+        self.guard
+            .as_ref()
+            .ok_or("checkout_guard_unavailable")?
+            .require_matching(store, self.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
         let phase = store.sql_phase();
@@ -305,6 +406,14 @@ impl Collector {
         Ok(context)
     }
     pub(super) fn lock_common(&mut self, context: &Context, b: &mut Budget) -> Held<()> {
+        self.guard
+            .as_ref()
+            .ok_or("checkout_guard_unavailable")?
+            .require_matching(
+                self.store.as_ref().ok_or("authority_unknown")?,
+                context.allocation.checkout,
+            )
+            .map_err(|_| "checkout_guard_unavailable")?;
         let identity = context
             .allocation
             .identity
@@ -377,6 +486,7 @@ impl Collector {
             Some(&retained.config),
         );
         self.plan = Some(FreshRecoveryPlan {
+            guard: self.guard.take().ok_or("checkout_guard_unavailable")?,
             checkout: self.checkout,
             operation: self.operation,
             result_id: Uuid::now_v7(),
@@ -395,6 +505,7 @@ impl Collector {
 }
 
 struct FreshRecoveryPlan {
+    guard: crate::checkout_guard::CheckoutGuard,
     checkout: Uuid,
     operation: Uuid,
     result_id: Uuid,
@@ -464,7 +575,10 @@ fn prepare_path(
             _ => "incomplete",
         };
     }
-    if let (Some(mut store), Some(plan)) = (collector.store.take(), collector.plan.take()) {
+    // Keep the owned plan (and SH/common guards) through the final report, not
+    // merely until the receipt helper returns.
+    let mut plan = collector.plan.take();
+    if let (Some(mut store), Some(plan)) = (collector.store.take(), plan.as_mut()) {
         match resume_or_execute(
             &mut store,
             plan,
@@ -490,7 +604,7 @@ fn prepare_path(
 
 fn resume_or_execute(
     store: &mut Store,
-    mut plan: FreshRecoveryPlan,
+    plan: &mut FreshRecoveryPlan,
     report: &mut RecoveryReport,
     mut mutating_git: u64,
     #[cfg(test)] fault: Fault,
@@ -498,6 +612,7 @@ fn resume_or_execute(
     if !plan.remote_cleanup {
         return Err("incomplete_observation");
     }
+    short_context_matches(store, &plan.guard, &plan.retained.context, &mut plan.budget)?;
     sync::persistent_manifest(plan.census.common())?;
     match receipts::read_raw(store, plan.operation, &mut plan.budget) {
         Ok(bytes) => resume_published(
@@ -511,7 +626,7 @@ fn resume_or_execute(
         ),
         Err(ReceiptError::Missing) => execute_fresh(
             store,
-            &mut plan,
+            plan,
             report,
             &mut mutating_git,
             #[cfg(test)]
@@ -525,7 +640,7 @@ fn resume_or_execute(
 fn resume_published(
     store: &mut Store,
     bytes: Vec<u8>,
-    mut plan: FreshRecoveryPlan,
+    plan: &mut FreshRecoveryPlan,
     report: &mut RecoveryReport,
     mutating_git: &mut u64,
     #[cfg(test)] fault: Fault,
@@ -572,15 +687,21 @@ fn resume_published(
     #[cfg(test)]
     WITNESS_DELTA.with(|hit| hit.set(true));
     preservation::source_witness_delta(&intent.source_witness, &current_witness, &planned_new)?;
-    receipts::resync_recovery_published(store, plan.operation, &mut plan.budget).map_err(
-        |error| {
-            if matches!(error, ReceiptError::UnsafeReceiptStore) {
-                "nonpersistent_filesystem"
-            } else {
-                receipt_reason(error)
-            }
-        },
-    )?;
+    short_context_matches(store, &plan.guard, &plan.retained.context, &mut plan.budget)?;
+    receipts::resync_recovery_published(
+        store,
+        &plan.guard,
+        plan.checkout,
+        plan.operation,
+        &mut plan.budget,
+    )
+    .map_err(|error| {
+        if matches!(error, ReceiptError::UnsafeReceiptStore) {
+            "nonpersistent_filesystem"
+        } else {
+            receipt_reason(error)
+        }
+    })?;
     report.intent_id = Some(plan.operation);
     report.intent_checksum = Some(hex(&storage::intent_checksum(&bytes)?));
     report.result_id = Some(intent.result_id);
@@ -601,7 +722,7 @@ fn resume_published(
             };
             execute_cas(
                 store,
-                &mut plan,
+                plan,
                 report,
                 mutating_git,
                 Some(bytes),
@@ -656,7 +777,8 @@ fn execute_fresh(
     mutating_git: &mut u64,
     #[cfg(test)] fault: Fault,
 ) -> Held<()> {
-    receipts::recovery_storage_persistent(store).map_err(|error| {
+    short_context_matches(store, &plan.guard, &plan.retained.context, &mut plan.budget)?;
+    receipts::recovery_storage_persistent(store, &plan.guard, plan.checkout).map_err(|error| {
         if matches!(error, ReceiptError::UnsafeReceiptStore) {
             "nonpersistent_filesystem"
         } else {
@@ -676,21 +798,30 @@ fn execute_fresh(
         identity.common_git_dir.as_os_str().as_bytes(),
     )?;
     let result_len = storage::encode_result(&empty_result_stub(plan))?.len() as u64;
-    let result_res =
-        receipts::reserve_with_budget(store, plan.result_id, result_len, Some(&mut plan.budget))
-            .map_err(receipt_reason)?;
+    let result_res = receipts::reserve_recovery(
+        store,
+        &plan.guard,
+        plan.checkout,
+        plan.result_id,
+        result_len,
+        &mut plan.budget,
+    )
+    .map_err(receipt_reason)?;
     let bound = receipts::reservation_binding(&result_res).map_err(receipt_reason)?;
     drop(result_res);
     let intent = current_intent(store, plan, &bound)?;
     let intent_bytes = storage::encode_intent(&intent)?;
-    let intent_res = receipts::reserve_with_budget(
+    let intent_res = receipts::reserve_recovery(
         store,
+        &plan.guard,
+        plan.checkout,
         plan.operation,
         intent_bytes.len() as u64,
-        Some(&mut plan.budget),
+        &mut plan.budget,
     )
     .map_err(receipt_reason)?;
-    let publication = mint_intent_publication(plan, intent_bytes, &bound, plan.operation)?;
+    let publication =
+        mint_intent_publication(plan, &plan.guard, intent_bytes, &bound, plan.operation)?;
     #[cfg(test)]
     if fault == Fault::IntentWrite {
         fault_hit(Fault::IntentWrite);
@@ -723,12 +854,14 @@ fn execute_fresh(
     report.intent_id = Some(published.id());
     report.intent_checksum = Some(hex(&storage::intent_checksum(publication.bytes())?));
     report.result_id = Some(plan.result_id);
+    let intent_bytes = publication.bytes().to_vec();
+    drop(publication);
     execute_cas(
         store,
         plan,
         report,
         mutating_git,
-        Some(publication.bytes().to_vec()),
+        Some(intent_bytes),
         Some(bound),
         #[cfg(test)]
         fault,
@@ -812,12 +945,16 @@ fn intent_redundant_bindings(intent: &storage::Intent, plan: &FreshRecoveryPlan)
     Ok(())
 }
 
-fn mint_intent_publication(
+fn mint_intent_publication<'g>(
     plan: &FreshRecoveryPlan,
+    guard: &'g crate::checkout_guard::CheckoutGuard,
     intent_bytes: Vec<u8>,
     bound: &receipts::RecoveryResultBinding,
     intent_id: Uuid,
-) -> Held<RecoveryIntentPublication> {
+) -> Held<RecoveryIntentPublication<'g>> {
+    guard
+        .matches_checkout(plan.checkout)
+        .map_err(|_| "checkout_guard_unavailable")?;
     if intent_id != plan.operation
         || bound.id != plan.result_id
         || intent_bytes.len() as u64 > 2 * 1024 * 1024
@@ -838,18 +975,24 @@ fn mint_intent_publication(
         storage::Record::Result(_) => return Err("record_kind"),
     }
     Ok(RecoveryIntentPublication {
+        guard,
+        checkout: plan.checkout,
         id: plan.operation,
         length: intent_bytes.len() as u64,
         bytes: intent_bytes,
     })
 }
 
-fn mint_result_publication(
+fn mint_result_publication<'g>(
+    guard: &'g crate::checkout_guard::CheckoutGuard,
     intent: &storage::Intent,
     intent_checksum: [u8; 32],
     bound: receipts::RecoveryResultBinding,
     result_bytes: Vec<u8>,
-) -> Held<RecoveryResultPublication> {
+) -> Held<RecoveryResultPublication<'g>> {
+    guard
+        .matches_checkout(intent.checkout)
+        .map_err(|_| "checkout_guard_unavailable")?;
     if bound.id != intent.result_id
         || bound.length != result_bytes.len() as u64
         || bound.length != intent.result_length
@@ -871,6 +1014,8 @@ fn mint_result_publication(
         storage::Record::Intent(_) => return Err("record_kind"),
     }
     Ok(RecoveryResultPublication {
+        guard,
+        checkout: intent.checkout,
         id: intent.result_id,
         length: result_bytes.len() as u64,
         bytes: result_bytes,
@@ -921,6 +1066,9 @@ fn execute_cas(
             identity.common_git_dir.as_os_str().as_bytes().to_vec(),
         )
     };
+    plan.guard
+        .require_matching(store, plan.checkout)
+        .map_err(|_| "checkout_guard_unavailable")?;
     plan.lock.revalidate(store, &plan.key, &common_path)?;
     let format = plan.census.format();
     let mut created = Vec::new();
@@ -936,6 +1084,8 @@ fn execute_cas(
         fault_hit(Fault::ObjectSync);
         return Err("object_sync_failed");
     }
+    short_context_matches(store, &plan.guard, &plan.retained.context, &mut plan.budget)?;
+    // SQL and allocation lease are gone; SH/common guards span sync and every CAS.
     sync::sync_objects(&plan.retained.physical.before.common, &mut plan.budget)?;
     for entry in &plan.plan {
         sync::recovery_log_absent(plan.census.common_mut(), &entry.reference, &mut plan.budget)?;
@@ -1029,7 +1179,9 @@ fn execute_cas(
     if let Err(reason) = plan.lock.revalidate(store, &plan.key, &common_path) {
         return fail(report, reason);
     }
-    if let Err(reason) = short_context_matches(store, &plan.retained.context, &mut plan.budget) {
+    if let Err(reason) =
+        short_context_matches(store, &plan.guard, &plan.retained.context, &mut plan.budget)
+    {
         return fail(report, reason);
     }
     #[cfg(test)]
@@ -1091,11 +1243,16 @@ fn execute_cas(
         Some(value) => value,
         None => return fail(report, "result_binding_changed"),
     };
-    let publication =
-        match mint_result_publication(&decoded_intent, intent_checksum, bound, result_bytes) {
-            Ok(value) => value,
-            Err(reason) => return fail(report, reason),
-        };
+    let publication = match mint_result_publication(
+        &plan.guard,
+        &decoded_intent,
+        intent_checksum,
+        bound,
+        result_bytes,
+    ) {
+        Ok(value) => value,
+        Err(reason) => return fail(report, reason),
+    };
     if let Err(error) = receipts::publish_recovery_result(
         store,
         &publication,
@@ -1119,7 +1276,15 @@ fn execute_cas(
     Ok(())
 }
 
-fn short_context_matches(store: &mut Store, expected: &Context, b: &mut Budget) -> Held<()> {
+fn short_context_matches(
+    store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    expected: &Context,
+    b: &mut Budget,
+) -> Held<()> {
+    guard
+        .require_matching(store, expected.allocation.checkout)
+        .map_err(|_| "checkout_guard_unavailable")?;
     store.may_acquire_lease().map_err(|_| "authority_unknown")?;
     let lease = store.authority_lease().map_err(|_| "authority_busy")?;
     let authority = std::sync::Arc::clone(store.authority_identity());
@@ -1127,14 +1292,22 @@ fn short_context_matches(store: &mut Store, expected: &Context, b: &mut Budget) 
         let phase = store.sql_phase();
         let tx = store
             .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|_| "context_unknown")?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(expected.allocation.checkout),
+            crate::retirement_journal::Attempt::RecoveryRefs,
+        )
+        .map_err(|error| receipt_reason(receipts::store_error(error)))?;
         let current = snapshot_in_transaction(&tx, &authority, expected.allocation.checkout, b)
             .map_err(|_| "context_unknown")?;
         if current.canonical != expected.canonical {
             return Err("context_changed");
         }
-        tx.rollback().map_err(|_| "context_unknown")?;
+        tx.commit().map_err(|_| "context_unknown")?;
         drop(phase);
     }
     drop(lease);
@@ -1152,6 +1325,7 @@ fn receipt_reason(error: ReceiptError) -> &'static str {
         ReceiptError::Missing => "receipt_missing",
         ReceiptError::Corrupt => "receipt_corrupt",
         ReceiptError::DurabilityUnknown { .. } => "durability_unknown",
+        ReceiptError::RetirementIntentActive => "retirement_intent_active",
     }
 }
 
@@ -1475,6 +1649,87 @@ mod tests {
         let path = f.temp.path().join("config.toml");
         fs::write(&path, format!("store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\n[remote_preservation]\nformat=1\nversion='fixture-v1'\n[[remote_preservation.targets]]\ncommon_dir={:?}\nremote='backup'\nurl={url:?}\nbranch='refs/heads/preserved'\n[capture]\nexecutable=false\n", f.temp.path().join("authority"), f.temp.path().join("registry"), f.root, f.common())).unwrap();
         (f, path)
+    }
+
+    #[test]
+    fn recovery_mutation_holds_before_common_lock_or_pending_files() {
+        let (mut f, path) = setup("sha1");
+        let lock_dir = f
+            .temp
+            .path()
+            .join("authority/recovery-preparation-locks-v1");
+        let locks = || {
+            fs::read_dir(&lock_dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let meta = entry.metadata().unwrap();
+                    (
+                        entry.file_name(),
+                        (meta.dev(), meta.ino(), meta.mode(), meta.nlink()),
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let prior_locks = locks();
+        assert!(
+            !prior_locks.is_empty(),
+            "allocation must own an existing common lock"
+        );
+        receipts::seed_collector_intent(&f.store, f.allocation.checkout);
+        let before = receipts::collector_source(&mut f.store, f.allocation.checkout);
+        for _ in 0..2 {
+            let report = prepare_path(&path, f.allocation.checkout, Uuid::now_v7(), Fault::None);
+            assert_eq!(report.reason, "retirement_intent_active", "{report:?}");
+            assert!(!report.prepared());
+            assert!(report.created_refs.is_empty());
+            receipts::assert_collector_held(&f.store, f.allocation.checkout, "recovery_refs");
+            assert_eq!(
+                before,
+                receipts::collector_source(&mut f.store, f.allocation.checkout)
+            );
+            assert!(!f
+                .temp
+                .path()
+                .join("authority/inspection-receipts-v1")
+                .exists());
+            assert_eq!(
+                locks(),
+                prior_locks,
+                "fenced recovery must not create or replace common locks"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_guard_survives_cas_without_global_lease() {
+        use crate::checkout_guard::CheckoutGuard;
+        let (f, path) = setup("sha1");
+        let registry = f.temp.path().join("registry");
+        let authority = f.temp.path().join("authority");
+        let root = f.root.clone();
+        let checkout = f.allocation.checkout;
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = reached.clone();
+        AFTER_CAS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let store =
+                    Store::open_existing_registered_mut(&registry, &authority, &[root]).unwrap();
+                assert!(matches!(
+                    CheckoutGuard::exclusive(&store, checkout),
+                    Err(crate::store::StoreError::OperationsInFlight)
+                ));
+                let other = CheckoutGuard::shared(&store, Uuid::now_v7()).unwrap();
+                let lock = File::open(authority.join("allocation.lock")).unwrap();
+                rfs::flock(&lock, rfs::FlockOperation::NonBlockingLockExclusive).unwrap();
+                drop((lock, other));
+                observed.set(true);
+            }))
+        });
+        let report = prepare_path(&path, checkout, Uuid::now_v7(), Fault::None);
+        assert!(reached.get(), "{report:?}");
+        assert!(report.prepared(), "{report:?}");
+        assert!(CheckoutGuard::exclusive(&f.store, checkout).is_ok());
     }
 
     #[test]

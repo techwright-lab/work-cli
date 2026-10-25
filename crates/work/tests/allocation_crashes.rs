@@ -7,6 +7,257 @@ use work_cli::{
 };
 
 #[test]
+fn creation_boundaries_release_global_authority_but_retain_checkout_exclusion() {
+    let f = Fixture::new();
+    let config =
+        Config::from_text(&std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap())
+            .unwrap();
+    let request = Start {
+        operation: Uuid::now_v7(),
+        repository: Some(f.repo.clone()),
+        root: Some(f.root.clone()),
+        actor: Some("alice".into()),
+        owner: None,
+        task: "task".into(),
+        branch: Some("topic".into()),
+        base: "main".into(),
+        reuse_branch: false,
+    };
+    let mut visited = Vec::new();
+    let mut creation_attempts = 0;
+    let allocation = start_observed(&config, request.clone(), |at| {
+        if !matches!(at, "intent" | "created" | "identity" | "marker") {
+            return;
+        }
+        visited.push(at.to_owned());
+        let dir = f.temp.path().join("private");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("allocation.lock"))
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("store.sqlite")).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+        let id: String = conn
+            .query_row(
+                "SELECT id FROM checkouts WHERE operation=?1",
+                [request.operation.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let checkout_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(
+                dir.join("checkout-operations-v1")
+                    .join(format!("{id}.lock")),
+            )
+            .unwrap();
+        assert_eq!(
+            rustix::fs::flock(
+                &checkout_lock,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive
+            ),
+            Err(rustix::io::Errno::WOULDBLOCK)
+        );
+        drop(lock);
+        if at == "intent" {
+            // Nested retry reaches the real common lock while the creator owns
+            // it. It may refuse busy, but cannot issue a second Git-add intent.
+            let retry = start_observed(&config, request.clone(), |stage| {
+                if stage == "intent" {
+                    creation_attempts += 1;
+                }
+            });
+            assert!(retry.is_err());
+        }
+    })
+    .unwrap();
+    assert_eq!(visited, ["intent", "created", "identity", "marker"]);
+    assert_eq!(creation_attempts, 0);
+    assert_eq!(allocation.stage, "ready");
+    assert_eq!(
+        work_cli::allocate::start(&config, request)
+            .unwrap()
+            .checkout,
+        allocation.checkout
+    );
+}
+
+#[test]
+fn creation_rechecks_filter_policy_and_root_binding_after_creating_intent() {
+    for change in ["filter", "root"] {
+        let f = Fixture::new();
+        std::fs::write(f.repo.join(".gitattributes"), "payload filter=sentinel\n").unwrap();
+        std::fs::write(f.repo.join("payload"), "payload").unwrap();
+        git(&f.repo, &["add", "."]);
+        git(&f.repo, &["commit", "-m", "attributes"]);
+        let config =
+            Config::from_text(&std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap())
+                .unwrap();
+        let request = Start {
+            operation: Uuid::now_v7(),
+            repository: Some(f.repo.clone()),
+            root: Some(f.root.clone()),
+            actor: Some("alice".into()),
+            owner: None,
+            task: "task".into(),
+            branch: Some("topic".into()),
+            base: "main".into(),
+            reuse_branch: false,
+        };
+        let sentinel = f.temp.path().join("filter-executed");
+        let mut reached = false;
+        let result = start_observed(&config, request, |stage| {
+            if stage == "intent" {
+                reached = true;
+                if change == "filter" {
+                    git(
+                        &f.repo,
+                        &[
+                            "config",
+                            "filter.sentinel.smudge",
+                            &format!("touch {}; cat", sentinel.display()),
+                        ],
+                    );
+                } else {
+                    std::fs::rename(&f.root, f.temp.path().join("original-root")).unwrap();
+                    std::fs::create_dir(&f.root).unwrap();
+                }
+            }
+        });
+        assert!(reached);
+        assert!(result.is_err());
+        assert!(!sentinel.exists());
+        assert!(!f.root.join("task").exists());
+        let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM checkouts WHERE state!='retired'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT state FROM checkouts", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "held"
+        );
+    }
+}
+
+#[test]
+fn stale_reserved_creator_cannot_publish_a_second_creating_stage() {
+    let f = Fixture::new();
+    let config =
+        Config::from_text(&std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap())
+            .unwrap();
+    let request = Start {
+        operation: Uuid::now_v7(),
+        repository: Some(f.repo.clone()),
+        root: Some(f.root.clone()),
+        actor: Some("alice".into()),
+        owner: None,
+        task: "task".into(),
+        branch: Some("topic".into()),
+        base: "main".into(),
+        reuse_branch: false,
+    };
+    let mut winner = None;
+    let mut intents = 0;
+    let stale = start_observed(&config, request.clone(), |stage| {
+        if stage == "reserved" {
+            winner = Some(
+                start_observed(&config, request.clone(), |stage| {
+                    if stage == "intent" {
+                        intents += 1;
+                    }
+                })
+                .unwrap(),
+            );
+        }
+        if stage == "intent" {
+            intents += 1;
+        }
+    });
+    assert!(stale.is_err());
+    assert_eq!(intents, 1, "stale selection issued another Git intent");
+    let winner = winner.unwrap();
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    let record: String = conn
+        .query_row(
+            "SELECT record FROM allocations WHERE checkout=?1",
+            [winner.checkout.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&record).unwrap(),
+        serde_json::to_value(&winner).unwrap()
+    );
+    assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+}
+
+#[test]
+fn stale_creation_acknowledgment_never_overwrites_newer_context() {
+    for at in ["created", "identity"] {
+        let f = Fixture::new();
+        let config =
+            Config::from_text(&std::fs::read_to_string(f.temp.path().join("config.toml")).unwrap())
+                .unwrap();
+        let request = Start {
+            operation: Uuid::now_v7(),
+            repository: Some(f.repo.clone()),
+            root: Some(f.root.clone()),
+            actor: Some("alice".into()),
+            owner: None,
+            task: "task".into(),
+            branch: Some("topic".into()),
+            base: "main".into(),
+            reuse_branch: false,
+        };
+        let mut reached = false;
+        let mut retained = String::new();
+        let mut events = 0i64;
+        let result = start_observed(&config, request, |stage| {
+            if stage == at {
+                reached = true;
+                let conn =
+                    rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+                conn.execute(
+                    "UPDATE checkouts SET state='held',ready=0,owner='new-owner'",
+                    [],
+                )
+                .unwrap();
+                retained = conn
+                    .query_row("SELECT record FROM allocations", [], |r| r.get(0))
+                    .unwrap();
+                events = conn
+                    .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
+                    .unwrap();
+            }
+        });
+        assert!(reached, "{at}: boundary not reached");
+        assert!(result.is_err(), "{at}: stale acknowledgment accepted");
+        let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        let current: (String,String,bool,String) = conn.query_row("SELECT c.owner,c.state,c.ready,a.record FROM checkouts c JOIN allocations a ON a.checkout=c.id", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(
+            current,
+            ("new-owner".into(), "held".into(), false, retained)
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM outbox", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            events
+        );
+    }
+}
+
+#[test]
 fn allocation_worker() {
     let Ok(base) = std::env::var("WORK_ALLOCATION_BASE") else {
         return;
@@ -333,7 +584,7 @@ fn version_one_migration_preserves_charge_without_inventing_ready() {
     drop(s);
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
     conn.execute_batch(
-        "DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
+        "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;",
     )
     .unwrap();
     drop(conn);

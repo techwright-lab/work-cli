@@ -76,6 +76,46 @@ impl ConfigDocument {
             value: parse_toml(text)?,
         })
     }
+    pub(crate) fn load_from_path(path: &std::path::Path) -> Result<Self, Error> {
+        use std::{io::Read, os::unix::fs::OpenOptionsExt};
+        const MAX_BYTES: u64 = 1024 * 1024;
+        let unreadable =
+            || Error::Config("cannot read configuration safely within size limit".into());
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOFOLLOW).bits() as i32,
+            )
+            .open(path)
+            .map_err(|_| unreadable())?;
+        let metadata = file.metadata().map_err(|_| unreadable())?;
+        if !metadata.is_file() || metadata.len() > MAX_BYTES {
+            return Err(unreadable());
+        }
+        let mut text = String::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|_| unreadable())?;
+        if text.len() as u64 > MAX_BYTES {
+            return Err(unreadable());
+        }
+        Self::from_text(&text)
+    }
+    pub(crate) fn retirement_prepare_intents(&self) -> Result<bool, Error> {
+        let invalid = || Error::Config("invalid retirement policy".into());
+        match self.value.get("retirement") {
+            None => Ok(false),
+            Some(value) => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct RetirementPolicy {
+                    prepare_intents: bool,
+                }
+                let policy: RetirementPolicy = value.clone().try_into().map_err(|_| invalid())?;
+                Ok(policy.prepare_intents)
+            }
+        }
+    }
     pub(crate) fn authority(&self) -> Result<Config, Error> {
         Ok(Config {
             store_dir: single_path(&self.value, "store_dir")?,

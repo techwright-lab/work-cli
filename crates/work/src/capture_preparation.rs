@@ -188,19 +188,94 @@ pub fn prepare_observed(
     config: &Config,
     root: &RootRunRequest,
     spec: &CaptureSpec,
-    mut observer: impl FnMut(Boundary, &Store),
+    observer: impl FnMut(Boundary, &Store),
 ) -> std::io::Result<(Store, PreparationResult)> {
     if root.input().attribution.is_some() {
         return Err(std::io::Error::other("capture rejects Off declaration"));
     }
-    let (mut store, result) = crate::capture_setup::begin(config, root, spec)
-        .map_err(|_| std::io::Error::other("capture setup refused"))?;
+    let checkout = uuid::Uuid::parse_str(&root.identity().checkout.to_string())
+        .map_err(|_| std::io::Error::other("invalid checkout"))?;
+    let guard =
+        crate::checkout_guard::CheckoutGuard::shared_known(config, checkout).map_err(|e| {
+            if matches!(e, crate::store::StoreError::OperationsInFlight) {
+                std::io::Error::other("checkout operations in flight")
+            } else {
+                std::io::Error::other(e.to_string())
+            }
+        })?;
+    prepare_under_guard(config, root, spec, observer, &guard)
+}
+
+/// Nested preparation. The caller retains the matching SH guard through BEGIN.
+pub(crate) fn prepare_under_guard(
+    config: &Config,
+    root: &RootRunRequest,
+    spec: &CaptureSpec,
+    mut observer: impl FnMut(Boundary, &Store),
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> std::io::Result<(Store, PreparationResult)> {
+    if root.input().attribution.is_some() {
+        return Err(std::io::Error::other("capture rejects Off declaration"));
+    }
+    let checkout = uuid::Uuid::parse_str(&root.identity().checkout.to_string())
+        .map_err(|_| std::io::Error::other("invalid checkout"))?;
+    let (mut store, result) =
+        match crate::capture_setup::begin_under_guard(config, root, spec, guard) {
+            Ok(value) => value,
+            Err(error)
+                if error.to_string() == crate::store::StoreError::RetirementFenced.to_string() =>
+            {
+                return Err(error);
+            }
+            Err(_) => return Err(std::io::Error::other("capture setup refused")),
+        };
+    if guard.require_matching(&store, checkout).is_err() {
+        return Err(std::io::Error::other("checkout guard identity changed"));
+    }
     let crate::capture_journal::BeginCapturedRun::Created(handle) = result else {
         let crate::capture_journal::BeginCapturedRun::Existing(record) = result else {
             unreachable!()
         };
-        return Ok((store, PreparationResult::Existing(record)));
+        let lease = store
+            .authority_lease()
+            .map_err(|_| std::io::Error::other("authority lease unavailable"))?;
+        match crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CapturePreparation,
+        ) {
+            Ok(()) => return Ok((store, PreparationResult::Existing(record))),
+            Err(crate::store::StoreError::RetirementFenced) => {
+                return Err(std::io::Error::other(
+                    "retirement intent fences cooperative writes",
+                ));
+            }
+            Err(_) => return Err(std::io::Error::other("capture existing checkpoint refused")),
+        }
     };
+    {
+        let lease = store
+            .authority_lease()
+            .map_err(|_| std::io::Error::other("authority lease unavailable"))?;
+        match crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CapturePreparation,
+        ) {
+            Ok(()) => {}
+            Err(crate::store::StoreError::RetirementFenced) => {
+                return Err(std::io::Error::other(
+                    "retirement intent fences cooperative writes",
+                ));
+            }
+            Err(_) => return Err(std::io::Error::other("capture existing checkpoint refused")),
+        }
+    }
+    if guard.require_matching(&store, checkout).is_err() {
+        return Err(std::io::Error::other("checkout guard identity changed"));
+    }
     let attempt = (|| {
         use crate::capture_artifacts::{
             credential_name, key_metadata, Context, Directory, Registry,
@@ -238,6 +313,9 @@ pub fn prepare_observed(
         observer(Boundary::BeforeCommit, &store);
         registry.revalidate().map_err(|_| "changed registry")?;
         context.revalidate().map_err(|_| "changed context")?;
+        guard
+            .require_matching(&store, checkout)
+            .map_err(|_| "guard")?;
         store
             .record_qualified_capture_prepared(handle, &prepared, &context)
             .map_err(|_| "prepared commit")?;

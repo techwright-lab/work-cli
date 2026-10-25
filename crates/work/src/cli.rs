@@ -69,6 +69,11 @@ enum Command {
         #[arg(long, value_parser = crate::inspection::parse_checkout)]
         operation: Option<uuid::Uuid>,
     },
+    /// Persistent retirement intent fence; never move, delete or live activation
+    Retire {
+        #[command(subcommand)]
+        command: RetireCommand,
+    },
     /// Explicit task completion; retirement disabled, tree and charge retained
     Finish {
         #[arg(value_name = "checkout-id")]
@@ -132,6 +137,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             || a == "status"
             || a == "adopt"
             || a == "participant"
+            || a == "retire"
     }) {
         match Cli::try_parse_from(argv) {
             Ok(cli) => cli,
@@ -388,6 +394,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 }
             }
         }
+        Command::Retire { command } => retire(command),
         Command::Doctor {
             json,
             repositories,
@@ -433,6 +440,84 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 }
             }
         }
+    }
+}
+
+#[derive(Subcommand)]
+enum RetireCommand {
+    /// Persist a prepared retirement fence; production execution stays disabled
+    Prepare {
+        #[arg(long, value_parser = crate::inspection::parse_checkout)]
+        operation: uuid::Uuid,
+        #[arg(long, value_parser = crate::inspection::parse_checkout)]
+        assertion: Option<uuid::Uuid>,
+        #[arg(long)]
+        task_complete: bool,
+        #[arg(value_name = "checkout", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+    },
+    /// Explicit validated abort; never auto-clears on expiry, reboot or flag removal
+    Abort {
+        #[arg(long, value_parser = crate::inspection::parse_checkout)]
+        operation: uuid::Uuid,
+        #[arg(long)]
+        revision: u64,
+        #[arg(value_name = "checkout", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+    },
+    /// Read-only fence description; cannot mint capability
+    Status {
+        #[arg(value_name = "checkout", value_parser = crate::inspection::parse_checkout)]
+        checkout: uuid::Uuid,
+    },
+}
+
+fn retire(command: RetireCommand) {
+    let path = match crate::config::Config::discover_path() {
+        Some(path) => path,
+        None => {
+            eprintln!("retire refused: configuration path unknown");
+            std::process::exit(2);
+        }
+    };
+    let report = match command {
+        RetireCommand::Prepare {
+            operation,
+            assertion,
+            task_complete,
+            checkout,
+        } => crate::inspection::prepare_retirement(
+            &path,
+            checkout,
+            operation,
+            assertion,
+            task_complete,
+        ),
+        RetireCommand::Abort {
+            operation,
+            revision,
+            checkout,
+        } => crate::inspection::abort_retirement(&path, checkout, operation, revision),
+        RetireCommand::Status { checkout } => crate::inspection::retirement_status(&path, checkout),
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&report).expect("retirement serialization")
+    );
+    let ok = match command_kind(&report) {
+        "status" => report.outcome() != "held",
+        _ => report.outcome() == "prepared" || report.outcome() == "existing",
+    };
+    if !ok {
+        std::process::exit(1);
+    }
+}
+
+fn command_kind(report: &crate::inspection::RetirementIntentReport) -> &'static str {
+    if report.outcome() == "observed" {
+        "status"
+    } else {
+        "mutate"
     }
 }
 

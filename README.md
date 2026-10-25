@@ -14,7 +14,12 @@ available, plus configured `work start` allocation. Start never launches a write
 Configured supervised `work run` coordination is available for construction/testing,
 not production activation. Adopted-only declarations (`work adopt begin/event/status`) are
 available without process control. Explicit `work finish <checkout-id>` records task completion;
-retirement is disabled and every finished checkout retains its tree and charge.
+retirement remains disabled by default and every finished checkout retains its tree and charge.
+Schema 16 adds a persistent retirement-intent fence: `work retire prepare|abort|status`.
+Prepare is inert unless `[retirement] prepare_intents = true` is set; abort and status never require that flag.
+A prepared or held intent stays fenced across expiry, reboot and lost acknowledgments until an explicit validated abort.
+Historical matching prepared/held/aborted results are not fresh authority. Schema-15 approvals are ineligible and require a fresh assertion; they are not migrated.
+This slice does not move, delete, quarantine or activate production retirement. Independent CI selectors exist so Task8 parked failures cannot hide these tests.
 Configured supervised capture integration and certified continuation are implemented in source;
 production qualification/activation and removal are not implemented.
 Status does not inspect lifecycle/run inventory or qualify a live runtime; use doctor

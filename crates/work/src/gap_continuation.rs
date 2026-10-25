@@ -528,8 +528,15 @@ pub(crate) fn publish(config: &crate::config::Config, seal: GapClosureSeal) -> R
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         lease.check_authority(&authority)?;
-        fresh()?;
         let checkout = uuid::Uuid::parse_str(&q.checkout).map_err(|_| StoreError::Invalid)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::GapPublication,
+        )?;
+        fresh()?;
         with_history(&tx, checkout, |history| {
             if history
                 .nodes
@@ -1261,6 +1268,7 @@ pub(crate) fn revoke(
     checkout: uuid::Uuid,
 ) -> Result<()> {
     lease.check_authority(authority)?;
+    crate::retirement_journal::require_unfenced(tx, checkout)?;
     crate::attribution_gap::validate_raw(tx)?;
     if !crate::attribution_gap::raw_history(tx, checkout)? {
         return Ok(());

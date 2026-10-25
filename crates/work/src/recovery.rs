@@ -59,6 +59,13 @@ pub(crate) fn hold_under_lease(
                 .conn
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate),
         )?;
+        let tx = allocate::db(crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(a.checkout),
+            crate::retirement_journal::Attempt::AllocationHold,
+        ))?;
         if allocate::db(crate::attribution_gap::required_origin(&tx, a.checkout))? {
             let (state,record,finished):(String,String,bool)=allocate::sql(tx.query_row(
                 "SELECT c.state,a.record,EXISTS(SELECT 1 FROM task_finishes WHERE checkout=c.id) FROM checkouts c JOIN allocations a ON a.checkout=c.id WHERE c.id=?1",
@@ -109,63 +116,23 @@ pub(crate) fn hold_under_lease(
 }
 #[cfg(test)]
 pub(crate) fn reconcile(store: &mut Store, a: &mut Allocation) -> io::Result<()> {
+    let guard = allocate::db(crate::checkout_guard::CheckoutGuard::shared(
+        store, a.checkout,
+    ))?;
+    let observed = allocate::observe_reconciliation(store, a, &guard)?;
     let lease = allocate::lifecycle_lock(store)?;
-    reconcile_under_lease(store, a, &lease)
+    reconcile_under_lease(store, a, observed, &lease)
 }
 pub(crate) fn reconcile_under_lease(
     store: &mut Store,
     a: &mut Allocation,
+    observed: allocate::PhysicalObservation,
     lease: &allocate::AuthorityLease,
 ) -> io::Result<()> {
-    allocate::db(lease.check(store))?;
-    {
-        let _phase = store.sql_phase();
-        allocate::db(crate::attribution_gap::guard_legacy_allocation(
-            &store.conn,
-            a.checkout,
-        ))?;
-    }
-    let required =
-        allocate::db(crate::capture_requirement::read(&store.conn, a.checkout))?.is_some();
-    if required
-        && !matches!(
-            a.stage.as_str(),
-            "reserved" | "creating" | "created" | "capture_pending" | "ready"
-        )
-    {
-        return Err(allocate::err(
-            "capture requirement has an unknown or later allocation stage",
-        ));
-    }
-    let result = verify(a);
-    match result {
-        Ok(current) => {
-            // Boot/device changes alone are not activity. Durable paths, marker,
-            // registration, HEAD and inode must still agree before refreshing stat.
-            if let Some(prior) = &a.identity {
-                if prior.head != current.head {
-                    // Commit evidence before refreshing the snapshot. A crash between
-                    // commits only repeats the ancestry observation; it grants no writer.
-                    let _phase=store.sql_phase();
-                    let tx = allocate::sql(store.conn.transaction())?;
-                    allocate::db(crate::capture_journal::guard_allocation_identity(&tx,a.checkout))?;
-                    allocate::db(crate::store::emit(&tx, &crate::events::Event::HeadAdvanced {
-                        checkout: a.checkout, old: prior.head.clone(), new: current.head.clone(),
-                    }))?;
-                    allocate::sql(tx.commit())?;
-                }
-            }
-            a.identity = Some(current);
-            if required && a.stage != "ready" {
-                a.stage = "capture_pending".into();
-                a.reason = Some("capture required; root preparation pending".into());
-            } else {
-                a.stage = "ready".into(); a.reason = None;
-            }
-            allocate::save_under_lease(store, a, lease)
-        }
-        Err(_) => hold_under_lease(store, a, "identity/marker/registration incomplete or changed; operator reconciliation required (slot retained)", lease),
-    }
+    observed.matches_allocation(a)?;
+    let current = allocate::reconcile_observation_under_lease(store, observed, lease)?;
+    *a = current;
+    Ok(())
 }
 pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
     verify_identity(a, false)

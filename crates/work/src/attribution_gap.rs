@@ -996,9 +996,14 @@ pub(crate) fn begin(
     if root.input().attribution != Some(AttributionDecision::Off) {
         return Err(StoreError::Invalid);
     }
+    let checkout = id(&root.identity().checkout.to_string())?;
+    let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)?;
     let (store, lock) = crate::allocate::locked(config)?;
+    guard.revalidate(&store)?;
     drop(lock);
-    begin_in_store(config, store, root, argv)
+    let result = begin_in_store(config, store, root, argv)?;
+    guard.revalidate(&result.0)?;
+    Ok(result)
 }
 // Private common core also lets owned contender tests preopen two native Stores
 // before their timed observations. No public bypass, alternate authority, or
@@ -1209,6 +1214,13 @@ fn begin_in_store(
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lock,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::GapAdmission,
+        )?;
         if let Some(old) = crate::run_journal::read(&tx, &root.identity().run)? {
             let record = matching_committed(&tx, root, &old.request)?;
             tx.commit()?;

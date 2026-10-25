@@ -126,6 +126,13 @@ pub(super) fn intents(
     let tx = store
         .conn
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let tx = crate::retirement_journal::fence(
+        tx,
+        lease,
+        &authority,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        crate::retirement_journal::Attempt::FinishPrepare,
+    )?;
     crate::run_journal::with_capture_history(&tx, checkout, |history| {
         for (root, (capture, spec, _)) in history {
             if root.outcome.is_none()

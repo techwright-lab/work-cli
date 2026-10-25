@@ -444,7 +444,9 @@ fn supervise_captured(
         .as_ref()
         .ok_or_else(|| err("supervisor not configured"))?;
     settings.policy()?;
+    let guard = acquire_checkout_guard(config, command.checkout)?;
     let (store, lock) = allocate::locked(config)?;
+    db(guard.revalidate(&store))?;
     let allocation: allocate::Allocation = {
         let _phase = store.sql_phase();
         let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
@@ -474,7 +476,9 @@ fn supervise_captured(
         vec![allocation.request.task.clone()],
         None,
     ))?;
-    let (store, prepared) = crate::capture_preparation::prepare(config, &root, &spec)?;
+    let (store, prepared) =
+        crate::capture_preparation::prepare_under_guard(config, &root, &spec, |_, _| {}, &guard)?;
+    db(guard.revalidate(&store))?;
     let crate::capture_preparation::PreparationResult::Live(live) = prepared else {
         return report(&store, &root.identity().run, true, None);
     };
@@ -493,6 +497,7 @@ fn supervise_captured(
             live: Box::new(live),
             completion,
         },
+        guard,
     )
 }
 pub(crate) fn supervise_off(
@@ -511,7 +516,9 @@ pub(crate) fn supervise_off(
         .as_ref()
         .ok_or_else(|| err("supervisor not configured"))?;
     settings.policy()?;
+    let guard = acquire_checkout_guard(config, command.checkout)?;
     let (store, lock) = allocate::locked(config)?;
+    db(guard.revalidate(&store))?;
     let allocation: allocate::Allocation = {
         let _phase = store.sql_phase();
         let _snapshot = db(crate::run_journal::read_transaction(&store.conn))?;
@@ -538,6 +545,7 @@ pub(crate) fn supervise_off(
     input.attribution = Some(crate::run_journal::AttributionDecision::Off);
     let root = db(RootRunRequest::new(default.identity().clone(), input))?;
     let (store, began) = db(crate::attribution_gap::begin(config, &root, &command.argv))?;
+    db(guard.revalidate(&store))?;
     let live = match began {
         crate::attribution_gap::BeginGap::Created(live) => live,
         crate::attribution_gap::BeginGap::Existing(committed) => {
@@ -560,6 +568,7 @@ pub(crate) fn supervise_off(
         root,
         profile,
         ExecutionMode::Gap(live),
+        guard,
     )
 }
 fn supervise(
@@ -590,9 +599,20 @@ fn supervise(
     }
     let run =
         RunId::parse(&command.run_id.to_string()).map_err(|_| err("run-id must be UUIDv7"))?;
+    let guard = acquire_checkout_guard(config, command.checkout)?;
     // Fresh lease BEFORE begin/writer/spawn, under the same short allocator lock.
     let (mut store, lock) = allocate::locked(config)?;
-    let allocation = verified_checkout_under_lease(&mut store, command.checkout, &lock)?;
+    db(guard.revalidate(&store))?;
+    db(crate::retirement_journal::checkpoint(
+        &mut store,
+        &lock,
+        crate::retirement_journal::Scope::Checkout(command.checkout),
+        crate::retirement_journal::Attempt::ExecutionPermit,
+    ))?;
+    drop(lock);
+    let physical = allocate::observe_checkout(&mut store, command.checkout, &guard)?;
+    let lock = allocate::lifecycle_lock(&store)?;
+    let allocation = verified_checkout_under_lease(&mut store, physical, &lock)?;
     let actor = command
         .actor
         .as_deref()
@@ -624,7 +644,20 @@ fn supervise(
         request,
         profile,
         ExecutionMode::Ordinary,
+        guard,
     )
+}
+fn acquire_checkout_guard(
+    config: &Config,
+    checkout: Uuid,
+) -> io::Result<crate::checkout_guard::CheckoutGuard> {
+    crate::checkout_guard::CheckoutGuard::shared_known(config, checkout).map_err(|e| {
+        if matches!(e, crate::store::StoreError::OperationsInFlight) {
+            err("checkout operations in flight")
+        } else {
+            err(&e.to_string())
+        }
+    })
 }
 enum ExecutionMode {
     Ordinary,
@@ -647,6 +680,7 @@ fn execute(
     request: RootRunRequest,
     profile: &ActorGitProfile,
     mode: ExecutionMode,
+    guard: crate::checkout_guard::CheckoutGuard,
 ) -> io::Result<RunReport> {
     let settings = config
         .supervisor
@@ -750,9 +784,43 @@ fn execute(
                 ExecutionMode::Gap(live) => Some(db(live.release_proof())?),
                 _ => None,
             };
+            let observed = match &mode {
+                ExecutionMode::Gap(_) => launch.observe_release(
+                    driver,
+                    crate::scope_spawn::ReleaseProof::Gap(gap_proof.as_ref().unwrap()),
+                ),
+                ExecutionMode::Captured { .. } => launch.observe_release(
+                    driver,
+                    crate::scope_spawn::ReleaseProof::Captured(capture_proof.as_ref().unwrap()),
+                ),
+                ExecutionMode::Ordinary => {
+                    launch.observe_release(driver, crate::scope_spawn::ReleaseProof::Ordinary)
+                }
+            }
+            .map_err(err)?;
             // Do not reconcile/revive holds at the irreversible boundary. Other
             // checkouts remain allocatable for the entire running actor lifetime.
-            let (mut fresh_store, lock) = allocate::locked(config)?;
+            let (mut fresh_store, initial_lock) = allocate::locked(config)?;
+            drop(initial_lock);
+            db(guard.revalidate(&fresh_store))?;
+            let physical = if gap_proof.is_none() {
+                Some(allocate::observe_checkout(
+                    &mut fresh_store,
+                    command.checkout,
+                    &guard,
+                )?)
+            } else {
+                None
+            };
+            // This exact final lease spans current-context comparison AND actual
+            // permit publication. No driver/Git call occurs after acquiring it.
+            let lock = allocate::lifecycle_lock(&fresh_store)?;
+            db(crate::retirement_journal::checkpoint(
+                &mut fresh_store,
+                &lock,
+                crate::retirement_journal::Scope::Checkout(command.checkout),
+                crate::retirement_journal::Attempt::ExecutionPermit,
+            ))?;
             if let (Some(live), Some(proof)) = (&live, &capture_proof) {
                 proof.validate(&live.guard()).map_err(err)?;
                 proof.fresh().map_err(err)?;
@@ -767,8 +835,11 @@ fn execute(
                     return Err(err("release held"));
                 }
             } else {
-                let fresh =
-                    verified_checkout_under_lease(&mut fresh_store, command.checkout, &lock)?;
+                let fresh = verified_checkout_under_lease(
+                    &mut fresh_store,
+                    physical.ok_or_else(|| err("missing physical observation"))?,
+                    &lock,
+                )?;
                 let current = record(&fresh_store, &request)?;
                 if fresh.destination != allocation.destination
                     || current.closed
@@ -779,16 +850,23 @@ fn execute(
                     return Err(err("release held"));
                 }
             }
-            // Every SQL guard has dropped; the allocator lease remains held through publication.
-            if let Some(proof) = gap_proof {
-                launch.release_gap(driver, proof, &fresh_store, &lock)
-            } else {
-                match capture_proof {
-                    Some(proof) => launch.release_captured(driver, proof),
-                    None => launch.release(driver),
-                }
-            }
-            .map_err(err)?;
+            let published = match &mode {
+                ExecutionMode::Gap(_) => launch.publish_prepared_release(
+                    observed,
+                    crate::scope_spawn::PublishProof::Gap(
+                        gap_proof.as_ref().unwrap(),
+                        &fresh_store,
+                        &lock,
+                    ),
+                ),
+                ExecutionMode::Captured { .. } => launch.publish_prepared_release(
+                    observed,
+                    crate::scope_spawn::PublishProof::Captured(capture_proof.as_ref().unwrap()),
+                ),
+                ExecutionMode::Ordinary => launch
+                    .publish_prepared_release(observed, crate::scope_spawn::PublishProof::Ordinary),
+            };
+            published.map_err(err)?;
             drop(lock);
             drop(fresh_store);
             None
@@ -854,19 +932,24 @@ fn execute(
                     if let Some(seal) = seal {
                         // Physical closure is already committed. Neither FINISH
                         // nor fresh filesystem inspection spans SQL or flock.
-                        let (_, finalization) = db(crate::capture_finalization::finalize(
-                            config,
-                            &request.identity().run,
-                        ))?;
+                        let (_, finalization) =
+                            db(crate::capture_finalization::finalize_under_guard(
+                                config,
+                                &request.identity().run,
+                                || {},
+                                || {},
+                                &guard,
+                            ))?;
                         if let crate::capture_finalization::FinalizeResult::Confirmed {
                             acknowledgement,
                             ..
                         } = finalization
                         {
-                            db(crate::capture_readiness::restore(
+                            db(crate::capture_readiness::restore_under_guard(
                                 config,
                                 seal,
                                 acknowledgement,
+                                &guard,
                             ))?;
                         }
                     }

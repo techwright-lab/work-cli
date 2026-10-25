@@ -4337,7 +4337,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         }
         store
             .conn
-            .execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
+            .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
             .unwrap();
         let migrated = Store::open_registered(
             config.trusted_registry.as_ref().unwrap(),
@@ -4355,7 +4355,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            15
+            16
         );
         assert_eq!(
             migrated
@@ -4474,7 +4474,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 15,
+        version, 16,
         "new authorities must install the additive Gap schema"
     );
     let original: String = store
@@ -4485,7 +4485,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
     // Construct an authentic schema13 authority, retaining its original payloads.
     store
         .conn
-        .execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
+        .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
         .unwrap();
     drop(store);
     let store = test_run_fixture::reopen(&dir).unwrap();
@@ -4506,7 +4506,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         "CREATE TABLE attribution_gaps(run TEXT PRIMARY KEY, group_id TEXT, checkout TEXT, event_id TEXT, record TEXT, fingerprint BLOB)",
     ] {
         let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-        sql.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
+        sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;").unwrap();
         sql.execute_batch(malformed).unwrap();
         assert!(Store::open(&dir.path().join("private"), &[dir.path().join("root")]).is_err());
         let version: i64 = sql.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();

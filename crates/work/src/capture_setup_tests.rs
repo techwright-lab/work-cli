@@ -429,3 +429,73 @@ fn physical_proof_expiration_is_checked_after_immediate_lock_and_before_handoff(
             .unwrap());
     }
 }
+fn seed_prepared_fence(store: &Store, checkout: Uuid) {
+    let operation = Uuid::now_v7();
+    store
+        .conn
+        .execute(
+            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+            rusqlite::params![
+                operation.to_string(),
+                checkout.to_string(),
+                [3u8; 32].as_slice(),
+                [4u8; 32].as_slice()
+            ],
+        )
+        .unwrap();
+}
+#[test]
+fn begin_under_guard_refuses_unrelated_checkout_guard() {
+    let (_temp, cfg, store, _a, r, s) = materialized();
+    let other = Uuid::now_v7();
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&store, other).unwrap();
+    assert!(super::begin_under_guard(&cfg, &r, &s, &guard).is_err());
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+#[test]
+fn begin_holds_prepared_intent_before_admission_rows() {
+    let (_temp, cfg, store, a, r, s) = materialized();
+    seed_prepared_fence(&store, a.checkout);
+    let error = super::begin(&cfg, &r, &s).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        crate::store::StoreError::RetirementFenced.to_string()
+    );
+    let (revision, stage, reason): (i64, String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT revision, stage, held_reason FROM retirement_intents WHERE checkout=?1",
+            [a.checkout.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, stage.as_str(), reason.as_deref()),
+        (2, "held", Some("capture_admission"))
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT count(*) FROM runs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let events = store
+        .pending_events(100)
+        .unwrap()
+        .into_iter()
+        .filter(|pending| {
+            matches!(
+                pending.event,
+                crate::events::Event::RetirementIntentChanged { stage, .. } if stage == "held"
+            )
+        })
+        .count();
+    assert_eq!(events, 1);
+}

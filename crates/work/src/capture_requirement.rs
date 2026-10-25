@@ -56,6 +56,7 @@ pub(crate) fn read(conn: &Connection, checkout: Uuid) -> Result<Option<Requireme
     }))
 }
 pub(crate) fn insert(conn: &Connection, checkout: Uuid, operation: Uuid) -> Result<()> {
+    crate::retirement_journal::require_unfenced(conn, checkout)?;
     conn.execute(
         "INSERT INTO capture_requirements VALUES(?1,?2,'portable-capture',1,1)",
         (checkout.to_string(), operation.to_string()),

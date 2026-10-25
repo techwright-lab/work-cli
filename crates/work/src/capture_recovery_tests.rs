@@ -843,3 +843,118 @@ fn missing_preparation_replays_exact_begin_and_stays_held() {
         "existing_preparation"
     );
 }
+fn seed_prepared_fence(store: &Store, checkout: uuid::Uuid) {
+    let operation = uuid::Uuid::now_v7();
+    store
+        .conn
+        .execute(
+            "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+            rusqlite::params![
+                operation.to_string(),
+                checkout.to_string(),
+                [3u8; 32].as_slice(),
+                [4u8; 32].as_slice()
+            ],
+        )
+        .unwrap();
+}
+fn root_checkout(root: &crate::run_journal::RootRunRequest) -> uuid::Uuid {
+    uuid::Uuid::parse_str(&root.identity().checkout.to_string()).unwrap()
+}
+#[test]
+fn unknown_run_refuses_without_invented_fence() {
+    let (_temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+    let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+    drop(created);
+    let unknown = work_contract::RunId::parse(&uuid::Uuid::now_v7().to_string()).unwrap();
+    assert!(matches!(
+        reconcile(&cfg, &unknown),
+        Err(StoreError::Invalid)
+    ));
+    let count: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM retirement_intents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+#[test]
+fn reconcile_holds_prepared_intent_before_receiver() {
+    let (temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+    let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+    drop(created);
+    let checkout = root_checkout(&root);
+    seed_prepared_fence(&store, checkout);
+    let before = raw(&store);
+    let saw = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = saw.clone();
+    let _guard = observing(move |stage, _| {
+        if stage == "pre_process" {
+            flag.set(true);
+        }
+    });
+    assert!(matches!(
+        reconcile(&cfg, &root.identity().run),
+        Err(StoreError::RetirementFenced)
+    ));
+    assert!(!saw.get());
+    assert_eq!(raw(&store), before);
+    assert!(!temp.path().join("calls").exists());
+    let (revision, stage, reason): (i64, String, Option<String>) = store
+        .conn
+        .query_row(
+            "SELECT revision, stage, held_reason FROM retirement_intents WHERE checkout=?1",
+            [checkout.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, stage.as_str(), reason.as_deref()),
+        (2, "held", Some("capture_reconcile"))
+    );
+}
+#[test]
+fn reconcile_shared_guard_excludes_exclusive_until_drain() {
+    let (_temp, cfg, _a, root, spec) = crate::capture_preparation::tests::qualified_fixture();
+    let (store, created) = crate::capture_setup::begin(&cfg, &root, &spec).unwrap();
+    drop(created);
+    drop(store);
+    let checkout = root_checkout(&root);
+    let registry = cfg.trusted_registry.clone().unwrap();
+    let dir = cfg.store_dir.clone().unwrap();
+    let roots = cfg.roots.clone();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let _guard = observing(move |stage, _| {
+        if stage == "post_process" {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }
+    });
+    let handle = std::thread::spawn({
+        let registry = registry.clone();
+        let dir = dir.clone();
+        let roots = roots.clone();
+        move || {
+            ready_rx.recv().unwrap();
+            let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
+            assert!(matches!(
+                crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout),
+                Err(StoreError::OperationsInFlight)
+            ));
+            crate::checkout_guard::CheckoutGuard::shared(&other, uuid::Uuid::now_v7()).unwrap();
+            let lock = crate::store::AuthorityIdentity::open_lock(
+                &other.authority_identity().directory,
+                false,
+            )
+            .unwrap();
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+            drop(lock);
+            release_tx.send(()).unwrap();
+        }
+    });
+    let result = reconcile(&cfg, &root.identity().run);
+    handle.join().unwrap();
+    assert_eq!(result.unwrap(), "metadata_reconciled");
+    let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
+    crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout).unwrap();
+}

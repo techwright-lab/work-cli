@@ -413,7 +413,7 @@ fn v4_migration_preserves_runs_and_fails_closed_on_missing_v5_state() {
     };
     drop(store);
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
+    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; ALTER TABLE run_groups DROP COLUMN child_count; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; ALTER TABLE run_groups DROP COLUMN closed; PRAGMA user_version=4;")
         .unwrap();
     assert!(
         report().is_ok(),
@@ -573,7 +573,7 @@ fn closure_schema_preserves_existing_charges_and_writer() {
     assert_eq!(
         sql.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        15
+        16
     );
     assert_eq!(
         sql.query_row("SELECT closed FROM run_groups", [], |row| row
@@ -906,7 +906,7 @@ fn report_rejects_missing_older_versioned_tables_and_views_are_not_journals() {
             r.get::<_, i64>(0)
         })
         .unwrap();
-    sql.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP VIEW runs; ALTER TABLE saved_runs RENAME TO runs; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3;").unwrap();
+    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP VIEW runs; ALTER TABLE saved_runs RENAME TO runs; DROP TABLE runs; DROP TABLE run_groups; PRAGMA user_version=3;").unwrap();
     work_cli::store::report_existing(
         &dir.path().join(".work-authorities"),
         &dir.path().join("private"),
@@ -1060,7 +1060,7 @@ fn old_schemas_preserve_charges_outbox_legacy_writers_and_aliases() {
             [dir.path().join("root").to_str().unwrap()],
         )
         .unwrap();
-        sql.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups;")
+        sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups;")
             .unwrap();
         if version < 3 {
             sql.execute_batch("DROP TABLE repository_aliases").unwrap();
@@ -1114,7 +1114,7 @@ fn old_schemas_preserve_charges_outbox_legacy_writers_and_aliases() {
 fn failed_migration_rolls_back_new_tables_and_version_without_repairing_old_loss() {
     let (dir, store, _) = fixture();
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
-    sql.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; PRAGMA user_version=3").unwrap();
+    sql.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; PRAGMA user_version=3").unwrap();
     drop(store);
     assert!(reopen(&dir).is_err());
     let version: i64 = sql
@@ -1139,7 +1139,7 @@ fn schema_five_is_durable_and_missing_versioned_tables_fail_closed() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
-        version, 15,
+        version, 16,
         "positive child enrollment requires a durable v8 migration"
     );
     for table in ["run_groups", "runs"] {

@@ -2,6 +2,108 @@ mod support;
 use support::*;
 use uuid::Uuid;
 
+// Owned fixtures only. A held EX must stop even malformed-record error writes,
+// and must not publish newly configured aliases before the target SH is acquired.
+#[test]
+fn allocation_target_guard_refuses_retry_reuse_and_ambiguous_batch_without_writes() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    for path in ["retry", "malformed", "reuse", "ambiguous"] {
+        let f = Fixture::new();
+        let operation = Uuid::now_v7().to_string();
+        let first = f.start(&operation, "task", "topic", &[]);
+        assert!(first.status.success());
+        let allocation: work_cli::allocate::Allocation =
+            serde_json::from_slice(&first.stdout).unwrap();
+        let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        if path == "malformed" {
+            conn.execute("UPDATE allocations SET record='{}'", [])
+                .unwrap();
+        }
+        if path == "ambiguous" {
+            f.store()
+                .reserve(
+                    &work_cli::admission::Reservation {
+                        operation: Uuid::now_v7(),
+                        repository: f.repo.clone(),
+                        actor: "alice".into(),
+                        owner: "alice".into(),
+                        task: "task".into(),
+                    },
+                    work_cli::admission::Limits {
+                        repository: 10,
+                        owner: 10,
+                        available_bytes: Some(100),
+                        floor_bytes: 0,
+                        warn_bytes: 0,
+                    },
+                )
+                .unwrap();
+        }
+        let sibling = f.temp.path().join("sibling");
+        git(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "sibling",
+                sibling.to_str().unwrap(),
+            ],
+        );
+        let config_path = f.temp.path().join("config.toml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            &format!("repositories = [{:?}]", f.repo),
+            &format!("repositories = [{:?}, {:?}]", f.repo, sibling),
+        );
+        std::fs::write(config_path, config).unwrap();
+        let lock_dir = f.temp.path().join("private/checkout-operations-v1");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+        std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(lock_dir.join(format!("{}.lock", allocation.checkout)))
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let snapshot = || {
+            ["checkouts", "allocations", "repository_aliases", "outbox"]
+                .into_iter()
+                .map(|table| {
+                    let mut stmt = conn
+                        .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                        .unwrap();
+                    let columns = stmt.column_count();
+                    let rows = stmt
+                        .query_map([], |r| {
+                            (0..columns)
+                                .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        })
+                        .unwrap();
+                    rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let retry_operation = if matches!(path, "retry" | "malformed") {
+            operation
+        } else {
+            Uuid::now_v7().to_string()
+        };
+        let result = f.start(&retry_operation, "task", "topic", &[]);
+        assert!(!result.status.success(), "{path}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("operations in flight"),
+            "{path}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(snapshot(), before, "{path}: caller rows changed before SH");
+    }
+}
+
 #[test]
 fn start_is_durable_idempotent_policy_bound_and_not_a_writer() {
     let f = Fixture::new();
@@ -237,7 +339,7 @@ fn sibling_alias_and_legacy_path_charge_share_capacity() {
             // Recreate the actual pre-v2 schema, retaining the charge and digest.
             let conn =
                 rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
-            conn.execute_batch("DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;").unwrap();
+            conn.execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; DROP TABLE run_participants; DROP TABLE adopted_segments; DROP TABLE adopted_sessions; DROP TABLE adopted_groups; DROP TABLE runs; DROP TABLE run_groups; DROP TABLE repository_aliases; DROP TABLE allocations; ALTER TABLE checkouts DROP COLUMN ready; PRAGMA user_version=1;").unwrap();
         } else {
             assert!(f
                 .start(&Uuid::now_v7().to_string(), "first", "first", &[])
@@ -278,7 +380,17 @@ fn sibling_alias_and_legacy_path_charge_share_capacity() {
             String::from_utf8_lossy(&out.stdout)
         );
         assert!(!f.root.join("second").exists());
-        assert_eq!(f.store().charged(&sibling, None).unwrap(), 1);
+        // A denied charge must not publish the staged sibling alias. Count the
+        // existing charged identity instead; legacy rows/digests remain unchanged.
+        assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+        let published: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM repository_aliases WHERE alias=?1)",
+                [sibling.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!published, "capacity refusal published a staged alias");
         let retained: (String, Vec<u8>) = conn
             .query_row("SELECT repository,digest FROM checkouts", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
@@ -336,7 +448,9 @@ fn concurrent_same_key_starts_return_one_checkout() {
             .map(|_| {
                 scope.spawn(|| {
                     barrier.wait();
-                    f.start(&Uuid::now_v7().to_string(), "task", "topic", &[])
+                    let operation = Uuid::now_v7().to_string();
+                    let output = f.start(&operation, "task", "topic", &[]);
+                    (operation, output)
                 })
             })
             .collect();
@@ -345,9 +459,27 @@ fn concurrent_same_key_starts_return_one_checkout() {
             .map(|h| h.join().unwrap())
             .collect::<Vec<_>>()
     });
+    assert!(
+        results.iter().any(|(_, out)| out.status.success()),
+        "no creator completed"
+    );
     let values: Vec<serde_json::Value> = results
-        .iter()
-        .map(|out| {
+        .into_iter()
+        .map(|(operation, out)| {
+            let out = if out.status.success() {
+                out
+            } else {
+                // A nonblocking common-operation lock never waits for another
+                // creator. A retry after both workers drain must converge without
+                // another charge; do not accept unrelated creation failures.
+                let reason = String::from_utf8_lossy(&out.stderr);
+                assert!(
+                    reason.contains("matching allocation incomplete")
+                        || reason.contains("operation would block"),
+                    "{reason}"
+                );
+                f.start(&operation, "task", "topic", &[])
+            };
             assert!(
                 out.status.success(),
                 "{}",
@@ -358,6 +490,73 @@ fn concurrent_same_key_starts_return_one_checkout() {
         .collect();
     assert_eq!(values[0]["checkout"], values[1]["checkout"]);
     assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
+}
+
+#[test]
+fn ambiguous_batch_write_failure_rolls_back_every_hold_and_staged_alias() {
+    let f = Fixture::new();
+    let mut store = f.store();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            store
+                .reserve(
+                    &work_cli::admission::Reservation {
+                        operation: Uuid::now_v7(),
+                        repository: f.repo.clone(),
+                        actor: "alice".into(),
+                        owner: "alice".into(),
+                        task: "task".into(),
+                    },
+                    work_cli::admission::Limits {
+                        repository: 10,
+                        owner: 10,
+                        available_bytes: Some(100),
+                        floor_bytes: 0,
+                        warn_bytes: 0,
+                    },
+                )
+                .unwrap(),
+        );
+    }
+    ids.sort();
+    let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+    conn.execute_batch(&format!("CREATE TRIGGER stop_second_hold BEFORE UPDATE ON checkouts WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT,'owned batch fault'); END;", ids[1])).unwrap();
+    let before = store.pending_events(100).unwrap().len();
+    let denied = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("owned batch fault"));
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checkouts WHERE state='reserved'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM repository_aliases", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(store.pending_events(100).unwrap().len(), before);
+    conn.execute_batch("DROP TRIGGER stop_second_hold;")
+        .unwrap();
+    let held = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
+    assert!(!held.status.success());
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM checkouts WHERE state='held' AND ready=0",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(store.pending_events(100).unwrap().len(), before + 2);
+    assert_eq!(store.charged(&f.repo, None).unwrap(), 2);
 }
 
 #[test]

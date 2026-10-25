@@ -239,6 +239,9 @@ impl ClosureSeal {
         }
         Ok(allocation)
     }
+    fn checkout(&self) -> Result<uuid::Uuid> {
+        crate::retirement_journal::parse_uuid(&self.root.request.identity().checkout.to_string())
+    }
 }
 fn fresh(observed: std::time::Instant) -> Result<()> {
     if std::time::Instant::now()
@@ -254,7 +257,19 @@ pub(crate) fn restore(
     seal: ClosureSeal,
     ack: crate::capture_finalization::FreezeAcknowledgement,
 ) -> Result<()> {
+    let checkout = seal.checkout()?;
+    let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)?;
+    restore_under_guard(config, seal, ack, &guard)
+}
+pub(crate) fn restore_under_guard(
+    config: &crate::config::Config,
+    seal: ClosureSeal,
+    ack: crate::capture_finalization::FreezeAcknowledgement,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<()> {
     use crate::store::StoreError;
+    let checkout = seal.checkout()?;
+    guard.matches_checkout(checkout)?;
     let dir = config.store_dir.as_ref().ok_or(StoreError::Invalid)?;
     let registry = config
         .trusted_registry
@@ -264,6 +279,16 @@ pub(crate) fn restore(
         return Err(StoreError::Conflict);
     }
     let mut store = Store::open_existing_registered_mut(registry, dir, &config.roots)?;
+    guard.revalidate(&store)?;
+    {
+        let lease = store.authority_lease()?;
+        crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CaptureReadiness,
+        )?;
+    }
     let (mut allocation, frontier_before, stable_before) = {
         let _phase = store.sql_phase();
         let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
@@ -290,10 +315,18 @@ pub(crate) fn restore(
     fresh(observed)?;
     let lease = store.authority_lease()?;
     lease.check(&store)?;
+    let authority = store.authority_identity().clone();
     let _phase = store.sql_phase();
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let tx = crate::retirement_journal::fence(
+        tx,
+        &lease,
+        &authority,
+        crate::retirement_journal::Scope::Checkout(allocation.checkout),
+        crate::retirement_journal::Attempt::CaptureReadiness,
+    )?;
     fresh(observed)?;
     seal.validate(&tx, &ack)?;
     if frontier(&tx, allocation.checkout)? != frontier_before
@@ -350,6 +383,7 @@ pub(crate) fn invalidate(
     authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
 ) -> Result<()> {
     lease.check_authority(authority)?;
+    crate::retirement_journal::require_unfenced(conn, checkout)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version >= 13 {
         conn.execute(
@@ -2707,5 +2741,63 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 .unwrap(),
             1
         );
+    }
+    fn seed_prepared_fence(store: &crate::store::Store, checkout: uuid::Uuid) {
+        let operation = uuid::Uuid::now_v7();
+        store
+            .conn
+            .execute(
+                "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+                rusqlite::params![
+                    operation.to_string(),
+                    checkout.to_string(),
+                    [3u8; 32].as_slice(),
+                    [4u8; 32].as_slice()
+                ],
+            )
+            .unwrap();
+    }
+    #[test]
+    fn restore_holds_prepared_intent_before_certificate() {
+        let (_temp, cfg, store, a, _root, closure, acknowledgement) = closed();
+        seed_prepared_fence(&store, a.checkout);
+        assert!(matches!(
+            restore(&cfg, closure, acknowledgement),
+            Err(crate::store::StoreError::RetirementFenced)
+        ));
+        let ready: bool = store
+            .conn
+            .query_row("SELECT ready FROM checkouts", [], |r| r.get(0))
+            .unwrap();
+        assert!(!ready);
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM capture_readiness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        let reason: String = store
+            .conn
+            .query_row(
+                "SELECT held_reason FROM retirement_intents WHERE checkout=?1",
+                [a.checkout.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "capture_readiness");
+    }
+    #[test]
+    fn restore_under_guard_refuses_mismatched_checkout() {
+        let (_temp, cfg, store, _a, _root, closure, acknowledgement) = closed();
+        let guard =
+            crate::checkout_guard::CheckoutGuard::shared(&store, uuid::Uuid::now_v7()).unwrap();
+        assert!(matches!(
+            restore_under_guard(&cfg, closure, acknowledgement, &guard),
+            Err(crate::store::StoreError::Invalid)
+        ));
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM capture_readiness", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

@@ -4,6 +4,7 @@ mod fixture_support;
 #[path = "support/capture_finalization_fixture.rs"]
 mod capture_fixture;
 use capture_fixture::Fixture;
+use uuid::Uuid;
 use work_cli::{capture_finalization::finalize, run_journal::RootOutcome};
 
 #[test]
@@ -673,7 +674,7 @@ fn schema_twelve_migration_preserves_old_bytes_and_requires_explicit_upgrade() {
         .unwrap();
     let events = f.store.pending_events(100).unwrap();
     sql.execute_batch(
-        "DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; PRAGMA user_version=11",
+        "DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; PRAGMA user_version=11",
     )
     .unwrap();
     assert!(matches!(
@@ -883,7 +884,7 @@ fn current_schema_has_separate_terminal_journal() {
     let version: i64 = sql
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     assert!(sql
         .prepare("SELECT run,intent,confirmation,revision FROM capture_finalizations")
         .is_ok());
@@ -910,4 +911,60 @@ fn terminal_retains_bounded_optional_facts() {
             && frozen.receipt().is_some(),
         "terminal facts discarded"
     );
+}
+fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: &str) {
+    let operation = Uuid::now_v7();
+    sql.execute(
+        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+        rusqlite::params![
+            operation.to_string(),
+            checkout,
+            [3u8; 32].as_slice(),
+            [4u8; 32].as_slice()
+        ],
+    )
+    .unwrap();
+}
+#[test]
+fn prepared_intent_refuses_finalize_without_finish() {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    let checkout = f.root.identity().checkout.to_string();
+    seed_prepared_fence(&f.sql(), &checkout);
+    assert!(
+        finalize(&f.config, &f.root.identity().run).is_err(),
+        "fenced finalize must refuse"
+    );
+    assert!(!f.dir.path().join("calls").exists());
+    let (revision, stage, reason): (i64, String, Option<String>) = f
+        .sql()
+        .query_row(
+            "SELECT revision, stage, held_reason FROM retirement_intents WHERE checkout=?1",
+            [&checkout],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, stage.as_str(), reason.as_deref()),
+        (2, "held", Some("capture_finalization"))
+    );
+}
+#[test]
+fn prepared_intent_refuses_retry_without_receiver() {
+    let f = Fixture::new(true, Some(RootOutcome::Completed));
+    finalize(&f.config, &f.root.identity().run).unwrap();
+    let checkout = f.root.identity().checkout.to_string();
+    seed_prepared_fence(&f.sql(), &checkout);
+    f.respond("pending", serde_json::json!({}), false);
+    assert!(
+        work_cli::capture_finalization::retry_delivery(&f.config, &f.root.identity().run).is_err()
+    );
+    let reason: String = f
+        .sql()
+        .query_row(
+            "SELECT held_reason FROM retirement_intents WHERE checkout=?1",
+            [&checkout],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "capture_delivery");
 }

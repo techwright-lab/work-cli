@@ -562,6 +562,10 @@ pub(crate) fn reconcile_hold(
     authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
 ) -> Result<()> {
     lease.check_authority(authority)?;
+    crate::retirement_journal::require_unfenced(
+        conn,
+        crate::retirement_journal::parse_uuid(&root.request.identity().checkout.to_string())?,
+    )?;
     let request = &root.request;
     let revision = root
         .revision
@@ -693,6 +697,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&request.identity().checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            &lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CapturePreparation,
+        )?;
         validate_related(&tx, &request.identity().checkout)?;
         let root = crate::run_journal::exact(&tx, request)?;
         let record = read(&tx, &root)?.ok_or(StoreError::Invalid)?;
@@ -892,6 +905,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&request.identity().checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::CaptureAdmission,
+        )?;
         #[cfg(test)]
         let agrees = span(Subphase::AdmissionAgrees);
         let allocation = spec.agrees(&tx, request)?;

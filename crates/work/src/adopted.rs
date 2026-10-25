@@ -48,16 +48,19 @@ pub fn begin(
     {
         return Err(err("capture bridge unsupported"));
     }
+    let checkout = uuid(&request.identity.checkout).map_err(|_| err("invalid checkout"))?;
+    let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)
+        .map_err(|e| err(&e.to_string()))?;
     let (mut store, lock) = crate::allocate::locked(config)?;
+    db(guard.revalidate(&store))?;
     // Exact retries confer no new grant and do not refresh activity or Git metadata.
     if db(store.adopted_status_optional(&request.identity.run))?.is_some() {
         return db(store.begin_adopted_under_lease(request, &lock));
     }
-    crate::allocate::verified_checkout_under_lease(
-        &mut store,
-        uuid(&request.identity.checkout).map_err(|_| err("invalid checkout"))?,
-        &lock,
-    )?;
+    drop(lock);
+    let physical = crate::allocate::observe_checkout(&mut store, checkout, &guard)?;
+    let lock = crate::allocate::lifecycle_lock(&store)?;
+    crate::allocate::verified_checkout_under_lease(&mut store, physical, &lock)?;
     let result = db(store.begin_adopted_under_lease(request, &lock));
     drop(lock);
     result
@@ -231,6 +234,15 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let checkout =
+            crate::retirement_journal::parse_uuid(&request.identity.checkout.to_string())?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::AdoptedBegin,
+        )?;
         let i = &request.identity;
         for value in [
             i.run.to_string(),
@@ -239,6 +251,10 @@ impl Store {
         ] {
             crate::capture_journal::exclude_operation(&tx, &value)?;
         }
+        crate::retirement_journal::exclude_operation(&tx, uuid(&i.run)?)?;
+        crate::retirement_journal::exclude_operation(&tx, uuid(&i.group)?)?;
+        crate::retirement_journal::exclude_operation(&tx, request.operation)?;
+        crate::retirement_journal::require_unfenced(&tx, uuid(&i.checkout)?)?;
         if let Some((existing, _, _)) = read(&tx, &i.run)? {
             if &existing != request {
                 return Err(StoreError::Conflict);

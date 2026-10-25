@@ -197,6 +197,7 @@ fn receipt_only(conn: &Connection, checkout: Uuid) -> Result<Option<Receipt>> {
     let r: Receipt = parse(&body)?;
     uuid7(r.operation)?;
     crate::capture_journal::exclude_operation(conn, &r.operation)?;
+    crate::retirement_journal::exclude_operation(conn, r.operation)?;
     uuid7(r.checkout)?;
     let (a, state, ready) = allocation(conn, checkout)?;
     let events:i64 = conn.query_row("SELECT count(*) FROM outbox WHERE json_extract(payload,'$.type')='task_finished' AND json_extract(payload,'$.checkout')=?1 AND json_extract(payload,'$.operation')=?2",(checkout.to_string(),r.operation.to_string()),|row|row.get(0))?;
@@ -364,7 +365,21 @@ fn finish_internal(
         .trusted_registry
         .as_deref()
         .ok_or(StoreError::Unsafe)?;
+    let preflight =
+        Store::preflight_existing_identity(registry, dir, &config.roots, |v| matches!(v, 8..=16))?;
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&preflight, checkout)?;
+    drop(preflight);
     let mut store = Store::open_finish_authority(registry, dir, &config.roots)?;
+    guard.revalidate(&store)?;
+    {
+        let lease = store.authority_lease()?;
+        crate::retirement_journal::checkpoint(
+            &mut store,
+            &lease,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::FinishPrepare,
+        )?;
+    }
     let integrated = matches!(mode, Mode::Integrated);
     {
         let _phase = store.sql_phase();
@@ -391,13 +406,25 @@ fn finish_internal(
     } else {
         None
     };
+    let ordinary_new = {
+        let _phase = store.sql_phase();
+        proof.is_none() && load(&store.conn, checkout)?.is_none()
+    };
+    let physical = if ordinary_new {
+        Some(
+            allocate::observe_checkout(&mut store, checkout, &guard)
+                .map_err(|_| StoreError::Invalid)?,
+        )
+    } else {
+        None
+    };
     let lock = store.authority_lease()?;
     let receipt = prepare(
         config,
         &mut store,
         checkout,
         &mode,
-        proof.as_ref(),
+        (proof.as_ref(), physical),
         &mut boundary,
         &lock,
     )?;
@@ -413,7 +440,10 @@ fn finish_internal(
                 intents.is_ok()
             }));
     drop(lock);
-    let adapter = CapturedFinish { config };
+    let adapter = CapturedFinish {
+        config,
+        guard: &guard,
+    };
     let sink: Option<&dyn LocalSink> = match mode {
         Mode::Library(sink) => sink,
         Mode::Integrated if capture_ready => Some(&adapter),
@@ -473,10 +503,18 @@ fn finish_internal(
         let persisted = (|| -> Result<()> {
             let lease = store.authority_lease()?;
             lease.check(&store)?;
+            let authority = store.authority_identity().clone();
             let _phase = store.sql_phase();
             let tx = store
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = crate::retirement_journal::fence(
+                tx,
+                &lease,
+                &authority,
+                crate::retirement_journal::Scope::Checkout(checkout),
+                crate::retirement_journal::Attempt::FinishCaptureResult,
+            )?;
             let current = load(&tx, checkout)?.ok_or(StoreError::Invalid)?;
             if current != receipt {
                 if current.operation != receipt.operation
@@ -614,6 +652,7 @@ pub fn finish(config: &Config, checkout: Uuid) -> Result<Report> {
 }
 struct CapturedFinish<'a> {
     config: &'a Config,
+    guard: &'a crate::checkout_guard::CheckoutGuard,
 }
 impl LocalSink for CapturedFinish<'_> {
     fn freeze(&self, context: &CaptureContext) -> CaptureResult {
@@ -654,7 +693,13 @@ impl CapturedFinish<'_> {
         let mut uncertain = false;
         let mut refused = false;
         for run in runs {
-            match crate::capture_finalization::finalize(self.config, &run) {
+            match crate::capture_finalization::finalize_under_guard(
+                self.config,
+                &run,
+                || {},
+                || {},
+                self.guard,
+            ) {
                 Ok(_) => {}
                 Err(StoreError::CaptureFinishUncertain) => uncertain = true,
                 Err(_) => refused = true,
@@ -711,11 +756,15 @@ fn prepare(
     store: &mut Store,
     checkout: Uuid,
     mode: &Mode<'_>,
-    proof: Option<&captured::Completion>,
+    evidence: (
+        Option<&captured::Completion>,
+        Option<allocate::PhysicalObservation>,
+    ),
     boundary: &mut impl FnMut(&str),
     lease: &allocate::AuthorityLease,
 ) -> Result<Receipt> {
     lease.check(store)?;
+    let (proof, physical) = evidence;
     let authority = store.authority_identity().clone();
     let configured = {
         let _phase = store.sql_phase();
@@ -742,6 +791,12 @@ fn prepare(
         }
         Ok(())
     };
+    crate::retirement_journal::checkpoint(
+        store,
+        lease,
+        crate::retirement_journal::Scope::Checkout(checkout),
+        crate::retirement_journal::Attempt::FinishPrepare,
+    )?;
     {
         let _phase = store.sql_phase();
         if let Some(r) = load(&store.conn, checkout)? {
@@ -765,7 +820,7 @@ fn prepare(
     let a = if let Some(proof) = proof {
         proof.allocation()
     } else {
-        allocate::verified_checkout_under_lease(store, checkout, lease)
+        allocate::verified_checkout_under_lease(store, physical.ok_or(StoreError::Invalid)?, lease)
             .map_err(|_| StoreError::Invalid)?
     };
     let operation = Uuid::now_v7();
@@ -799,6 +854,13 @@ fn prepare(
         let tx = store
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = crate::retirement_journal::fence(
+            tx,
+            lease,
+            &authority,
+            crate::retirement_journal::Scope::Checkout(checkout),
+            crate::retirement_journal::Attempt::FinishPrepare,
+        )?;
         if let Some(receipt) = load(&tx, checkout)? {
             return Ok(receipt);
         }
@@ -1082,7 +1144,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
                 &mut store,
                 a.checkout,
                 &Mode::Integrated,
-                Some(&proof),
+                (Some(&proof), None),
                 &mut |boundary| {
                     if change == "near_commit" && boundary == "before_commit" {
                         std::thread::sleep(std::time::Duration::from_millis(2100));
@@ -1151,7 +1213,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
                     &mut store,
                     a.checkout,
                     &Mode::Integrated,
-                    Some(&proof),
+                    (Some(&proof), None),
                     &mut |_| {},
                     &lease,
                 );

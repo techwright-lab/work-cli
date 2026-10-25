@@ -850,3 +850,47 @@ fn unsafe_context_never_becomes_ready() {
         "unsafe contexts accepted: {accepted:?}"
     );
 }
+fn seed_prepared_fence(sql: &rusqlite::Connection, checkout: &str) {
+    let operation = Uuid::now_v7();
+    sql.execute(
+        "INSERT INTO retirement_intents(operation,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,record,held_reason,aborted_from) VALUES(?1,?2,1,'prepared','supervised',NULL,NULL,NULL,?3,?4,'{}',NULL,NULL)",
+        rusqlite::params![
+            operation.to_string(),
+            checkout,
+            [3u8; 32].as_slice(),
+            [4u8; 32].as_slice()
+        ],
+    )
+    .unwrap();
+}
+#[test]
+fn prepared_intent_refuses_prepare_without_receiver() {
+    let h = Harness::new();
+    let checkout = h.root.identity().checkout.to_string();
+    seed_prepared_fence(&h.sql(), &checkout);
+    let error = capture_preparation::prepare(&h.cfg, &h.root, &h.spec).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "retirement intent fences cooperative writes"
+    );
+    assert!(!h.f.temp.path().join("calls").exists());
+    let (revision, stage, reason): (i64, String, Option<String>) = h
+        .sql()
+        .query_row(
+            "SELECT revision, stage, held_reason FROM retirement_intents WHERE checkout=?1",
+            [&checkout],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (revision, stage.as_str(), reason.as_deref()),
+        (2, "held", Some("capture_admission"))
+    );
+    let prepared_null: bool = h
+        .sql()
+        .query_row("SELECT NOT EXISTS(SELECT 1 FROM capture_runs)", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(prepared_null);
+}

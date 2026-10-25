@@ -86,6 +86,8 @@ enum ModeKind {
 
 /// Private retained assessment. Not Clone/Deserialize or caller-constructible.
 struct Assessment {
+    // None only for passive assessment. Future prepare retains its EX owner.
+    guard: Option<crate::checkout_guard::CheckoutGuard>,
     context: Context,
     physical: Physical,
     budget: Budget,
@@ -101,6 +103,7 @@ struct Assessment {
     terminals: Vec<TerminalCandidate>,
     task_completed: bool,
     approval_policy_digest: Option<String>,
+    binding_policy_digest: String,
     policies: ValidatedPolicies,
     lock: recovery_refs::ExistingLock,
     store: Store,
@@ -112,12 +115,14 @@ pub(super) struct Collector {
     checkout: Uuid,
     assertion: Option<Uuid>,
     store: Option<Store>,
+    guard: Option<crate::checkout_guard::CheckoutGuard>,
     lock: Option<recovery_refs::ExistingLock>,
     mode: Option<ModeKind>,
     adopted: Option<approval::AdoptedMode>,
     terminals: Option<Vec<TerminalCandidate>>,
     task_completed: Option<bool>,
     approval_policy_digest: Option<String>,
+    binding_policy_digest: Option<String>,
     policies: Option<ValidatedPolicies>,
     runtime: Option<(std::path::PathBuf, String)>,
     sealed: Option<Assessment>,
@@ -129,17 +134,38 @@ impl Collector {
             checkout,
             assertion,
             store: None,
+            guard: None,
             lock: None,
             mode: None,
             adopted: None,
             terminals: None,
             task_completed: None,
             approval_policy_digest: None,
+            binding_policy_digest: None,
             policies: None,
             runtime: None,
             sealed: None,
             failure: None,
         }
+    }
+    // Private future prepare seam. Does not prepare an intent, mint authority,
+    // acquire another guard, or alter the inert public prepare entrypoint.
+    pub(super) fn with_exclusive(
+        checkout: Uuid,
+        assertion: Option<Uuid>,
+        store: Store,
+        guard: crate::checkout_guard::CheckoutGuard,
+    ) -> Held<Self> {
+        if !guard.exclusive_held() {
+            return Err("exclusive_guard_required");
+        }
+        guard
+            .require_matching(&store, checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let mut collector = Self::new(checkout, assertion);
+        collector.store = Some(store);
+        collector.guard = Some(guard);
+        Ok(collector)
     }
     pub(super) fn failed(&mut self, reason: &'static str) {
         self.failure = Some(reason);
@@ -150,38 +176,54 @@ impl Collector {
         document: &ConfigDocument,
         config: &crate::config::Config,
     ) -> Held<()> {
-        let policies = document
-            .inspection_policies()
-            .map_err(|_| "inspection_policy_unknown")?;
-        let approval_policy_digest = match document.approval() {
-            Ok(policy) => {
-                let mut approval = Vec::new();
-                frame(&mut approval, 0, b"work.approval.policy.v1");
-                frame(
-                    &mut approval,
-                    1,
-                    &serde_json::to_vec(&policy).map_err(|_| "approval_policy_unknown")?,
-                );
-                frame(&mut approval, 2, policies.canonical_bytes());
-                frame(
-                    &mut approval,
-                    3,
-                    &serde_json::to_vec(
-                        &document
-                            .remote_preservation()
-                            .map_err(|_| "policy_unknown")?,
-                    )
-                    .map_err(|_| "policy_unknown")?,
-                );
-                Some(hex(&Sha256::digest(approval)))
+        let readonly = Store::open_existing_registered_readonly(
+            config
+                .trusted_registry
+                .as_deref()
+                .ok_or("authority_unknown")?,
+            config.store_dir.as_deref().ok_or("authority_unknown")?,
+            &config.roots,
+        )
+        .map_err(|_| "authority_unknown")?;
+        if let Some(guard) = &self.guard {
+            // Configuration must match the retained guarded authority; never
+            // reopen a replacement mutable Store for the prepare collector.
+            let retained = self.store.as_ref().ok_or("authority_unknown")?;
+            guard
+                .require_matching(retained, self.checkout)
+                .map_err(|_| "authority_unknown")?;
+            let expected = retained.authority_identity();
+            let current = readonly.authority_identity();
+            if expected.registry() != current.registry()
+                || expected.directory != current.directory
+                || expected.directory_id != current.directory_id
+                || expected.database_id() != current.database_id()
+            {
+                return Err("authority_unknown");
             }
-            Err(_) => None,
+        } else {
+            crate::retirement_journal::require_unfenced(&readonly.conn, self.checkout)
+                .map_err(|error| receipts::store_error(error).label())?;
+        }
+        drop(readonly);
+        let (policies, approval_policy_digest, binding_policy_digest) =
+            configuration_bindings(document)?;
+        let store = match self.store.take() {
+            Some(store) => {
+                self.guard
+                    .as_ref()
+                    .ok_or("checkout_guard_unavailable")?
+                    .require_matching(&store, self.checkout)
+                    .map_err(|_| "authority_unknown")?;
+                store
+            }
+            None => open_configured_store(config).map_err(|_| "authority_unknown")?,
         };
-        let store = open_configured_store(config).map_err(|_| "authority_unknown")?;
         self.runtime = document
             .recovery_runtime()
             .ok()
             .map(|runtime| (runtime.runtime_directory, runtime.bus_address));
+        self.binding_policy_digest = Some(binding_policy_digest);
         self.approval_policy_digest = approval_policy_digest;
         self.policies = Some(policies);
         self.store = Some(store);
@@ -189,6 +231,11 @@ impl Collector {
     }
     pub(super) fn context(&mut self, b: &mut Budget) -> Held<Context> {
         let store = self.store.as_mut().ok_or("authority_unknown")?;
+        if let Some(guard) = &self.guard {
+            guard
+                .require_matching(store, self.checkout)
+                .map_err(|_| "checkout_guard_unavailable")?;
+        }
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
         let phase = store.sql_phase();
@@ -196,8 +243,18 @@ impl Collector {
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "authority_unknown")?;
+        // Passive refusal only; never commits an ordinary-activity hold.
+        crate::retirement_journal::require_unfenced(&tx, self.checkout).map_err(|error| {
+            if self.guard.is_some() && matches!(error, crate::store::StoreError::RetirementFenced) {
+                "intent_conflict"
+            } else {
+                receipts::store_error(error).label()
+            }
+        })?;
         let context = snapshot_in_transaction(&tx, &authority, self.checkout, b)
             .map_err(|_| "context_unknown")?;
+        b.reserve(context.history.len() as u64)
+            .map_err(|_| "deadline")?;
         let checkout = self.checkout.to_string();
         let (adopted, supervised, capture, gap, writers): (bool, bool, bool, bool, i64) = tx
             .query_row(
@@ -216,6 +273,9 @@ impl Collector {
         }
         if gap {
             return Err("gap_history_unsupported");
+        }
+        if self.guard.is_some() {
+            require_prepare_predecessor(&tx, &context)?;
         }
         if adopted && supervised {
             return Err("mixed_mode");
@@ -289,6 +349,7 @@ impl Collector {
         let store = self.store.take().ok_or("authority_unknown")?;
         let mode = self.mode.take().ok_or("mode_unknown")?;
         self.sealed = Some(Assessment {
+            guard: self.guard.take(),
             context: retained.context,
             physical: retained.physical,
             budget,
@@ -304,6 +365,7 @@ impl Collector {
             terminals: self.terminals.take().unwrap_or_default(),
             task_completed: self.task_completed.take().unwrap_or(false),
             approval_policy_digest: self.approval_policy_digest.take(),
+            binding_policy_digest: self.binding_policy_digest.take().ok_or("policy_unknown")?,
             policies: self.policies.take().ok_or("inspection_policy_unknown")?,
             lock,
             store,
@@ -312,6 +374,48 @@ impl Collector {
         });
         Ok(())
     }
+}
+
+/// Shared pure policy framing for fresh collection and offline local recapture.
+/// The adopted digest is byte-for-byte the existing approval policy convention.
+fn configuration_bindings(
+    document: &ConfigDocument,
+) -> Held<(ValidatedPolicies, Option<String>, String)> {
+    let policies = document
+        .inspection_policies()
+        .map_err(|_| "inspection_policy_unknown")?;
+    let remote = serde_json::to_vec(
+        &document
+            .remote_preservation()
+            .map_err(|_| "policy_unknown")?,
+    )
+    .map_err(|_| "policy_unknown")?;
+    let approval_digest = match document.approval() {
+        Ok(policy) => {
+            let mut bytes = Vec::new();
+            frame(&mut bytes, 0, b"work.approval.policy.v1");
+            frame(
+                &mut bytes,
+                1,
+                &serde_json::to_vec(&policy).map_err(|_| "approval_policy_unknown")?,
+            );
+            frame(&mut bytes, 2, policies.canonical_bytes());
+            frame(&mut bytes, 3, &remote);
+            Some(hex(&Sha256::digest(bytes)))
+        }
+        Err(_) => None,
+    };
+    let combined = match &approval_digest {
+        Some(digest) => digest.clone(),
+        None => {
+            let mut bytes = Vec::new();
+            frame(&mut bytes, 0, b"work.retirement.policy.without-approval.v1");
+            frame(&mut bytes, 1, policies.canonical_bytes());
+            frame(&mut bytes, 2, &remote);
+            hex(&Sha256::digest(bytes))
+        }
+    };
+    Ok((policies, approval_digest, combined))
 }
 
 pub(super) struct RetainedRetirement {
@@ -368,7 +472,23 @@ fn assess_path(
             return report;
         }
     }
-    let mut collector = Collector::new(checkout, assertion);
+    // Same pipeline; public assessment drops the private retained outcome.
+    collect_retained(
+        path,
+        Collector::new(checkout, assertion),
+        #[cfg(test)]
+        driver,
+    )
+    .0
+}
+
+fn collect_retained(
+    path: &Path,
+    mut collector: Collector,
+    #[cfg(test)] driver: Option<&Driver>,
+) -> (RetirementAssessmentReport, Option<RetainedDecision>) {
+    let checkout = collector.checkout;
+    let assertion = collector.assertion;
     let mut audit = preservation::Audit::new(checkout);
     let remote = remote_proof::retirement_path(path, checkout, &mut audit, &mut collector);
     let preservation = audit.finish(remote);
@@ -376,42 +496,60 @@ fn assess_path(
     report.assertion_id = assertion;
     report.preservation = Some(preservation);
     report.reason = collector.failure.unwrap_or("observation_held");
-    let Some(mut assessment) = collector.sealed.take() else {
-        return report;
+    let Some(assessment) = collector.sealed.take() else {
+        return (report, None);
     };
     report.mode = match assessment.mode {
         ModeKind::Supervised => "supervised",
         ModeKind::Adopted => "adopted",
     };
-    match decide(
-        &mut assessment,
+    let retained = match decide(
+        assessment,
         &mut report,
         #[cfg(test)]
         driver,
     ) {
-        Ok(()) => {
+        Ok(retained) => {
             report.coverage = "complete";
             report.outcome = "prerequisites_complete";
             report.reason = "prerequisites_complete";
             report.cleanup = "complete";
+            Some(retained)
         }
         Err(reason) => {
             report.outcome = "held";
             report.reason = reason;
+            None
         }
-    }
+    };
     report.execution_enabled = false;
     report.retirement_authority = false;
     report.writer_charges_retained = true;
     report.recorded = false;
-    report
+    (report, retained)
+}
+
+/// Owns the decision inputs and their original clocks, including the final
+/// recapture previously dropped by decide. Not a receipt or report capability.
+struct RetainedDecision {
+    assessment: Assessment,
+    assertion: Option<approval::AssertionAssessment>,
+    observations: Vec<TerminalObservation>,
+    closing_census: filesystem::Census,
+    closing_inputs: GitInputs,
+    closing_recovery: preservation::RecoveryCensus,
 }
 
 fn decide(
-    assessment: &mut Assessment,
+    mut assessment: Assessment,
     report: &mut RetirementAssessmentReport,
     #[cfg(test)] injected: Option<&Driver>,
-) -> Held<()> {
+) -> Held<RetainedDecision> {
+    if let Some(guard) = &assessment.guard {
+        guard
+            .require_matching(&assessment.store, assessment.context.allocation.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+    }
     if !assessment.findings.is_empty() {
         return Err("inspection_held");
     }
@@ -529,12 +667,12 @@ fn decide(
             if let Some(driver) = injected {
                 driver
             } else {
-                owned = production_driver(assessment)?;
+                owned = production_driver(&assessment)?;
                 &owned
             }
             #[cfg(not(test))]
             {
-                owned = production_driver(assessment)?;
+                owned = production_driver(&assessment)?;
                 &owned
             }
         };
@@ -557,6 +695,11 @@ fn decide(
     assessment
         .lock
         .revalidate(&assessment.store, &common_path)?;
+    if let Some(guard) = &assessment.guard {
+        guard
+            .require_matching(&assessment.store, assessment.context.allocation.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+    }
     {
         let lease = assessment
             .store
@@ -579,6 +722,13 @@ fn decide(
             &mut assessment.budget,
         )
         .map_err(|_| "context_changed")?;
+        assessment
+            .budget
+            .reserve(current.history.len() as u64)
+            .map_err(|_| "deadline")?;
+        if assessment.guard.is_some() {
+            require_prepare_predecessor(&tx, &current)?;
+        }
         match assessment.mode {
             ModeKind::Adopted => {
                 let mode = approval::AdoptedMode::read(&tx, &current)?;
@@ -610,7 +760,7 @@ fn decide(
         drop(phase);
         drop(lease);
     }
-    if let Some(mut assertion) = assertion {
+    if let Some(assertion) = assertion.as_mut() {
         assertion.recheck_expiry(&mut assessment.budget)?;
     }
     if assessment.mode == ModeKind::Supervised {
@@ -618,7 +768,1432 @@ fn decide(
         report.quiescence = "supervised_observed_empty";
     }
     assessment.budget.check().map_err(|_| "deadline")?;
+    Ok(RetainedDecision {
+        assessment,
+        assertion,
+        observations,
+        closing_census: census,
+        closing_inputs: inputs,
+        closing_recovery: fresh,
+    })
+}
+
+fn require_prepare_predecessor(tx: &rusqlite::Connection, context: &Context) -> Held<()> {
+    crate::retirement_journal::require_unfenced(tx, context.allocation.checkout).map_err(
+        |error| {
+            if matches!(error, crate::store::StoreError::RetirementFenced) {
+                "intent_conflict"
+            } else {
+                receipts::store_error(error).label()
+            }
+        },
+    )?;
+    let state: String = tx
+        .query_row(
+            "SELECT state FROM checkouts WHERE id=?1",
+            [context.allocation.checkout.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|_| "context_unknown")?;
+    if state != "active" || context.allocation.stage != "ready" {
+        return Err("allocation_not_active");
+    }
     Ok(())
+}
+
+/// Fresh prepare owner. No Clone/Deserialize, public fields or DTO constructor.
+/// Owns EX, Store, common lock and every census through acknowledged commit;
+/// all checks spend the original collection Budget. Never deletion authority.
+pub(super) struct FreshRetirementAssessment {
+    retained: RetainedDecision,
+    source_repository: SourceRepository,
+    local: LocalBinding,
+    binding: crate::retirement_journal::ImmutableBinding,
+}
+
+pub(super) fn collect_fresh_prepare(
+    config_path: &Path,
+    checkout: Uuid,
+    assertion: Option<Uuid>,
+    store: Store,
+    guard: crate::checkout_guard::CheckoutGuard,
+) -> Held<FreshRetirementAssessment> {
+    collect_fresh_prepare_inner(
+        config_path,
+        checkout,
+        assertion,
+        store,
+        guard,
+        #[cfg(test)]
+        None,
+    )
+}
+
+pub(super) fn collect_fresh_prepare_inner(
+    path: &Path,
+    checkout: Uuid,
+    assertion: Option<Uuid>,
+    store: Store,
+    guard: crate::checkout_guard::CheckoutGuard,
+    #[cfg(test)] driver: Option<&Driver>,
+) -> Held<FreshRetirementAssessment> {
+    parse_checkout(&checkout.to_string()).map_err(|_| "invalid_checkout")?;
+    if let Some(id) = assertion {
+        parse_checkout(&id.to_string()).map_err(|_| "assertion_ineligible")?;
+    }
+    let collector = Collector::with_exclusive(checkout, assertion, store, guard)?;
+    let (report, retained) = collect_retained(
+        path,
+        collector,
+        #[cfg(test)]
+        driver,
+    );
+    // The report cannot create this owner. Only the actual private decide result
+    // can cross the seam; report.reason is used solely for negative diagnostics.
+    let mut retained = retained.ok_or(report.reason)?;
+    let a = &mut retained.assessment;
+    if a.context.allocation.stage != "ready" {
+        return Err("allocation_not_active");
+    }
+    let (local, source_repository) = capture_local_binding(
+        &a.context,
+        a.store.authority_identity(),
+        LocalBindingInputs {
+            first: &a.physical.first,
+            before: &a.physical.before,
+            closing_census: &retained.closing_census,
+            closing_inputs: &retained.closing_inputs,
+            // The final LOCAL capture has a reproducible witness shape; the
+            // earlier census also retains synchronization-only absence probes.
+            recovery: &retained.closing_recovery,
+            manifests: &a.manifests,
+            policies: &a.policies,
+            combined_policy: &a.binding_policy_digest,
+            operator: retained
+                .assertion
+                .as_ref()
+                .map(approval::AssertionAssessment::operator),
+        },
+        &mut a.budget,
+    )?;
+    let binding = local.with_history(&a.approval_semantic, &a.approval_invalidation);
+    let mut owner = FreshRetirementAssessment {
+        retained,
+        source_repository,
+        local,
+        binding,
+    };
+    owner.recheck_before_transaction()?;
+    owner.check_commit_freshness()?;
+    Ok(owner)
+}
+
+impl FreshRetirementAssessment {
+    /// Metadata only; copying this fixed-shape record never copies the owner.
+    pub(super) fn binding(&self) -> &crate::retirement_journal::ImmutableBinding {
+        &self.binding
+    }
+    pub(super) fn checkout(&self) -> Uuid {
+        self.retained.assessment.context.allocation.checkout
+    }
+    /// Declaration inputs come from the validated assertion and bound SQL task,
+    /// never a caller string or allocation owner substituted for the operator.
+    pub(super) fn declaration_context(&self) -> Option<(Uuid, &str, &str)> {
+        self.retained.assertion.as_ref().map(|assertion| {
+            (
+                assertion.assertion_id(),
+                assertion.operator(),
+                self.retained
+                    .assessment
+                    .context
+                    .allocation
+                    .request
+                    .task
+                    .as_str(),
+            )
+        })
+    }
+    pub(super) fn context_bindings(&self) -> ([u8; 32], [u8; 32], [u8; 32], u64) {
+        let c = &self.retained.assessment.context;
+        (
+            Sha256::digest(&c.canonical).into(),
+            Sha256::digest(&c.source).into(),
+            Sha256::digest(&c.history).into(),
+            c.history_count,
+        )
+    }
+    /// Recheck the enabled flag against the actually retained configuration,
+    /// spending the original Budget outside lease/SQL. No replacement clock.
+    pub(super) fn recheck_prepare_configuration(&mut self, path: &Path) -> Held<()> {
+        let a = &mut self.retained.assessment;
+        let (document, manifest) = remote_proof::load_document(path, &mut a.budget)?;
+        if !document
+            .retirement_prepare_intents()
+            .map_err(|_| "configuration_unknown")?
+        {
+            return Err("prepare_intents_disabled");
+        }
+        if manifest.fingerprint() != a.manifests[0].fingerprint()
+            || manifest.fingerprint() != a.manifests[1].fingerprint()
+        {
+            return Err("configuration_changed");
+        }
+        manifest
+            .recheck(&mut a.budget)
+            .map_err(|_| "configuration_changed")
+    }
+    /// Physical/configuration/boot checks belong OUTSIDE the transaction.
+    pub(super) fn recheck_before_transaction(&mut self) -> Held<()> {
+        let a = &mut self.retained.assessment;
+        a.budget.check().map_err(|_| "deadline")?;
+        let guard = a.guard.as_ref().ok_or("exclusive_guard_required")?;
+        if !guard.exclusive_held() {
+            return Err("exclusive_guard_required");
+        }
+        guard
+            .require_matching(&a.store, a.context.allocation.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let identity = a
+            .context
+            .allocation
+            .identity
+            .as_ref()
+            .ok_or("identity_unknown")?;
+        a.lock
+            .revalidate(&a.store, identity.common_git_dir.as_os_str().as_bytes())?;
+        a.physical
+            .recheck(&mut a.budget)
+            .map_err(|_| "census_changed")?;
+        a.census.recheck(&mut a.budget)?;
+        self.retained
+            .closing_census
+            .recheck(&mut a.budget)
+            .map_err(|_| "census_changed")?;
+        self.retained
+            .closing_inputs
+            .recheck(&mut a.budget)
+            .map_err(|_| "census_changed")?;
+        self.retained.closing_recovery.recheck(&mut a.budget)?;
+        for manifest in &a.manifests {
+            manifest
+                .recheck(&mut a.budget)
+                .map_err(|_| "configuration_changed")?;
+        }
+        self.source_repository.recheck(&mut a.budget)?;
+        let boot = filesystem::boot_id(&mut a.budget).map_err(|_| "boot_mismatch")?;
+        if boot != a.physical.before.boot || boot != self.retained.closing_inputs.boot {
+            return Err("boot_mismatch");
+        }
+        if let Some(assertion) = &mut self.retained.assertion {
+            assertion.recheck_expiry(&mut a.budget)?;
+        }
+        a.budget.check().map_err(|_| "deadline")
+    }
+    /// Pure rejection gate for the eventual IMMEDIATE commit boundary. Uses an
+    /// actual new Instant, never retimestamps observations or returns a proof DTO.
+    pub(super) fn check_commit_freshness(&mut self) -> Held<()> {
+        check_commit_freshness(
+            self.retained.assessment.mode,
+            &mut self.retained.assessment.budget,
+            &mut self.retained.assertion,
+            &self.retained.observations,
+        )
+    }
+
+    fn prepare_record(
+        &self,
+        operation: Uuid,
+        task_complete: bool,
+    ) -> Held<crate::retirement_journal::IntentRecord> {
+        use crate::retirement_journal::{AdoptedDeclaration, IntentRecord, Mode, Stage};
+        crate::retirement_journal::parse_uuid(&operation.to_string())
+            .map_err(|_| "invalid_operation")?;
+        let (predecessor, source, history, count) = self.context_bindings();
+        let declaration = match self.declaration_context() {
+            Some((assertion, operator, task)) if task_complete => Some(AdoptedDeclaration {
+                task: task.to_owned(),
+                operator: operator.to_owned(),
+                assertion: assertion.to_string(),
+                operation: operation.to_string(),
+                checkout: self.checkout().to_string(),
+                predecessor_hex: hex(&predecessor),
+            }),
+            Some(_) => return Err("declaration_required"),
+            None if task_complete => return Err("declaration_invalid"),
+            None => None,
+        };
+        let mode = match self.retained.assessment.mode {
+            ModeKind::Adopted if declaration.is_some() => Mode::Adopted,
+            ModeKind::Supervised if declaration.is_none() => Mode::Supervised,
+            _ => return Err("mode_changed"),
+        };
+        Ok(IntentRecord {
+            version: 1,
+            operation: operation.to_string(),
+            checkout: self.checkout().to_string(),
+            mode,
+            revision: 1,
+            stage: Stage::Prepared,
+            assertion: declaration.as_ref().map(|d| d.assertion.clone()),
+            declaration,
+            predecessor_hex: hex(&predecessor),
+            source_hex: hex(&source),
+            history_predecessor_hex: hex(&history),
+            prior_history_count: count,
+            immutable_binding: self.binding().clone(),
+            quiescence: match mode {
+                Mode::Adopted => "asserted",
+                Mode::Supervised => "empty",
+            }
+            .into(),
+            task_completion: match mode {
+                Mode::Adopted => "adopted_declared",
+                Mode::Supervised => "supervised_empty",
+            }
+            .into(),
+            policy_digest: self.binding().inspection_policy.clone(),
+            combined_policy_digest: self.binding().combined_policy.clone(),
+            prepared_wall_ms: wall_time().map_err(|_| "clock_anomaly")?,
+            // collect_retained yields a retained decision only after complete
+            // remote cleanup. This is not caller-supplied positive evidence.
+            remote_cleanup: "complete".into(),
+        })
+    }
+
+    pub(super) fn commit_prepared(
+        mut self,
+        operation: Uuid,
+        task_complete: bool,
+        #[cfg(test)] fault: PrepareFault,
+    ) -> Held<PrepareCommit> {
+        use super::retirement_intent::{historical_operation, prepare_store_error};
+        use crate::retirement_journal::{self as journal, PreparedInsert};
+        let record = self.prepare_record(operation, task_complete)?;
+        // Encode once before acquiring the lease; no reservation of disk space.
+        let encoded = journal::encode_record(&record).map_err(|_| "record_invalid")?;
+        let (predecessor, source, _, count) = self.context_bindings();
+        let checkout = self.checkout();
+        self.recheck_before_transaction()?;
+        {
+            // Split actual disjoint owner fields, not a new Store/Budget/clock.
+            // The transaction borrows ONLY the retained Store connection, while
+            // the pure final rejection gate borrows the original timing inputs.
+            let RetainedDecision {
+                assessment,
+                assertion,
+                observations,
+                ..
+            } = &mut self.retained;
+            let Assessment {
+                store,
+                budget,
+                context,
+                mode,
+                adopted,
+                task_completed,
+                ..
+            } = assessment;
+            let lease = store.authority_lease().map_err(|_| "authority_unknown")?;
+            lease.check(store).map_err(|_| "authority_unknown")?;
+            let authority = std::sync::Arc::clone(store.authority_identity());
+            let _phase = store.sql_phase();
+            let tx = store
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|_| "commit_unknown")?;
+            lease
+                .check_authority(&authority)
+                .map_err(|_| "authority_unknown")?;
+            if let Some((row, count)) = historical_operation(&tx, checkout, operation)? {
+                tx.rollback().map_err(|_| "commit_unknown")?;
+                return Ok(PrepareCommit::Historical(Box::new(row), count));
+            }
+            journal::exclude_prepare_operation(&tx, operation).map_err(prepare_store_error)?;
+            #[cfg(test)]
+            if fault == PrepareFault::ContextMutation {
+                tx.execute(
+                    "UPDATE checkouts SET task='changed-at-immediate' WHERE id=?1",
+                    [checkout.to_string()],
+                )
+                .unwrap();
+            }
+            let current = snapshot_in_transaction(&tx, &authority, checkout, budget)
+                .map_err(|_| "context_changed")?;
+            budget
+                .reserve(current.history.len() as u64)
+                .map_err(|_| "deadline")?;
+            if current.canonical != context.canonical {
+                return Err("context_changed");
+            }
+            require_prepare_predecessor(&tx, &current)?;
+            match mode {
+                ModeKind::Adopted => {
+                    let current_mode = approval::AdoptedMode::read(&tx, &current)?;
+                    if adopted.as_ref() != Some(&current_mode) {
+                        return Err("mode_changed");
+                    }
+                    let declaration = record.declaration.as_ref().ok_or("declaration_required")?;
+                    let validated = assertion.as_ref().ok_or("assertion_ineligible")?;
+                    if declaration.task != current.allocation.request.task
+                        || declaration.operator != validated.operator()
+                        || declaration.assertion != validated.assertion_id().to_string()
+                        || declaration.operation != operation.to_string()
+                        || declaration.checkout != checkout.to_string()
+                        || declaration.predecessor_hex != hex(&predecessor)
+                    {
+                        return Err("declaration_invalid");
+                    }
+                }
+                ModeKind::Supervised => {
+                    let terminals = terminal_candidates(&tx, checkout)
+                        .map_err(|_| "terminal_candidate_unknown")?;
+                    if terminals.is_empty() || terminals.len() != observations.len() {
+                        return Err("terminal_candidate_unknown");
+                    }
+                    if !*task_completed
+                        || crate::finish::task_open(&tx, checkout)
+                            .map_err(|_| "task_completion_unknown")?
+                    {
+                        return Err("task_completion_missing");
+                    }
+                    let invalid: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM writers WHERE checkout=?1)
+                            OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1)
+                            OR EXISTS(SELECT 1 FROM capture_runs WHERE checkout=?1)
+                            OR EXISTS(SELECT 1 FROM attribution_gaps WHERE checkout=?1)",
+                            [checkout.to_string()],
+                            |r| r.get(0),
+                        )
+                        .map_err(|_| "mode_unknown")?;
+                    if invalid {
+                        return Err("mode_changed");
+                    }
+                }
+            }
+            journal::insert_prepared(
+                &tx,
+                &PreparedInsert {
+                    operation,
+                    checkout,
+                    mode: record.mode,
+                    assertion: assertion
+                        .as_ref()
+                        .map(approval::AssertionAssessment::assertion_id),
+                    declared_task: record.declaration.as_ref().map(|d| d.task.clone()),
+                    declared_operator: record.declaration.as_ref().map(|d| d.operator.clone()),
+                    predecessor,
+                    source,
+                    record: encoded.clone(),
+                },
+            )
+            .map_err(prepare_store_error)?;
+            // Read back every immutable binding/declaration column. The new row
+            // never participates in its OWN predecessor/hash; only successor S.
+            let inserted = journal::load_operation(&tx, operation).map_err(|_| "record_invalid")?;
+            if inserted.record != encoded
+                || inserted.checkout != checkout
+                || inserted.revision != 1
+                || inserted.stage != "prepared"
+            {
+                return Err("record_invalid");
+            }
+            #[cfg(test)]
+            match fault {
+                PrepareFault::ExpireAssertion => assertion
+                    .as_mut()
+                    .expect("adopted fault")
+                    .script_commit_fault_for_test("expiry"),
+                PrepareFault::AgeTerminal => observations
+                    .first_mut()
+                    .expect("supervised fault")
+                    .age_for_test(),
+                PrepareFault::Deadline => budget.test_elapsed = Some(Duration::from_secs(30)),
+                _ => {}
+            }
+            // NO filesystem/config/Git/driver work between lease acquisition and
+            // commit. This is the same pure check used by the owner method above.
+            check_commit_freshness(*mode, budget, assertion, observations)?;
+            tx.commit().map_err(|_| "commit_unknown")?;
+        }
+        #[cfg(test)]
+        if fault == PrepareFault::LostAck {
+            return Err("commit_unknown");
+        }
+        // The sole constructor is AFTER acknowledged commit. No row decoder,
+        // historical retry or uncertainty branch can construct this owner.
+        Ok(PrepareCommit::Prepared(Box::new(PreparedRetirement {
+            owner: self,
+            operation,
+            revision: 1,
+            mode: record.mode,
+            history_count: count + 1,
+        })))
+    }
+}
+
+fn check_commit_freshness(
+    mode: ModeKind,
+    budget: &mut Budget,
+    assertion: &mut Option<approval::AssertionAssessment>,
+    observations: &[TerminalObservation],
+) -> Held<()> {
+    budget.check().map_err(|_| "deadline")?;
+    match mode {
+        ModeKind::Adopted => assertion
+            .as_mut()
+            .ok_or("assertion_ineligible")?
+            .commit_time(budget)?,
+        ModeKind::Supervised => seal_terminal_observations(observations, Instant::now())?,
+    }
+    budget.check().map_err(|_| "deadline")
+}
+
+pub(super) enum PrepareCommit {
+    Prepared(Box<PreparedRetirement>),
+    Historical(Box<crate::retirement_journal::IntentRow>, u64),
+}
+
+/// Non-Clone/non-Serialize/non-Deserialize. Its fresh owner transitively owns EX,
+/// the original Store/Budget, common lock, assertion and every observation.
+pub(super) struct PreparedRetirement {
+    owner: FreshRetirementAssessment,
+    operation: Uuid,
+    revision: u64,
+    mode: crate::retirement_journal::Mode,
+    history_count: u64,
+}
+impl PreparedRetirement {
+    pub(super) fn into_report(self) -> super::retirement_intent::RetirementIntentReport {
+        let report = super::retirement_intent::committed_report(
+            self.owner.checkout(),
+            self.operation,
+            self.revision,
+            self.mode,
+            self.history_count,
+        );
+        // EX remains owned through report construction; no other consumer exists.
+        drop(self);
+        report
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrepareFault {
+    None,
+    ExpireAssertion,
+    AgeTerminal,
+    Deadline,
+    ContextMutation,
+    LostAck,
+}
+
+/// An abort owns its actual mutable authority and EX from preflight to report.
+/// Its one original Budget covers configuration, SQL framing and all LOCAL I/O.
+struct OfflineAbort {
+    store: Store,
+    guard: crate::checkout_guard::CheckoutGuard,
+    budget: Budget,
+    original: crate::retirement_journal::IntentRow,
+}
+
+struct OfflineWitness {
+    context: Context,
+    lock: recovery_refs::ExistingLock,
+    physical: Physical,
+    first_recovery: preservation::RecoveryCensus,
+    closing_census: filesystem::Census,
+    closing_inputs: GitInputs,
+    recovery: preservation::RecoveryCensus,
+    manifests: [filesystem::Manifest; 2],
+    source: SourceRepository,
+    policies: ValidatedPolicies,
+    combined_policy: String,
+    operator: Option<String>,
+    local: LocalBinding,
+}
+
+pub(super) enum AbortCommit {
+    Historical(Box<crate::retirement_journal::IntentRow>, u64, bool),
+    Aborted(Box<AbortedRetirement>),
+}
+
+/// Acknowledged abort, never a retirement/deletion/readiness capability.
+pub(super) struct AbortedRetirement {
+    owner: OfflineAbort,
+    witness: OfflineWitness,
+    row: crate::retirement_journal::IntentRow,
+    count: u64,
+}
+impl AbortedRetirement {
+    pub(super) fn into_report(self) -> super::retirement_intent::RetirementIntentReport {
+        // Keep both physical/common and EX owners alive through report creation.
+        let report = super::retirement_intent::aborted_report(&self.row, self.count);
+        let _retained = (&self.owner, &self.witness);
+        drop(self);
+        report
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AbortFault {
+    None,
+    Deadline,
+    BootChanged,
+    LostAck,
+    HoldBeforeCommit,
+    SourceBeforeCommit,
+    CorruptBeforeCommit,
+}
+
+/// Strict target selection precedes all physical work. Revision errors and a
+/// competitor are NOT validation failures and cannot hold another operation.
+fn abort_target(
+    conn: &rusqlite::Connection,
+    checkout: Uuid,
+    operation: Uuid,
+    revision: u64,
+) -> Held<(crate::retirement_journal::IntentRow, u64, bool)> {
+    use crate::retirement_journal as journal;
+    let history = journal::read_history(conn, checkout).map_err(|_| "history_unknown")?;
+    let row = journal::find_operation(conn, operation)
+        .map_err(|_| "history_unknown")?
+        .ok_or("intent_conflict")?;
+    if row.checkout != checkout || !(1..=2).contains(&revision) {
+        return Err("intent_conflict");
+    }
+    if row.stage == "aborted" {
+        if row.aborted_from != Some(revision as i64) {
+            return Err("intent_conflict");
+        }
+    } else if row.revision != revision as i64 {
+        return Err("intent_conflict");
+    }
+    if !history.iter().any(|entry| entry == &row) {
+        return Err("history_unknown");
+    }
+    let fence_active = history.iter().any(|row| row.stage != "aborted");
+    Ok((row, history.len() as u64, fence_active))
+}
+
+pub(super) fn abort_offline(
+    path: &Path,
+    checkout: Uuid,
+    operation: Uuid,
+    revision: u64,
+    #[cfg(test)] fault: AbortFault,
+) -> Held<AbortCommit> {
+    use crate::retirement_journal::parse_uuid;
+    let mut budget = Budget::new();
+    // Deliberately do not inspect prepare_intents: routing is independent of it.
+    // Its bytes still participate in both unchanged configuration commitments.
+    let (document, first_config) = remote_proof::load_document(path, &mut budget)?;
+    parse_uuid(&checkout.to_string()).map_err(|_| "invalid_checkout")?;
+    parse_uuid(&operation.to_string()).map_err(|_| "invalid_operation")?;
+    if !(1..=2).contains(&revision) {
+        return Err("intent_conflict");
+    }
+    let config = document.authority().map_err(|_| "authority_unknown")?;
+    let registry = config
+        .trusted_registry
+        .as_deref()
+        .ok_or("authority_unknown")?;
+    let dir = config.store_dir.as_deref().ok_or("authority_unknown")?;
+    let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)
+        .map_err(|_| "authority_unknown")?;
+    let (original, count, fence_active) = {
+        let _phase = readonly.sql_phase();
+        abort_target(&readonly.conn, checkout, operation, revision)?
+    };
+    if original.stage == "aborted" {
+        return Ok(AbortCommit::Historical(
+            Box::new(original),
+            count,
+            fence_active,
+        ));
+    }
+    let guard =
+        crate::checkout_guard::CheckoutGuard::exclusive(&readonly, checkout).map_err(|error| {
+            match error {
+                crate::store::StoreError::OperationsInFlight => "operations_in_flight",
+                _ => "lock_unknown",
+            }
+        })?;
+    let store = Store::open_existing_registered_mut(registry, dir, &config.roots)
+        .map_err(|_| "authority_unknown")?;
+    guard
+        .require_matching(&store, checkout)
+        .map_err(|_| "lock_unknown")?;
+    drop(readonly);
+    let mut owner = OfflineAbort {
+        store,
+        guard,
+        budget,
+        original,
+    };
+    // Close the preflight/EX race before treating anything as failed evidence.
+    {
+        let _phase = owner.store.sql_phase();
+        let tx = owner
+            .store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+            .map_err(|_| "history_unknown")?;
+        let (current, count, fence_active) = abort_target(&tx, checkout, operation, revision)?;
+        if current.stage == "aborted" {
+            tx.rollback().map_err(|_| "history_unknown")?;
+            return Ok(AbortCommit::Historical(
+                Box::new(current),
+                count,
+                fence_active,
+            ));
+        }
+        if current != owner.original {
+            return Err("intent_conflict");
+        }
+        tx.rollback().map_err(|_| "history_unknown")?;
+    }
+    let collected = owner.collect(path, document, first_config);
+    let witness = match collected {
+        Ok(witness) => witness,
+        Err(reason) => {
+            owner.hold_failed_validation()?;
+            return Err(reason);
+        }
+    };
+    #[cfg(test)]
+    let mut witness = witness;
+    #[cfg(test)]
+    if fault == AbortFault::BootChanged {
+        // Corrupt only this invocation's retained observation, then exercise the
+        // real boot equality gate. Never provide a caller-positive boot proof.
+        witness.closing_inputs.boot = b"changed-boot\n".to_vec();
+    }
+    if let Err(reason) = owner.recheck(&witness) {
+        owner.hold_failed_validation()?;
+        return Err(reason);
+    }
+    #[cfg(test)]
+    match fault {
+        AbortFault::HoldBeforeCommit => {
+            assert!(matches!(
+                owner.store.transfer(
+                    checkout,
+                    "racing-owner",
+                    crate::admission::Limits {
+                        repository: 10,
+                        owner: 10,
+                        available_bytes: Some(1 << 30),
+                        floor_bytes: 0,
+                        warn_bytes: 0,
+                    }
+                ),
+                Err(crate::store::StoreError::RetirementFenced)
+            ));
+        }
+        AbortFault::SourceBeforeCommit => {
+            owner
+                .store
+                .conn
+                .execute(
+                    "UPDATE checkouts SET task='changed-after-local-capture' WHERE id=?1",
+                    [checkout.to_string()],
+                )
+                .unwrap();
+        }
+        AbortFault::CorruptBeforeCommit => {
+            owner
+                .store
+                .conn
+                .execute(
+                    "UPDATE retirement_intents SET record='{}' WHERE operation=?1",
+                    [operation.to_string()],
+                )
+                .unwrap();
+        }
+        _ => (),
+    }
+    let result = owner.commit(
+        &witness,
+        #[cfg(test)]
+        fault,
+    );
+    let (row, count) = match result {
+        Ok(result) => result,
+        Err(reason) => {
+            // Only binding failures qualify. Never swallow a revision conflict,
+            // budget/SQL failure or uncertain commit as validation failure.
+            if matches!(reason, "history_changed" | "context_changed") {
+                owner.hold_failed_validation()?;
+            }
+            return Err(reason);
+        }
+    };
+    Ok(AbortCommit::Aborted(Box::new(AbortedRetirement {
+        owner,
+        witness,
+        row,
+        count,
+    })))
+}
+
+impl OfflineAbort {
+    fn collect(
+        &mut self,
+        path: &Path,
+        document: ConfigDocument,
+        first_config: filesystem::Manifest,
+    ) -> Held<OfflineWitness> {
+        self.budget.check().map_err(|_| "deadline")?;
+        let context = {
+            let authority = self.guard_authority();
+            let _phase = self.store.sql_phase();
+            let tx = self
+                .store
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .map_err(|_| "history_unknown")?;
+            let (target, _, _) = abort_target(
+                &tx,
+                self.original.checkout,
+                self.original.operation,
+                self.original.revision as u64,
+            )?;
+            if target != self.original {
+                return Err("intent_conflict");
+            }
+            let context =
+                snapshot_in_transaction(&tx, &authority, self.original.checkout, &mut self.budget)
+                    .map_err(|_| "context_changed")?;
+            self.budget
+                .reserve(context.history.len() as u64)
+                .map_err(|_| "deadline")?;
+            validate_abort_context(&tx, &context, &self.original, &mut self.budget)?;
+            tx.rollback().map_err(|_| "history_unknown")?;
+            context
+        };
+        // Acquire existing common lock only after EX, outside any global lease.
+        let lock = recovery_refs::ExistingLock::retain(&self.store, &context, &mut self.budget)?;
+        let (first_recovery, first, before) =
+            preservation::RecoveryCensus::recapture(&context, &mut self.budget)?;
+        lock.confirm(
+            &self.store,
+            &before.common,
+            context
+                .allocation
+                .identity
+                .as_ref()
+                .ok_or("identity_unknown")?
+                .common_git_dir
+                .as_os_str()
+                .as_bytes(),
+        )?;
+        lock.matches_census(&first_recovery)?;
+        let (recovery, closing_census, closing_inputs) =
+            preservation::RecoveryCensus::recapture(&context, &mut self.budget)?;
+        let (closing_document, closing_config) =
+            remote_proof::load_document(path, &mut self.budget)?;
+        let manifests = [first_config, closing_config];
+        if manifests[0].fingerprint() != manifests[1].fingerprint() {
+            return Err("configuration_changed");
+        }
+        let (policies, _, combined_policy) = configuration_bindings(&document)?;
+        let (_, _, closing_policy) = configuration_bindings(&closing_document)?;
+        if combined_policy != closing_policy {
+            return Err("configuration_changed");
+        }
+        let operator = match self.original.decoded.mode {
+            crate::retirement_journal::Mode::Adopted => Some(
+                document
+                    .approval()
+                    .map_err(|_| "approval_policy_unknown")?
+                    .operator_id,
+            ),
+            crate::retirement_journal::Mode::Supervised => None,
+        };
+        let (local, source) = capture_local_binding(
+            &context,
+            self.store.authority_identity(),
+            LocalBindingInputs {
+                first: &first,
+                before: &before,
+                closing_census: &closing_census,
+                closing_inputs: &closing_inputs,
+                recovery: &recovery,
+                manifests: &manifests,
+                policies: &policies,
+                combined_policy: &combined_policy,
+                operator: operator.as_deref(),
+            },
+            &mut self.budget,
+        )?;
+        if local != LocalBinding::from_record(&self.original.decoded.immutable_binding) {
+            return Err("local_binding_changed");
+        }
+        let witness = OfflineWitness {
+            context,
+            lock,
+            physical: Physical {
+                first,
+                before,
+                last: None,
+            },
+            first_recovery,
+            closing_census,
+            closing_inputs,
+            recovery,
+            manifests,
+            source,
+            policies,
+            combined_policy,
+            operator,
+            local,
+        };
+        self.recheck(&witness)?;
+        Ok(witness)
+    }
+
+    fn guard_authority(&self) -> std::sync::Arc<crate::store::AuthorityIdentity> {
+        std::sync::Arc::clone(self.store.authority_identity())
+    }
+
+    fn recheck(&mut self, witness: &OfflineWitness) -> Held<()> {
+        self.budget.check().map_err(|_| "deadline")?;
+        self.guard
+            .require_matching(&self.store, self.original.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        if !self.guard.exclusive_held() {
+            return Err("exclusive_guard_required");
+        }
+        let identity = witness
+            .context
+            .allocation
+            .identity
+            .as_ref()
+            .ok_or("identity_unknown")?;
+        witness
+            .lock
+            .revalidate(&self.store, identity.common_git_dir.as_os_str().as_bytes())?;
+        let boot = filesystem::boot_id(&mut self.budget).map_err(|_| "boot_mismatch")?;
+        if boot != witness.physical.before.boot || boot != witness.closing_inputs.boot {
+            return Err("boot_mismatch");
+        }
+        witness
+            .physical
+            .recheck(&mut self.budget)
+            .map_err(|_| "census_changed")?;
+        witness.first_recovery.recheck(&mut self.budget)?;
+        witness
+            .closing_census
+            .recheck(&mut self.budget)
+            .map_err(|_| "census_changed")?;
+        witness
+            .closing_inputs
+            .recheck(&mut self.budget)
+            .map_err(|_| "census_changed")?;
+        witness.recovery.recheck(&mut self.budget)?;
+        for manifest in &witness.manifests {
+            manifest
+                .recheck(&mut self.budget)
+                .map_err(|_| "configuration_changed")?;
+        }
+        witness.source.recheck(&mut self.budget)?;
+        // Retained policies are the same actual decoded inputs used to capture
+        // the projection, not historical values substituted for fresh config.
+        if witness.local.inspection_policy
+            != binding_hash(b"inspection-policy", witness.policies.canonical_bytes())
+            || witness.local.combined_policy
+                != binding_hash(b"combined-policy", witness.combined_policy.as_bytes())
+            || witness.operator.as_deref()
+                != self
+                    .original
+                    .decoded
+                    .declaration
+                    .as_ref()
+                    .map(|d| d.operator.as_str())
+        {
+            return Err("local_binding_changed");
+        }
+        self.budget.check().map_err(|_| "deadline")
+    }
+
+    fn commit(
+        &mut self,
+        witness: &OfflineWitness,
+        #[cfg(test)] fault: AbortFault,
+    ) -> Held<(crate::retirement_journal::IntentRow, u64)> {
+        use crate::retirement_journal as journal;
+        // No FS/boot/Git/config/driver calls from here through commit. The owned
+        // guard and common descriptors remain retained, not reacquired in SQL.
+        let lease = self
+            .store
+            .authority_lease()
+            .map_err(|_| "authority_unknown")?;
+        lease.check(&self.store).map_err(|_| "authority_unknown")?;
+        let authority = self.guard_authority();
+        let _phase = self.store.sql_phase();
+        let tx = self
+            .store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| "commit_unknown")?;
+        lease
+            .check_authority(&authority)
+            .map_err(|_| "authority_unknown")?;
+        let (current, count, _) = abort_target(
+            &tx,
+            self.original.checkout,
+            self.original.operation,
+            self.original.revision as u64,
+        )?;
+        if current != self.original {
+            return Err("intent_conflict");
+        }
+        let context =
+            snapshot_in_transaction(&tx, &authority, self.original.checkout, &mut self.budget)
+                .map_err(|_| "context_changed")?;
+        self.budget
+            .reserve(context.history.len() as u64)
+            .map_err(|_| "deadline")?;
+        if context.canonical != witness.context.canonical {
+            return Err("context_changed");
+        }
+        validate_abort_context(&tx, &context, &self.original, &mut self.budget)?;
+        journal::abort_cas(
+            &tx,
+            self.original.checkout,
+            self.original.operation,
+            self.original.revision as u64,
+        )
+        .map_err(super::retirement_intent::prepare_store_error)?;
+        let aborted =
+            journal::load_operation(&tx, self.original.operation).map_err(|_| "record_invalid")?;
+        #[cfg(test)]
+        if fault == AbortFault::Deadline {
+            self.budget.test_elapsed = Some(Duration::from_secs(30));
+        }
+        // Pure original-budget rejection immediately before the atomic commit.
+        self.budget.check().map_err(|_| "deadline")?;
+        tx.commit().map_err(|_| "commit_unknown")?;
+        #[cfg(test)]
+        if fault == AbortFault::LostAck {
+            return Err("commit_unknown");
+        }
+        Ok((aborted, count))
+    }
+
+    fn hold_failed_validation(&mut self) -> Held<()> {
+        if self.original.stage != "prepared" {
+            return Ok(());
+        }
+        self.guard
+            .require_matching(&self.store, self.original.checkout)
+            .map_err(|_| "checkout_guard_unavailable")?;
+        let lease = self
+            .store
+            .authority_lease()
+            .map_err(|_| "authority_unknown")?;
+        lease.check(&self.store).map_err(|_| "authority_unknown")?;
+        let authority = self.guard_authority();
+        let _phase = self.store.sql_phase();
+        let tx = self
+            .store
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| "commit_unknown")?;
+        lease
+            .check_authority(&authority)
+            .map_err(|_| "authority_unknown")?;
+        let (current, _, _) =
+            abort_target(&tx, self.original.checkout, self.original.operation, 1)?;
+        // Full strict equality, including immutable bytes and mutable original
+        // stage. No rebind, stale-revision hold, competitor hold or corrupt write.
+        if current != self.original {
+            return Err("intent_conflict");
+        }
+        crate::retirement_journal::hold_abort_validation(&tx, current.checkout, current.operation)
+            .map_err(super::retirement_intent::prepare_store_error)?;
+        self.budget.check().map_err(|_| "deadline")?;
+        tx.commit().map_err(|_| "commit_unknown")
+    }
+}
+
+fn validate_abort_context(
+    conn: &rusqlite::Connection,
+    context: &Context,
+    original: &crate::retirement_journal::IntentRow,
+    budget: &mut Budget,
+) -> Held<()> {
+    if hex(&Sha256::digest(&context.source)) != original.decoded.source_hex {
+        return Err("context_changed");
+    }
+    let mut predecessor = context.source.clone();
+    let (history, count) = crate::retirement_journal::frame_history_without(
+        conn,
+        original.checkout,
+        original.operation,
+        &mut predecessor,
+    )
+    .map_err(|_| "history_unknown")?;
+    budget
+        .reserve(predecessor.len() as u64)
+        .map_err(|_| "deadline")?;
+    if count != original.decoded.prior_history_count
+        || hex(&Sha256::digest(&history)) != original.decoded.history_predecessor_hex
+        || hex(&Sha256::digest(&predecessor)) != original.decoded.predecessor_hex
+    {
+        return Err("history_changed");
+    }
+    budget.check().map_err(|_| "deadline")
+}
+
+/// Fixed local projection: deliberately NO historical remote-graph hashes.
+/// Offline abort must reproduce these fields, not the two approval history hashes.
+#[derive(Debug, PartialEq, Eq)]
+struct LocalBinding {
+    authority_allocation: String,
+    source_sql: String,
+    managed_physical: String,
+    census: String,
+    git_private: String,
+    local_git: String,
+    git_inputs: String,
+    source_commitment: String,
+    protection: String,
+    protection_count: u64,
+    config_manifests: [String; 2],
+    inspection_policy: String,
+    combined_policy: String,
+    operator: String,
+    source_repository: String,
+}
+impl LocalBinding {
+    fn from_record(binding: &crate::retirement_journal::ImmutableBinding) -> Self {
+        Self {
+            authority_allocation: binding.authority_allocation.clone(),
+            source_sql: binding.source_sql.clone(),
+            managed_physical: binding.managed_physical.clone(),
+            census: binding.census.clone(),
+            git_private: binding.git_private.clone(),
+            local_git: binding.local_git.clone(),
+            git_inputs: binding.git_inputs.clone(),
+            source_commitment: binding.source_commitment.clone(),
+            protection: binding.protection.clone(),
+            protection_count: binding.protection_count,
+            config_manifests: binding.config_manifests.clone(),
+            inspection_policy: binding.inspection_policy.clone(),
+            combined_policy: binding.combined_policy.clone(),
+            operator: binding.operator.clone(),
+            source_repository: binding.source_repository.clone(),
+        }
+    }
+
+    fn with_history(
+        &self,
+        semantic: &[u8],
+        invalidation: &[u8],
+    ) -> crate::retirement_journal::ImmutableBinding {
+        crate::retirement_journal::ImmutableBinding {
+            version: 1,
+            authority_allocation: self.authority_allocation.clone(),
+            source_sql: self.source_sql.clone(),
+            managed_physical: self.managed_physical.clone(),
+            census: self.census.clone(),
+            git_private: self.git_private.clone(),
+            local_git: self.local_git.clone(),
+            git_inputs: self.git_inputs.clone(),
+            source_commitment: self.source_commitment.clone(),
+            approval_semantic: binding_hash(b"approval-semantic", semantic),
+            approval_invalidation: binding_hash(b"approval-invalidation", invalidation),
+            protection: self.protection.clone(),
+            protection_count: self.protection_count,
+            config_manifests: self.config_manifests.clone(),
+            inspection_policy: self.inspection_policy.clone(),
+            combined_policy: self.combined_policy.clone(),
+            operator: self.operator.clone(),
+            source_repository: self.source_repository.clone(),
+        }
+    }
+}
+
+fn binding_hash(field: &[u8], bytes: &[u8]) -> String {
+    let mut framed = Vec::new();
+    frame(&mut framed, 0, b"work.retirement.immutable-binding.v1");
+    frame(&mut framed, 1, field);
+    frame(&mut framed, 2, bytes);
+    hex(&Sha256::digest(framed))
+}
+
+struct LocalBindingInputs<'a> {
+    first: &'a filesystem::Census,
+    before: &'a GitInputs,
+    closing_census: &'a filesystem::Census,
+    closing_inputs: &'a GitInputs,
+    recovery: &'a preservation::RecoveryCensus,
+    manifests: &'a [filesystem::Manifest; 2],
+    policies: &'a ValidatedPolicies,
+    combined_policy: &'a str,
+    operator: Option<&'a str>,
+}
+
+/// Reusable LOCAL collector/projection for the later offline abort stage. Takes
+/// actual native inputs, never remote evidence or a reconstructed positive DTO.
+/// No fetch, protection creation, synchronization, receipt or SQL mutation.
+fn capture_local_binding(
+    context: &Context,
+    authority: &crate::store::AuthorityIdentity,
+    inputs: LocalBindingInputs<'_>,
+    budget: &mut Budget,
+) -> Held<(LocalBinding, SourceRepository)> {
+    budget.check().map_err(|_| "deadline")?;
+    let source_repository = SourceRepository::capture(context, inputs.before, budget)?;
+    inputs.first.recheck(budget).map_err(|_| "census_changed")?;
+    inputs
+        .before
+        .recheck(budget)
+        .map_err(|_| "census_changed")?;
+    inputs
+        .closing_census
+        .recheck(budget)
+        .map_err(|_| "census_changed")?;
+    inputs
+        .closing_inputs
+        .recheck(budget)
+        .map_err(|_| "census_changed")?;
+    inputs.recovery.recheck(budget)?;
+    for manifest in inputs.manifests {
+        manifest
+            .recheck(budget)
+            .map_err(|_| "configuration_changed")?;
+    }
+    let mut authority_bytes = Vec::new();
+    frame(
+        &mut authority_bytes,
+        1,
+        authority.registry().as_os_str().as_bytes(),
+    );
+    frame(
+        &mut authority_bytes,
+        2,
+        authority.directory.as_os_str().as_bytes(),
+    );
+    let lock = authority.lock_id.ok_or("authority_unknown")?;
+    // Only stable authority identity: never authority-dir mtime, DB contents/stat
+    // timestamps or checkout-guard metadata, all of which our own commit changes.
+    for pair in [authority.directory_id, authority.database_id(), lock] {
+        frame(&mut authority_bytes, 3, &pair.0.to_be_bytes());
+        frame(&mut authority_bytes, 4, &pair.1.to_be_bytes());
+    }
+    let a = &context.allocation;
+    let allocation = serde_json::to_vec(&(
+        a.checkout,
+        &a.request,
+        &a.destination,
+        &a.base_commit,
+        &a.identity,
+    ))
+    .map_err(|_| "identity_unknown")?;
+    budget
+        .reserve(allocation.len() as u64)
+        .map_err(|_| "binding_budget")?;
+    frame(&mut authority_bytes, 5, &allocation);
+    let mut targets = recovery_refs::verify_existing_protection(inputs.recovery, a.checkout)?;
+    targets.sort();
+    let mut protection = Vec::new();
+    frame(
+        &mut protection,
+        1,
+        inputs.recovery.object_format().as_bytes(),
+    );
+    let (dev, ino) = inputs.recovery.common_dev_ino();
+    frame(&mut protection, 2, &dev.to_be_bytes());
+    frame(&mut protection, 3, &ino.to_be_bytes());
+    for (reference, oid) in &targets {
+        frame(&mut protection, 4, reference.as_bytes());
+        frame(&mut protection, 5, oid.as_bytes());
+    }
+    let mut operator = Vec::new();
+    frame(&mut operator, 1, &[u8::from(inputs.operator.is_some())]);
+    if let Some(id) = inputs.operator {
+        frame(&mut operator, 2, id.as_bytes());
+    }
+    let result = LocalBinding {
+        authority_allocation: binding_hash(b"authority-allocation", &authority_bytes),
+        // P_source is the established complete SQL framing, also used by the
+        // journal's source column; do not change its hash convention here.
+        source_sql: hex(&Sha256::digest(&context.source)),
+        managed_physical: binding_hash(b"managed-physical", &inputs.first.fingerprint()),
+        census: binding_hash(b"closing-census", &inputs.closing_census.fingerprint()),
+        git_private: binding_hash(b"git-private", &inputs.before.private.fingerprint()),
+        local_git: binding_hash(b"local-git", &inputs.before.fingerprint()),
+        git_inputs: binding_hash(b"closing-git-inputs", &inputs.closing_inputs.fingerprint()),
+        source_commitment: binding_hash(
+            b"local-source",
+            &inputs.recovery.source_commitment(
+                inputs.first,
+                inputs.before,
+                Some(&inputs.manifests[0]),
+            ),
+        ),
+        protection: binding_hash(b"protection", &protection),
+        protection_count: targets.len() as u64,
+        config_manifests: [
+            binding_hash(b"config-first", &inputs.manifests[0].fingerprint()),
+            binding_hash(b"config-closing", &inputs.manifests[1].fingerprint()),
+        ],
+        inspection_policy: binding_hash(b"inspection-policy", inputs.policies.canonical_bytes()),
+        combined_policy: binding_hash(b"combined-policy", inputs.combined_policy.as_bytes()),
+        operator: binding_hash(b"operator", &operator),
+        source_repository: source_repository.digest.clone(),
+    };
+    source_repository.recheck(budget)?;
+    budget.check().map_err(|_| "deadline")?;
+    Ok((result, source_repository))
+}
+
+/// Original request.repository, not the managed checkout. Selective identity and
+/// link/marker metadata only: no source payload walk or source object traversal.
+struct SourceRepository {
+    root: filesystem::Manifest,
+    private: filesystem::Manifest,
+    common: filesystem::Manifest,
+    routes: Vec<filesystem::Endpoint>,
+    digest: String,
+}
+impl SourceRepository {
+    fn capture(context: &Context, inputs: &GitInputs, budget: &mut Budget) -> Held<Self> {
+        let identity = context
+            .allocation
+            .identity
+            .as_ref()
+            .ok_or("identity_unknown")?;
+        let path = context
+            .allocation
+            .request
+            .repository
+            .as_deref()
+            .ok_or("source_repository_unknown")?;
+        native_anchor_path(path).map_err(|_| "source_repository_unknown")?;
+        // snapshot_in_transaction already proves requested alias -> charged common.
+        // Independently prove the current source root resolves to that same common.
+        if !inputs
+            .registrations
+            .iter()
+            .any(|r| r.path == path.as_os_str().as_bytes() && !r.missing)
+        {
+            return Err("source_repository_unknown");
+        }
+        let checked =
+            |result: Result<_, IncompleteReason>| result.map_err(|_| "source_repository_changed");
+        let mut root = checked(filesystem::Manifest::new(path, budget))?;
+        let is_main = root
+            .is_directory(b".git", budget)
+            .map_err(|_| "source_repository_unknown")?;
+        let private_path = if is_main {
+            let common = path.join(".git");
+            if common != identity.common_git_dir {
+                return Err("source_repository_unknown");
+            }
+            common
+        } else {
+            let marker = root
+                .required(b".git", budget)
+                .map_err(|_| "source_repository_unknown")?;
+            absolute_gitdir(
+                marker
+                    .strip_prefix(b"gitdir: ")
+                    .ok_or("source_repository_unknown")?,
+            )
+            .map_err(|_| "source_repository_unknown")?
+        };
+        let mut private = checked(filesystem::Manifest::new(&private_path, budget))?;
+        let common = checked(filesystem::Manifest::new(&identity.common_git_dir, budget))?;
+        if common.root_dev_ino() != inputs.common.root_dev_ino() {
+            return Err("source_repository_changed");
+        }
+        if !is_main {
+            let registration = private_path
+                .strip_prefix(identity.common_git_dir.join("worktrees"))
+                .map_err(|_| "source_repository_unknown")?;
+            if registration.as_os_str().is_empty()
+                || registration.components().count() != 1
+                || private
+                    .required(b"commondir", budget)
+                    .map_err(|_| "source_repository_unknown")?
+                    != b"../..\n"
+                || absolute_gitdir(
+                    &private
+                        .required(b"gitdir", budget)
+                        .map_err(|_| "source_repository_unknown")?,
+                )
+                .map_err(|_| "source_repository_unknown")?
+                    != path.join(".git")
+            {
+                return Err("source_repository_unknown");
+            }
+        }
+        private
+            .optional(b"work-lease.json", budget)
+            .map_err(|_| "source_repository_unknown")?;
+        // Endpoint fingerprints bind route ancestors by identity only, excluding
+        // unrelated parent directory churn. The actual roots retain full stats.
+        let route_paths = [
+            if is_main {
+                path.join(".git/HEAD")
+            } else {
+                path.join(".git")
+            },
+            private_path.join("HEAD"),
+            identity.common_git_dir.join("HEAD"),
+        ];
+        let mut routes = Vec::new();
+        for path in route_paths {
+            let route = filesystem::Endpoint::open(&path, budget)
+                .map_err(|_| "source_repository_unknown")?;
+            if route.missing() {
+                return Err("source_repository_unknown");
+            }
+            routes.push(route);
+        }
+        let mut bytes = Vec::new();
+        for path in [
+            path,
+            private_path.as_path(),
+            identity.common_git_dir.as_path(),
+        ] {
+            frame(&mut bytes, 1, path.as_os_str().as_bytes());
+        }
+        for manifest in [&root, &private, &common] {
+            frame(&mut bytes, 2, &manifest.fingerprint());
+        }
+        for route in &routes {
+            frame(&mut bytes, 3, &route.fingerprint());
+        }
+        let result = Self {
+            root,
+            private,
+            common,
+            routes,
+            digest: binding_hash(b"source-repository", &bytes),
+        };
+        result.recheck(budget)?;
+        Ok(result)
+    }
+    fn recheck(&self, budget: &mut Budget) -> Held<()> {
+        for manifest in [&self.root, &self.private, &self.common] {
+            manifest
+                .recheck(budget)
+                .map_err(|_| "source_repository_changed")?;
+        }
+        for route in &self.routes {
+            route
+                .recheck(budget)
+                .map_err(|_| "source_repository_changed")?;
+        }
+        Ok(())
+    }
 }
 
 fn seal_terminal_observations(observations: &[TerminalObservation], now: Instant) -> Held<()> {
@@ -1111,6 +2686,1630 @@ mod tests {
         (r, b, os, config)
     }
 
+    fn fresh_for_test(
+        f: &fixture::ManagedFixture,
+        path: &Path,
+        assertion: Option<Uuid>,
+        driver: Option<&Driver>,
+    ) -> FreshRetirementAssessment {
+        let store = Store::open_existing_registered_mut(
+            &f.temp.path().join("registry"),
+            &f.temp.path().join("authority"),
+            &[f.root.clone()],
+        )
+        .unwrap();
+        let guard =
+            crate::checkout_guard::CheckoutGuard::exclusive(&store, f.allocation.checkout).unwrap();
+        let result = match driver {
+            Some(driver) => collect_fresh_prepare_inner(
+                path,
+                f.allocation.checkout,
+                assertion,
+                store,
+                guard,
+                Some(driver),
+            ),
+            None => collect_fresh_prepare(path, f.allocation.checkout, assertion, store, guard),
+        };
+        result.unwrap_or_else(|reason| panic!("fresh collector: {reason}"))
+    }
+
+    fn enable_prepare(path: &Path) {
+        let mut text = fs::read_to_string(path).unwrap();
+        text.push_str("\n[retirement]\nprepare_intents=true\n");
+        fs::write(path, text).unwrap();
+    }
+
+    fn prepare_test(
+        path: &Path,
+        checkout: Uuid,
+        operation: Uuid,
+        assertion: Option<Uuid>,
+        task_complete: bool,
+        driver: Option<&Driver>,
+        fault: PrepareFault,
+    ) -> Held<super::retirement_intent::RetirementIntentReport> {
+        super::retirement_intent::prepare_inner(
+            path,
+            checkout,
+            operation,
+            assertion,
+            task_complete,
+            driver,
+            fault,
+        )
+    }
+
+    // Test-only raw surface snapshot remains usable when negative tampering makes
+    // the strict inspection context intentionally undecodable.
+    fn abort_source_rows(store: &Store) -> Vec<String> {
+        let mut statement = store.conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('retirement_intents','outbox') ORDER BY name").unwrap();
+        let tables: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut result = Vec::new();
+        for table in tables {
+            let mut statement = store
+                .conn
+                .prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let values: Vec<_> = (0..columns)
+                    .map(|column| format!("{:?}", row.get_ref(column).unwrap()))
+                    .collect();
+                result.push(format!("{table}:{values:?}"));
+            }
+        }
+        result.sort();
+        result
+    }
+
+    fn abort_files(f: &fixture::ManagedFixture) -> Vec<u8> {
+        fn visit(path: &Path, out: &mut Vec<u8>) {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => panic!("{}: {error}", path.display()),
+            };
+            frame(out, 1, path.as_os_str().as_bytes());
+            for value in [
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mode() as u64,
+                metadata.uid() as u64,
+                metadata.gid() as u64,
+                metadata.nlink(),
+                metadata.len(),
+                metadata.mtime() as u64,
+                metadata.mtime_nsec() as u64,
+                metadata.ctime() as u64,
+                metadata.ctime_nsec() as u64,
+            ] {
+                frame(out, 2, &value.to_be_bytes());
+            }
+            if metadata.is_dir() {
+                let mut children: Vec<_> = fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                children.sort();
+                for child in children {
+                    visit(&child, out);
+                }
+            } else if metadata.is_file() {
+                frame(out, 3, &Sha256::digest(fs::read(path).unwrap()));
+            } else if metadata.file_type().is_symlink() {
+                frame(out, 4, fs::read_link(path).unwrap().as_os_str().as_bytes());
+            }
+        }
+        let mut out = Vec::new();
+        for path in [
+            f.allocation.destination.as_path(),
+            f.common(),
+            f.temp
+                .path()
+                .join("authority/inspection-receipts-v1")
+                .as_path(),
+        ] {
+            visit(path, &mut out);
+        }
+        out
+    }
+
+    fn abort_test(
+        path: &Path,
+        checkout: Uuid,
+        operation: Uuid,
+        revision: u64,
+        fault: AbortFault,
+    ) -> Held<super::retirement_intent::RetirementIntentReport> {
+        super::retirement_intent::abort_inner(path, checkout, operation, revision, fault)
+    }
+
+    fn prepared_adopted_intent() -> (fixture::ManagedFixture, PathBuf, Uuid) {
+        let f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (config, _) = f.approval();
+        enable_prepare(&config);
+        assert!(recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared());
+        let assertion = approval::assertion_for_retirement_test(&config, f.allocation.checkout);
+        let operation = Uuid::now_v7();
+        assert!(prepare_test(
+            &config,
+            f.allocation.checkout,
+            operation,
+            Some(assertion),
+            true,
+            None,
+            PrepareFault::None
+        )
+        .unwrap()
+        .fresh_commit());
+        (f, config, operation)
+    }
+
+    #[test]
+    fn private_abort_prepared_and_held_restart_exact_retry_and_writer_reconciliation() {
+        for attempted_writer in [false, true] {
+            let (mut f, config, operation) = prepared_adopted_intent();
+            let checkout = f.allocation.checkout;
+            let original =
+                crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+            let source = abort_source_rows(&f.store);
+            let files = abort_files(&f);
+            let refs = recovery_ref_rows(&f);
+            let destination = fs::metadata(&f.allocation.destination).unwrap();
+            let mut revision = 1;
+            if attempted_writer {
+                assert!(matches!(
+                    f.store.transfer(
+                        checkout,
+                        "other-owner",
+                        crate::admission::Limits {
+                            repository: 10,
+                            owner: 10,
+                            available_bytes: Some(1 << 30),
+                            floor_bytes: 0,
+                            warn_bytes: 0
+                        }
+                    ),
+                    Err(crate::store::StoreError::RetirementFenced)
+                ));
+                revision = 2;
+            }
+            drop(f.store);
+            f.store = Store::open_existing_registered_mut(
+                &f.temp.path().join("registry"),
+                &f.temp.path().join("authority"),
+                &[f.root.clone()],
+            )
+            .unwrap();
+            let events = f.store.pending_events(1000).unwrap().len();
+            let status = super::retirement_intent::retirement_status(&config, checkout);
+            assert_eq!(status.reason(), "status");
+            assert!(status.fence_active());
+            assert!(!status.fresh_commit());
+            assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            for (wrong_checkout, wrong_operation, wrong_revision) in [
+                (Uuid::now_v7(), operation, revision),
+                (checkout, Uuid::now_v7(), revision),
+                (checkout, operation, if revision == 1 { 2 } else { 1 }),
+                (checkout, operation, u64::MAX),
+            ] {
+                assert_eq!(
+                    abort_test(
+                        &config,
+                        wrong_checkout,
+                        wrong_operation,
+                        wrong_revision,
+                        AbortFault::None
+                    )
+                    .unwrap_err(),
+                    "intent_conflict"
+                );
+                assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            }
+            let report =
+                abort_test(&config, checkout, operation, revision, AbortFault::None).unwrap();
+            assert_eq!(report.outcome(), "aborted");
+            assert!(report.fresh_commit());
+            assert!(!report.fence_active());
+            let row = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+            assert_eq!(row.record, original.record);
+            assert_eq!(row.aborted_from, Some(revision as i64));
+            assert_eq!(row.revision, revision as i64 + 1);
+            assert_eq!(row.held_reason.is_some(), attempted_writer);
+            assert_eq!(source, abort_source_rows(&f.store));
+            assert_eq!(files, abort_files(&f));
+            assert_eq!(refs, recovery_ref_rows(&f));
+            use std::os::unix::fs::MetadataExt;
+            let after = fs::metadata(&f.allocation.destination).unwrap();
+            assert_eq!(
+                (destination.dev(), destination.ino()),
+                (after.dev(), after.ino())
+            );
+            assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+            let ex = crate::checkout_guard::CheckoutGuard::exclusive(&f.store, checkout).unwrap();
+            let retry =
+                abort_test(&config, checkout, operation, revision, AbortFault::None).unwrap();
+            assert_eq!(retry.reason(), "historical");
+            assert!(!retry.fresh_commit());
+            assert!(!retry.fence_active());
+            assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+            drop(ex);
+            f.store
+                .transfer(
+                    checkout,
+                    "other-owner",
+                    crate::admission::Limits {
+                        repository: 10,
+                        owner: 10,
+                        available_bytes: Some(1 << 30),
+                        floor_bytes: 0,
+                        warn_bytes: 0,
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn private_abort_owns_ex_and_common_through_report_but_not_global_lease() {
+        let (mut f, config, operation) = prepared_adopted_intent();
+        let checkout = f.allocation.checkout;
+        let shared = crate::checkout_guard::CheckoutGuard::shared(&f.store, checkout).unwrap();
+        let files = abort_files(&f);
+        let rows = abort_source_rows(&f.store);
+        let events = f.store.pending_events(1000).unwrap().len();
+        assert_eq!(
+            abort_test(&config, checkout, operation, 1, AbortFault::None).unwrap_err(),
+            "operations_in_flight"
+        );
+        assert_eq!(
+            super::retirement_intent::retirement_status(&config, checkout).reason(),
+            "status"
+        );
+        assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+        assert_eq!(files, abort_files(&f));
+        drop(shared);
+        let AbortCommit::Aborted(aborted) =
+            abort_offline(&config, checkout, operation, 1, AbortFault::None).unwrap()
+        else {
+            panic!("fresh acknowledged abort owner required");
+        };
+        assert!(matches!(
+            crate::checkout_guard::CheckoutGuard::shared(&f.store, checkout),
+            Err(crate::store::StoreError::OperationsInFlight)
+        ));
+        let context = snapshot(&mut f.store, checkout, &mut Budget::new()).unwrap();
+        assert!(matches!(
+            recovery_refs::ExistingLock::retain(&f.store, &context, &mut Budget::new()),
+            Err("preparation_busy")
+        ));
+        let lease = f.store.authority_lease().unwrap();
+        {
+            let tx = f
+                .store
+                .conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.rollback().unwrap();
+        }
+        drop(lease);
+        let report = aborted.into_report();
+        assert_eq!(report.outcome(), "aborted");
+        assert!(crate::checkout_guard::CheckoutGuard::shared(&f.store, checkout).is_ok());
+        assert!(
+            recovery_refs::ExistingLock::retain(&f.store, &context, &mut Budget::new()).is_ok()
+        );
+        assert_eq!(rows, abort_source_rows(&f.store));
+        assert_eq!(files, abort_files(&f));
+        assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+    }
+
+    #[test]
+    fn private_abort_lost_ack_and_original_deadline_do_not_claim_clearance() {
+        for fault in [
+            AbortFault::LostAck,
+            AbortFault::Deadline,
+            AbortFault::BootChanged,
+        ] {
+            let (mut f, config, operation) = prepared_adopted_intent();
+            let checkout = f.allocation.checkout;
+            let source = receipts::collector_source(&mut f.store, checkout);
+            let events = f.store.pending_events(1000).unwrap().len();
+            let result = abort_test(&config, checkout, operation, 1, fault);
+            if fault == AbortFault::LostAck {
+                let report = result.unwrap();
+                assert_eq!(report.outcome(), "uncertain");
+                assert_eq!(
+                    serde_json::to_value(&report).unwrap()["recorded"],
+                    "unknown"
+                );
+                assert!(report.fence_active()); // conservative, not a claim of cleared authority
+                assert!(!report.fresh_commit());
+                let row =
+                    crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+                assert_eq!(row.stage, "aborted");
+                let retry = abort_test(&config, checkout, operation, 1, AbortFault::None).unwrap();
+                assert_eq!(retry.reason(), "historical");
+                assert!(!retry.fence_active());
+                assert!(!retry.fresh_commit());
+                assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    if fault == AbortFault::Deadline {
+                        "deadline"
+                    } else {
+                        "boot_mismatch"
+                    }
+                );
+                assert!(matches!(
+                    crate::retirement_journal::require_unfenced(&f.store.conn, checkout),
+                    Err(crate::store::StoreError::RetirementFenced)
+                ));
+                let status = super::retirement_intent::retirement_status(&config, checkout);
+                assert!(status.fence_active());
+                assert!(!status.fresh_commit());
+            }
+            assert_eq!(source, receipts::collector_source(&mut f.store, checkout));
+        }
+    }
+
+    #[test]
+    fn private_abort_expired_retained_assertion_does_not_clear_or_renew_the_fence() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (config, _) = f.approval();
+        enable_prepare(&config);
+        assert!(recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared());
+        let assertion = approval::assertion_for_retirement_test(&config, f.allocation.checkout);
+        let fresh = fresh_for_test(&f, &config, Some(assertion), None);
+        let operation = Uuid::now_v7();
+        let PrepareCommit::Prepared(mut prepared) = fresh
+            .commit_prepared(operation, true, PrepareFault::None)
+            .unwrap()
+        else {
+            panic!("actual fresh commit required");
+        };
+        let record = crate::retirement_journal::load_operation(&f.store.conn, operation)
+            .unwrap()
+            .record;
+        // Existing private negative clock seam on the actually retained claim.
+        // No sleep, host clock change, rewritten receipt, or new positive proof.
+        prepared
+            .owner
+            .retained
+            .assertion
+            .as_mut()
+            .unwrap()
+            .expire_for_test();
+        assert_eq!(
+            prepared.owner.check_commit_freshness(),
+            Err("approval_expired")
+        );
+        drop(prepared);
+        drop(f.store);
+        f.store = Store::open_existing_registered_mut(
+            &f.temp.path().join("registry"),
+            &f.temp.path().join("authority"),
+            &[f.root.clone()],
+        )
+        .unwrap();
+        let events = f.store.pending_events(1000).unwrap().len();
+        let status = super::retirement_intent::retirement_status(&config, f.allocation.checkout);
+        assert!(status.fence_active());
+        assert!(!status.fresh_commit());
+        assert_eq!(serde_json::to_value(status).unwrap()["stage"], "prepared");
+        assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+        let row = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+        assert_eq!(row.record, record);
+        assert_eq!(row.revision, 1);
+        assert_eq!(
+            abort_test(
+                &config,
+                f.allocation.checkout,
+                operation,
+                1,
+                AbortFault::None
+            )
+            .unwrap()
+            .outcome(),
+            "aborted"
+        );
+    }
+
+    #[test]
+    fn private_abort_final_cas_rejects_new_hold_source_change_and_corrupt_record() {
+        for fault in [
+            AbortFault::HoldBeforeCommit,
+            AbortFault::SourceBeforeCommit,
+            AbortFault::CorruptBeforeCommit,
+        ] {
+            let (f, config, operation) = prepared_adopted_intent();
+            let checkout = f.allocation.checkout;
+            let events = f.store.pending_events(1000).unwrap().len();
+            let files = abort_files(&f);
+            assert_eq!(
+                abort_test(&config, checkout, operation, 1, fault).unwrap_err(),
+                match fault {
+                    AbortFault::HoldBeforeCommit => "intent_conflict",
+                    AbortFault::SourceBeforeCommit => "context_changed",
+                    AbortFault::CorruptBeforeCommit => "history_unknown",
+                    _ => unreachable!(),
+                }
+            );
+            let stage: String = f
+                .store
+                .conn
+                .query_row(
+                    "SELECT stage FROM retirement_intents WHERE operation=?1",
+                    [operation.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stage,
+                if fault == AbortFault::CorruptBeforeCommit {
+                    "prepared"
+                } else {
+                    "held"
+                }
+            );
+            assert_eq!(
+                events + usize::from(fault != AbortFault::CorruptBeforeCommit),
+                f.store.pending_events(1000).unwrap().len()
+            );
+            assert_eq!(files, abort_files(&f));
+            if fault == AbortFault::HoldBeforeCommit {
+                let row =
+                    crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+                assert_eq!(row.held_reason.as_deref(), Some("owner_transfer"));
+                assert_eq!(
+                    abort_test(&config, checkout, operation, 2, AbortFault::None)
+                        .unwrap()
+                        .outcome(),
+                    "aborted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn private_abort_local_tampering_refuses_and_holds_only_valid_own_record_once() {
+        for change in [
+            "payload",
+            "marker-inode",
+            "config-comment",
+            "flag-off",
+            "policy",
+            "operator",
+            "ref",
+            "protection",
+            "object",
+            "stat",
+            "source-root",
+            "source-sql",
+            "record",
+            "oversize",
+        ] {
+            let (f, config, operation) = prepared_adopted_intent();
+            let checkout = f.allocation.checkout;
+            match change {
+                "payload" => {
+                    fs::write(f.allocation.destination.join("tracked"), b"different").unwrap()
+                }
+                "marker-inode" => {
+                    let marker = f
+                        .allocation
+                        .identity
+                        .as_ref()
+                        .unwrap()
+                        .private_git_dir
+                        .join("work-lease.json");
+                    let replacement = marker.with_extension("replacement");
+                    fs::write(&replacement, fs::read(&marker).unwrap()).unwrap();
+                    fs::set_permissions(&replacement, fs::metadata(&marker).unwrap().permissions())
+                        .unwrap();
+                    fs::rename(replacement, marker).unwrap();
+                }
+                "config-comment" => {
+                    let text = fs::read_to_string(&config).unwrap();
+                    fs::write(&config, format!("{text}\n# valid comment\n")).unwrap();
+                }
+                "flag-off" | "policy" | "operator" => {
+                    let text = fs::read_to_string(&config).unwrap();
+                    let text = match change {
+                        "flag-off" => text.replace("prepare_intents=true", "prepare_intents=false"),
+                        "policy" => text.replace("fixture-v1", "fixture-v2"),
+                        _ => text.replace("explicit-operator", "different-operator"),
+                    };
+                    fs::write(&config, text).unwrap();
+                }
+                "ref" => {
+                    git_at(
+                        &f.allocation.destination,
+                        &["update-ref", "refs/tags/new", "HEAD"],
+                    );
+                }
+                "protection" => {
+                    let reference = first_recovery_ref(&f);
+                    let tree = git_text(&f, &["rev-parse", "HEAD^{tree}"]);
+                    git_at(
+                        &f.allocation.destination,
+                        &["update-ref", &reference, &tree],
+                    );
+                }
+                "object" => {
+                    git_at(&f.allocation.destination, &["hash-object", "-w", "--stdin"]);
+                }
+                "stat" | "source-root" => {
+                    let path = if change == "stat" {
+                        f.allocation.destination.join("tracked")
+                    } else {
+                        f.allocation.request.repository.clone().unwrap()
+                    };
+                    let mode = fs::metadata(&path).unwrap().permissions().mode();
+                    fs::set_permissions(
+                        path,
+                        fs::Permissions::from_mode(
+                            mode ^ if change == "source-root" {
+                                0o010
+                            } else {
+                                0o100
+                            },
+                        ),
+                    )
+                    .unwrap();
+                }
+                "source-sql" => {
+                    f.store
+                        .conn
+                        .execute(
+                            "UPDATE checkouts SET task='tampered' WHERE id=?1",
+                            [checkout.to_string()],
+                        )
+                        .unwrap();
+                }
+                "oversize" => {
+                    f.store
+                        .conn
+                        .execute_batch("PRAGMA ignore_check_constraints=ON")
+                        .unwrap();
+                    f.store
+                        .conn
+                        .execute(
+                            "UPDATE retirement_intents SET record=?1 WHERE operation=?2",
+                            rusqlite::params!["x".repeat(8193), operation.to_string()],
+                        )
+                        .unwrap();
+                }
+                "record" => {
+                    f.store
+                        .conn
+                        .execute(
+                            "UPDATE retirement_intents SET record='{}' WHERE operation=?1",
+                            [operation.to_string()],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let source = abort_source_rows(&f.store);
+            let files = abort_files(&f);
+            let refs = recovery_ref_rows(&f);
+            let events = f.store.pending_events(1000).unwrap().len();
+            let result = abort_test(&config, checkout, operation, 1, AbortFault::None);
+            let reason = result.unwrap_err();
+            assert_eq!(
+                reason,
+                match change {
+                    "record" | "oversize" => "history_unknown",
+                    "source-sql" => "context_changed",
+                    "object" => "recovery_target_unknown",
+                    "protection" => "recovery_ref_conflict",
+                    _ => "local_binding_changed",
+                },
+                "{change}"
+            );
+            let status = super::retirement_intent::retirement_status(&config, checkout);
+            assert!(
+                status.fence_active(),
+                "refusal/corruption is never an absent fence"
+            );
+            if matches!(change, "record" | "oversize") {
+                let wire = serde_json::to_value(&status).unwrap();
+                assert_eq!(wire["stage"], "unknown");
+                assert_eq!(wire["recorded"], "unknown");
+            }
+            let (stage, held_reason): (String, Option<String>) = f
+                .store
+                .conn
+                .query_row(
+                    "SELECT stage,held_reason FROM retirement_intents WHERE operation=?1",
+                    [operation.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                stage,
+                if matches!(change, "record" | "oversize") {
+                    "prepared"
+                } else {
+                    "held"
+                }
+            );
+            assert_eq!(
+                held_reason.as_deref(),
+                if matches!(change, "record" | "oversize") {
+                    None
+                } else {
+                    Some("abort_validation_failed")
+                }
+            );
+            assert_eq!(
+                events + usize::from(!matches!(change, "record" | "oversize")),
+                f.store.pending_events(1000).unwrap().len()
+            );
+            let repeat = abort_test(
+                &config,
+                checkout,
+                operation,
+                if matches!(change, "record" | "oversize") {
+                    1
+                } else {
+                    2
+                },
+                AbortFault::None,
+            );
+            assert_eq!(repeat.unwrap_err(), reason);
+            assert_eq!(
+                events + usize::from(!matches!(change, "record" | "oversize")),
+                f.store.pending_events(1000).unwrap().len()
+            );
+            assert_eq!(source, abort_source_rows(&f.store));
+            assert_eq!(files, abort_files(&f));
+            assert_eq!(refs, recovery_ref_rows(&f));
+        }
+    }
+
+    #[test]
+    fn private_abort_preserves_all_prior_history_not_only_active_row() {
+        for change in [
+            "unchanged",
+            "delete",
+            "corrupt",
+            "mutable",
+            "add",
+            "history-bound",
+            "immutable-column",
+        ] {
+            let (f, config, first) = prepared_adopted_intent();
+            let checkout = f.allocation.checkout;
+            assert_eq!(
+                abort_test(&config, checkout, first, 1, AbortFault::None)
+                    .unwrap()
+                    .outcome(),
+                "aborted"
+            );
+            let assertion = approval::assertion_for_retirement_test(&config, checkout);
+            let second = Uuid::now_v7();
+            assert!(prepare_test(
+                &config,
+                checkout,
+                second,
+                Some(assertion),
+                true,
+                None,
+                PrepareFault::None
+            )
+            .unwrap()
+            .fresh_commit());
+            // Exact historical retry never claims a later competing fence cleared.
+            let historical = abort_test(&config, checkout, first, 1, AbortFault::None).unwrap();
+            assert_eq!(historical.reason(), "historical");
+            assert!(!historical.fresh_commit());
+            assert!(historical.fence_active());
+            match change {
+                "delete" => {
+                    f.store
+                        .conn
+                        .execute(
+                            "DELETE FROM retirement_intents WHERE operation=?1",
+                            [first.to_string()],
+                        )
+                        .unwrap();
+                }
+                "corrupt" => {
+                    f.store
+                        .conn
+                        .execute(
+                            "UPDATE retirement_intents SET record='{}' WHERE operation=?1",
+                            [first.to_string()],
+                        )
+                        .unwrap();
+                }
+                "mutable" => {
+                    f.store.conn.execute("UPDATE retirement_intents SET revision=3,aborted_from=2,held_reason='reserve' WHERE operation=?1", [first.to_string()]).unwrap();
+                }
+                "immutable-column" => {
+                    f.store
+                        .conn
+                        .execute(
+                            "UPDATE retirement_intents SET source=zeroblob(32) WHERE operation=?1",
+                            [second.to_string()],
+                        )
+                        .unwrap();
+                }
+                "add" | "history-bound" => {
+                    // Negative-only raw SQL tamper: copy a genuine tombstone with rewritten identity.
+                    let row =
+                        crate::retirement_journal::load_operation(&f.store.conn, first).unwrap();
+                    for _ in 0..if change == "history-bound" { 63 } else { 1 } {
+                        let extra = Uuid::now_v7();
+                        let mut record = row.decoded.clone();
+                        record.operation = extra.to_string();
+                        record.declaration.as_mut().unwrap().operation = extra.to_string();
+                        let encoded = crate::retirement_journal::encode_record(&record).unwrap();
+                        f.store.conn.execute("INSERT INTO retirement_intents SELECT ?1,checkout,revision,stage,mode,assertion,declared_task,declared_operator,predecessor,source,?2,held_reason,aborted_from FROM retirement_intents WHERE operation=?3",
+                            rusqlite::params![extra.to_string(), encoded, first.to_string()]).unwrap();
+                    }
+                }
+                _ => (),
+            }
+            let source = abort_source_rows(&f.store);
+            let files = abort_files(&f);
+            let events = f.store.pending_events(1000).unwrap().len();
+            let result = abort_test(&config, checkout, second, 1, AbortFault::None);
+            if change == "unchanged" {
+                assert_eq!(result.unwrap().outcome(), "aborted");
+            } else {
+                let corrupt = matches!(change, "corrupt" | "immutable-column" | "history-bound");
+                assert_eq!(
+                    result.unwrap_err(),
+                    if corrupt {
+                        "history_unknown"
+                    } else {
+                        "history_changed"
+                    }
+                );
+                assert_eq!(
+                    super::retirement_intent::retirement_status(&config, checkout).reason(),
+                    if corrupt { "history_unknown" } else { "status" }
+                );
+                assert_eq!(
+                    f.store.pending_events(1000).unwrap().len(),
+                    events + usize::from(!corrupt)
+                );
+            }
+            assert_eq!(source, abort_source_rows(&f.store));
+            assert_eq!(files, abort_files(&f));
+        }
+    }
+
+    #[test]
+    fn private_abort_supervised_remote_ahead_stays_offline_without_scratch() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        enable_prepare(&config);
+        let remote = f.temp.path().join("backup.git");
+        let parent = git_at(&remote, &["rev-parse", "refs/heads/preserved"]);
+        let tree = git_at(&remote, &["rev-parse", "refs/heads/preserved^{tree}"]);
+        let descendant = git_at(
+            &remote,
+            &["commit-tree", &tree, "-p", &parent, "-m", "remote-only"],
+        );
+        git_at(
+            &remote,
+            &["update-ref", "refs/heads/preserved", &descendant],
+        );
+        let scratch_path = Arc::new(std::sync::Mutex::new(None));
+        let captured_path = scratch_path.clone();
+        remote_proof::set_retirement_observer(move |phase, path| {
+            if phase == remote_proof::Phase::BeforeCleanup {
+                *captured_path.lock().unwrap() = Some(path.to_path_buf());
+            }
+        });
+        let operation = Uuid::now_v7();
+        assert!(prepare_test(
+            &config,
+            f.allocation.checkout,
+            operation,
+            None,
+            false,
+            Some(&os.driver),
+            PrepareFault::None
+        )
+        .unwrap()
+        .fresh_commit());
+        let scratch_path = scratch_path
+            .lock()
+            .unwrap()
+            .take()
+            .expect("actual remote scratch observed");
+        assert!(
+            !scratch_path.exists(),
+            "prepare removed its remote graph scratch"
+        );
+        let files = abort_files(&f);
+        let source = abort_source_rows(&f.store);
+        let absent = Command::new("/usr/bin/git")
+            .env_clear()
+            .args(["cat-file", "-e", &descendant])
+            .current_dir(&f.allocation.destination)
+            .output()
+            .unwrap();
+        assert!(!absent.status.success());
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0)).unwrap();
+        let remote_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = remote_calls.clone();
+        remote_proof::set_retirement_observer(move |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let report = abort_test(
+            &config,
+            f.allocation.checkout,
+            operation,
+            1,
+            AbortFault::None,
+        )
+        .unwrap();
+        assert_eq!(report.outcome(), "aborted");
+        assert_eq!(remote_calls.load(Ordering::SeqCst), 0);
+        assert!(!scratch_path.exists());
+        assert_eq!(source, abort_source_rows(&f.store));
+        assert_eq!(files, abort_files(&f));
+        remote_proof::set_retirement_observer(|_, _| {});
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn private_prepare_adopted_commits_real_declaration_and_retains_accounting() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (config, _) = f.approval();
+        enable_prepare(&config);
+        assert!(recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared());
+        let assertion = approval::assertion_for_retirement_test(&config, f.allocation.checkout);
+        let predecessor =
+            snapshot(&mut f.store, f.allocation.checkout, &mut Budget::new()).unwrap();
+        let before = receipts::collector_source(&mut f.store, f.allocation.checkout);
+        let events = f.store.pending_events(1000).unwrap().len();
+        let operation = Uuid::now_v7();
+        let report = prepare_test(
+            &config,
+            f.allocation.checkout,
+            operation,
+            Some(assertion),
+            true,
+            None,
+            PrepareFault::None,
+        )
+        .unwrap();
+        assert!(report.fresh_commit(), "{report:?}");
+        let row = crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+        let declaration = row.decoded.declaration.as_ref().unwrap();
+        assert_eq!(declaration.operator, "explicit-operator");
+        assert_eq!(declaration.task, f.allocation.request.task);
+        assert_eq!(declaration.assertion, assertion.to_string());
+        assert_eq!(declaration.operation, operation.to_string());
+        assert_eq!(declaration.checkout, f.allocation.checkout.to_string());
+        assert_eq!(declaration.predecessor_hex, row.decoded.predecessor_hex);
+        assert_eq!(
+            row.decoded.predecessor_hex,
+            hex(&Sha256::digest(&predecessor.canonical))
+        );
+        assert_eq!(
+            row.decoded.source_hex,
+            hex(&Sha256::digest(&predecessor.source))
+        );
+        assert_eq!(
+            row.decoded.history_predecessor_hex,
+            hex(&Sha256::digest(&predecessor.history))
+        );
+        let successor = snapshot(&mut f.store, f.allocation.checkout, &mut Budget::new()).unwrap();
+        assert_ne!(
+            row.decoded.predecessor_hex,
+            hex(&Sha256::digest(&successor.canonical))
+        );
+        assert_eq!(successor.history_count, 1);
+        assert_eq!(
+            row.decoded.source_hex,
+            row.decoded.immutable_binding.source_sql
+        );
+        assert_eq!(
+            row.decoded.policy_digest,
+            row.decoded.immutable_binding.inspection_policy
+        );
+        assert_eq!(row.decoded.prior_history_count, 0);
+        assert_eq!(row.decoded.remote_cleanup, "complete");
+        assert_eq!(
+            before,
+            receipts::collector_source(&mut f.store, f.allocation.checkout)
+        );
+        assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+        let prepared_events = f.store.pending_events(1000).unwrap().into_iter().filter(|pending| {
+            matches!(&pending.event, crate::events::Event::RetirementIntentChanged { checkout, operation: id, revision: 1, stage, reason: None }
+                if *checkout == f.allocation.checkout && *id == operation && stage == "prepared")
+        }).count();
+        assert_eq!(prepared_events, 1);
+        let writers: i64 = f
+            .store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM writers WHERE checkout=?1",
+                [f.allocation.checkout.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(writers, 1);
+        let wire = serde_json::to_value(report).unwrap();
+        assert_eq!(wire["retirement_authority"], false);
+        assert_eq!(wire["execution_enabled"], false);
+        assert!(wire.get("immutable_binding").is_none());
+        assert!(
+            crate::checkout_guard::CheckoutGuard::shared(&f.store, f.allocation.checkout).is_ok()
+        );
+
+        let abort = super::retirement_intent::abort_retirement(
+            &config,
+            f.allocation.checkout,
+            operation,
+            1,
+        );
+        assert_eq!(abort.reason(), "implementation_incomplete");
+        assert_eq!(
+            crate::retirement_journal::load_operation(&f.store.conn, operation)
+                .unwrap()
+                .stage,
+            "prepared"
+        );
+        assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+
+        // Retry is read-only, including when EX cannot be acquired. No renewed owner.
+        let guard =
+            crate::checkout_guard::CheckoutGuard::exclusive(&f.store, f.allocation.checkout)
+                .unwrap();
+        for stage in ["prepared", "held", "aborted"] {
+            if stage == "held" {
+                let lease = f.store.authority_lease().unwrap();
+                assert!(matches!(
+                    crate::retirement_journal::checkpoint(
+                        &mut f.store,
+                        &lease,
+                        crate::retirement_journal::Scope::Checkout(f.allocation.checkout),
+                        crate::retirement_journal::Attempt::Reserve
+                    ),
+                    Err(crate::store::StoreError::RetirementFenced)
+                ));
+            } else if stage == "aborted" {
+                // Structural CAS only: explicitly NOT public/offline abort proof.
+                let tx = f
+                    .store
+                    .conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                crate::retirement_journal::abort_cas(&tx, f.allocation.checkout, operation, 2)
+                    .unwrap();
+                tx.commit().unwrap();
+            }
+            let events = f.store.pending_events(1000).unwrap().len();
+            let retry = prepare_test(
+                &config,
+                f.allocation.checkout,
+                operation,
+                Some(assertion),
+                true,
+                None,
+                PrepareFault::None,
+            )
+            .unwrap();
+            assert!(!retry.fresh_commit());
+            assert_eq!(retry.outcome(), "existing");
+            assert_eq!(serde_json::to_value(retry).unwrap()["stage"], stage);
+            assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            if stage != "aborted" {
+                assert_eq!(
+                    prepare_test(
+                        &config,
+                        f.allocation.checkout,
+                        Uuid::now_v7(),
+                        Some(assertion),
+                        true,
+                        None,
+                        PrepareFault::None
+                    )
+                    .unwrap_err(),
+                    "intent_conflict"
+                );
+                assert_eq!(
+                    crate::retirement_journal::load_operation(&f.store.conn, operation)
+                        .unwrap()
+                        .stage,
+                    stage
+                );
+            }
+            assert_eq!(
+                prepare_test(
+                    &config,
+                    Uuid::now_v7(),
+                    operation,
+                    Some(assertion),
+                    true,
+                    None,
+                    PrepareFault::None
+                )
+                .unwrap_err(),
+                "intent_conflict"
+            );
+        }
+        drop(guard);
+        let events = f.store.pending_events(1000).unwrap().len();
+        f.store
+            .conn
+            .execute(
+                "UPDATE retirement_intents SET record='{}' WHERE operation=?1",
+                [operation.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            prepare_test(
+                &config,
+                f.allocation.checkout,
+                operation,
+                Some(assertion),
+                true,
+                None,
+                PrepareFault::None
+            )
+            .unwrap_err(),
+            "history_unknown"
+        );
+        assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+    }
+
+    #[test]
+    fn private_prepare_supervised_uses_actual_closed_roster_and_final_age_gate() {
+        for fault in [PrepareFault::None, PrepareFault::AgeTerminal] {
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+            let (_r, _b, os, config) = prepared_supervised(&mut f);
+            enable_prepare(&config);
+            let source = receipts::collector_source(&mut f.store, f.allocation.checkout);
+            let events = f.store.pending_events(1000).unwrap().len();
+            let operation = Uuid::now_v7();
+            let result = prepare_test(
+                &config,
+                f.allocation.checkout,
+                operation,
+                None,
+                false,
+                Some(&os.driver),
+                fault,
+            );
+            if fault == PrepareFault::None {
+                assert!(result.unwrap().fresh_commit());
+                let row =
+                    crate::retirement_journal::load_operation(&f.store.conn, operation).unwrap();
+                assert_eq!(row.mode, "supervised");
+                assert!(row.decoded.declaration.is_none());
+                assert_eq!(events + 1, f.store.pending_events(1000).unwrap().len());
+            } else {
+                assert_eq!(result.unwrap_err(), "observation_stale");
+                assert!(!crate::retirement_journal::operation_reserved(
+                    &f.store.conn,
+                    &operation.to_string()
+                )
+                .unwrap());
+                assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            }
+            assert_eq!(
+                source,
+                receipts::collector_source(&mut f.store, f.allocation.checkout)
+            );
+        }
+    }
+
+    #[test]
+    fn private_prepare_final_immediate_failures_rollback_except_lost_ack() {
+        for fault in [
+            PrepareFault::ExpireAssertion,
+            PrepareFault::Deadline,
+            PrepareFault::ContextMutation,
+            PrepareFault::LostAck,
+        ] {
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+            let (config, _) = f.approval();
+            enable_prepare(&config);
+            assert!(
+                recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared()
+            );
+            let assertion = approval::assertion_for_retirement_test(&config, f.allocation.checkout);
+            let source = receipts::collector_source(&mut f.store, f.allocation.checkout);
+            let events = f.store.pending_events(1000).unwrap().len();
+            let operation = Uuid::now_v7();
+            let result = prepare_test(
+                &config,
+                f.allocation.checkout,
+                operation,
+                Some(assertion),
+                true,
+                None,
+                fault,
+            );
+            if fault == PrepareFault::LostAck {
+                let report = result.unwrap();
+                assert_eq!(report.outcome(), "uncertain");
+                assert!(!report.fresh_commit());
+                assert!(report.fence_active());
+                assert_eq!(serde_json::to_value(report).unwrap()["recorded"], "unknown");
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    match fault {
+                        PrepareFault::ExpireAssertion => "approval_expired",
+                        PrepareFault::Deadline => "deadline",
+                        PrepareFault::ContextMutation => "context_changed",
+                        _ => unreachable!(),
+                    }
+                );
+            }
+            assert_eq!(
+                source,
+                receipts::collector_source(&mut f.store, f.allocation.checkout)
+            );
+            assert_eq!(
+                crate::retirement_journal::operation_reserved(
+                    &f.store.conn,
+                    &operation.to_string()
+                )
+                .unwrap(),
+                fault == PrepareFault::LostAck
+            );
+            assert_eq!(
+                events + usize::from(fault == PrepareFault::LostAck),
+                f.store.pending_events(1000).unwrap().len()
+            );
+            if fault == PrepareFault::LostAck {
+                assert!(matches!(
+                    crate::retirement_journal::require_unfenced(
+                        &f.store.conn,
+                        f.allocation.checkout
+                    ),
+                    Err(crate::store::StoreError::RetirementFenced)
+                ));
+                let retry = prepare_test(
+                    &config,
+                    f.allocation.checkout,
+                    operation,
+                    Some(assertion),
+                    true,
+                    None,
+                    PrepareFault::None,
+                )
+                .unwrap();
+                assert!(!retry.fresh_commit());
+            }
+        }
+    }
+
+    #[test]
+    fn private_prepare_refuses_missing_declaration_wrong_assertion_operator_and_dirty_policy() {
+        for fault in [
+            "declaration",
+            "assertion",
+            "operator",
+            "policy",
+            "dirty",
+            "mode",
+        ] {
+            let f = fixture::ManagedFixture::recovery("sha1", "2");
+            let (config, _) = f.approval();
+            enable_prepare(&config);
+            assert!(
+                recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared()
+            );
+            let assertion = approval::assertion_for_retirement_test(&config, f.allocation.checkout);
+            match fault {
+                "operator" => {
+                    let text = fs::read_to_string(&config)
+                        .unwrap()
+                        .replace("explicit-operator", "different-operator");
+                    fs::write(&config, text).unwrap();
+                }
+                "policy" => {
+                    let text = fs::read_to_string(&config)
+                        .unwrap()
+                        .replace("expiry_seconds=60", "expiry_seconds=59");
+                    fs::write(&config, text).unwrap();
+                }
+                "dirty" => {
+                    fs::write(
+                        f.allocation.destination.join("unpreserved-new-file"),
+                        b"not backed up",
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let events = f.store.pending_events(1000).unwrap().len();
+            let result = prepare_test(
+                &config,
+                f.allocation.checkout,
+                Uuid::now_v7(),
+                match fault {
+                    "assertion" => Some(Uuid::now_v7()),
+                    "mode" => None,
+                    _ => Some(assertion),
+                },
+                fault != "declaration" && fault != "mode",
+                None,
+                PrepareFault::None,
+            );
+            assert!(result.is_err(), "{fault}");
+            assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            assert!(
+                crate::retirement_journal::read_history(&f.store.conn, f.allocation.checkout)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_supervised_owner_retains_ex_and_original_terminal_times_without_rows() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let before = receipts::collector_source(&mut f.store, f.allocation.checkout);
+        let events = f.store.pending_events(1000).unwrap().len();
+        let mut fresh = fresh_for_test(&f, &config, None, Some(&os.driver));
+        assert!(fresh.retained.assertion.is_none());
+        assert!(
+            !fresh.retained.observations.is_empty(),
+            "full decide seam reached"
+        );
+        assert_eq!(fresh.declaration_context(), None);
+        assert_eq!(fresh.checkout(), f.allocation.checkout);
+        let (_, source, _, history_count) = fresh.context_bindings();
+        assert_eq!(hex(&source), fresh.binding().source_sql);
+        assert_eq!(history_count, 0);
+        assert!(matches!(
+            crate::checkout_guard::CheckoutGuard::shared(&f.store, f.allocation.checkout),
+            Err(crate::store::StoreError::OperationsInFlight)
+        ));
+        fresh.recheck_before_transaction().unwrap();
+        fresh.check_commit_freshness().unwrap();
+        let first = fresh.retained.observations[0].observed_at();
+        fresh.retained.observations[0].age_for_test();
+        assert!(fresh.retained.observations[0].observed_at() < first);
+        assert_eq!(fresh.check_commit_freshness(), Err("observation_stale"));
+        fresh.retained.assessment.budget.test_elapsed = Some(Duration::from_secs(30));
+        assert_eq!(fresh.check_commit_freshness(), Err("deadline"));
+        assert_eq!(
+            before,
+            receipts::collector_source(&mut f.store, f.allocation.checkout)
+        );
+        assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+        let rows: i64 = f
+            .store
+            .conn
+            .query_row("SELECT count(*) FROM retirement_intents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        drop(fresh);
+        assert!(
+            crate::checkout_guard::CheckoutGuard::shared(&f.store, f.allocation.checkout).is_ok()
+        );
+        let report = assess_path_with_driver(&config, f.allocation.checkout, None, &os.driver);
+        assert_eq!(
+            report.outcome(),
+            "prerequisites_complete",
+            "{}",
+            report.reason()
+        );
+        let wire = serde_json::to_value(report).unwrap();
+        assert_eq!(wire["execution_enabled"], false);
+        assert_eq!(wire["recorded"], false);
+        assert!(wire.get("immutable_binding").is_none());
+        assert_eq!(
+            before,
+            receipts::collector_source(&mut f.store, f.allocation.checkout)
+        );
+        assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+    }
+
+    #[test]
+    fn fresh_adopted_owner_uses_validated_operator_and_pure_commit_clock() {
+        for fault in ["none", "boot", "expiry", "wall", "boottime", "budget"] {
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+            let (config, _) = f.approval();
+            assert!(
+                recovery_refs::prepare_for_assessment(&config, f.allocation.checkout).prepared()
+            );
+            let id = approval::assertion_for_retirement_test(&config, f.allocation.checkout);
+            let source = receipts::collector_source(&mut f.store, f.allocation.checkout);
+            let events = f.store.pending_events(1000).unwrap().len();
+            let mut fresh = fresh_for_test(&f, &config, Some(id), None);
+            assert!(matches!(
+                crate::checkout_guard::CheckoutGuard::shared(&f.store, f.allocation.checkout),
+                Err(crate::store::StoreError::OperationsInFlight)
+            ));
+            let (assertion, operator, task) = fresh
+                .declaration_context()
+                .expect("validated adopted owner");
+            assert_eq!(assertion, id);
+            assert_eq!(operator, "explicit-operator");
+            assert_eq!(task, f.allocation.request.task);
+            assert!(fresh.retained.observations.is_empty());
+            fresh.recheck_before_transaction().unwrap();
+            let assertion = fresh
+                .retained
+                .assertion
+                .as_mut()
+                .expect("consume seam reached");
+            let claim_before = assertion.claim_binding_for_test();
+            let latest_before = assertion.latest_for_test();
+            assertion.script_commit_fault_for_test(if fault == "budget" { "none" } else { fault });
+            if fault == "budget" {
+                fresh.retained.assessment.budget.test_elapsed = Some(Duration::from_secs(30));
+            }
+            let before = fresh.retained.assessment.budget.counters.clone();
+            let result = fresh.check_commit_freshness();
+            assert_eq!(
+                result,
+                match fault {
+                    "none" => Ok(()),
+                    "expiry" => Err("approval_expired"),
+                    "budget" => Err("deadline"),
+                    _ => Err("clock_anomaly"),
+                },
+                "{fault}"
+            );
+            let assertion = fresh.retained.assertion.as_ref().unwrap();
+            assert_eq!(assertion.script_consumed_for_test(), fault != "budget");
+            assert_eq!(assertion.claim_binding_for_test(), claim_before);
+            if fault != "none" {
+                assert_eq!(assertion.latest_for_test(), latest_before);
+            }
+            assert_eq!(
+                fresh.retained.assessment.budget.counters, before,
+                "pure clock does not charge file reads"
+            );
+            assert_eq!(
+                source,
+                receipts::collector_source(&mut f.store, f.allocation.checkout)
+            );
+            assert_eq!(events, f.store.pending_events(1000).unwrap().len());
+            let writers: i64 = f
+                .store
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM writers WHERE checkout=?1",
+                    [f.allocation.checkout.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(writers, 1);
+        }
+    }
+
+    fn repeat_local(fresh: &FreshRetirementAssessment, config: &Path) -> Held<LocalBinding> {
+        // Independent offline invocation: one new outer budget, shared by every
+        // nested collector. Never replace/reset the preparation owner's budget.
+        let mut budget = Budget::new();
+        let retained = &fresh.retained;
+        let a = &retained.assessment;
+        let (local, census, inputs) =
+            preservation::RecoveryCensus::recapture(&a.context, &mut budget)?;
+        let (document, first_config) = remote_proof::load_document(config, &mut budget)?;
+        let (_, closing_config) = remote_proof::load_document(config, &mut budget)?;
+        let manifests = [first_config, closing_config];
+        let (policies, _, combined_policy) = configuration_bindings(&document)?;
+        let operator = match a.mode {
+            ModeKind::Adopted => Some(
+                document
+                    .approval()
+                    .map_err(|_| "approval_policy_unknown")?
+                    .operator_id,
+            ),
+            ModeKind::Supervised => None,
+        };
+        let (projection, _source) = capture_local_binding(
+            &a.context,
+            a.store.authority_identity(),
+            LocalBindingInputs {
+                first: &census,
+                before: &inputs,
+                closing_census: &census,
+                closing_inputs: &inputs,
+                recovery: &local,
+                manifests: &manifests,
+                policies: &policies,
+                combined_policy: &combined_policy,
+                operator: operator.as_deref(),
+            },
+            &mut budget,
+        )?;
+        Ok(projection)
+    }
+
+    #[test]
+    fn local_projection_repeats_offline_and_detects_native_input_mutations() {
+        for change in [
+            "unchanged",
+            "payload",
+            "marker",
+            "config",
+            "ref",
+            "stat",
+            "source-root",
+        ] {
+            let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+            let (_r, _b, os, config) = prepared_supervised(&mut f);
+            let fresh = fresh_for_test(&f, &config, None, Some(&os.driver));
+            let original = repeat_local(&fresh, &config).expect("actual offline recollection");
+            assert_eq!(&original, &fresh.local);
+            // Authority-dir/checkout-operation metadata churn is not source
+            // identity. Creating an unrelated guard must not invalidate this.
+            let unrelated =
+                crate::checkout_guard::CheckoutGuard::shared(&f.store, Uuid::now_v7()).unwrap();
+            drop(unrelated);
+            let source = f.allocation.request.repository.as_ref().unwrap();
+            match change {
+                "payload" => {
+                    fs::write(f.allocation.destination.join("new-payload"), b"changed").unwrap()
+                }
+                "marker" => {
+                    let path = f
+                        .allocation
+                        .identity
+                        .as_ref()
+                        .unwrap()
+                        .private_git_dir
+                        .join("work-lease.json");
+                    fs::write(path, b"{}").unwrap();
+                }
+                "config" => {
+                    let text = fs::read_to_string(&config).unwrap();
+                    fs::write(&config, text.replace("fixture-v1", "fixture-v2")).unwrap();
+                }
+                "ref" => {
+                    git_at(
+                        &f.allocation.destination,
+                        &["update-ref", "refs/tags/extra", "HEAD"],
+                    );
+                }
+                "stat" => {
+                    let file = f.allocation.destination.join("tracked");
+                    let mode = fs::metadata(&file).unwrap().permissions().mode();
+                    fs::set_permissions(file, fs::Permissions::from_mode(mode ^ 0o100)).unwrap();
+                }
+                "source-root" => {
+                    let mode = fs::metadata(source).unwrap().permissions().mode();
+                    fs::set_permissions(source, fs::Permissions::from_mode(mode ^ 0o010)).unwrap();
+                }
+                "unchanged" => (),
+                _ => unreachable!(),
+            }
+            let repeated = repeat_local(&fresh, &config);
+            if change == "marker" {
+                assert_eq!(
+                    repeated,
+                    Err("census_unknown"),
+                    "invalid marker reaches native recapture"
+                );
+            } else if change == "unchanged" {
+                assert_eq!(repeated.unwrap(), original);
+            } else {
+                let changed = repeated.unwrap_or_else(|reason| {
+                    panic!("{change}: recapture failed before binding comparison: {reason}")
+                });
+                assert_ne!(changed, original, "{change}");
+                match change {
+                    "payload" | "stat" => {
+                        assert_ne!(changed.managed_physical, original.managed_physical)
+                    }
+                    "config" => {
+                        assert_ne!(changed.config_manifests, original.config_manifests);
+                        assert_ne!(changed.combined_policy, original.combined_policy);
+                    }
+                    "ref" => assert_ne!(changed.local_git, original.local_git),
+                    "source-root" => {
+                        assert_ne!(changed.source_repository, original.source_repository)
+                    }
+                    "marker" => panic!("invalid marker must fail native collection"),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_closing_mutation_reaches_collector_and_releases_ex_on_failure() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let store = Store::open_existing_registered_mut(
+            &f.temp.path().join("registry"),
+            &f.temp.path().join("authority"),
+            &[f.root.clone()],
+        )
+        .unwrap();
+        let guard =
+            crate::checkout_guard::CheckoutGuard::exclusive(&store, f.allocation.checkout).unwrap();
+        let reached = Arc::new(AtomicBool::new(false));
+        let hit = reached.clone();
+        let destination = f.allocation.destination.clone();
+        set_after_protection(move || {
+            fs::write(destination.join("closing-change"), b"changed").unwrap();
+            hit.store(true, Ordering::SeqCst);
+        });
+        let result = collect_fresh_prepare_inner(
+            &config,
+            f.allocation.checkout,
+            None,
+            store,
+            guard,
+            Some(&os.driver),
+        );
+        assert!(
+            reached.load(Ordering::SeqCst),
+            "actual protected collection reached"
+        );
+        assert!(matches!(result, Err("census_changed")));
+        assert!(
+            crate::checkout_guard::CheckoutGuard::shared(&f.store, f.allocation.checkout).is_ok()
+        );
+    }
+
+    #[test]
+    fn historical_remote_graph_is_not_an_offline_local_projection() {
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (_r, _b, os, config) = prepared_supervised(&mut f);
+        let first = fresh_for_test(&f, &config, None, Some(&os.driver));
+        let local = repeat_local(&first, &config).unwrap();
+        let historical = first.binding().approval_semantic.clone();
+        drop(first);
+        let remote = f.temp.path().join("backup.git");
+        let parent = git_at(&remote, &["rev-parse", "refs/heads/preserved"]);
+        let tree = git_at(&remote, &["rev-parse", "refs/heads/preserved^{tree}"]);
+        let descendant = git_at(
+            &remote,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "remote-only descendant",
+            ],
+        );
+        git_at(
+            &remote,
+            &["update-ref", "refs/heads/preserved", &descendant],
+        );
+        let second = fresh_for_test(&f, &config, None, Some(&os.driver));
+        assert_ne!(second.binding().approval_semantic, historical);
+        // Make the fixture remote inaccessible after genuine remote-ahead
+        // collection. The local projection must not contact it or require its
+        // scratch graph. Restore permissions even when recollection refuses.
+        let permissions = fs::metadata(&remote).unwrap().permissions();
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0)).unwrap();
+        let offline = repeat_local(&second, &config);
+        fs::set_permissions(&remote, permissions).unwrap();
+        assert_eq!(offline.unwrap(), local);
+        let result = Command::new("/usr/bin/git")
+            .args(["cat-file", "-e", &descendant])
+            .current_dir(&f.allocation.destination)
+            .output()
+            .unwrap();
+        assert!(
+            !result.status.success(),
+            "remote descendant was not imported locally"
+        );
+    }
+
     #[test]
     fn closed_ordinary_supervised_success_from_public_journal_and_finish() {
         let mut f = fixture::ManagedFixture::recovery("sha1", "2");
@@ -1147,6 +4346,94 @@ mod tests {
         assert_eq!(after_writers, before_writers);
         assert!(f.store.group_snapshot(&r.identity().run).is_err());
         let _ = (r, b);
+    }
+
+    #[test]
+    fn passive_assessment_does_not_hold_intent_or_create_operation_locks() {
+        use std::os::unix::fs::MetadataExt;
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct LockIdentity {
+            name: std::ffi::OsString,
+            dev: u64,
+            ino: u64,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            links: u64,
+        }
+        fn common_locks(path: &Path) -> (Vec<fs::File>, Vec<LockIdentity>) {
+            let mut entries: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .collect();
+            entries.sort_by_key(|entry| entry.file_name());
+            let mut handles = Vec::new();
+            let mut identities = Vec::new();
+            for entry in entries {
+                let named = fs::symlink_metadata(entry.path()).unwrap();
+                assert!(named.is_file());
+                assert_eq!(named.nlink(), 1);
+                let handle = fs::File::open(entry.path()).unwrap();
+                let opened = handle.metadata().unwrap();
+                assert_eq!((named.dev(), named.ino()), (opened.dev(), opened.ino()));
+                assert_eq!(named.mode(), opened.mode());
+                assert_eq!((named.uid(), named.gid()), (opened.uid(), opened.gid()));
+                assert_eq!(named.nlink(), opened.nlink());
+                identities.push(LockIdentity {
+                    name: entry.file_name(),
+                    dev: opened.dev(),
+                    ino: opened.ino(),
+                    mode: opened.mode(),
+                    uid: opened.uid(),
+                    gid: opened.gid(),
+                    links: opened.nlink(),
+                });
+                handles.push(handle);
+            }
+            (handles, identities)
+        }
+
+        let f = fixture::ManagedFixture::new("sha1", "2");
+        let runtime = f.temp.path().join("runtime");
+        let path = remote_config(&f, &runtime);
+        let operation_dir = f.temp.path().join("authority/checkout-operations-v1");
+        let before: Vec<_> = std::fs::read_dir(&operation_dir)
+            .into_iter()
+            .flatten()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let common_dir = f
+            .temp
+            .path()
+            .join("authority/recovery-preparation-locks-v1");
+        let (before_handles, common_before) = common_locks(&common_dir);
+        assert!(
+            !common_before.is_empty(),
+            "allocation must create the common lock"
+        );
+        receipts::seed_collector_intent(&f.store, f.allocation.checkout);
+        let events_before = f.store.pending_events(1000).unwrap().len();
+        let report = assess_retirement(&path, f.allocation.checkout, None);
+        assert_eq!(report.reason(), "retirement_intent_active");
+        let stage: String = f
+            .store
+            .conn
+            .query_row("SELECT stage FROM retirement_intents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stage, "prepared");
+        let after: Vec<_> = std::fs::read_dir(&operation_dir)
+            .into_iter()
+            .flatten()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
+        let (after_handles, common_after) = common_locks(&common_dir);
+        assert_eq!(common_before, common_after);
+        assert_eq!(f.store.pending_events(1000).unwrap().len(), events_before);
+        // Keep the original descriptors open through comparison so replacement
+        // cannot be hidden by inode reuse. Never unlink an allocation lock.
+        drop((before_handles, after_handles));
     }
 
     #[test]
