@@ -3902,6 +3902,588 @@ mod tests {
         assert_eq!(abort_source_rows(&store), resources.source_rows);
     }
 
+    // Raw DATA observers only: these neither validate history nor create owners.
+    // Every connection/statement ends before the caller attempts initialization EX.
+    type Legacy16RawRows = std::collections::BTreeMap<
+        String,
+        Vec<std::collections::BTreeMap<String, rusqlite::types::Value>>,
+    >;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Legacy16RawDatabase {
+        version: i64,
+        cookie: i64,
+        schema: Vec<std::collections::BTreeMap<String, rusqlite::types::Value>>,
+        tables: Legacy16RawRows,
+    }
+
+    fn legacy16_raw_database(path: &Path) -> Legacy16RawDatabase {
+        fn rows(
+            conn: &rusqlite::Connection,
+            sql: &str,
+        ) -> Vec<std::collections::BTreeMap<String, rusqlite::types::Value>> {
+            let mut statement = conn.prepare(sql).unwrap();
+            let names: Vec<String> = statement
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let data = statement
+                .query_map([], |row| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| {
+                            Ok((name.clone(), row.get::<_, rusqlite::types::Value>(index)?))
+                        })
+                        .collect::<rusqlite::Result<_>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            data
+        }
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        conn.execute_batch("BEGIN;").unwrap();
+        let version = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        let cookie = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        let schema = rows(
+            &conn,
+            "SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type,name",
+        );
+        let tables = {
+            let mut statement = conn
+                .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+                .unwrap();
+            let names: Vec<String> = statement
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            names
+                .into_iter()
+                .map(|name| {
+                    let data = rows(
+                        &conn,
+                        &format!(
+                            "SELECT rowid AS __work_rowid,* FROM \"{}\" ORDER BY rowid",
+                            name.replace('"', "\"\"")
+                        ),
+                    );
+                    (name, data)
+                })
+                .collect()
+        };
+        conn.execute_batch("ROLLBACK;").unwrap();
+        Legacy16RawDatabase {
+            version,
+            cookie,
+            schema,
+            tables,
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Legacy16RawEvidence {
+        store: Legacy16RawDatabase,
+        registry: Legacy16RawDatabase,
+        identities: Vec<(PathBuf, Vec<u64>)>,
+        native: Vec<u8>,
+        configuration: Vec<u8>,
+        marker: Vec<u8>,
+    }
+
+    fn legacy16_raw_evidence(resources: &Legacy16NativeResources) -> Legacy16RawEvidence {
+        use std::os::unix::fs::MetadataExt;
+        let registry = resources.temp.path().join("registry");
+        let directory = resources.temp.path().join("authority");
+        let identity = resources.allocation.identity.as_ref().unwrap();
+        let mut paths = vec![
+            registry.clone(),
+            registry.join("initialization.lock"),
+            registry.join("initialization.json"),
+            registry.join("authorities.sqlite"),
+            directory.clone(),
+            directory.join("store.sqlite"),
+            directory.join("allocation.lock"),
+            directory.join("checkout-operations-v1"),
+            directory.join(format!(
+                "checkout-operations-v1/{}.lock",
+                resources.allocation.checkout
+            )),
+            resources.repo.clone(),
+            resources.root.clone(),
+            resources.config.clone(),
+            resources.allocation.destination.clone(),
+            identity.common_git_dir.clone(),
+            identity.private_git_dir.clone(),
+        ];
+        let common_locks = directory.join("recovery-preparation-locks-v1");
+        let mut locks: Vec<_> = fs::read_dir(&common_locks)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        locks.sort();
+        assert!(!locks.is_empty());
+        paths.push(common_locks);
+        paths.extend(locks);
+        // Stable authority identities, not DB byte/timestamp equality across SQL.
+        // Native payload/refs/receipts below retain the full existing stat oracle.
+        let identities = paths
+            .into_iter()
+            .map(|path| {
+                let m = fs::symlink_metadata(&path).unwrap();
+                let identity = vec![
+                    m.dev(),
+                    m.ino(),
+                    u64::from(m.mode()),
+                    u64::from(m.uid()),
+                    u64::from(m.gid()),
+                    m.nlink(),
+                ];
+                (path, identity)
+            })
+            .collect();
+        Legacy16RawEvidence {
+            store: legacy16_raw_database(&directory.join("store.sqlite")),
+            registry: legacy16_raw_database(&registry.join("authorities.sqlite")),
+            identities,
+            native: abort_native_files(
+                &resources.allocation.destination,
+                &identity.common_git_dir,
+                &directory,
+            ),
+            configuration: fs::read(&resources.config).unwrap(),
+            marker: fs::read(registry.join("initialization.json")).unwrap(),
+        }
+    }
+
+    fn legacy16_initialization_is_free(resources: &Legacy16NativeResources) {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+        assert_eq!(
+            probe_initialization_exclusive(&resources.temp.path().join("registry")).unwrap(),
+            ExclusiveProbe::Acquired,
+            "all actual Store, Context, proof, guard and reader owners must have drained"
+        );
+    }
+
+    #[test]
+    fn legacy16_qualification_offline_abort_then_normal_upgrade_preserves_tombstone() {
+        use rusqlite::types::Value;
+        let (fixture, resources) = legacy16_native();
+        let checkout = resources.allocation.checkout;
+        let initial = legacy16_raw_evidence(&resources);
+        assert_eq!(initial.store.version, 16);
+        assert!(initial.store.tables["retirement_intents"].is_empty());
+        assert!(!initial.store.tables.contains_key("quarantine_actions"));
+        assert_eq!(initial.native, resources.native);
+        assert_eq!(initial.configuration, resources.configuration);
+        let fresh = fixture
+            .collect(&resources.config, &resources.manager.driver)
+            .unwrap();
+        let operation = Uuid::now_v7();
+        let PrepareCommit::Prepared(prepared) = fresh
+            .commit_prepared(operation, PrepareFault::None)
+            .unwrap()
+        else {
+            panic!("actual fresh16 acknowledged preparation required");
+        };
+        assert_eq!(prepared.operation, operation);
+        assert_eq!(prepared.revision, 1);
+        assert_eq!(prepared.history_count, 1);
+        let (original, source, predecessor, history) = {
+            let a = &prepared.owner.retained.assessment;
+            assert_eq!(
+                a.store.schema_role(),
+                crate::store::SchemaRole::Legacy16Abort
+            );
+            assert_eq!(a.context.role, crate::store::SchemaRole::Legacy16Abort);
+            let _phase = a.store.sql_phase();
+            assert_eq!(abort_source_rows(&a.store), resources.source_rows);
+            (
+                crate::retirement_journal::load_operation(&a.store.conn, operation).unwrap(),
+                a.context.source.clone(),
+                a.context.canonical.clone(),
+                a.context.history.clone(),
+            )
+        };
+        assert_eq!(original.stage, "prepared");
+        assert_eq!(original.mode, "supervised");
+        assert_eq!(original.decoded.remote_cleanup, "complete");
+        assert_eq!(original.source, Sha256::digest(&source).to_vec());
+        assert_eq!(original.predecessor, Sha256::digest(&predecessor).to_vec());
+        assert_eq!(
+            original.decoded.history_predecessor_hex,
+            hex(&Sha256::digest(&history))
+        );
+        assert_eq!(original.decoded.prior_history_count, 0);
+        // DATA survives; no fresh owner, schema Arc, Context or guard crosses EX.
+        drop(prepared);
+        legacy16_initialization_is_free(&resources);
+        let before = legacy16_raw_evidence(&resources);
+        assert_eq!(before.store.version, 16);
+        assert_eq!(before.store.cookie, initial.store.cookie);
+        assert_eq!(before.store.schema, initial.store.schema);
+        assert_eq!(before.native, initial.native);
+        assert_eq!(before.identities, initial.identities);
+        assert_eq!(before.registry, initial.registry);
+        assert_eq!(before.configuration, initial.configuration);
+        assert_eq!(before.marker, initial.marker);
+        let before_events = &before.store.tables["outbox"];
+        let initial_events = &initial.store.tables["outbox"];
+        assert_eq!(&before_events[..initial_events.len()], initial_events);
+        assert_eq!(before_events.len(), initial_events.len() + 1);
+        let prepared_event = crate::events::Event::RetirementIntentChanged {
+            checkout,
+            operation,
+            revision: 1,
+            stage: "prepared".into(),
+            reason: None,
+        };
+        assert_eq!(
+            before_events.last().unwrap()["payload"],
+            Value::Text(serde_json::to_string(&prepared_event).unwrap())
+        );
+        assert_eq!(before_events.last().unwrap()["version"], Value::Integer(1));
+        assert_eq!(
+            before_events.last().unwrap()["acknowledged"],
+            Value::Integer(0)
+        );
+        legacy16_initialization_is_free(&resources);
+        // This is the real offline collector/recheck/leased CAS, not abort_validated.
+        let AbortCommit::Aborted(aborted) =
+            abort_offline(&resources.config, checkout, operation, 1, AbortFault::None).unwrap()
+        else {
+            panic!("fresh acknowledged offline abort required, not historical metadata");
+        };
+        assert_eq!(
+            aborted.owner.store.schema_role(),
+            crate::store::SchemaRole::Legacy16Abort
+        );
+        assert_eq!(
+            aborted.witness.context.role,
+            crate::store::SchemaRole::Legacy16Abort
+        );
+        assert_eq!(aborted.witness.context.source, source);
+        let mut prepared_frame = source.clone();
+        let (prepared_history, prepared_count) = crate::retirement_journal::frame_history_rows(
+            std::slice::from_ref(&original),
+            &mut prepared_frame,
+        )
+        .unwrap();
+        assert_eq!(prepared_count, 1);
+        assert_eq!(aborted.witness.context.canonical, prepared_frame);
+        assert_eq!(aborted.witness.context.history, prepared_history);
+        assert_eq!(aborted.witness.context.history_count, 1);
+        assert!(aborted.witness.context.physical_history.is_empty());
+        assert_eq!(aborted.witness.context.physical_count, 0);
+        assert_eq!(
+            aborted.witness.local,
+            LocalBinding::from_record(&original.decoded.immutable_binding)
+        );
+        assert_eq!(aborted.owner.original, original);
+        assert_eq!(aborted.count, 1);
+        let mut expected_row = original.clone();
+        expected_row.stage = "aborted".into();
+        expected_row.revision = 2;
+        expected_row.aborted_from = Some(1);
+        assert_eq!(
+            aborted.row, expected_row,
+            "immutable JSON, source and predecessor must survive exactly"
+        );
+        {
+            let _phase = aborted.owner.store.sql_phase();
+            assert_eq!(
+                abort_source_rows(&aborted.owner.store),
+                resources.source_rows
+            );
+        }
+        drop(aborted);
+        legacy16_initialization_is_free(&resources);
+        let after = legacy16_raw_evidence(&resources);
+        // Exact expected raw transition, including the outbox AUTOINCREMENT row.
+        // These are assertion DATA only; nothing is written back into SQLite.
+        let mut expected = before.clone();
+        let intent = &mut expected.store.tables.get_mut("retirement_intents").unwrap()[0];
+        intent.insert("stage".into(), Value::Text("aborted".into()));
+        intent.insert("revision".into(), Value::Integer(2));
+        intent.insert("aborted_from".into(), Value::Integer(1));
+        let Value::Integer(last_sequence) = before_events.last().unwrap()["sequence"] else {
+            panic!("integer outbox sequence");
+        };
+        let aborted_event = crate::events::Event::RetirementIntentChanged {
+            checkout,
+            operation,
+            revision: 2,
+            stage: "aborted".into(),
+            reason: None,
+        };
+        expected.store.tables.get_mut("outbox").unwrap().push(
+            [
+                ("__work_rowid".into(), Value::Integer(last_sequence + 1)),
+                ("sequence".into(), Value::Integer(last_sequence + 1)),
+                ("version".into(), Value::Integer(1)),
+                (
+                    "payload".into(),
+                    Value::Text(serde_json::to_string(&aborted_event).unwrap()),
+                ),
+                ("acknowledged".into(), Value::Integer(0)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let sequence = expected
+            .store
+            .tables
+            .get_mut("sqlite_sequence")
+            .unwrap()
+            .iter_mut()
+            .find(|row| row["name"] == Value::Text("outbox".into()))
+            .unwrap();
+        sequence.insert("seq".into(), Value::Integer(last_sequence + 1));
+        assert_eq!(
+            after, expected,
+            "only abort stage/revision/from and one exact event may change"
+        );
+        let AbortCommit::Historical(retry, count, fence) =
+            abort_offline(&resources.config, checkout, operation, 1, AbortFault::None).unwrap()
+        else {
+            panic!("exact offline retry must return metadata, not another commit owner");
+        };
+        assert_eq!(*retry, expected_row);
+        assert_eq!(count, 1);
+        assert!(!fence);
+        drop(retry);
+        legacy16_initialization_is_free(&resources);
+        assert_eq!(
+            legacy16_raw_evidence(&resources),
+            after,
+            "retry adds no event or native mutation"
+        );
+        legacy16_initialization_is_free(&resources);
+        let mut upgraded = Store::open_registered(
+            &resources.temp.path().join("registry"),
+            &resources.temp.path().join("authority"),
+            std::slice::from_ref(&resources.root),
+        )
+        .unwrap();
+        assert_eq!(upgraded.schema_role(), crate::store::SchemaRole::Current17);
+        {
+            let _phase = upgraded.sql_phase();
+            upgraded.schema_role().validate(&upgraded.conn).unwrap();
+            crate::quarantine_journal::validate_schema(&upgraded.conn).unwrap();
+            assert!(
+                crate::quarantine_journal::read_history(&upgraded.conn, checkout)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                crate::retirement_journal::read_history(&upgraded.conn, checkout).unwrap(),
+                vec![expected_row]
+            );
+            assert_eq!(abort_source_rows(&upgraded), resources.source_rows);
+        }
+        let current = snapshot(&mut upgraded, checkout, &mut Budget::new()).unwrap();
+        assert_eq!(current.role, crate::store::SchemaRole::Current17);
+        assert_eq!(current.physical_count, 0);
+        assert_eq!(current.history_count, 1);
+        assert_ne!(
+            current.source, source,
+            "normal migration advances the native schema epoch"
+        );
+        drop(current);
+        drop(upgraded);
+        legacy16_initialization_is_free(&resources);
+        let migrated = legacy16_raw_evidence(&resources);
+        assert_eq!(migrated.store.version, 17);
+        // CREATE TABLE (including its automatic PK index) plus CREATE INDEX.
+        assert_eq!(migrated.store.cookie, after.store.cookie + 2);
+        let mut expected_tables = after.store.tables.clone();
+        expected_tables.insert("quarantine_actions".into(), Vec::new());
+        assert_eq!(
+            migrated.store.tables, expected_tables,
+            "all16 tombstone/prerequisite/event/sequence bytes preserved"
+        );
+        let legacy_schema: Vec<_> = migrated
+            .store
+            .schema
+            .iter()
+            .filter(|row| row["tbl_name"] != Value::Text("quarantine_actions".into()))
+            .cloned()
+            .collect();
+        assert_eq!(legacy_schema, after.store.schema);
+        assert_eq!(migrated.store.schema.len(), after.store.schema.len() + 3);
+        assert_eq!(migrated.registry, after.registry);
+        assert_eq!(migrated.identities, after.identities);
+        assert_eq!(migrated.native, after.native);
+        assert_eq!(migrated.configuration, after.configuration);
+        assert_eq!(migrated.marker, after.marker);
+    }
+
+    #[test]
+    fn legacy16_qualification_prepared_history_vetoes_normal_upgrade_after_owner_drain() {
+        let (fixture, resources) = legacy16_native();
+        let fresh = fixture
+            .collect(&resources.config, &resources.manager.driver)
+            .unwrap();
+        let operation = Uuid::now_v7();
+        let PrepareCommit::Prepared(prepared) = fresh
+            .commit_prepared(operation, PrepareFault::None)
+            .unwrap()
+        else {
+            panic!("actual acknowledged genuine16 preparation required");
+        };
+        assert_eq!(prepared.operation, operation);
+        assert_eq!(prepared.revision, 1);
+        assert_eq!(prepared.history_count, 1);
+        {
+            let a = &prepared.owner.retained.assessment;
+            let _phase = a.store.sql_phase();
+            assert_eq!(
+                a.store.schema_role(),
+                crate::store::SchemaRole::Legacy16Abort
+            );
+            let history = crate::retirement_journal::read_history(
+                &a.store.conn,
+                resources.allocation.checkout,
+            )
+            .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].operation, operation);
+            assert_eq!(history[0].stage, "prepared");
+            assert_eq!(abort_source_rows(&a.store), resources.source_rows);
+        }
+        drop(prepared);
+        legacy16_initialization_is_free(&resources);
+        let before = legacy16_raw_evidence(&resources);
+        assert_eq!(before.store.version, 16);
+        assert!(!before.store.tables.contains_key("quarantine_actions"));
+        assert_eq!(before.native, resources.native);
+        assert_eq!(before.configuration, resources.configuration);
+        legacy16_initialization_is_free(&resources);
+        assert!(
+            matches!(
+                Store::open_registered(
+                    &resources.temp.path().join("registry"),
+                    &resources.temp.path().join("authority"),
+                    std::slice::from_ref(&resources.root),
+                ),
+                Err(crate::store::StoreError::RetirementFenced)
+            ),
+            "history veto, not owner self-contention or unknown admission"
+        );
+        legacy16_initialization_is_free(&resources);
+        assert_eq!(
+            legacy16_raw_evidence(&resources),
+            before,
+            "no DDL, claims, cookie, fence, accounting, event or native rewrite"
+        );
+        legacy16_initialization_is_free(&resources);
+    }
+
+    #[test]
+    fn legacy16_qualification_corrupt_history_vetoes_normal_upgrade_before_ddl_or_claims() {
+        use rusqlite::types::Value;
+        let (fixture, resources) = legacy16_native();
+        let fresh = fixture
+            .collect(&resources.config, &resources.manager.driver)
+            .unwrap();
+        let operation = Uuid::now_v7();
+        let PrepareCommit::Prepared(prepared) = fresh
+            .commit_prepared(operation, PrepareFault::None)
+            .unwrap()
+        else {
+            panic!("corruption must begin from an actual acknowledged genuine16 preparation");
+        };
+        assert_eq!(prepared.operation, operation);
+        assert_eq!(prepared.revision, 1);
+        assert_eq!(prepared.history_count, 1);
+        {
+            let a = &prepared.owner.retained.assessment;
+            let _phase = a.store.sql_phase();
+            assert_eq!(
+                a.store.schema_role(),
+                crate::store::SchemaRole::Legacy16Abort
+            );
+            let history = crate::retirement_journal::read_history(
+                &a.store.conn,
+                resources.allocation.checkout,
+            )
+            .unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].operation, operation);
+            assert_eq!(history[0].stage, "prepared");
+            assert_eq!(abort_source_rows(&a.store), resources.source_rows);
+        }
+        drop(prepared);
+        legacy16_initialization_is_free(&resources);
+        let valid = legacy16_raw_evidence(&resources);
+        assert_eq!(valid.store.version, 16);
+        assert!(!valid.store.tables.contains_key("quarantine_actions"));
+        assert_eq!(valid.native, resources.native);
+        assert_eq!(valid.configuration, resources.configuration);
+        // Deliberate NEGATIVE data corruption, never a prepared/held row factory.
+        // No validated reader is used after this fault and no repair follows it.
+        {
+            let conn = rusqlite::Connection::open_with_flags(
+                resources.temp.path().join("authority/store.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )
+            .unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE retirement_intents SET record='{}' WHERE operation=?1",
+                    [operation.to_string()]
+                )
+                .unwrap(),
+                1
+            );
+        }
+        legacy16_initialization_is_free(&resources);
+        let corrupted = legacy16_raw_evidence(&resources);
+        let mut expected_fault = valid;
+        expected_fault
+            .store
+            .tables
+            .get_mut("retirement_intents")
+            .unwrap()[0]
+            .insert("record".into(), Value::Text("{}".into()));
+        assert_eq!(
+            corrupted, expected_fault,
+            "the intentional record fault is the entire baseline delta"
+        );
+        legacy16_initialization_is_free(&resources);
+        assert!(
+            matches!(
+                Store::open_registered(
+                    &resources.temp.path().join("registry"),
+                    &resources.temp.path().join("authority"),
+                    std::slice::from_ref(&resources.root),
+                ),
+                Err(crate::store::StoreError::Invalid)
+            ),
+            "corrupt history is Invalid, not merely an active fence or contention"
+        );
+        legacy16_initialization_is_free(&resources);
+        assert_eq!(
+            legacy16_raw_evidence(&resources),
+            corrupted,
+            "rejection precedes any DDL/registry mutation, with original cookies and native IDs"
+        );
+        legacy16_initialization_is_free(&resources);
+    }
+
     fn fresh_for_test(
         f: &fixture::ManagedFixture,
         path: &Path,
@@ -3985,6 +4567,14 @@ mod tests {
     }
 
     fn abort_files(f: &fixture::ManagedFixture) -> Vec<u8> {
+        abort_native_files(
+            &f.allocation.destination,
+            f.common(),
+            &f.temp.path().join("authority"),
+        )
+    }
+
+    fn abort_native_files(destination: &Path, common: &Path, authority: &Path) -> Vec<u8> {
         fn visit(path: &Path, out: &mut Vec<u8>) {
             use std::os::unix::fs::MetadataExt;
             let metadata = match fs::symlink_metadata(path) {
@@ -4025,12 +4615,9 @@ mod tests {
         }
         let mut out = Vec::new();
         for path in [
-            f.allocation.destination.as_path(),
-            f.common(),
-            f.temp
-                .path()
-                .join("authority/inspection-receipts-v1")
-                .as_path(),
+            destination,
+            common,
+            authority.join("inspection-receipts-v1").as_path(),
         ] {
             visit(path, &mut out);
         }

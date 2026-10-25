@@ -121,6 +121,9 @@ jobs:
           # Genuine16 fixture consumer only; no ordinary legacy preparation.
           - kind: lib
             selector: 'inspection::retirement::tests::legacy16_consumer_'
+          # Genuine16 offline abort and migration qualification; no movement.
+          - kind: lib
+            selector: 'inspection::retirement::tests::legacy16_qualification_'
           - kind: lib
             selector: 'run_participants::tests::'
           - kind: lib
