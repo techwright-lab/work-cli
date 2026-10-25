@@ -948,6 +948,43 @@ mod physical_tests {
         (temp, config, allocation)
     }
     #[test]
+    fn authority_lease_drop_unlocks_while_an_inherited_descriptor_remains_open() {
+        let (_temp, config, _) = fixture();
+        let (store, lease) = locked(&config).unwrap();
+        let inherited = lease._file.try_clone().unwrap();
+        let probe = crate::store::AuthorityIdentity::open_lock(
+            &store.authority_identity().directory,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive),
+            Err(rustix::io::Errno::WOULDBLOCK)
+        );
+        drop(lease);
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert!(inherited.metadata().unwrap().is_file());
+        drop(inherited);
+        let contender = crate::store::AuthorityIdentity::open_lock(
+            &store.authority_identity().directory,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            rustix::fs::flock(
+                &contender,
+                rustix::fs::FlockOperation::NonBlockingLockExclusive
+            ),
+            Err(rustix::io::Errno::WOULDBLOCK)
+        );
+        // This raw probe is not an AuthorityLease. Explicitly end its own lock
+        // before verifying normal typed acquisition at the restored boundary.
+        rustix::fs::flock(&probe, rustix::fs::FlockOperation::Unlock).unwrap();
+        let next = store.authority_lease().unwrap();
+        next.check(&store).unwrap();
+    }
+
+    #[test]
     fn physical_allocator_resolves_reservation_identity_before_borrowed_lease() {
         let reached = std::rc::Rc::new(std::cell::Cell::new(0));
         let observed = reached.clone();
@@ -1469,6 +1506,15 @@ mod physical_tests {
 pub(crate) struct AuthorityLease {
     _file: fs::File,
     authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+}
+impl Drop for AuthorityLease {
+    fn drop(&mut self) {
+        // End this Store-bound owner's exclusion now, not at the last close of
+        // an incidental fork-inherited descriptor. The same lease still spans
+        // permission through actual publication; no caller releases it early.
+        // Normal descriptor close remains fallback if Drop cannot unlock.
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
+    }
 }
 impl AuthorityLease {
     pub(crate) fn check(&self, store: &Store) -> crate::store::Result<()> {

@@ -78,6 +78,8 @@ jobs:
           - kind: lib
             selector: attribution_gap::tests::lease_tests::public_revokers_winning_during_gap_driver_observation_prevent_publication
           - kind: lib
+            selector: attribution_gap::tests::gap_publication_reopened_store_keeps_outer_guard_until_acknowledgement
+          - kind: lib
             selector: 'admission::allocation_tests::'
           - kind: lib
             selector: 'allocate::physical_tests::'
