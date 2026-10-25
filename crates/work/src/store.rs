@@ -1690,6 +1690,10 @@ pub(crate) fn identity(value: &str) -> Result<()> {
 pub(crate) mod schema_participation_tests;
 
 #[cfg(test)]
+#[path = "schema17_migration_tests.rs"]
+mod schema17_migration_tests;
+
+#[cfg(test)]
 mod tests {
     const SCAN: &str = "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<5000) SELECT sum(x) FROM n";
 
