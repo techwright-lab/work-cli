@@ -208,6 +208,12 @@ pub(super) fn prepare_inner(
         }
         retirement_journal::exclude_prepare_operation(&readonly.conn, operation)
             .map_err(prepare_store_error)?;
+        // End the opener-owned BEGIN before checkout metadata, retaining its
+        // Store/schema owner. Current history is still reread after EX below.
+        readonly
+            .conn
+            .execute_batch("ROLLBACK;")
+            .map_err(|_| "history_unknown")?;
     }
     let guard =
         crate::checkout_guard::CheckoutGuard::exclusive(&readonly, checkout).map_err(|error| {

@@ -132,6 +132,7 @@ fn readonly_context(config: &Config, checkout: Uuid, b: &mut Budget) -> Held<Con
     .map_err(|_| "authority_unknown")?;
     // The read-only opener RETAINS BEGIN. Collect inside that transaction;
     // never may_acquire_lease(), begin another transaction or open a writer.
+    let schema = store.schema_participation();
     let phase = store.sql_phase();
     let authority = std::sync::Arc::clone(store.authority_identity());
     let result = if store.conn.is_autocommit() {
@@ -140,6 +141,7 @@ fn readonly_context(config: &Config, checkout: Uuid, b: &mut Budget) -> Held<Con
         input(snapshot_in_transaction(
             &store.conn,
             &authority,
+            &schema,
             checkout,
             b,
         ))
@@ -157,6 +159,8 @@ pub(crate) enum Phase {
     BeforeFinalAdvertisement,
     BeforeRecheck,
     BeforeCleanup,
+    AfterCleanup,
+    BeforeAcknowledgment,
 }
 #[cfg(test)]
 type Observer<'a> = Option<&'a mut dyn FnMut(Phase, &Scratch)>;
@@ -319,6 +323,9 @@ fn verify_with_audit(
     let mut recovery_retained = None;
     let mut retirement_retained = None;
     let mut report = RemoteReport::held(checkout);
+    // Ordinary readonly Context is scoped to collection, but its actual schema
+    // owner must also span error cleanup and the completed report/collector ACK.
+    let mut schema_owner = None;
     let mut scratch = None;
     let result = (|| -> Held<()> {
         if checkout.get_version_num() != 7 || checkout.get_variant() != uuid::Variant::RFC4122 {
@@ -340,6 +347,10 @@ fn verify_with_audit(
         } else {
             readonly_context(&config, checkout, &mut b)?
         };
+        schema_owner = Some(context.schema.clone());
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.retain_schema(context.schema.clone());
+        }
         // Mutation collectors own SH and checkpoint before policy or remote IO.
         let policy = document
             .remote_preservation()
@@ -714,9 +725,9 @@ fn verify_with_audit(
         input(b.check())
     })();
     report.reason = result.err().unwrap_or("consistent_observation");
-    if let Some(scratch) = scratch {
+    if let Some(scratch) = scratch.as_ref() {
         #[cfg(test)]
-        notify(&mut observer, Phase::BeforeCleanup, &scratch);
+        notify(&mut observer, Phase::BeforeCleanup, scratch);
         // Removal requires successful helper returns; an ambiguous helper
         // error (including unknown wait outcome) leaves scratch untouched.
         report.cleanup = if scratch.cleanup(&mut b).is_ok() {
@@ -724,6 +735,8 @@ fn verify_with_audit(
         } else {
             "incomplete"
         };
+        #[cfg(test)]
+        notify(&mut observer, Phase::AfterCleanup, scratch);
     }
     match wall_time() {
         Ok(ended) if report.started_ms != 0 && ended >= report.started_ms => {
@@ -803,6 +816,12 @@ fn verify_with_audit(
             collector.failed(reason);
         }
     }
+    #[cfg(test)]
+    if let Some(scratch) = scratch.as_ref() {
+        notify(&mut observer, Phase::BeforeAcknowledgment, scratch);
+    }
+    // Report metadata is complete; retained collectors own their own clone.
+    drop(schema_owner);
     #[cfg(test)]
     RETIREMENT_OBSERVER.with(|slot| {
         slot.borrow_mut().take();
@@ -1605,6 +1624,43 @@ mod tests {
         // These are the intended old-code behavioral failures, deliberately last.
         for (_, result, _) in observations {
             assert_eq!(result.unwrap(), ExclusiveProbe::Blocked);
+        }
+    }
+
+    #[test]
+    fn schema_participation_retained_through_cleanup_and_ack() {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+        let (f, config, _) = setup();
+        let checkout = f.allocation.checkout;
+        let registry = f.temp.path().join("registry");
+        drop(f.store);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired
+        );
+        let mut probes = Vec::new();
+        let mut hook = |phase, scratch: &Scratch| {
+            if matches!(phase, Phase::AfterCleanup | Phase::BeforeAcknowledgment) {
+                probes.push((
+                    phase,
+                    probe_initialization_exclusive(&registry),
+                    scratch.path().exists(),
+                ));
+            }
+        };
+        let report = verify_path(&config, checkout, Some(&mut hook));
+        let released = probe_initialization_exclusive(&registry);
+        assert!(report.observed(), "{report:?}");
+        assert_eq!(report.cleanup(), "complete");
+        assert_eq!(probes.len(), 2);
+        assert!(probes[0].0 == Phase::AfterCleanup);
+        assert!(probes[1].0 == Phase::BeforeAcknowledgment);
+        assert_eq!(released.unwrap(), ExclusiveProbe::Acquired);
+        for (_, probe, exists) in probes {
+            assert!(!exists, "actual scratch cleanup must have completed");
+            assert_eq!(probe.unwrap(), ExclusiveProbe::Blocked);
         }
     }
 

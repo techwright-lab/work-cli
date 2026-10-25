@@ -88,8 +88,18 @@ pub fn audit_preservation(checkout: Uuid) -> PreservationReport {
 // Only the remote coordinator drives this owned collector. It shares that
 // invocation's budget and immutable document. It never receives a scratch path
 // or controls a Git fetch/ref, and cannot shorten the closing/cleanup sequence.
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum AuditFinishPhase {
+    Entry,
+    MetadataComplete,
+}
+
 pub(super) struct Audit {
     report: PreservationReport,
+    schema: Option<crate::store::SchemaParticipation>,
+    #[cfg(test)]
+    finish_observer: Option<Box<dyn FnMut(AuditFinishPhase)>>,
     local: Option<Local>,
     graph: Option<BTreeSet<Vec<u8>>>,
     rechecked: bool,
@@ -114,12 +124,24 @@ impl Audit {
                 recorded: false,
                 retirement_authority: false,
             },
+            schema: None,
+            #[cfg(test)]
+            finish_observer: None,
             local: None,
             graph: None,
             rechecked: false,
             inspection_policy: None,
             sealed: false,
         }
+    }
+    // Called by the remote coordinator immediately after actual Context
+    // collection. Early failures before Context must not invent participation.
+    pub(super) fn retain_schema(&mut self, schema: crate::store::SchemaParticipation) {
+        self.schema = Some(schema);
+    }
+    // Share only the actual Context-derived owner retained by the coordinator.
+    pub(super) fn schema_participation(&self) -> Option<crate::store::SchemaParticipation> {
+        self.schema.clone()
     }
     pub(super) fn take_approval_local(&mut self) -> Held<ApprovalLocal> {
         if !self.sealed
@@ -410,6 +432,10 @@ impl Audit {
         Ok(())
     }
     pub(super) fn finish(mut self, remote: RemoteReport) -> PreservationReport {
+        #[cfg(test)]
+        if let Some(observer) = self.finish_observer.as_mut() {
+            observer(AuditFinishPhase::Entry);
+        }
         self.report.cleanup = if remote.cleanup() == "complete" {
             "complete"
         } else if remote.cleanup() == "not_created" {
@@ -439,7 +465,15 @@ impl Audit {
             self.report.reason = "incomplete_observation";
         }
         self.report.remote_head = Some(remote);
-        self.report
+        #[cfg(test)]
+        if let Some(observer) = self.finish_observer.as_mut() {
+            observer(AuditFinishPhase::MetadataComplete);
+        }
+        // Final metadata is now complete. Neither returned historical report
+        // nor any serialized data becomes a runtime schema capability.
+        let Self { report, schema, .. } = self;
+        drop(schema);
+        report
     }
 }
 fn checked<T>(value: Result<T, IncompleteReason>) -> Held<T> {
@@ -1904,6 +1938,55 @@ mod tests {
         fs::write(&path, format!("store_dir={:?}\ntrusted_registry={:?}\nroots=[{:?}]\n[remote_preservation]\nformat=1\nversion='fixture-v1'\n[[remote_preservation.targets]]\ncommon_dir={:?}\nremote='backup'\nurl={url:?}\nbranch='refs/heads/preserved'\n", f.temp.path().join("authority"), f.temp.path().join("registry"), f.root, f.common())).unwrap();
         (f, path)
     }
+    #[test]
+    fn schema_participation_spans_remote_return_and_audit_report_finalization() {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+        let (f, config) = setup("sha1");
+        let checkout = f.allocation.checkout;
+        let registry = f.temp.path().join("registry");
+        drop(f.store);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired
+        );
+        let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = probes.clone();
+        let probe_registry = registry.clone();
+        let mut audit = Audit::new(checkout);
+        audit.finish_observer = Some(Box::new(move |phase| {
+            // Record only: even an unexpected successful EX cannot strand the
+            // coordinator's native work or prevent final report construction.
+            observed
+                .borrow_mut()
+                .push((phase, probe_initialization_exclusive(&probe_registry)));
+        }));
+        let remote = remote_proof::audit_path(&config, checkout, &mut audit, None);
+        let at_remote_return = probe_initialization_exclusive(&registry);
+        let report = audit.finish(remote);
+        let released = probe_initialization_exclusive(&registry);
+        assert!(report.observed(), "{report:?}");
+        assert_eq!(report.cleanup, "complete");
+        let remote = report.remote_head.as_ref().unwrap();
+        assert!(remote.observed(), "{remote:?}");
+        assert_eq!(remote.transport(), Some("LOCAL"));
+        assert_eq!(remote.cleanup(), "complete");
+        let probes = probes.borrow();
+        assert_eq!(
+            probes.len(),
+            2,
+            "both actual Audit::finish boundaries reached"
+        );
+        assert_eq!(probes[0].0, AuditFinishPhase::Entry);
+        assert_eq!(probes[1].0, AuditFinishPhase::MetadataComplete);
+        assert_eq!(released.unwrap(), ExclusiveProbe::Acquired);
+        assert_eq!(at_remote_return.unwrap(), ExclusiveProbe::Blocked);
+        for (_, probe) in probes.iter() {
+            assert_eq!(probe.as_ref().unwrap(), &ExclusiveProbe::Blocked);
+        }
+    }
+
     #[test]
     fn actual_sha256_flow_uses_exact_format_without_caller_positive_ids() {
         let (f, config) = setup("sha256");

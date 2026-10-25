@@ -111,6 +111,14 @@ struct Assessment {
     runtime: Option<(std::path::PathBuf, String)>,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum AssessmentReportPhase {
+    NegativeDecision(&'static str),
+    NoAssessment,
+    MetadataComplete,
+}
+
 pub(super) struct Collector {
     checkout: Uuid,
     assertion: Option<Uuid>,
@@ -127,6 +135,9 @@ pub(super) struct Collector {
     runtime: Option<(std::path::PathBuf, String)>,
     sealed: Option<Assessment>,
     failure: Option<&'static str>,
+    // Scoped to this actual collection; never supplies evidence or ownership.
+    #[cfg(test)]
+    report_observer: Option<Box<dyn FnMut(AssessmentReportPhase)>>,
 }
 impl Collector {
     fn new(checkout: Uuid, assertion: Option<Uuid>) -> Self {
@@ -146,6 +157,14 @@ impl Collector {
             runtime: None,
             sealed: None,
             failure: None,
+            #[cfg(test)]
+            report_observer: None,
+        }
+    }
+    #[cfg(test)]
+    fn observe_report(&mut self, phase: AssessmentReportPhase) {
+        if let Some(observer) = self.report_observer.as_mut() {
+            observer(phase);
         }
     }
     // Private future prepare seam. Does not prepare an intent, mint authority,
@@ -186,6 +205,15 @@ impl Collector {
         )
         .map_err(|_| "authority_unknown")?;
         if let Some(guard) = &self.guard {
+            // This separate readonly connection must not keep BEGIN open while
+            // the retained Store's guard performs filesystem metadata checks.
+            {
+                let _phase = readonly.sql_phase();
+                readonly
+                    .conn
+                    .execute_batch("ROLLBACK;")
+                    .map_err(|_| "authority_unknown")?;
+            }
             // Configuration must match the retained guarded authority; never
             // reopen a replacement mutable Store for the prepare collector.
             let retained = self.store.as_ref().ok_or("authority_unknown")?;
@@ -238,6 +266,7 @@ impl Collector {
         }
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
+        let schema = store.schema_participation();
         let phase = store.sql_phase();
         let tx = store
             .conn
@@ -251,7 +280,7 @@ impl Collector {
                 receipts::store_error(error).label()
             }
         })?;
-        let context = snapshot_in_transaction(&tx, &authority, self.checkout, b)
+        let context = snapshot_in_transaction(&tx, &authority, &schema, self.checkout, b)
             .map_err(|_| "context_unknown")?;
         b.reserve(context.history.len() as u64)
             .map_err(|_| "deadline")?;
@@ -491,12 +520,22 @@ fn collect_retained(
     let assertion = collector.assertion;
     let mut audit = preservation::Audit::new(checkout);
     let remote = remote_proof::retirement_path(path, checkout, &mut audit, &mut collector);
+    // Audit owns the actual collected Context's participation even when sealing
+    // failed. Retain it before finish consumes Audit and decide may drop every
+    // Assessment owner; report data must never reconstruct this capability.
+    let schema = audit.schema_participation();
     let preservation = audit.finish(remote);
     let mut report = RetirementAssessmentReport::held(checkout);
     report.assertion_id = assertion;
     report.preservation = Some(preservation);
     report.reason = collector.failure.unwrap_or("observation_held");
     let Some(assessment) = collector.sealed.take() else {
+        #[cfg(test)]
+        {
+            collector.observe_report(AssessmentReportPhase::NoAssessment);
+            collector.observe_report(AssessmentReportPhase::MetadataComplete);
+        }
+        drop(schema);
         return (report, None);
     };
     report.mode = match assessment.mode {
@@ -517,6 +556,8 @@ fn collect_retained(
             Some(retained)
         }
         Err(reason) => {
+            #[cfg(test)]
+            collector.observe_report(AssessmentReportPhase::NegativeDecision(reason));
             report.outcome = "held";
             report.reason = reason;
             None
@@ -526,6 +567,9 @@ fn collect_retained(
     report.retirement_authority = false;
     report.writer_charges_retained = true;
     report.recorded = false;
+    #[cfg(test)]
+    collector.observe_report(AssessmentReportPhase::MetadataComplete);
+    drop(schema);
     (report, retained)
 }
 
@@ -709,6 +753,7 @@ fn decide(
             .check(&assessment.store)
             .map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(assessment.store.authority_identity());
+        let schema = assessment.store.schema_participation();
         let phase = assessment.store.sql_phase();
         let tx = assessment
             .store
@@ -718,6 +763,7 @@ fn decide(
         let current = snapshot_in_transaction(
             &tx,
             &authority,
+            &schema,
             assessment.context.allocation.checkout,
             &mut assessment.budget,
         )
@@ -1107,6 +1153,7 @@ impl FreshRetirementAssessment {
             let lease = store.authority_lease().map_err(|_| "authority_unknown")?;
             lease.check(store).map_err(|_| "authority_unknown")?;
             let authority = std::sync::Arc::clone(store.authority_identity());
+            let schema = store.schema_participation();
             let _phase = store.sql_phase();
             let tx = store
                 .conn
@@ -1134,7 +1181,7 @@ impl FreshRetirementAssessment {
                 )
                 .unwrap();
             }
-            let current = snapshot_in_transaction(&tx, &authority, checkout, budget)
+            let current = snapshot_in_transaction(&tx, &authority, &schema, checkout, budget)
                 .map_err(|_| "context_changed")?;
             budget
                 .reserve(current.history.len() as u64)
@@ -1422,7 +1469,16 @@ pub(super) fn abort_offline(
         .map_err(|_| "authority_unknown")?;
     let (original, count, fence_active) = {
         let _phase = readonly.sql_phase();
-        abort_target(&readonly.conn, checkout, operation, revision)?
+        let selected = abort_target(&readonly.conn, checkout, operation, revision)?;
+        if selected.0.stage != "aborted" {
+            // Keep the actual schema owner and selected DATA, not its BEGIN,
+            // across checkout EX. Close within the same bounded SQL phase.
+            readonly
+                .conn
+                .execute_batch("ROLLBACK;")
+                .map_err(|_| "history_unknown")?;
+        }
+        selected
     };
     if original.stage == "aborted" {
         return Ok(AbortCommit::Historical(
@@ -1566,6 +1622,7 @@ impl OfflineAbort {
         self.budget.check().map_err(|_| "deadline")?;
         let context = {
             let authority = self.guard_authority();
+            let schema = self.store.schema_participation();
             let _phase = self.store.sql_phase();
             let tx = self
                 .store
@@ -1581,9 +1638,14 @@ impl OfflineAbort {
             if target != self.original {
                 return Err("intent_conflict");
             }
-            let context =
-                snapshot_in_transaction(&tx, &authority, self.original.checkout, &mut self.budget)
-                    .map_err(|_| "context_changed")?;
+            let context = snapshot_in_transaction(
+                &tx,
+                &authority,
+                &schema,
+                self.original.checkout,
+                &mut self.budget,
+            )
+            .map_err(|_| "context_changed")?;
             self.budget
                 .reserve(context.history.len() as u64)
                 .map_err(|_| "deadline")?;
@@ -1744,6 +1806,7 @@ impl OfflineAbort {
         use crate::retirement_journal as journal;
         // No FS/boot/Git/config/driver calls from here through commit. The owned
         // guard and common descriptors remain retained, not reacquired in SQL.
+        let schema = self.store.schema_participation();
         let lease = self
             .store
             .authority_lease()
@@ -1768,9 +1831,14 @@ impl OfflineAbort {
         if current != self.original {
             return Err("intent_conflict");
         }
-        let context =
-            snapshot_in_transaction(&tx, &authority, self.original.checkout, &mut self.budget)
-                .map_err(|_| "context_changed")?;
+        let context = snapshot_in_transaction(
+            &tx,
+            &authority,
+            &schema,
+            self.original.checkout,
+            &mut self.budget,
+        )
+        .map_err(|_| "context_changed")?;
         self.budget
             .reserve(context.history.len() as u64)
             .map_err(|_| "deadline")?;
@@ -4843,6 +4911,71 @@ mod tests {
         // Keep the original descriptors open through comparison so replacement
         // cannot be hidden by inode reuse. Never unlink an allocation lock.
         drop((before_handles, after_handles));
+    }
+
+    #[test]
+    fn schema_participation_spans_negative_assessment_report_finalization() {
+        use crate::store::schema_participation_tests::{
+            probe_initialization_exclusive, ExclusiveProbe,
+        };
+
+        let mut f = fixture::ManagedFixture::recovery("sha1", "2");
+        let (request, binding, os) = close_completed(&mut f);
+        // Deliberately do not finish the task: the genuine sealed assessment
+        // must reach decide's task_completion_missing negative return.
+        let config = remote_config(&f, &os.tmp.path().join("runtime"));
+        let checkout = f.allocation.checkout;
+        let registry = f.temp.path().join("registry");
+        let prepared = recovery_refs::prepare_for_assessment(&config, checkout);
+        assert!(prepared.prepared(), "{prepared:?}");
+        drop((prepared, request, binding));
+        drop(f.store);
+        assert_eq!(
+            probe_initialization_exclusive(&registry).unwrap(),
+            ExclusiveProbe::Acquired,
+            "no fixture schema owner may mask the operation's lifetime"
+        );
+
+        let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = probes.clone();
+        let probe_registry = registry.clone();
+        let mut collector = Collector::new(checkout, None);
+        collector.report_observer = Some(Box::new(move |phase| {
+            // Record only, including probe errors. A successful EX is released
+            // by the helper before returning; assertions await report cleanup.
+            observed
+                .borrow_mut()
+                .push((phase, probe_initialization_exclusive(&probe_registry)));
+        }));
+        let (report, retained) = collect_retained(&config, collector, Some(&os.driver));
+        let released = probe_initialization_exclusive(&registry);
+
+        assert!(retained.is_none());
+        assert_eq!(report.outcome(), "held");
+        assert_eq!(report.reason(), "task_completion_missing");
+        assert_eq!(report.mode(), "supervised");
+        assert!(!report.execution_enabled());
+        assert!(!report.retirement_authority());
+        assert!(report.writer_charges_retained());
+        assert!(!report.recorded);
+        let metadata = serde_json::to_value(&report).unwrap();
+        assert_eq!(metadata["preservation"]["outcome"], "observed");
+        assert_eq!(metadata["preservation"]["cleanup"], "complete");
+        let remote = &metadata["preservation"]["remote_head"];
+        assert_eq!(remote["outcome"], "observed");
+        assert_eq!(remote["transport"], "LOCAL");
+        assert_eq!(remote["cleanup"], "complete");
+        let probes = probes.borrow();
+        assert_eq!(probes.len(), 2, "both outer report boundaries reached");
+        assert_eq!(
+            probes[0].0,
+            AssessmentReportPhase::NegativeDecision("task_completion_missing")
+        );
+        assert_eq!(probes[1].0, AssessmentReportPhase::MetadataComplete);
+        assert_eq!(released.unwrap(), ExclusiveProbe::Acquired);
+        for (_, probe) in probes.iter() {
+            assert_eq!(probe.as_ref().unwrap(), &ExclusiveProbe::Blocked);
+        }
     }
 
     #[test]

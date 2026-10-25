@@ -52,7 +52,7 @@ pub fn begin(
     let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)
         .map_err(|e| err(&e.to_string()))?;
     let (mut store, lock) = crate::allocate::locked(config)?;
-    db(guard.revalidate(&store))?;
+    db(guard.revalidate_under_lease(&store, &lock))?;
     // Exact retries confer no new grant and do not refresh activity or Git metadata.
     if db(store.adopted_status_optional(&request.identity.run))?.is_some() {
         return db(store.begin_adopted_under_lease(request, &lock));

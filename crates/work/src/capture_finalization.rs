@@ -397,8 +397,10 @@ fn acquire_run_guard(
     let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
     let checkout = {
         let _phase = readonly.sql_phase();
-        let _read = crate::run_journal::read_transaction(&readonly.conn)?;
-        checkout_for_run(&readonly.conn, run)?
+        let checkout = checkout_for_run(&readonly.conn, run)?;
+        // This BEGIN belongs to the readonly opener, not read_transaction.
+        readonly.conn.execute_batch("ROLLBACK;")?;
+        checkout
     };
     let guard = crate::checkout_guard::CheckoutGuard::shared(&readonly, checkout)?;
     Ok((guard, checkout))

@@ -441,7 +441,7 @@ fn supervise_captured(
     }
     let guard = acquire_checkout_guard(config, command.checkout)?;
     let (mut store, lock) = allocate::locked(config)?;
-    db(guard.require_matching(&store, command.checkout))?;
+    db(guard.require_matching_under_lease(&store, command.checkout, &lock))?;
     db(crate::retirement_journal::checkpoint(
         &mut store,
         &lock,
@@ -519,7 +519,7 @@ pub(crate) fn supervise_off(
     }
     let guard = acquire_checkout_guard(config, command.checkout)?;
     let (mut store, lock) = allocate::locked(config)?;
-    db(guard.require_matching(&store, command.checkout))?;
+    db(guard.require_matching_under_lease(&store, command.checkout, &lock))?;
     db(crate::retirement_journal::checkpoint(
         &mut store,
         &lock,
@@ -619,7 +619,7 @@ fn supervise(
     let guard = acquire_checkout_guard(config, command.checkout)?;
     // Fresh lease BEFORE begin/writer/spawn, under the same short allocator lock.
     let (mut store, lock) = allocate::locked(config)?;
-    db(guard.revalidate(&store))?;
+    db(guard.revalidate_under_lease(&store, &lock))?;
     db(crate::retirement_journal::checkpoint(
         &mut store,
         &lock,

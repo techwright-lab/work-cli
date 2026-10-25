@@ -293,8 +293,8 @@ impl Store {
         // Sole permitted reverse-order acquisition: one nonblocking SH while
         // already leased, with no live transaction and no caller writes yet.
         let guard = if selection.is_some() {
-            Some(crate::checkout_guard::CheckoutGuard::shared(
-                self, checkout,
+            Some(crate::checkout_guard::CheckoutGuard::shared_under_lease(
+                self, checkout, lease,
             )?)
         } else {
             None
@@ -305,13 +305,15 @@ impl Store {
                     .matches
                     .iter()
                     .filter(|id| **id != checkout)
-                    .map(|id| crate::checkout_guard::CheckoutGuard::shared(self, *id))
+                    .map(|id| {
+                        crate::checkout_guard::CheckoutGuard::shared_under_lease(self, *id, lease)
+                    })
                     .collect::<Result<Vec<_>>>()?
             } else {
                 Vec::new()
             };
         for held in guard.iter().chain(other_guards.iter()) {
-            held.revalidate(self)?;
+            held.revalidate_under_lease(self, lease)?;
         }
         let _phase = self.sql_phase();
         let tx = self

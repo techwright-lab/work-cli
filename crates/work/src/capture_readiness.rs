@@ -1914,6 +1914,19 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
     ) {
         many_closed_history_with_timeout(50, completed);
     }
+    // Only the populated legacy-migration caller needs to end actual schema
+    // participation before reopening. The builder retains its TempDir/config
+    // through this callback; all existing borrowed APIs stay unchanged.
+    pub(crate) fn many_closed_history_owned(
+        completed: impl FnMut(
+            &crate::config::Config,
+            Store,
+            &crate::allocate::Allocation,
+            &crate::run_journal::RootRunRequest,
+        ),
+    ) {
+        many_closed_history_with_counts_owned(&[2], 50, completed);
+    }
     // Pilot functional coverage keeps every assertion at two roots; full-load
     // qualification remains explicit in the ignored stress callers.
     fn many_closed_history_with_timeout(
@@ -1943,6 +1956,20 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
         mut completed: impl FnMut(
             &crate::config::Config,
             &Store,
+            &crate::allocate::Allocation,
+            &crate::run_journal::RootRunRequest,
+        ),
+    ) {
+        many_closed_history_with_counts_owned(counts, timeout_ms, |cfg, store, a, root| {
+            completed(cfg, &store, a, root);
+        });
+    }
+    fn many_closed_history_with_counts_owned(
+        counts: &[usize],
+        timeout_ms: u64,
+        mut completed: impl FnMut(
+            &crate::config::Config,
+            Store,
             &crate::allocate::Allocation,
             &crate::run_journal::RootRunRequest,
         ),
@@ -2167,7 +2194,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
                 let _phase = store.sql_phase();
                 guard_certified_identity(&store.conn, a.checkout).unwrap();
             }
-            completed(&cfg, &store, &a, &original);
+            completed(&cfg, store, &a, &original);
         }
     }
     fn git_at(a: &crate::allocate::Allocation, args: &[&str]) -> String {

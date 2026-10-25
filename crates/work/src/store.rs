@@ -48,6 +48,7 @@ pub struct Store {
     pub(crate) conn: Connection,
     budget: SqlBudget,
     authority: Arc<AuthorityIdentity>,
+    schema: SchemaParticipation,
     access: StoreAccess,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,7 +172,7 @@ fn check_file(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
+fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<Connection> {
     let path = dir.join(name);
     if !pending {
         check_file(&path)?;
@@ -221,37 +222,291 @@ fn database(dir: &Path, name: &str, pending: bool) -> Result<Connection> {
         return Err(StoreError::Unsafe);
     }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
-    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    let mode: String = conn.query_row(
+        if initialize {
+            "PRAGMA journal_mode=WAL"
+        } else {
+            "PRAGMA journal_mode"
+        },
+        [],
+        |r| r.get(0),
+    )?;
     if mode != "wal" {
         return Err(StoreError::Unsafe);
     }
     Ok(conn)
 }
-// The registry lock serializes the entire bootstrap, not just claims. The file
-// is private, never unlinked, and NOFOLLOW prevents following a planted link.
-fn initialization_lock(registry: &Path) -> Result<fs::File> {
+// One actual open-file description per independent schema participant. Runtime
+// clones share ownership, not a path-based permission or a serialized proof.
+#[derive(Clone)]
+pub(crate) struct SchemaParticipation(Arc<SharedSchemaOwner>);
+struct SharedSchemaOwner {
+    file: fs::File,
+    registry: PathBuf,
+    registry_file: fs::File,
+    marker: SchemaFile,
+    marker_bytes: Vec<u8>,
+    registration: SchemaFile,
+    directory: PathBuf,
+    directory_file: fs::File,
+    directory_id: (u64, u64),
+    database: SchemaFile,
+    database_id: (u64, u64),
+}
+struct SchemaFile {
+    path: PathBuf,
+    file: fs::File,
+}
+impl SchemaFile {
+    fn open(path: PathBuf) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
+            .open(&path)?;
+        let binding = Self { path, file };
+        binding.revalidate()?;
+        Ok(binding)
+    }
+    fn revalidate(&self) -> Result<()> {
+        checked_schema_file(&self.path, &self.file)
+    }
+    fn bytes(&self) -> Result<Vec<u8>> {
+        use std::io::Read;
+        // Reopen independently: do not share a mutable seek offset with another
+        // legitimate Arc owner. Compare this descriptor with the retained inode.
+        let current = Self::open(self.path.clone())?;
+        if file_id(&current.file)? != file_id(&self.file)? {
+            return Err(StoreError::Unsafe);
+        }
+        let mut bytes = Vec::new();
+        current.file.take(8193).read_to_end(&mut bytes)?;
+        if bytes.len() > 8192 {
+            return Err(StoreError::Unsafe);
+        }
+        Ok(bytes)
+    }
+}
+fn file_id(file: &fs::File) -> Result<(u64, u64)> {
+    let m = file.metadata()?;
+    Ok((m.dev(), m.ino()))
+}
+fn checked_schema_file(path: &Path, file: &fs::File) -> Result<()> {
+    check_file(path)?;
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !held.is_file()
+        || held.nlink() != 1
+        || held.uid() != rustix::process::geteuid().as_raw()
+        || held.mode() & 0o7777 != 0o600
+        || named.mode() & 0o7777 != 0o600
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        return Err(StoreError::Unsafe);
+    }
+    Ok(())
+}
+fn schema_directory(path: &Path) -> Result<fs::File> {
+    existing_directory(path)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(
+            (rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK)
+                .bits() as i32,
+        )
+        .open(path)?;
+    revalidate_schema_directory(path, &file)?;
+    Ok(file)
+}
+fn revalidate_schema_directory(path: &Path, file: &fs::File) -> Result<()> {
+    existing_directory(path)?;
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !held.is_dir()
+        || held.uid() != rustix::process::geteuid().as_raw()
+        || held.mode() & 0o7777 != 0o700
+        || named.mode() & 0o7777 != 0o700
+        || (held.dev(), held.ino()) != (named.dev(), named.ino())
+    {
+        return Err(StoreError::Unsafe);
+    }
+    Ok(())
+}
+fn open_initialization_file(registry: &Path, create: bool) -> Result<fs::File> {
     let path = registry.join("initialization.lock");
     let file = fs::OpenOptions::new()
         .read(true)
-        .write(true)
-        .create(true)
+        .write(create)
+        .create(create)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32)
         .open(&path)?;
-    check_file(&path)?;
-    let metadata = file.metadata()?;
-    if metadata.ino() != fs::symlink_metadata(&path)?.ino() {
-        return Err(StoreError::Unsafe);
-    }
-    let start = std::time::Instant::now();
+    checked_schema_file(&path, &file)?;
+    Ok(file)
+}
+fn lock_initialization(file: &fs::File, exclusive: bool) -> Result<()> {
+    let op = if exclusive {
+        rustix::fs::FlockOperation::NonBlockingLockExclusive
+    } else {
+        rustix::fs::FlockOperation::NonBlockingLockShared
+    };
+    let start = Instant::now();
     loop {
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => return Ok(file),
+        match rustix::fs::flock(file, op) {
+            Ok(()) => return Ok(()),
             Err(rustix::io::Errno::WOULDBLOCK) if start.elapsed() < Duration::from_millis(500) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(e) => return Err(std::io::Error::from(e).into()),
+        }
+    }
+}
+impl Drop for SharedSchemaOwner {
+    fn drop(&mut self) {
+        // End the last legitimate owner's participation even if a dup/fork FD
+        // survives. Unlocking this OFD cannot unlock an independent SH owner.
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+impl SchemaParticipation {
+    pub(crate) fn open_existing(registry: &Path) -> Result<Self> {
+        let registry_file = schema_directory(registry)?;
+        let file = open_initialization_file(registry, false)?;
+        lock_initialization(&file, false)?;
+        revalidate_schema_directory(registry, &registry_file)?;
+        checked_schema_file(&registry.join("initialization.lock"), &file)?;
+        let marker = SchemaFile::open(registry.join("initialization.json"))?;
+        let marker_bytes = marker.bytes()?;
+        let record: Initialization =
+            serde_json::from_slice(&marker_bytes).map_err(|_| StoreError::Unsafe)?;
+        if record.version != 1 || !record.store.is_absolute() {
+            return Err(StoreError::Unsafe);
+        }
+        if !record.initialized {
+            return Err(StoreError::UpgradeRequired);
+        }
+        let directory_file = schema_directory(&record.store)?;
+        let database = SchemaFile::open(record.store.join("store.sqlite"))?;
+        let registration = SchemaFile::open(registry.join("authorities.sqlite"))?;
+        let owner = Self(Arc::new(SharedSchemaOwner {
+            file,
+            registry: registry.to_path_buf(),
+            registry_file,
+            marker,
+            marker_bytes,
+            registration,
+            directory: record.store,
+            directory_id: file_id(&directory_file)?,
+            database_id: file_id(&database.file)?,
+            directory_file,
+            database,
+        }));
+        owner.revalidate()?;
+        Ok(owner)
+    }
+    pub(crate) fn revalidate(&self) -> Result<()> {
+        let owner = &self.0;
+        #[cfg(test)]
+        schema_participation_tests::observe_schema_fs(&owner.directory);
+        revalidate_schema_directory(&owner.registry, &owner.registry_file)?;
+        checked_schema_file(&owner.registry.join("initialization.lock"), &owner.file)?;
+        owner.marker.revalidate()?;
+        if owner.marker.bytes()? != owner.marker_bytes {
+            return Err(StoreError::Unsafe);
+        }
+        owner.registration.revalidate()?;
+        revalidate_schema_directory(&owner.directory, &owner.directory_file)?;
+        owner.database.revalidate()
+    }
+    // Cached comparisons only: callers may use this inside bounded SQL. The
+    // inode tuple is captured at acquisition, never filesystem work under SQL.
+    pub(crate) fn matches_authority(&self, authority: &AuthorityIdentity) -> Result<()> {
+        if self.0.registry != authority.registry
+            || self.0.directory != authority.directory
+            || self.0.directory_id != authority.directory_id
+            || self.0.database_id != authority.database_id
+        {
+            return Err(StoreError::Unsafe);
+        }
+        Ok(())
+    }
+}
+// EX is a separate, non-Clone owner, used only before normal operation guards.
+struct ExclusiveInitialization {
+    file: fs::File,
+    registry: PathBuf,
+    directory: fs::File,
+}
+impl ExclusiveInitialization {
+    fn acquire(registry: &Path, create: bool) -> Result<Self> {
+        if create {
+            private_dir(registry)?;
+        }
+        let directory = schema_directory(registry)?;
+        match fs::symlink_metadata(registry.join("initialization.lock")) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match fs::symlink_metadata(registry.join("initialization.json")) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => return Err(StoreError::Unsafe),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let file = open_initialization_file(registry, create)?;
+        lock_initialization(&file, true)?;
+        let owner = Self {
+            file,
+            registry: registry.to_path_buf(),
+            directory,
+        };
+        owner.revalidate()?;
+        if create {
+            owner.file.sync_all()?;
+            sync_dir(registry)?;
+            sync_dir(registry.parent().ok_or(StoreError::Unsafe)?)?;
+        }
+        Ok(owner)
+    }
+    fn revalidate(&self) -> Result<()> {
+        revalidate_schema_directory(&self.registry, &self.directory)?;
+        checked_schema_file(&self.registry.join("initialization.lock"), &self.file)
+    }
+}
+impl Drop for ExclusiveInitialization {
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self.file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+#[cfg(test)]
+mod schema_handoff_fixture {
+    use std::cell::RefCell;
+    type Hook = Box<dyn FnMut()>;
+    thread_local! { static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) }; }
+    pub(super) struct Guard(std::marker::PhantomData<std::rc::Rc<()>>);
+    pub(super) fn install(hook: impl FnMut() + 'static) -> Guard {
+        HOOK.with(|slot| {
+            assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+        });
+        Guard(std::marker::PhantomData)
+    }
+    pub(super) fn reached() {
+        let hook = HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
         }
     }
 }
@@ -262,6 +517,31 @@ struct Initialization {
     version: u32,
     store: PathBuf,
     initialized: bool,
+}
+// Absence is bootstrap only when neither authority database has ever been
+// published here. Check before creating a lock, then again under initialization EX.
+fn validate_uninitialized(registry: &Path, dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(registry) {
+        Ok(_) => {
+            existing_directory(registry)?;
+            for entry in fs::read_dir(registry)? {
+                let name = entry?.file_name();
+                if name != "initialization.lock" && name != "initialization.tmp" {
+                    return Err(StoreError::Unsafe);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        match fs::symlink_metadata(dir.join(format!("store.sqlite{suffix}"))) {
+            Ok(_) => return Err(StoreError::Unsafe),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 fn sync_dir(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
@@ -342,6 +622,9 @@ impl Store {
     pub(crate) fn sql_phase(&self) -> SqlPhase {
         self.budget.enter()
     }
+    pub(crate) fn schema_participation(&self) -> SchemaParticipation {
+        self.schema.clone()
+    }
     pub(crate) fn authority_identity(&self) -> &Arc<AuthorityIdentity> {
         &self.authority
     }
@@ -349,6 +632,11 @@ impl Store {
         if self.access != StoreAccess::ReadWrite {
             return Err(StoreError::Unsafe);
         }
+        self.require_outside_sql()
+    }
+    // Checkout metadata has the same outside-SQL boundary as lease acquisition,
+    // but readonly participants may acquire a guard after closing their BEGIN.
+    pub(crate) fn require_outside_sql(&self) -> Result<()> {
         if self.budget.is_active() || !self.conn.is_autocommit() {
             return Err(StoreError::Invalid);
         }
@@ -368,7 +656,8 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, budget, _, authority) = existing_authority(registry, dir, managed, false)?;
+        let (schema, conn, budget, _, authority) =
+            existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 16 {
@@ -380,6 +669,7 @@ impl Store {
             conn,
             budget,
             authority,
+            schema,
             access: StoreAccess::ReadOnly,
         })
     }
@@ -390,7 +680,8 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, budget, _, authority) = existing_authority(registry, dir, managed, true)?;
+        let (schema, conn, budget, _, authority) =
+            existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 16 {
@@ -402,6 +693,7 @@ impl Store {
             conn,
             budget,
             authority,
+            schema,
             access: StoreAccess::ReadWrite,
         })
     }
@@ -412,7 +704,8 @@ impl Store {
         managed: &[PathBuf],
         accepted: impl Fn(i64) -> bool,
     ) -> Result<Self> {
-        let (conn, budget, _, authority) = existing_authority(registry, dir, managed, false)?;
+        let (schema, conn, budget, _, authority) =
+            existing_authority(registry, dir, managed, false)?;
         let _phase = budget.enter();
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if !accepted(version) {
@@ -424,6 +717,7 @@ impl Store {
             conn,
             budget,
             authority,
+            schema,
             access: StoreAccess::ReadOnly,
         })
     }
@@ -434,7 +728,8 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        let (conn, budget, _, _) = existing_authority(registry, dir, managed, false)?;
+        let (schema, conn, budget, _, _authority) =
+            existing_authority(registry, dir, managed, false)?;
         {
             let (reg, reg_budget) = existing_database(registry, "authorities.sqlite")?;
             let _reg_phase = reg_budget.enter();
@@ -453,6 +748,7 @@ impl Store {
             crate::run_journal::validate_enrollment_rosters(&conn)?;
         }
         drop(conn);
+        drop(schema);
         Self::open_registered(registry, dir, managed)
     }
     /// Uses `.work-authorities` at the store's parent as the trusted registry,
@@ -477,10 +773,35 @@ impl Store {
     /// storage durability/locality remains a host qualification obligation.
     pub fn open_registered(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Self> {
         let managed = roots(managed)?;
-        let registry = private_dir(registry)?;
-        sync_dir(registry.parent().ok_or(StoreError::Unsafe)?)?;
+        // Only a specifically validated need for bootstrap, registration or
+        // migration reaches EX. Corrupt established metadata is never retried.
+        let marker_present = match fs::symlink_metadata(registry.join("initialization.json")) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e.into()),
+        };
+        if marker_present {
+            match existing_authority_for_open(registry, dir, &managed, true, true) {
+                Ok((schema, conn, budget, _, authority)) => {
+                    return Ok(Self {
+                        conn,
+                        budget,
+                        authority,
+                        schema,
+                        access: StoreAccess::ReadWrite,
+                    })
+                }
+                Err(StoreError::UpgradeRequired) => {}
+                Err(error) => return Err(error),
+            }
+        } else {
+            validate_uninitialized(registry, dir)?;
+        }
+        // Preliminary connections/owners have ended. EX never upgrades SH.
+        let initialization = ExclusiveInitialization::acquire(registry, !marker_present)?;
+        let managed = roots(&managed)?;
+        let registry = registry.to_path_buf();
         initialization_boundary("registry_dir");
-        let _lock = initialization_lock(&registry)?;
         // Bind pending intent before creating either database (or the store
         // directory). A marker-less directory is recoverable only with no prior
         // authority data; SQLite files without proof are never adopted.
@@ -493,23 +814,11 @@ impl Store {
         let marker = registry.join("initialization.json");
         let mut record: Initialization = match fs::symlink_metadata(&marker) {
             Ok(_) => {
-                check_file(&marker)?;
-                serde_json::from_slice(&fs::read(&marker)?).map_err(|_| StoreError::Unsafe)?
+                let marker = SchemaFile::open(marker.clone())?;
+                serde_json::from_slice(&marker.bytes()?).map_err(|_| StoreError::Unsafe)?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                for entry in fs::read_dir(&registry)? {
-                    let name = entry?.file_name();
-                    if name != "initialization.lock" && name != "initialization.tmp" {
-                        return Err(StoreError::Unsafe);
-                    }
-                }
-                for suffix in ["", "-wal", "-shm", "-journal"] {
-                    match fs::symlink_metadata(dir.join(format!("store.sqlite{suffix}"))) {
-                        Ok(_) => return Err(StoreError::Unsafe),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                        Err(e) => return Err(e.into()),
-                    }
-                }
+                validate_uninitialized(&registry, dir)?;
                 let record = Initialization {
                     version: 1,
                     store: expected.clone(),
@@ -528,7 +837,7 @@ impl Store {
         let dir = private_dir(dir)?;
         sync_dir(parent)?;
         initialization_boundary("store_dir");
-        let mut reg = database(&registry, "authorities.sqlite", pending)?;
+        let mut reg = database(&registry, "authorities.sqlite", pending, true)?;
         initialization_boundary("registry_db");
         let reg_budget = SqlBudget::install(&reg)?;
         let reg_phase = reg_budget.enter();
@@ -564,7 +873,7 @@ impl Store {
         tx.commit()?;
         drop(reg_phase);
         initialization_boundary("claims");
-        let mut conn = database(&dir, "store.sqlite", pending)?;
+        let mut conn = database(&dir, "store.sqlite", pending, true)?;
         initialization_boundary("store_db");
         // Bound mutable validation/migration before taking the SQLite writer
         // lock. The same Store-owned callback remains installed on return.
@@ -712,6 +1021,11 @@ impl Store {
         tx.commit()?;
         drop(phase);
         initialization_boundary("store_schema");
+        // Complete ordinary authority guard infrastructure under bootstrap EX;
+        // discard the descriptor before the fresh shared observation below.
+        let allocation_lock = AuthorityIdentity::open_lock(&dir, true)?;
+        allocation_lock.sync_all()?;
+        drop(allocation_lock);
         // FULL SQLite commits make schema and claims durable, including their
         // WAL records. Sync directory entries before publishing initialized.
         sync_dir(&dir)?;
@@ -721,13 +1035,15 @@ impl Store {
             persist_initialization(&registry, &record)?;
         }
         initialization_boundary("initialized");
-        let authority = AuthorityIdentity::collect(&registry, &dir, true)?;
-        Ok(Self {
-            conn,
-            budget,
-            authority,
-            access: StoreAccess::ReadWrite,
-        })
+        initialization.revalidate()?;
+        drop(conn);
+        drop(reg);
+        drop(initialization);
+        #[cfg(test)]
+        schema_handoff_fixture::reached();
+        // No observations or connections cross the non-atomic EX/SH gap. A
+        // complete no-create current-schema reopen is the only return path.
+        Self::open_existing_registered_mut(&registry, &dir, &managed)
     }
     pub fn charged(&self, repository: &Path, owner: Option<&str>) -> Result<u64> {
         let repo = canonical(repository)?;
@@ -981,21 +1297,44 @@ fn existing_authority(
     dir: &Path,
     managed: &[PathBuf],
     writable: bool,
-) -> Result<(Connection, SqlBudget, usize, Arc<AuthorityIdentity>)> {
-    existing_directory(registry)?;
-    existing_directory(dir)?;
-    let marker = registry.join("initialization.json");
-    check_file(&marker)?;
-    if fs::metadata(&marker)?.len() > 8192 {
-        return Err(StoreError::Unsafe);
-    }
-    let record: Initialization =
-        serde_json::from_slice(&fs::read(marker)?).map_err(|_| StoreError::Unsafe)?;
-    if record.version != 1 || !record.initialized || record.store != dir {
+) -> Result<ExistingAuthority> {
+    existing_authority_for_open(registry, dir, managed, writable, false)
+}
+// Destructure schema FIRST so the connection/SQL cleanup ends before its last
+// local participation owner on every early-return path as well as success.
+type ExistingAuthority = (
+    SchemaParticipation,
+    Connection,
+    SqlBudget,
+    usize,
+    Arc<AuthorityIdentity>,
+);
+fn existing_authority_for_open(
+    registry: &Path,
+    dir: &Path,
+    managed: &[PathBuf],
+    writable: bool,
+    allow_registration: bool,
+) -> Result<ExistingAuthority> {
+    let schema = SchemaParticipation::open_existing(registry)?;
+    // Passive historical accounting never requires the old payload roots to
+    // remain on disk. Mutable opens revalidate actual roots under participation.
+    let managed = if writable {
+        roots(managed)?
+    } else {
+        managed.to_vec()
+    };
+    if schema.0.directory != dir {
         return Err(StoreError::Unsafe);
     }
     let (reg, reg_budget) = existing_database(registry, "authorities.sqlite")?;
     let _reg_phase = reg_budget.enter();
+    if writable {
+        let mode: String = reg.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+        if mode != "wal" {
+            return Err(StoreError::Unsafe);
+        }
+    }
     let mut stmt = reg.prepare("SELECT root,store FROM authorities LIMIT 1025")?;
     let mut rows = stmt.query([])?;
     let mut claims = Vec::new();
@@ -1012,11 +1351,14 @@ fn existing_authority(
         }
         claims.push((root, store));
     }
-    if claims.len() != managed.len()
-        || claims
-            .iter()
-            .any(|(root, store)| Path::new(store) != dir || !managed.contains(&PathBuf::from(root)))
+    if claims
+        .iter()
+        .any(|(root, store)| Path::new(store) != dir || !managed.contains(&PathBuf::from(root)))
     {
+        return Err(StoreError::Unsafe);
+    }
+    let registration_needed = claims.len() != managed.len();
+    if registration_needed && !allow_registration {
         return Err(StoreError::Unsafe);
     }
     drop(rows);
@@ -1025,13 +1367,15 @@ fn existing_authority(
     drop(reg);
     let (conn, budget) = existing_database(dir, "store.sqlite")?;
     let readonly_authority = AuthorityIdentity::collect(registry, dir, false)?;
+    schema.revalidate()?;
+    schema.matches_authority(&readonly_authority)?;
     let _phase = budget.enter();
     conn.execute_batch("BEGIN;")?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    if writable && version != 16 {
+    validate_existing_schema(&conn, version)?;
+    if writable && (version != 16 || registration_needed) {
         return Err(StoreError::UpgradeRequired);
     }
-    validate_existing_schema(&conn, version)?;
     if writable {
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         if mode != "wal" {
@@ -1041,15 +1385,23 @@ fn existing_authority(
         // In particular, do not switch a rejected DELETE-mode DB into WAL.
         drop(_phase);
         drop(conn);
-        let writer = database(dir, "store.sqlite", false)?;
+        schema.revalidate()?;
+        let writer = database(dir, "store.sqlite", false, false)?;
         let writer_budget = SqlBudget::install(&writer)?;
         let _writer_phase = writer_budget.enter();
         query_protections(&writer)?;
+        let version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version != 16 {
+            return Err(StoreError::Unsafe);
+        }
+        validate_existing_schema(&writer, version)?;
         drop(_writer_phase);
         let authority = AuthorityIdentity::collect(registry, dir, true)?;
-        Ok((writer, writer_budget, output_bytes, authority))
+        schema.revalidate()?;
+        schema.matches_authority(&authority)?;
+        Ok((schema, writer, writer_budget, output_bytes, authority))
     } else {
-        Ok((conn, budget, output_bytes, readonly_authority))
+        Ok((schema, conn, budget, output_bytes, readonly_authority))
     }
 }
 fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
@@ -1127,7 +1479,8 @@ fn validate_existing_schema(conn: &Connection, version: i64) -> Result<()> {
 }
 /// Strict bounded accounting report using the same existing authority reader.
 pub fn report_existing(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Vec<Charge>> {
-    let (conn, budget, mut output_bytes, _) = existing_authority(registry, dir, managed, false)?;
+    let (_schema, conn, budget, mut output_bytes, _authority) =
+        existing_authority(registry, dir, managed, false)?;
     let _phase = budget.enter();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     validate_existing_schema(&conn, version)?;

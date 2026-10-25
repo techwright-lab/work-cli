@@ -367,9 +367,11 @@ fn finish_internal(
         .ok_or(StoreError::Unsafe)?;
     let preflight =
         Store::preflight_existing_identity(registry, dir, &config.roots, |v| matches!(v, 8..=16))?;
-    let guard = crate::checkout_guard::CheckoutGuard::shared(&preflight, checkout)?;
+    // Identity-only preflight carries no proof/sink work through the EX gap.
+    // Finish upgrading first, then take checkout SH under the fresh Store SH.
     drop(preflight);
     let mut store = Store::open_finish_authority(registry, dir, &config.roots)?;
+    let guard = crate::checkout_guard::CheckoutGuard::shared(&store, checkout)?;
     guard.revalidate(&store)?;
     {
         let lease = store.authority_lease()?;

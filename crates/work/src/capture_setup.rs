@@ -53,7 +53,7 @@ pub(crate) fn begin_under_guard(
         &request.identity().checkout.to_string(),
     ))?;
     let (mut store, lock) = crate::allocate::locked(config)?;
-    crate::allocate::db(guard.require_matching(&store, checkout))?;
+    crate::allocate::db(guard.require_matching_under_lease(&store, checkout, &lock))?;
     crate::allocate::db(crate::retirement_journal::checkpoint(
         &mut store,
         &lock,

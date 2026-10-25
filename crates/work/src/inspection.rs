@@ -328,6 +328,7 @@ pub(super) fn open_configured_store(
     let preflight = Store::open_existing_registered_readonly(registry, directory, &config.roots)
         .map_err(|_| InspectionError)?;
     let authority = std::sync::Arc::clone(preflight.authority_identity());
+    let schema = preflight.schema_participation();
     drop(preflight);
     let lock = crate::store::AuthorityIdentity::open_lock(directory, false)
         .map_err(|_| InspectionError)?;
@@ -351,6 +352,10 @@ pub(super) fn open_configured_store(
     let retained = lock_identity(lock.metadata().map_err(|_| InspectionError)?)?;
     let current = lock_identity(named.metadata().map_err(|_| InspectionError)?)?;
     let cached = store.authority_identity();
+    schema.revalidate().map_err(|_| InspectionError)?;
+    schema
+        .matches_authority(cached)
+        .map_err(|_| InspectionError)?;
     if retained != lock_id
         || current != lock_id
         || cached.lock_id != Some(lock_id)
@@ -658,6 +663,8 @@ fn finish_observation(
 }
 
 pub(super) struct Context {
+    // Runtime ownership only; deliberately absent from canonical/source/history.
+    pub(super) schema: crate::store::SchemaParticipation,
     pub(super) allocation: crate::allocate::Allocation,
     pub(super) canonical: Vec<u8>,
     pub(super) source: Vec<u8>,
@@ -675,12 +682,13 @@ fn snapshot(
         .may_acquire_lease()
         .map_err(|_| IncompleteReason::ContextUnavailable)?;
     let authority = std::sync::Arc::clone(store.authority_identity());
+    let schema = store.schema_participation();
     let phase = store.sql_phase();
     let tx = store
         .conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
         .map_err(|_| IncompleteReason::ContextUnavailable)?;
-    let context = snapshot_in_transaction(&tx, &authority, checkout, b)?;
+    let context = snapshot_in_transaction(&tx, &authority, &schema, checkout, b)?;
     tx.rollback()
         .map_err(|_| IncompleteReason::ContextUnavailable)?;
     drop(phase);
@@ -691,6 +699,7 @@ fn snapshot(
 fn snapshot_in_transaction(
     tx: &rusqlite::Connection,
     authority: &crate::store::AuthorityIdentity,
+    schema: &crate::store::SchemaParticipation,
     checkout: Uuid,
     b: &mut Budget,
 ) -> Result<Context, IncompleteReason> {
@@ -699,6 +708,8 @@ fn snapshot_in_transaction(
         IncompleteReason::ContextUnavailable
     }
     b.check()?;
+    schema.matches_authority(authority).map_err(unavailable)?;
+    let participation = schema.clone();
     let mut canonical = Vec::new();
     frame(
         &mut canonical,
@@ -839,6 +850,7 @@ fn snapshot_in_transaction(
         crate::retirement_journal::frame_history(tx, checkout, &mut canonical)
             .map_err(|_| IncompleteReason::ContextUnavailable)?;
     Ok(Context {
+        schema: participation,
         allocation,
         canonical,
         source,

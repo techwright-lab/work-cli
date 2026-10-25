@@ -595,12 +595,13 @@ impl Collector {
             .map_err(|_| "checkout_guard_unavailable")?;
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
+        let schema = store.schema_participation();
         let phase = store.sql_phase();
         let tx = store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "authority_unknown")?;
-        let context = snapshot_in_transaction(&tx, &authority, self.checkout, b)
+        let context = snapshot_in_transaction(&tx, &authority, &schema, self.checkout, b)
             .map_err(|_| "context_unknown")?;
         if self.start.as_ref().ok_or("clock_anomaly")?.boot
             != context
@@ -1726,15 +1727,21 @@ mod tests {
     fn real_unadopted_allocation_has_no_approval_mode() {
         let mut f = fixture::ManagedFixture::new("sha1", "2");
         let authority = std::sync::Arc::clone(f.store.authority_identity());
+        let schema = f.store.schema_participation();
         let phase = f.store.sql_phase();
         let tx = f
             .store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .unwrap();
-        let context =
-            snapshot_in_transaction(&tx, &authority, f.allocation.checkout, &mut Budget::new())
-                .unwrap();
+        let context = snapshot_in_transaction(
+            &tx,
+            &authority,
+            &schema,
+            f.allocation.checkout,
+            &mut Budget::new(),
+        )
+        .unwrap();
         assert!(matches!(
             AdoptedMode::read(&tx, &context),
             Err("adopted_mode_required")

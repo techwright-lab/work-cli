@@ -375,6 +375,7 @@ fn publish(
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     reservation.check(store, true)?;
     let authority = std::sync::Arc::clone(store.authority_identity());
+    let schema = store.schema_participation();
     {
         let phase = store.sql_phase();
         let tx = store
@@ -394,6 +395,7 @@ fn publish(
         let current = super::snapshot_in_transaction(
             &tx,
             &authority,
+            &schema,
             context.allocation.checkout,
             &mut captured.budget,
         )
@@ -915,6 +917,7 @@ fn publish_reserved(
     let lease = store.authority_lease().map_err(|_| ReceiptError::Busy)?;
     lease.check(store).map_err(|_| ReceiptError::Conflict)?;
     let authority = std::sync::Arc::clone(store.authority_identity());
+    let schema = store.schema_participation();
     {
         let phase = store.sql_phase();
         let tx = store
@@ -929,9 +932,14 @@ fn publish_reserved(
             crate::retirement_journal::Attempt::RecoveryRefs,
         )
         .map_err(store_error)?;
-        let current =
-            super::snapshot_in_transaction(&tx, &authority, context.allocation.checkout, budget)
-                .map_err(|_| ReceiptError::Conflict)?;
+        let current = super::snapshot_in_transaction(
+            &tx,
+            &authority,
+            &schema,
+            context.allocation.checkout,
+            budget,
+        )
+        .map_err(|_| ReceiptError::Conflict)?;
         if current.canonical != context.canonical {
             return Err(ReceiptError::Conflict);
         }

@@ -4668,11 +4668,12 @@ fn supported_classes_and_complete_history_fences() {
 
 #[test]
 fn strict_gap_shape_binding_and_schema14_migration() {
+    use crate::capture_readiness::tests::many_closed_history_owned;
     // Existing unchanged 2/48-root, contained-child durable fixture. Its extra
     // roots are synthetic history, not claims of separate physical executions.
-    crate::capture_readiness::tests::many_closed_history(|config, store, allocation, prior| {
+    many_closed_history_owned(|config, store, allocation, prior| {
         // Reuse populated frozen/certified history before a finish fence exists.
-        let before = durable_rows(store);
+        let before = durable_rows(&store);
         let mut identity = prior.identity().clone();
         identity.run = work_contract::RunId::generate();
         identity.group = work_contract::GroupId::generate();
@@ -4687,7 +4688,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
             }
             assert!(super::begin(&invocation, &root, &["/usr/bin/true".into()]).is_err());
             assert_eq!(
-                durable_rows(store),
+                durable_rows(&store),
                 before,
                 "frozen/certified history must never become Off"
             );
@@ -4706,7 +4707,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
             "checkouts",
             "outbox",
         ];
-        let snapshot = || {
+        let snapshot = |store: &Store| {
             tables
                 .iter()
                 .map(|table| {
@@ -4726,7 +4727,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
                 })
                 .collect::<Vec<_>>()
         };
-        let before = snapshot();
+        let before = snapshot(&store);
         for (table, rows) in tables.iter().zip(&before) {
             assert!(
                 !rows.is_empty(),
@@ -4737,6 +4738,9 @@ fn strict_gap_shape_binding_and_schema14_migration() {
             .conn
             .execute_batch("DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; PRAGMA user_version=13;")
             .unwrap();
+        // The helper transfers the actual Store, retaining its TempDir until
+        // this callback returns. No schema participant may block migration EX.
+        drop(store);
         let migrated = Store::open_registered(
             config.trusted_registry.as_ref().unwrap(),
             config.store_dir.as_ref().unwrap(),
@@ -4744,7 +4748,7 @@ fn strict_gap_shape_binding_and_schema14_migration() {
         )
         .unwrap();
         assert_eq!(
-            snapshot(),
+            snapshot(&migrated),
             before,
             "migration rewrote existing durable bytes"
         );

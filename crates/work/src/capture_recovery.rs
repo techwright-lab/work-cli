@@ -161,8 +161,10 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
     let readonly = Store::open_existing_registered_readonly(registry, dir, &config.roots)?;
     let checkout = {
         let _phase = readonly.sql_phase();
-        let _read = run_journal::read_transaction(&readonly.conn)?;
-        checkout_for_run(&readonly.conn, run)?
+        let checkout = checkout_for_run(&readonly.conn, run)?;
+        // Retain the actual Store/schema owner, but close its opener-owned BEGIN.
+        readonly.conn.execute_batch("ROLLBACK;")?;
+        checkout
     };
     let guard = crate::checkout_guard::CheckoutGuard::shared(&readonly, checkout)?;
     drop(readonly);

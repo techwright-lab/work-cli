@@ -1676,6 +1676,7 @@ mod physical_tests {
 /// A live, Store-instance-bound exclusion capability, never a wire value.
 pub(crate) struct AuthorityLease {
     _file: fs::File,
+    schema: crate::store::SchemaParticipation,
     authority: std::sync::Arc<crate::store::AuthorityIdentity>,
 }
 impl Drop for AuthorityLease {
@@ -1698,6 +1699,7 @@ impl AuthorityLease {
         &self,
         authority: &std::sync::Arc<crate::store::AuthorityIdentity>,
     ) -> crate::store::Result<()> {
+        self.schema.matches_authority(authority)?;
         if !std::sync::Arc::ptr_eq(&self.authority, authority)
             || self.authority.as_ref() != authority.as_ref()
             || authority.lock_id.is_none()
@@ -1723,7 +1725,10 @@ pub(crate) fn locked(config: &Config) -> io::Result<(Store, AuthorityLease)> {
 pub(crate) fn lifecycle_lock(store: &Store) -> io::Result<AuthorityLease> {
     use std::os::unix::fs::MetadataExt;
     db(store.may_acquire_lease())?;
+    let schema = store.schema_participation();
+    db(schema.revalidate())?;
     let authority = store.authority_identity();
+    db(schema.matches_authority(authority))?;
     let directory = fs::symlink_metadata(&authority.directory)?;
     if !directory.is_dir()
         || directory.uid() != rustix::process::geteuid().as_raw()
@@ -1755,6 +1760,7 @@ pub(crate) fn lifecycle_lock(store: &Store) -> io::Result<AuthorityLease> {
     }
     Ok(AuthorityLease {
         _file: lock,
+        schema,
         authority: std::sync::Arc::clone(authority),
     })
 }
@@ -1931,13 +1937,13 @@ pub fn start_observed(
         let guards = matches
             .iter()
             .map(|checkout| {
-                db(crate::checkout_guard::CheckoutGuard::shared(
-                    &store, *checkout,
+                db(crate::checkout_guard::CheckoutGuard::shared_under_lease(
+                    &store, *checkout, &lease,
                 ))
             })
             .collect::<io::Result<Vec<_>>>()?;
         for guard in &guards {
-            db(guard.revalidate(&store))?;
+            db(guard.revalidate_under_lease(&store, &lease))?;
         }
         #[cfg(test)]
         crate::retirement_journal::tests::observe_late(
@@ -2095,8 +2101,8 @@ fn resume_operation(
     lease: AuthorityLease,
     boundary: &mut impl FnMut(&str),
 ) -> io::Result<Allocation> {
-    let guard = db(crate::checkout_guard::CheckoutGuard::shared(
-        store, checkout,
+    let guard = db(crate::checkout_guard::CheckoutGuard::shared_under_lease(
+        store, checkout, &lease,
     ))?;
     db(crate::retirement_journal::checkpoint(
         store,

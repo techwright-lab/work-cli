@@ -393,12 +393,13 @@ impl Collector {
             .map_err(|_| "checkout_guard_unavailable")?;
         store.may_acquire_lease().map_err(|_| "authority_unknown")?;
         let authority = std::sync::Arc::clone(store.authority_identity());
+        let schema = store.schema_participation();
         let phase = store.sql_phase();
         let tx = store
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
             .map_err(|_| "authority_unknown")?;
-        let context = snapshot_in_transaction(&tx, &authority, self.checkout, b)
+        let context = snapshot_in_transaction(&tx, &authority, &schema, self.checkout, b)
             .map_err(|_| "context_unknown")?;
         tx.rollback().map_err(|_| "context_unknown")?;
         drop(phase);
@@ -1287,6 +1288,7 @@ fn short_context_matches(
     store.may_acquire_lease().map_err(|_| "authority_unknown")?;
     let lease = store.authority_lease().map_err(|_| "authority_busy")?;
     let authority = std::sync::Arc::clone(store.authority_identity());
+    let schema = store.schema_participation();
     {
         let phase = store.sql_phase();
         let tx = store
@@ -1301,8 +1303,9 @@ fn short_context_matches(
             crate::retirement_journal::Attempt::RecoveryRefs,
         )
         .map_err(|error| receipt_reason(receipts::store_error(error)))?;
-        let current = snapshot_in_transaction(&tx, &authority, expected.allocation.checkout, b)
-            .map_err(|_| "context_unknown")?;
+        let current =
+            snapshot_in_transaction(&tx, &authority, &schema, expected.allocation.checkout, b)
+                .map_err(|_| "context_unknown")?;
         if current.canonical != expected.canonical {
             return Err("context_changed");
         }

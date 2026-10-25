@@ -25,6 +25,7 @@ pub(crate) struct CheckoutGuard {
     database_id: (u64, u64),
     lock_id: Option<(u64, u64)>,
     exclusive: bool,
+    schema: crate::store::SchemaParticipation,
 }
 
 impl Drop for CheckoutGuard {
@@ -44,6 +45,20 @@ impl CheckoutGuard {
     pub(crate) fn exclusive(store: &Store, checkout: Uuid) -> Result<Self> {
         acquire(store, checkout, true)
     }
+    // Only the existing nonblocking checkout metadata exception is permitted
+    // under authority. The actual lease proves Store provenance; its retained
+    // schema SH keeps cooperative schema/marker changes excluded.
+    pub(crate) fn shared_under_lease(
+        store: &Store,
+        checkout: Uuid,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<Self> {
+        store.require_outside_sql()?;
+        lease.check(store)?;
+        let schema = store.schema_participation();
+        schema.matches_authority(store.authority_identity())?;
+        acquire_validated(store, checkout, false, schema)
+    }
     pub(crate) fn shared_known(config: &crate::config::Config, checkout: Uuid) -> Result<Self> {
         let registry = config
             .trusted_registry
@@ -52,6 +67,12 @@ impl CheckoutGuard {
         let dir = config.store_dir.as_deref().ok_or(StoreError::Invalid)?;
         let readonly =
             Store::preflight_existing_identity(registry, dir, &config.roots, |v| v == 16)?;
+        // End BEGIN before acquiring filesystem guards, retaining the actual
+        // schema owner across that boundary and after this temporary Store dies.
+        {
+            let _phase = readonly.sql_phase();
+            readonly.conn.execute_batch("ROLLBACK;")?;
+        }
         Self::shared(&readonly, checkout)
     }
     pub(crate) fn matches_checkout(&self, checkout: Uuid) -> Result<()> {
@@ -65,6 +86,21 @@ impl CheckoutGuard {
         self.exclusive
     }
     pub(crate) fn revalidate(&self, store: &Store) -> Result<()> {
+        store.require_outside_sql()?;
+        self.schema.revalidate()?;
+        self.revalidate_checkout_metadata(store)
+    }
+    pub(crate) fn revalidate_under_lease(
+        &self,
+        store: &Store,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<()> {
+        store.require_outside_sql()?;
+        lease.check(store)?;
+        self.revalidate_checkout_metadata(store)
+    }
+    fn revalidate_checkout_metadata(&self, store: &Store) -> Result<()> {
+        self.schema.matches_authority(store.authority_identity())?;
         let identity = store.authority_identity();
         if identity.registry() != self.registry.as_path()
             || identity.directory != self.directory_path
@@ -110,9 +146,32 @@ impl CheckoutGuard {
         self.matches_checkout(checkout)?;
         self.revalidate(store)
     }
+    pub(crate) fn require_matching_under_lease(
+        &self,
+        store: &Store,
+        checkout: Uuid,
+        lease: &crate::allocate::AuthorityLease,
+    ) -> Result<()> {
+        self.matches_checkout(checkout)?;
+        self.revalidate_under_lease(store, lease)
+    }
 }
 
 fn acquire(store: &Store, checkout: Uuid, exclusive: bool) -> Result<CheckoutGuard> {
+    store.require_outside_sql()?;
+    let schema = store.schema_participation();
+    schema.revalidate()?;
+    schema.matches_authority(store.authority_identity())?;
+    acquire_validated(store, checkout, exclusive, schema)
+}
+// Private shared mechanism receives the actual owner validated by one of the
+// two purpose-specific entry points above, never a validation-bypass flag.
+fn acquire_validated(
+    store: &Store,
+    checkout: Uuid,
+    exclusive: bool,
+    schema: crate::store::SchemaParticipation,
+) -> Result<CheckoutGuard> {
     crate::retirement_journal::parse_uuid(&checkout.to_string())?;
     let identity = store.authority_identity();
     let authority = open_authority(store)?;
@@ -162,6 +221,7 @@ fn acquire(store: &Store, checkout: Uuid, exclusive: bool) -> Result<CheckoutGua
             database_id: identity.database_id(),
             lock_id: identity.lock_id,
             exclusive,
+            schema,
         }),
         Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err(StoreError::OperationsInFlight),
         Err(_) => Err(StoreError::Unsafe),
@@ -364,6 +424,10 @@ mod tests {
         let readonly =
             Store::open_existing_registered_readonly(&registry, &dir, std::slice::from_ref(&root))
                 .unwrap();
+        {
+            let _phase = readonly.sql_phase();
+            readonly.conn.execute_batch("ROLLBACK;").unwrap();
+        }
         let guard = CheckoutGuard::shared(&readonly, checkout).unwrap();
         guard.revalidate(&store).unwrap();
         let mut_again =
