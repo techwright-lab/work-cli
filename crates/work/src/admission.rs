@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     pub operation: Uuid,
     pub repository: PathBuf,
@@ -27,6 +27,85 @@ pub struct Limits {
     pub floor_bytes: u64,
     pub warn_bytes: u64,
 }
+/// Opaque retained request identity. Only actual repository resolution can
+/// construct it; neither a caller DTO nor a journal row grants SQL permission.
+/// No Clone/Deserialize and no public field or canonical-string constructor.
+pub(crate) struct ReservationIdentity {
+    authority: std::sync::Arc<crate::store::AuthorityIdentity>,
+    request: Reservation,
+    repository: String,
+    digest: Vec<u8>,
+}
+impl ReservationIdentity {
+    pub(crate) fn observe(store: &Store, request: &Reservation) -> Result<Self> {
+        if request.operation.get_version_num() != 7
+            || request.operation.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(StoreError::Invalid);
+        }
+        for value in [&request.actor, &request.owner, &request.task] {
+            identity(value)?;
+        }
+        #[cfg(test)]
+        canonical_fixture::boundary(store);
+        let repository = canonical(&request.repository)?;
+        // Preserve the original v1 framing exactly. Capacity is not identity.
+        let mut hash = Sha256::new();
+        for field in [
+            "work-reservation-v1",
+            &repository,
+            &request.actor,
+            &request.owner,
+            &request.task,
+        ] {
+            hash.update((field.len() as u64).to_be_bytes());
+            hash.update(field.as_bytes());
+        }
+        Ok(Self {
+            authority: store.authority_identity().clone(),
+            request: request.clone(),
+            repository,
+            digest: hash.finalize().to_vec(),
+        })
+    }
+    fn check(&self, store: &Store, request: &Reservation) -> Result<()> {
+        if !std::sync::Arc::ptr_eq(&self.authority, store.authority_identity())
+            || &self.request != request
+        {
+            return Err(StoreError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod canonical_fixture {
+    type Callback = Box<dyn FnMut(&super::Store)>;
+    thread_local! { static OBSERVER: std::cell::RefCell<Option<Callback>> = const { std::cell::RefCell::new(None) }; }
+    pub(crate) struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+    pub(crate) fn observe(callback: impl FnMut(&super::Store) + 'static) -> Guard {
+        OBSERVER.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(callback));
+        });
+        Guard
+    }
+    pub(super) fn boundary(store: &super::Store) {
+        OBSERVER.with(|slot| {
+            if let Some(callback) = slot.borrow_mut().as_mut() {
+                callback(store);
+            }
+        });
+    }
+}
+
 pub(crate) struct AllocationIntent {
     pub(crate) request: String,
     pub(crate) record: String,
@@ -164,9 +243,10 @@ fn candidate() -> Uuid {
 
 impl Store {
     pub fn reserve(&mut self, request: &Reservation, limits: Limits) -> Result<Uuid> {
+        let observed = ReservationIdentity::observe(self, request)?;
         let lease = self.authority_lease()?;
         self.reserve_recorded_under_lease(
-            request,
+            &observed,
             limits,
             |_| Ok(None),
             &lease,
@@ -178,37 +258,18 @@ impl Store {
     /// allocation owns SH from the read selection through the caller's final ACK.
     pub(crate) fn reserve_recorded_under_lease(
         &mut self,
-        request: &Reservation,
+        observed: &ReservationIdentity,
         limits: Limits,
         record: impl FnOnce(Uuid) -> Result<Option<AllocationIntent>>,
         lease: &crate::allocate::AuthorityLease,
         purpose: ReservationPurpose<'_>,
     ) -> Result<RecordedReservation> {
         lease.check(self)?;
+        let request = &observed.request;
+        observed.check(self, request)?;
         let authority = self.authority_identity().clone();
-        if request.operation.get_version_num() != 7
-            || request.operation.get_variant() != uuid::Variant::RFC4122
-        {
-            return Err(StoreError::Invalid);
-        }
-        for value in [&request.actor, &request.owner, &request.task] {
-            identity(value)?;
-        }
-        let repo = canonical(&request.repository)?;
-        // Length-framed fields avoid concatenation ambiguity; policy/measurements are
-        // deliberately not request identity, so retries work under reduced capacity.
-        let mut hash = Sha256::new();
-        for field in [
-            "work-reservation-v1",
-            &repo,
-            &request.actor,
-            &request.owner,
-            &request.task,
-        ] {
-            hash.update((field.len() as u64).to_be_bytes());
-            hash.update(field.as_bytes());
-        }
-        let digest = hash.finalize().to_vec();
+        let repo = &observed.repository;
+        let digest = observed.digest.as_slice();
         let staged = match purpose {
             ReservationPurpose::SqlOnly => &[][..],
             ReservationPurpose::Allocation(aliases) => aliases,
@@ -327,7 +388,7 @@ impl Store {
             )
             .optional()?;
         if let Some((id, stored)) = prior {
-            if stored != digest {
+            if stored.as_slice() != digest {
                 return Err(StoreError::Conflict);
             }
             let id = crate::retirement_journal::parse_uuid(&id)?;
@@ -354,8 +415,8 @@ impl Store {
             || limits
                 .available_bytes
                 .is_none_or(|b| b < limits.floor_bytes)
-            || count(&tx, &repo, None)? >= limits.repository
-            || count(&tx, &repo, Some(&request.owner))? >= limits.owner
+            || count(&tx, repo, None)? >= limits.repository
+            || count(&tx, repo, Some(&request.owner))? >= limits.owner
         {
             return Err(StoreError::Capacity);
         }
@@ -511,6 +572,145 @@ mod allocation_tests {
     }
 
     #[test]
+    fn public_reservation_canonicalization_precedes_global_lease_and_preserves_digest_retry() {
+        let (_dir, mut store, mut request, _) = fixture();
+        let real = request.repository.clone();
+        let alias = real.with_file_name("repository-link");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        request.repository = alias;
+        let reached = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = reached.clone();
+        let _hook = canonical_fixture::observe(move |store| {
+            assert!(store.conn.is_autocommit());
+            let lock = crate::store::AuthorityIdentity::open_lock(
+                &store.authority_identity().directory,
+                false,
+            )
+            .unwrap();
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+            observed.set(observed.get() + 1);
+        });
+        let checkout = store.reserve(&request, limits()).unwrap();
+        let mut expected = Sha256::new();
+        for field in [
+            "work-reservation-v1",
+            real.to_str().unwrap(),
+            &request.actor,
+            &request.owner,
+            &request.task,
+        ] {
+            expected.update((field.len() as u64).to_be_bytes());
+            expected.update(field.as_bytes());
+        }
+        let (repository, digest): (String, Vec<u8>) = store
+            .conn
+            .query_row(
+                "SELECT repository,digest FROM checkouts WHERE id=?1",
+                [checkout.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(repository, real.to_str().unwrap());
+        assert_eq!(digest, expected.finalize().to_vec());
+        let before = rows(&store);
+        request.repository = real;
+        assert_eq!(
+            store
+                .reserve(
+                    &request,
+                    Limits {
+                        repository: 0,
+                        owner: 0,
+                        available_bytes: None,
+                        ..limits()
+                    }
+                )
+                .unwrap(),
+            checkout
+        );
+        assert_eq!(rows(&store), before);
+        assert_eq!(
+            reached.get(),
+            2,
+            "both public calls reached actual canonicalization without lease"
+        );
+    }
+
+    #[test]
+    fn observed_reservation_binds_store_and_exact_request_without_new_filesystem_io() {
+        let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
+        for field in ["operation", "repository", "actor", "owner", "task"] {
+            let mut changed = request.clone();
+            match field {
+                "operation" => changed.operation = Uuid::now_v7(),
+                "repository" => changed.repository = aliases[0].0.clone(),
+                "actor" => changed.actor = "other".into(),
+                "owner" => changed.owner = "other".into(),
+                _ => changed.task = "other".into(),
+            }
+            assert!(
+                matches!(observed.check(&store, &changed), Err(StoreError::Conflict)),
+                "{field}"
+            );
+        }
+        let (_other_dir, mut other, _, _) = fixture();
+        assert!(matches!(
+            observed.check(&other, &request),
+            Err(StoreError::Conflict)
+        ));
+        let before_other = rows(&other);
+        let other_lease = other.authority_lease().unwrap();
+        assert!(matches!(
+            other.reserve_recorded_under_lease(
+                &observed,
+                limits(),
+                |_| panic!("wrong authority must not call intent"),
+                &other_lease,
+                ReservationPurpose::SqlOnly
+            ),
+            Err(StoreError::Conflict)
+        ));
+        assert_eq!(rows(&other), before_other);
+        drop(other_lease);
+        let _hook = canonical_fixture::observe(|_| {
+            panic!("borrowed adapter must not resolve repository paths")
+        });
+        let lease = store.authority_lease().unwrap();
+        let reserved = store
+            .reserve_recorded_under_lease(
+                &observed,
+                limits(),
+                |_| Ok(None),
+                &lease,
+                ReservationPurpose::Allocation(&aliases),
+            )
+            .unwrap();
+        assert!(matches!(
+            CheckoutGuard::exclusive(&store, reserved.checkout),
+            Err(StoreError::OperationsInFlight)
+        ));
+        let before = rows(&store);
+        assert_eq!(
+            store
+                .reserve_recorded_under_lease(
+                    &observed,
+                    Limits {
+                        repository: 0,
+                        ..limits()
+                    },
+                    |_| panic!("retry"),
+                    &lease,
+                    ReservationPurpose::Allocation(&aliases)
+                )
+                .unwrap()
+                .checkout,
+            reserved.checkout
+        );
+        assert_eq!(rows(&store), before);
+    }
+
+    #[test]
     fn reserved_retry_commits_retirement_hold_before_existing_once() {
         for allocation in [false, true] {
             let (_dir, mut store, request, aliases) = fixture();
@@ -519,10 +719,11 @@ mod allocation_tests {
             let before = rows(&store);
             for _ in 0..2 {
                 let result = if allocation {
+                    let observed = ReservationIdentity::observe(&store, &request).unwrap();
                     let lease = store.authority_lease().unwrap();
                     store
                         .reserve_recorded_under_lease(
-                            &request,
+                            &observed,
                             limits(),
                             |_| panic!("fenced retry must not call intent"),
                             &lease,
@@ -550,6 +751,7 @@ mod allocation_tests {
     #[test]
     fn published_aliases_do_not_fence_independent_allocation() {
         let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         publish_aliases(&store.conn, &aliases).unwrap();
         let legacy = Reservation {
             operation: Uuid::now_v7(),
@@ -563,7 +765,7 @@ mod allocation_tests {
         let lease = store.authority_lease().unwrap();
         let result = store
             .reserve_recorded_under_lease(
-                &request,
+                &observed,
                 limits(),
                 |_| Ok(None),
                 &lease,
@@ -578,7 +780,7 @@ mod allocation_tests {
         let after = rows(&store);
         let retry = store
             .reserve_recorded_under_lease(
-                &request,
+                &observed,
                 limits(),
                 |_| panic!("Existing does not call intent"),
                 &lease,
@@ -592,6 +794,7 @@ mod allocation_tests {
     #[test]
     fn allocation_retry_scopes_actual_checkout_without_publishing_missing_aliases() {
         let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         let other = Reservation {
             operation: Uuid::now_v7(),
             ..request.clone()
@@ -604,7 +807,7 @@ mod allocation_tests {
         let lease = store.authority_lease().unwrap();
         let retry = store
             .reserve_recorded_under_lease(
-                &request,
+                &observed,
                 limits(),
                 |_| panic!("retry must not publish intent"),
                 &lease,
@@ -636,6 +839,7 @@ mod allocation_tests {
     #[test]
     fn all_staged_alias_repositories_are_fenced_in_one_atomic_batch() {
         let (_dir, mut store, request, mut aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         let other = aliases[0].0.join("other");
         std::fs::create_dir(&other).unwrap();
         let mut checkouts = Vec::new();
@@ -658,7 +862,7 @@ mod allocation_tests {
         let before = rows(&store);
         let lease = store.authority_lease().unwrap();
         let result = store.reserve_recorded_under_lease(
-            &request,
+            &observed,
             limits(),
             |_| panic!("fence precedes caller intent"),
             &lease,
@@ -683,7 +887,7 @@ mod allocation_tests {
             .unwrap();
         for _ in 0..2 {
             let result = store.reserve_recorded_under_lease(
-                &request,
+                &observed,
                 limits(),
                 |_| panic!("fence precedes caller intent"),
                 &lease,
@@ -710,6 +914,7 @@ mod allocation_tests {
     #[test]
     fn candidate_guard_contention_precedes_every_caller_write() {
         let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         let checkout = Uuid::now_v7();
         let exclusive = CheckoutGuard::exclusive(&store, checkout).unwrap();
         candidate_fixture::CHECKOUT.with(|slot| slot.set(Some(checkout)));
@@ -717,7 +922,7 @@ mod allocation_tests {
         let before = rows(&store);
         let mut called = false;
         let result = store.reserve_recorded_under_lease(
-            &request,
+            &observed,
             limits(),
             |_| {
                 called = true;
@@ -735,10 +940,11 @@ mod allocation_tests {
     #[test]
     fn borrowed_lease_keeps_atomic_intent_capture_and_owned_guard() {
         let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         let lease = store.authority_lease().unwrap();
         let reservation = store
             .reserve_recorded_under_lease(
-                &request,
+                &observed,
                 limits(),
                 |checkout| {
                     Ok(Some(AllocationIntent {
@@ -773,7 +979,7 @@ mod allocation_tests {
         let before = rows(&store);
         let retry = store
             .reserve_recorded_under_lease(
-                &request,
+                &observed,
                 Limits {
                     repository: 0,
                     ..limits()
@@ -793,6 +999,7 @@ mod allocation_tests {
     #[test]
     fn staged_alias_capacity_failure_keeps_legacy_charge_and_rolls_back_aliases() {
         let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         let legacy = Reservation {
             repository: aliases[0].0.clone(),
             actor: "legacy".into(),
@@ -804,7 +1011,7 @@ mod allocation_tests {
         let before = rows(&store);
         let lease = store.authority_lease().unwrap();
         let result = store.reserve_recorded_under_lease(
-            &request,
+            &observed,
             Limits {
                 repository: 1,
                 ..limits()
@@ -821,11 +1028,12 @@ mod allocation_tests {
     #[test]
     fn candidate_collision_rolls_back_staged_aliases() {
         let (_dir, mut store, request, aliases) = fixture();
+        let observed = ReservationIdentity::observe(&store, &request).unwrap();
         candidate_fixture::CHECKOUT.with(|slot| slot.set(Some(request.operation)));
         let before = rows(&store);
         let lease = store.authority_lease().unwrap();
         let result = store.reserve_recorded_under_lease(
-            &request,
+            &observed,
             limits(),
             |_| panic!("collision precedes intent"),
             &lease,

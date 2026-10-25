@@ -221,6 +221,152 @@ fn new_gap_event_cannot_reuse_active_or_aborted_retirement_operation() {
     }
 }
 
+#[test]
+fn existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths() {
+    use crate::retirement_journal::tests::{seed_prepared, source_rows};
+    for aborted in [false, true] {
+        for late in [false, true] {
+            let (_temp, config, allocation, root, argv) = ordinary();
+            let (mut observer_store, lease) = crate::allocate::locked(&config).unwrap();
+            drop(lease);
+            let other = observer_store
+                .reserve(
+                    &crate::admission::Reservation {
+                        operation: uuid::Uuid::now_v7(),
+                        repository: allocation.request.repository.clone().unwrap(),
+                        actor: "other".into(),
+                        owner: "other".into(),
+                        task: "other".into(),
+                    },
+                    crate::admission::Limits {
+                        repository: 10,
+                        owner: 10,
+                        available_bytes: Some(100),
+                        floor_bytes: 0,
+                        warn_bytes: 0,
+                    },
+                )
+                .unwrap();
+            // Preopen the real contender before injection so schema validation
+            // cannot mask either committed-Existing reader with an opener error.
+            let (attempt_store, lease) = crate::allocate::locked(&config).unwrap();
+            drop(lease);
+            let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let captured = snapshot.clone();
+            let config_copy = config.clone();
+            let root_copy = root.clone();
+            let argv_copy = argv.clone();
+            let inject = move || {
+                // A real committed Gap on B must be valid before A's contradictory
+                // structural retirement row is inserted. No intent on B can mask
+                // the namespace defect with a checkout-scoped hold.
+                let (store, created) = super::begin(&config_copy, &root_copy, &argv_copy).unwrap();
+                assert!(matches!(created, super::BeginGap::Created(_)));
+                let gap = super::read_record(&store.conn, &root_copy).unwrap();
+                super::validate_raw(&store.conn).unwrap();
+                let operation = uuid::Uuid::parse_str(&gap.event_id).unwrap();
+                seed_prepared(&store, other, operation);
+                if aborted {
+                    store.conn.execute("UPDATE retirement_intents SET stage='aborted',revision=2,aborted_from=1 WHERE operation=?1", [operation.to_string()]).unwrap();
+                }
+                let history = crate::retirement_journal::read_history(&store.conn, other).unwrap();
+                *captured.borrow_mut() = Some((
+                    source_rows(&store),
+                    store.pending_events(1000).unwrap(),
+                    history,
+                ));
+            };
+            let mut inject = Some(inject);
+            let _hook = if late {
+                Some(observing_admission(move |stage, _| {
+                    if stage == "reinspect" {
+                        // Remove the observer before nested genuine admission.
+                        // The outer callback is temporarily taken by observe_admission.
+                        inject.take().unwrap()();
+                    }
+                }))
+            } else {
+                inject.take().unwrap()();
+                None
+            };
+            assert!(matches!(
+                super::begin_in_store(&config, attempt_store, &root, &argv),
+                Err(crate::store::StoreError::Invalid)
+            ));
+            let captured = snapshot.borrow();
+            let (rows, events, history) = captured
+                .as_ref()
+                .expect("committed Gap and conflicting namespace reached");
+            assert_eq!(&source_rows(&observer_store), rows);
+            assert_eq!(&observer_store.pending_events(1000).unwrap(), events);
+            assert_eq!(
+                &crate::retirement_journal::read_history(&observer_store.conn, other).unwrap(),
+                history
+            );
+            assert!(crate::retirement_journal::read_history(
+                &observer_store.conn,
+                allocation.checkout
+            )
+            .unwrap()
+            .is_empty());
+            assert!(matches!(
+                super::read_record(&observer_store.conn, &root),
+                Err(crate::store::StoreError::Invalid)
+            ));
+            assert!(matches!(
+                super::validate_raw(&observer_store.conn),
+                Err(crate::store::StoreError::Invalid)
+            ));
+        }
+    }
+}
+
+#[test]
+fn committed_gap_reader_preserves_schema15_without_retirement_table() {
+    let (_temp, config, _a, root, argv) = ordinary();
+    let (store, _) = super::begin(&config, &root, &argv).unwrap();
+    let record = super::read_record(&store.conn, &root).unwrap();
+    store
+        .conn
+        .execute_batch("DROP TABLE retirement_intents; PRAGMA user_version=15;")
+        .unwrap();
+    assert_eq!(
+        super::encode(&super::read_record(&store.conn, &root).unwrap()).unwrap(),
+        super::encode(&record).unwrap()
+    );
+    super::validate_raw(&store.conn).unwrap();
+}
+
+#[test]
+fn required_gap_recovery_hold_fences_at_late_transaction() {
+    use crate::retirement_journal::tests::{LateBoundary, LateFence};
+    let (_temp, config, mut allocation, root, argv) = materialized(true);
+    let (mut store, created) = super::begin(&config, &root, &argv).unwrap();
+    assert!(matches!(created, super::BeginGap::Created(_)));
+    assert!(super::required_origin(&store.conn, allocation.checkout).unwrap());
+    let lease = store.authority_lease().unwrap();
+    crate::retirement_journal::checkpoint(
+        &mut store,
+        &lease,
+        crate::retirement_journal::Scope::Checkout(allocation.checkout),
+        crate::retirement_journal::Attempt::AllocationHold,
+    )
+    .unwrap();
+    drop(lease);
+    let original = serde_json::to_value(&allocation).unwrap();
+    let injected = LateFence::install(LateBoundary::RequiredGapHold, vec![allocation.checkout]);
+    for _ in 0..2 {
+        let error =
+            crate::recovery::hold(&mut store, &mut allocation, "preservation hold").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            crate::store::StoreError::RetirementFenced.to_string()
+        );
+        injected.assert_held(&store, "allocation_hold");
+        assert_eq!(serde_json::to_value(&allocation).unwrap(), original);
+    }
+}
+
 // Public capture declarations/codecs only. Injection below is deliberately
 // contradictory persisted history, never a preparation or execution capability.
 fn mixed_history_spec(
@@ -1050,8 +1196,11 @@ impl Drop for ReleaseObserverGuard {
 }
 pub(super) fn observe_admission(stage: &str, conn: &Connection) {
     ADMISSION_OBSERVER.with(|slot| {
-        if let Some(observer) = slot.borrow_mut().as_mut() {
+        // Permit a nested real admission without a recursive observer or RefCell borrow.
+        let observer = slot.borrow_mut().take();
+        if let Some(mut observer) = observer {
             observer(stage, conn);
+            *slot.borrow_mut() = Some(observer);
         }
     });
 }

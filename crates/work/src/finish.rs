@@ -849,6 +849,11 @@ fn prepare(
         },
         reason: None,
     };
+    #[cfg(test)]
+    crate::retirement_journal::tests::observe_late(
+        crate::retirement_journal::tests::LateBoundary::FinishInsert,
+        store,
+    );
     {
         let _phase = store.sql_phase();
         let tx = store

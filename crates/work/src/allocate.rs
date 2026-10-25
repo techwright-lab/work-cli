@@ -751,6 +751,11 @@ pub(crate) fn reconcile_observation_under_lease(
         a.stage = "ready".into();
         a.reason = None;
     }
+    #[cfg(test)]
+    crate::retirement_journal::tests::observe_late(
+        crate::retirement_journal::tests::LateBoundary::ReconcileHead,
+        store,
+    );
     if let Err(error) = save_checked_under_lease(store, &a, lease, Some(&observed.predecessor)) {
         // A failed acknowledgment grants nothing. Hold only the exact original
         // source context; if it changed, this additional comparison writes nothing.
@@ -829,6 +834,11 @@ fn refresh_ready_identity_under_lease(
 ) -> io::Result<()> {
     db(lease.check(store))?;
     let authority = store.authority_identity().clone();
+    #[cfg(test)]
+    crate::retirement_journal::tests::observe_late(
+        crate::retirement_journal::tests::LateBoundary::RefreshIdentity,
+        store,
+    );
     let _phase = store.sql_phase();
     let tx = sql(store
         .conn
@@ -935,6 +945,251 @@ mod physical_tests {
         .unwrap();
         (temp, config, allocation)
     }
+    #[test]
+    fn physical_allocator_resolves_reservation_identity_before_borrowed_lease() {
+        let reached = std::rc::Rc::new(std::cell::Cell::new(0));
+        let observed = reached.clone();
+        let _hook = crate::admission::canonical_fixture::observe(move |store| {
+            assert!(store.conn.is_autocommit());
+            let lock = crate::store::AuthorityIdentity::open_lock(
+                &store.authority_identity().directory,
+                false,
+            )
+            .unwrap();
+            rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+            observed.set(observed.get() + 1);
+        });
+        let (_temp, config, allocation) = fixture();
+        assert_eq!(
+            reached.get(),
+            1,
+            "new allocation must observe actual canonical reservation identity"
+        );
+        assert_eq!(
+            start(&config, allocation.request.clone()).unwrap().checkout,
+            allocation.checkout
+        );
+        assert_eq!(
+            reached.get(),
+            1,
+            "exact durable retry does not reconstruct reservation identity"
+        );
+    }
+
+    #[test]
+    fn late_head_reconciliation_and_identity_refresh_fence_after_clear_checkpoints() {
+        use crate::retirement_journal::tests::{LateBoundary, LateFence};
+        for reconciliation in [true, false] {
+            let (_temp, config, mut a) = fixture();
+            git(
+                &a.destination,
+                &["commit", "--allow-empty", "-m", "advanced HEAD"],
+            );
+            let (mut store, lease) = locked(&config).unwrap();
+            drop(lease);
+            let guard = crate::checkout_guard::CheckoutGuard::shared(&store, a.checkout).unwrap();
+            let observed = if reconciliation {
+                observe_reconciliation(&mut store, &a, &guard).unwrap()
+            } else {
+                observe_checkout(&mut store, a.checkout, &guard).unwrap()
+            };
+            assert_ne!(
+                observed.evidence.as_ref().unwrap().checkout.head,
+                a.identity.as_ref().unwrap().head
+            );
+            assert!(
+                crate::retirement_journal::read_history(&store.conn, a.checkout)
+                    .unwrap()
+                    .is_empty()
+            );
+            let injected = LateFence::install(
+                if reconciliation {
+                    LateBoundary::ReconcileHead
+                } else {
+                    LateBoundary::RefreshIdentity
+                },
+                vec![a.checkout],
+            );
+            let original = serde_json::to_value(&a).unwrap();
+            let lease = lifecycle_lock(&store).unwrap();
+            let error = if reconciliation {
+                crate::recovery::reconcile_under_lease(&mut store, &mut a, observed, &lease)
+                    .unwrap_err()
+            } else {
+                verified_checkout_under_lease(&mut store, observed, &lease).unwrap_err()
+            };
+            assert_eq!(
+                error.to_string(),
+                crate::store::StoreError::RetirementFenced.to_string()
+            );
+            injected.assert_held(
+                &store,
+                if reconciliation {
+                    "allocation_stage"
+                } else {
+                    "allocation_identity"
+                },
+            );
+            assert_eq!(serde_json::to_value(&a).unwrap(), original);
+            drop(lease);
+            // A repeat enters the real native API but cannot collect new physical
+            // evidence or acknowledge the stored HEAD once held.
+            let error = if reconciliation {
+                crate::recovery::reconcile(&mut store, &mut a).unwrap_err()
+            } else {
+                verified_checkout(&mut store, a.checkout).unwrap_err()
+            };
+            assert_eq!(
+                error.to_string(),
+                crate::store::StoreError::RetirementFenced.to_string()
+            );
+            injected.assert_held(
+                &store,
+                if reconciliation {
+                    "allocation_stage"
+                } else {
+                    "allocation_identity"
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn late_physical_reuse_and_ambiguous_batch_are_atomic_on_outbox_and_commit_failure() {
+        use crate::retirement_journal::tests::{LateBoundary, LateFault, LateFence};
+        for (ambiguous, fault) in [
+            (false, LateFault::None),
+            (true, LateFault::None),
+            (true, LateFault::Outbox),
+            (true, LateFault::Commit),
+        ] {
+            let (_temp, config, a) = fixture();
+            let (mut store, lease) = locked(&config).unwrap();
+            drop(lease);
+            let mut checkouts = vec![a.checkout];
+            if ambiguous {
+                // Native SQL-only reservations legitimately permit separate
+                // charges; a later physical request must refuse ambiguous reuse.
+                for _ in 0..2 {
+                    checkouts.push(
+                        store
+                            .reserve(
+                                &Reservation {
+                                    operation: Uuid::now_v7(),
+                                    repository: a.identity.as_ref().unwrap().common_git_dir.clone(),
+                                    actor: a.request.actor.clone().unwrap(),
+                                    owner: a.request.owner.clone().unwrap(),
+                                    task: a.request.task.clone(),
+                                },
+                                Limits {
+                                    repository: 10,
+                                    owner: 10,
+                                    available_bytes: Some(100),
+                                    floor_bytes: 0,
+                                    warn_bytes: 0,
+                                },
+                            )
+                            .unwrap(),
+                    );
+                }
+            }
+            // Stage a genuine missing alias delta on the native start path.
+            store
+                .conn
+                .execute("DELETE FROM repository_aliases", [])
+                .unwrap();
+            let mut request = a.request.clone();
+            request.operation = Uuid::now_v7();
+            // A new operation has no known-checkout entry checkpoint in start;
+            // establish a real clear baseline for the complete selected set.
+            // Injection remains after native selection/SH, not at this baseline.
+            let lease = store.authority_lease().unwrap();
+            crate::retirement_journal::checkpoint(
+                &mut store,
+                &lease,
+                crate::retirement_journal::Scope::Checkouts(checkouts.clone()),
+                crate::retirement_journal::Attempt::AliasPublication,
+            )
+            .unwrap();
+            drop(lease);
+            let injected =
+                LateFence::with_fault(LateBoundary::ReusePublication, checkouts, fault, ambiguous);
+            let error = start(&config, request.clone()).unwrap_err();
+            if !matches!(fault, LateFault::None) {
+                assert_ne!(
+                    error.to_string(),
+                    crate::store::StoreError::RetirementFenced.to_string()
+                );
+                match fault {
+                    LateFault::Outbox => {
+                        assert!(error.to_string().contains("late outbox fault"), "{error}")
+                    }
+                    LateFault::Commit => injected.assert_commit_fault_reached(),
+                    LateFault::None => unreachable!(),
+                }
+                injected.assert_rollback(&store);
+                // The native start's Store has unwound: its TEMP trigger or
+                // connection-local commit veto cannot leak into the retry.
+            } else {
+                assert_eq!(
+                    error.to_string(),
+                    crate::store::StoreError::RetirementFenced.to_string()
+                );
+                injected.assert_held(
+                    &store,
+                    if ambiguous {
+                        "allocation_hold"
+                    } else {
+                        "alias_publication"
+                    },
+                );
+            }
+            for _ in 0..2 {
+                let error = start(&config, request.clone()).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    crate::store::StoreError::RetirementFenced.to_string()
+                );
+                injected.assert_held(
+                    &store,
+                    if ambiguous {
+                        "allocation_hold"
+                    } else {
+                        "alias_publication"
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finish_final_preparation_insert_fences_after_clear_entry_and_verification() {
+        use crate::retirement_journal::tests::{LateBoundary, LateFence};
+        let (_temp, config, a) = fixture();
+        let (store, lease) = locked(&config).unwrap();
+        drop(lease);
+        let injected = LateFence::install(LateBoundary::FinishInsert, vec![a.checkout]);
+        for _ in 0..2 {
+            let result =
+                crate::finish::finish_with_sink_observed(&config, a.checkout, None, |_| {
+                    panic!("no committed finish or external boundary allowed")
+                });
+            assert!(matches!(
+                result,
+                Err(crate::store::StoreError::RetirementFenced)
+            ));
+            injected.assert_held(&store, "finish_prepare");
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("SELECT count(*) FROM task_finishes", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     #[test]
     fn allocation_and_reuse_with_published_aliases_leave_other_checkout_prepared() {
         let (_temp, config, a) = fixture();
@@ -1404,6 +1659,12 @@ pub fn start_observed(
     if CheckoutIdentity::inspect(repo)? != source {
         return Err(err("source changed during observation"));
     }
+    // Retain the actual canonical reservation observation before reacquiring
+    // authority. The borrowed SQL adapter cannot resolve repository paths.
+    let reservation_identity = db(crate::admission::ReservationIdentity::observe(
+        &store,
+        &reservation,
+    ))?;
     let lease = lifecycle_lock(&store)?;
     let appeared: Option<String> = sql(store
         .conn
@@ -1452,6 +1713,11 @@ pub fn start_observed(
         for guard in &guards {
             db(guard.revalidate(&store))?;
         }
+        #[cfg(test)]
+        crate::retirement_journal::tests::observe_late(
+            crate::retirement_journal::tests::LateBoundary::ReusePublication,
+            &store,
+        );
         let phase = store.sql_phase();
         let tx = sql(store
             .conn
@@ -1568,7 +1834,7 @@ pub fn start_observed(
     }
     let (mut a, limits, capture_required) = candidate?;
     let recorded = db(store.reserve_recorded_under_lease(
-        &reservation,
+        &reservation_identity,
         limits,
         |checkout| {
             a.checkout = checkout;

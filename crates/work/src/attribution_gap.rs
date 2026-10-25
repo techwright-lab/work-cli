@@ -355,6 +355,12 @@ pub(crate) fn read_record(conn: &Connection, root: &RootRunRequest) -> Result<Ga
         return Err(StoreError::Invalid);
     }
     id(&event_id)?;
+    // A committed Gap is not valid namespace evidence when its event identity
+    // is reserved by any retirement operation, including another checkout's
+    // aborted tombstone. Both Existing paths share this canonical reader.
+    if crate::retirement_journal::operation_reserved(conn, &event_id)? {
+        return Err(StoreError::Invalid);
+    }
     if let Some(destination) = &record.destination {
         destination.validate()?;
     }
@@ -411,6 +417,17 @@ pub(crate) fn validate_raw(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     crate::gap_continuation::validate_raw(conn)?;
+    // Genuine historical authorities have no retirement table. Keep the version
+    // gate on this passive structural read, never on mutation permission.
+    if version >= 16 {
+        let collision: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attribution_gaps a JOIN retirement_intents i ON i.operation=a.event_id)",
+            [], |r| r.get(0),
+        )?;
+        if collision {
+            return Err(StoreError::Invalid);
+        }
+    }
     let invalid: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM attribution_gaps a LEFT JOIN runs r ON r.id=a.run LEFT JOIN run_groups g ON g.id=a.group_id LEFT JOIN checkouts c ON c.id=a.checkout WHERE r.id IS NULL OR g.id IS NULL OR c.id IS NULL OR r.group_id<>a.group_id OR g.checkout<>a.checkout
         OR EXISTS(SELECT 1 FROM checkouts WHERE id=a.event_id OR operation=a.event_id)

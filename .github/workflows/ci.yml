@@ -116,7 +116,13 @@ jobs:
           - kind: lib
             selector: attribution_gap::tests::continuation::schema15_and_strict_v2_preserve_legacy_bytes_without_backfill
           - kind: lib
-            selector: attribution_gap::tests::continuation::key_rotation_and_unqualified_tails
+            selector: attribution_gap::tests::continuation::historical_claims_are_passive_and_new_target_checks_are_fresh
+          - kind: lib
+            selector: attribution_gap::tests::existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths
+          - kind: lib
+            selector: attribution_gap::tests::committed_gap_reader_preserves_schema15_without_retirement_table
+          - kind: lib
+            selector: attribution_gap::tests::required_gap_recovery_hold_fences_at_late_transaction
           - kind: test
             selector: retirement_intent
           - kind: test

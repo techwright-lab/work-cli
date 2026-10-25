@@ -32,6 +32,182 @@ pub(crate) fn source_rows(store: &Store) -> SourceRows {
         .collect()
 }
 
+// One-shot negative injection at actual late writer boundaries. This test-only
+// observer cannot authorize a writer, return evidence, skip a fence, or reset a budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LateBoundary {
+    RequiredGapHold,
+    ReconcileHead,
+    RefreshIdentity,
+    ReusePublication,
+    FinishInsert,
+}
+#[derive(Clone, Copy)]
+pub(crate) enum LateFault {
+    None,
+    Outbox,
+    Commit,
+}
+type LateCallback = Box<dyn FnOnce(&Store)>;
+thread_local! {
+    static LATE_WRITER: std::cell::RefCell<Option<(LateBoundary, LateCallback)>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) fn observe_late(boundary: LateBoundary, store: &Store) {
+    let callback = LATE_WRITER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|(expected, _)| *expected == boundary)
+        {
+            slot.take().map(|(_, callback)| callback)
+        } else {
+            None
+        }
+    });
+    if let Some(callback) = callback {
+        callback(store);
+    }
+}
+struct LateSnapshot {
+    source: SourceRows,
+    events: Vec<crate::events::PendingEvent>,
+    intents: Vec<(Uuid, Uuid, String, bool)>,
+}
+pub(crate) struct LateFence {
+    boundary: LateBoundary,
+    snapshot: std::rc::Rc<std::cell::RefCell<Option<LateSnapshot>>>,
+    commit_reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl LateFence {
+    pub(crate) fn install(boundary: LateBoundary, checkouts: Vec<Uuid>) -> Self {
+        Self::with_fault(boundary, checkouts, LateFault::None, false)
+    }
+    pub(crate) fn with_fault(
+        boundary: LateBoundary,
+        checkouts: Vec<Uuid>,
+        fault: LateFault,
+        already_held: bool,
+    ) -> Self {
+        let snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let captured = snapshot.clone();
+        let commit_reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let commit_observer = commit_reached.clone();
+        LATE_WRITER.with(|slot| {
+            assert!(slot.borrow().is_none(), "overlapping negative writer observer");
+            *slot.borrow_mut() = Some((boundary, Box::new(move |store| {
+                assert!(store.conn.is_autocommit(), "injection must precede the actual transaction");
+                let mut intents = Vec::new();
+                for (index, checkout) in checkouts.into_iter().enumerate() {
+                    assert!(read_history(&store.conn, checkout).unwrap().is_empty(), "entry must be clear before this seam");
+                    let operation = Uuid::now_v7();
+                    let record = seed_prepared(store, checkout, operation);
+                    let held = already_held && index == 0;
+                    if held {
+                        store.conn.execute("UPDATE retirement_intents SET stage='held',revision=2,held_reason='allocation_hold' WHERE operation=?1", [operation.to_string()]).unwrap();
+                        crate::store::emit(&store.conn, &Event::RetirementIntentChanged {
+                            checkout, operation, revision: 2, stage: "held".into(), reason: Some("allocation_hold".into()),
+                        }).unwrap();
+                    }
+                    read_history(&store.conn, checkout).unwrap();
+                    intents.push((checkout, operation, record, held));
+                }
+                *captured.borrow_mut() = Some(LateSnapshot { source: source_rows(store), events: store.pending_events(1000).unwrap(), intents });
+                match fault {
+                    LateFault::None => {}
+                    LateFault::Outbox => store.conn.execute_batch("CREATE TEMP TRIGGER late_outbox_fault BEFORE INSERT ON outbox WHEN (SELECT count(*) FROM retirement_intents WHERE stage='held')>=2 BEGIN SELECT RAISE(ABORT,'late outbox fault'); END;").unwrap(),
+                    LateFault::Commit => store.conn.commit_hook(Some(move || {
+                        commit_observer.store(true, std::sync::atomic::Ordering::SeqCst);
+                        true
+                    })),
+                }
+            })));
+        });
+        Self {
+            boundary,
+            snapshot,
+            commit_reached,
+        }
+    }
+    pub(crate) fn assert_held(&self, store: &Store, reason: &str) {
+        let captured = self.snapshot.borrow();
+        let snapshot = captured.as_ref().unwrap_or_else(|| {
+            panic!(
+                "{:?} actual pretransaction boundary not reached",
+                self.boundary
+            )
+        });
+        assert_eq!(source_rows(store), snapshot.source);
+        let events = store.pending_events(1000).unwrap();
+        assert_eq!(&events[..snapshot.events.len()], snapshot.events.as_slice());
+        let new_holds = snapshot
+            .intents
+            .iter()
+            .filter(|(_, _, _, held)| !held)
+            .count();
+        assert_eq!(events.len(), snapshot.events.len() + new_holds);
+        for (checkout, operation, record, already_held) in &snapshot.intents {
+            let row = load_operation(&store.conn, *operation).unwrap();
+            let reason = if *already_held {
+                "allocation_hold"
+            } else {
+                reason
+            };
+            assert_eq!(
+                (
+                    row.stage.as_str(),
+                    row.revision,
+                    row.held_reason.as_deref(),
+                    row.record.as_str()
+                ),
+                ("held", 2, Some(reason), record.as_str())
+            );
+            assert_eq!(
+                held_events(store, *checkout),
+                vec![Event::RetirementIntentChanged {
+                    checkout: *checkout,
+                    operation: *operation,
+                    revision: 2,
+                    stage: "held".into(),
+                    reason: Some(reason.into()),
+                }]
+            );
+        }
+    }
+    pub(crate) fn assert_rollback(&self, store: &Store) {
+        let captured = self.snapshot.borrow();
+        let snapshot = captured
+            .as_ref()
+            .expect("actual late batch boundary reached");
+        assert_eq!(source_rows(store), snapshot.source);
+        assert_eq!(store.pending_events(1000).unwrap(), snapshot.events);
+        for (_, operation, record, held) in &snapshot.intents {
+            let row = load_operation(&store.conn, *operation).unwrap();
+            assert_eq!(
+                (row.stage.as_str(), row.revision, row.record.as_str()),
+                (
+                    if *held { "held" } else { "prepared" },
+                    if *held { 2 } else { 1 },
+                    record.as_str()
+                )
+            );
+        }
+    }
+    pub(crate) fn assert_commit_fault_reached(&self) {
+        assert!(
+            self.commit_reached
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "actual final commit veto must be reached"
+        );
+    }
+}
+impl Drop for LateFence {
+    fn drop(&mut self) {
+        LATE_WRITER.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
 fn assert_writer_fenced(
     store: &mut Store,
     checkout: Uuid,

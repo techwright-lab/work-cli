@@ -52,6 +52,11 @@ pub(crate) fn hold_under_lease(
 ) -> io::Result<()> {
     allocate::db(lease.check(store))?;
     let authority = store.authority_identity().clone();
+    #[cfg(test)]
+    crate::retirement_journal::tests::observe_late(
+        crate::retirement_journal::tests::LateBoundary::RequiredGapHold,
+        store,
+    );
     let _phase = store.sql_phase();
     {
         let tx = allocate::sql(
