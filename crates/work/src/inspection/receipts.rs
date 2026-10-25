@@ -1616,10 +1616,7 @@ fn decode(store: &Store, expected_id: Uuid, bytes: &[u8]) -> Result<ReceiptData>
 }
 
 #[cfg(test)]
-use crate as work_cli_api;
-#[cfg(test)]
-#[path = "../../tests/support/inspection_fixture.rs"]
-mod fixture;
+use crate::inspection::fixture;
 
 // Private journal seed only: never a public prepare capability.
 #[cfg(test)]

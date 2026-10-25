@@ -161,8 +161,15 @@ pub(crate) enum Phase {
 #[cfg(test)]
 type Observer<'a> = Option<&'a mut dyn FnMut(Phase, &Scratch)>;
 #[cfg(test)]
+struct TestHooks<'a> {
+    observer: Observer<'a>,
+    before_recheck: Option<&'a mut dyn FnMut()>,
+}
+#[cfg(test)]
+type RetirementObserver = Box<dyn FnMut(Phase, &Path)>;
+#[cfg(test)]
 thread_local! {
-    static RETIREMENT_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut(Phase, &Path)>>> =
+    static RETIREMENT_OBSERVER: std::cell::RefCell<Option<RetirementObserver>> =
         std::cell::RefCell::new(None);
 }
 #[cfg(test)]
@@ -191,9 +198,10 @@ fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>)
         None,
         None,
         #[cfg(test)]
-        observer,
-        #[cfg(test)]
-        None,
+        TestHooks {
+            observer,
+            before_recheck: None,
+        },
     )
 }
 pub(super) fn audit_configured(
@@ -225,9 +233,10 @@ pub(super) fn audit_path(
         None,
         None,
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        before_recheck,
+        TestHooks {
+            observer: None,
+            before_recheck,
+        },
     )
 }
 pub(super) fn approval_path(
@@ -244,9 +253,10 @@ pub(super) fn approval_path(
         None,
         None,
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
+        TestHooks {
+            observer: None,
+            before_recheck: None,
+        },
     )
 }
 pub(super) fn recovery_path(
@@ -263,9 +273,10 @@ pub(super) fn recovery_path(
         Some(collector),
         None,
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
+        TestHooks {
+            observer: None,
+            before_recheck: None,
+        },
     )
 }
 pub(super) fn retirement_path(
@@ -282,9 +293,10 @@ pub(super) fn retirement_path(
         None,
         Some(collector),
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        None,
+        TestHooks {
+            observer: None,
+            before_recheck: None,
+        },
     )
 }
 fn verify_with_audit(
@@ -294,9 +306,13 @@ fn verify_with_audit(
     mut approval: Option<&mut super::approval::Collector>,
     mut recovery: Option<&mut super::recovery_refs::Collector>,
     mut retirement: Option<&mut super::retirement::Collector>,
-    #[cfg(test)] mut observer: Observer<'_>,
-    #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
+    #[cfg(test)] hooks: TestHooks<'_>,
 ) -> RemoteReport {
+    #[cfg(test)]
+    let TestHooks {
+        mut observer,
+        before_recheck,
+    } = hooks;
     let mut b = Budget::new();
     let mut audit_nonancestor = false;
     let mut approval_retained = None;
@@ -1402,10 +1418,7 @@ fn cleanup_binding(actual: &rfs::Stat, node: &CleanupNode) -> Held<()> {
 }
 
 #[cfg(test)]
-use crate as work_cli_api;
-#[cfg(test)]
-#[path = "../../tests/support/inspection_fixture.rs"]
-mod fixture;
+use crate::inspection::fixture;
 
 #[cfg(test)]
 mod tests {

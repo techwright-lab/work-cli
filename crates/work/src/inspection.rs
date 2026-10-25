@@ -42,6 +42,12 @@ pub use receipts::{
 };
 
 #[cfg(test)]
+use crate as work_cli_api;
+#[cfg(test)]
+#[path = "../tests/support/inspection_fixture.rs"]
+pub(crate) mod fixture;
+
+#[cfg(test)]
 #[path = "inspection_tests.rs"]
 mod tests;
 

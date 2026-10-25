@@ -273,44 +273,6 @@ impl Prepared {
         )
     }
 }
-/// Test-only observation of the actual validated permit publication edge. The
-/// callback receives only the owned gate path; it cannot supply permission or
-/// replace the following real metadata publication.
-#[cfg(test)]
-pub(crate) mod publication_observer {
-    use std::{cell::RefCell, marker::PhantomData, path::Path, rc::Rc};
-
-    type Observer = Box<dyn FnMut(&Path)>;
-    thread_local! {
-        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
-    }
-
-    pub(crate) struct Guard(PhantomData<Rc<()>>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            OBSERVER.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-    pub(crate) fn observing(observer: impl FnMut(&Path) + 'static) -> Guard {
-        OBSERVER.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            assert!(
-                slot.is_none(),
-                "permit publication observer already installed"
-            );
-            *slot = Some(Box::new(observer));
-        });
-        Guard(PhantomData)
-    }
-    pub(super) fn observe(path: &Path) {
-        OBSERVER.with(|slot| {
-            if let Some(observer) = slot.borrow_mut().as_mut() {
-                observer(path);
-            }
-        });
-    }
-}
-
 /// Hidden production entry point; collectors and kernel roots cannot be selected by CLI.
 pub fn run(context: &Path, argv: &[OsString]) -> Result<()> {
     run_with_collector(context, argv, &OsCollector)
@@ -491,4 +453,42 @@ fn publish<T: Serialize>(dir: &File, name: &str, value: &T) -> Result<()> {
     file.sync_all().map_err(|_| HOLD)?;
     renameat_with(dir, temporary.as_str(), dir, name, RenameFlags::NOREPLACE).map_err(|_| HOLD)?;
     dir.sync_all().map_err(|_| HOLD)
+}
+
+/// Test-only observation of the actual validated permit publication edge. The
+/// callback receives only the owned gate path; it cannot supply permission or
+/// replace the following real metadata publication.
+#[cfg(test)]
+pub(crate) mod publication_observer {
+    use std::{cell::RefCell, marker::PhantomData, path::Path, rc::Rc};
+
+    type Observer = Box<dyn FnMut(&Path)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct Guard(PhantomData<Rc<()>>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OBSERVER.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    pub(crate) fn observing(observer: impl FnMut(&Path) + 'static) -> Guard {
+        OBSERVER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(
+                slot.is_none(),
+                "permit publication observer already installed"
+            );
+            *slot = Some(Box::new(observer));
+        });
+        Guard(PhantomData)
+    }
+    pub(super) fn observe(path: &Path) {
+        OBSERVER.with(|slot| {
+            if let Some(observer) = slot.borrow_mut().as_mut() {
+                observer(path);
+            }
+        });
+    }
 }

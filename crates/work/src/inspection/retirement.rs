@@ -2323,10 +2323,7 @@ pub(super) fn set_age_first_observation() {
 }
 
 #[cfg(test)]
-use crate as work_cli_api;
-#[cfg(test)]
-#[path = "../../tests/support/inspection_fixture.rs"]
-mod fixture;
+use crate::inspection::fixture;
 
 #[cfg(test)]
 mod tests {
@@ -2726,7 +2723,7 @@ mod tests {
         let store = Store::open_existing_registered_mut(
             &f.temp.path().join("registry"),
             &f.temp.path().join("authority"),
-            &[f.root.clone()],
+            std::slice::from_ref(&f.root),
         )
         .unwrap();
         let guard =
@@ -3885,7 +3882,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(!absent.status.success());
-        fs::set_permissions(&remote, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0o0)).unwrap();
         let remote_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls = remote_calls.clone();
         remote_proof::set_retirement_observer(move |_, _| {
@@ -4707,7 +4704,7 @@ mod tests {
         // collection. The local projection must not contact it or require its
         // scratch graph. Restore permissions even when recollection refuses.
         let permissions = fs::metadata(&remote).unwrap().permissions();
-        fs::set_permissions(&remote, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0o0)).unwrap();
         let offline = repeat_local(&second, &config);
         fs::set_permissions(&remote, permissions).unwrap();
         assert_eq!(offline.unwrap(), local);

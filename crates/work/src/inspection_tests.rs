@@ -322,11 +322,9 @@ fn canonical_digest_binds_all_evidence() {
 
 use super::filesystem::{self, Boundary, Event, Identity, SystemBoundary};
 use super::*;
-use crate as work_cli_api;
-use std::{fs, os::unix::fs::symlink, time::Duration};
-#[path = "../tests/support/inspection_fixture.rs"]
-mod fixture;
+use crate::inspection::fixture;
 use fixture::InspectionFixture;
+use std::{fs, os::unix::fs::symlink, time::Duration};
 
 #[test]
 fn context_change_is_incomplete_without_inspection_mutations() {

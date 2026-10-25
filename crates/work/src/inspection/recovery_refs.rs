@@ -1605,10 +1605,7 @@ pub(super) fn prepare_for_assessment(path: &Path, checkout: Uuid) -> RecoveryRep
 }
 
 #[cfg(test)]
-use crate as work_cli_api;
-#[cfg(test)]
-#[path = "../../tests/support/inspection_fixture.rs"]
-mod fixture;
+use crate::inspection::fixture;
 
 #[cfg(test)]
 mod tests {
@@ -1891,7 +1888,7 @@ mod tests {
     fn refused_entry_is_not_prepared() {
         let report = prepare_recovery_refused(Uuid::now_v7());
         assert_eq!(report.outcome, "held");
-        assert_eq!(report.retirement_authority, false);
+        assert!(!report.retirement_authority);
         assert!(report.limitation.contains("audit-preservation"));
     }
 
@@ -1986,7 +1983,7 @@ mod tests {
         let resume = prepare_path(&config, f.allocation.checkout, operation, Fault::None);
         assert_eq!(resume.outcome, "prepared", "{resume:?}");
         assert_eq!(resume.durability, "acknowledged", "{resume:?}");
-        assert_eq!(resume.resume, true);
+        assert!(resume.resume);
         for name in &created {
             assert!(
                 resume.verified_refs.iter().any(|r| r == name)

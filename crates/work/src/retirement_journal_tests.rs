@@ -141,7 +141,7 @@ impl LateFence {
                         store.conn.commit_hook(Some(move || {
                             commit_observer.store(true, std::sync::atomic::Ordering::SeqCst);
                             true
-                        }));
+                        })).unwrap();
                     }
                 }
             })));
