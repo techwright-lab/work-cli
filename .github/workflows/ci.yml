@@ -62,19 +62,19 @@ jobs:
       matrix:
         include:
           - kind: lib
-            selector: retirement_journal::
+            selector: 'retirement_journal::'
           - kind: lib
-            selector: checkout_guard::
+            selector: 'checkout_guard::'
           - kind: lib
-            selector: inspection::retirement_intent::
+            selector: 'inspection::retirement_intent::'
           - kind: lib
-            selector: inspection::receipts::tests::
+            selector: 'inspection::receipts::tests::'
           - kind: lib
-            selector: scope_spawn::
+            selector: 'scope_spawn::'
           - kind: lib
-            selector: admission::allocation_tests::
+            selector: 'admission::allocation_tests::'
           - kind: lib
-            selector: allocate::physical_tests::
+            selector: 'allocate::physical_tests::'
           - kind: lib
             selector: capture_setup::tests::begin_under_guard_refuses_unrelated_checkout_guard
           - kind: lib
@@ -92,11 +92,11 @@ jobs:
           - kind: lib
             selector: capture_recovery::tests::reconcile_shared_guard_excludes_exclusive_until_drain
           - kind: lib
-            selector: capture_finalization::tests::
+            selector: 'capture_finalization::tests::'
           - kind: lib
-            selector: store::tests::
+            selector: 'store::tests::'
           - kind: lib
-            selector: run_participants::tests::
+            selector: 'run_participants::tests::'
           - kind: lib
             selector: attribution_gap::tests::strict_gap_shape_binding_and_schema14_migration
           - kind: lib
