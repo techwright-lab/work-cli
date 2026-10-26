@@ -247,6 +247,26 @@ pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<b
     )?)
 }
 
+/// Check every child in one roster in the caller's existing read snapshot.
+/// The append-only outbox has no operation index: scan it once, probing the
+/// participant primary key, rather than rescanning all events for each child.
+/// EXISTS streams the evidence without collecting historical operation IDs.
+pub(crate) fn participant_operations_reserved(conn: &Connection, group: &str) -> Result<bool> {
+    if schema_version(conn)? < 16 {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT
+        EXISTS(SELECT 1 FROM run_participants p JOIN retirement_intents r ON r.operation=p.id WHERE p.group_id=?1)
+        OR EXISTS(SELECT 1 FROM outbox o
+            WHERE json_extract(o.payload,'$.type')='interactive_removal'
+            AND EXISTS(SELECT 1 FROM run_participants p
+                WHERE p.id=json_extract(o.payload,'$.operation') AND p.group_id=?1))",
+        [group],
+        |r| r.get(0),
+    )?)
+}
+
 pub(crate) fn exclude_operation(conn: &Connection, id: Uuid) -> Result<()> {
     if schema_version(conn)? < 16 {
         return Ok(());
