@@ -41,10 +41,19 @@ warn_bytes=0
         allocation = work("start", "--task", task)
         assert work("start", "--task", task)["checkout"] == allocation["checkout"]
         assert work("status", "--json")["charged"] == 1
+        checkout = Path(allocation["destination"])
+        (checkout / "work.txt").write_text(f"Completed {task}\n")
+        for args in [["add", "work.txt"], ["commit", "-m", f"Complete {task}"]]:
+            subprocess.run(["/usr/bin/git", *args], cwd=checkout, env=environment, check=True, capture_output=True)
+        commit = subprocess.check_output(["/usr/bin/git", "rev-parse", "HEAD"], cwd=checkout, env=environment, text=True).strip()
         assert work("finish", task)["task_finished"]
         assert work("remove", task)["outcome"] == "preview"
         assert Path(allocation["destination"]).is_dir()
-        assert work("remove", task, "--confirm-stopped")["outcome"] == "removed"
+        removed = work("remove", task, "--confirm-stopped")
+        assert removed["outcome"] == "removed"
+        preserved = f"refs/work-preserved/{allocation['checkout']}/{commit}"
+        assert preserved in removed["preserved_refs"]
+        assert subprocess.check_output(["/usr/bin/git", "rev-parse", preserved], cwd=repo, env=environment, text=True).strip() == commit
         assert not Path(allocation["destination"]).exists()
         assert work("status", "--json")["charged"] == 0
-    print("Artifact smoke passed: two interactive tasks, capacity one, explicit removal.")
+    print("Artifact smoke passed: two committed tasks, preserved history, capacity one, explicit removal.")
