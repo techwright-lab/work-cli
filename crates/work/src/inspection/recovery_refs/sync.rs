@@ -15,7 +15,10 @@ fn checked<T>(value: Result<T, IncompleteReason>) -> Held<T> {
     value.map_err(|_| "sync_unknown")
 }
 
-pub(super) fn sync_objects(objects: &filesystem::Manifest, b: &mut Budget) -> Held<()> {
+pub(in crate::inspection) fn sync_objects(
+    objects: &filesystem::Manifest,
+    b: &mut Budget,
+) -> Held<()> {
     if !objects.contains(b"objects") {
         return Err("object_storage_missing");
     }
@@ -35,7 +38,7 @@ pub(super) fn sync_objects(objects: &filesystem::Manifest, b: &mut Budget) -> He
     Ok(())
 }
 
-pub(super) fn sync_refs(
+pub(in crate::inspection) fn sync_refs(
     common: &filesystem::Manifest,
     targets: &[String],
     packed: bool,

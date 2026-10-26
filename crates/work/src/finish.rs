@@ -242,7 +242,8 @@ fn receipt_only(conn: &Connection, checkout: Uuid) -> Result<Option<Receipt>> {
         || r.allocation_operation != a.request.operation
         || r.allocation_digest != digest(json(&a)?)
         || Some(&r.identity) != a.identity.as_ref()
-        || state != "held"
+        || (state != "held"
+            && !(state == "retired" && crate::removal_journal::completed(conn, checkout)?))
         || ready
     {
         return Err(StoreError::Invalid);
@@ -290,6 +291,33 @@ pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<b
 }
 pub(crate) fn task_open(conn: &Connection, checkout: Uuid) -> Result<bool> {
     Ok(load(conn, checkout)?.is_none())
+}
+/// Initial interactive removal deliberately excludes every historical run mode.
+pub(crate) fn interactive_completion(
+    conn: &Connection,
+    checkout: Uuid,
+) -> Result<allocate::Allocation> {
+    let receipt = load(conn, checkout)?.ok_or(StoreError::Invalid)?;
+    if receipt.local_freeze != Freeze::NotConfigured {
+        return Err(StoreError::Invalid);
+    }
+    let blocked: bool = conn.query_row(
+        "SELECT
+        EXISTS(SELECT 1 FROM run_groups WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM adopted_groups WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM capture_runs WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM capture_requirements WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM attribution_gaps WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM gap_qualifications WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM gap_eligibility WHERE checkout=?1)
+        OR EXISTS(SELECT 1 FROM retirement_intents WHERE checkout=?1)",
+        [checkout.to_string()],
+        |r| r.get(0),
+    )?;
+    if blocked {
+        return Err(StoreError::Invalid);
+    }
+    Ok(allocation(conn, checkout)?.0)
 }
 pub(crate) fn capture_not_configured(conn: &Connection, checkout: Uuid) -> Result<bool> {
     Ok(load(conn, checkout)?.is_none_or(|r| r.local_freeze == Freeze::NotConfigured))

@@ -801,8 +801,10 @@ fn missing_preparation_replays_exact_begin_and_stays_held() {
     store.conn.execute("INSERT INTO capture_runs SELECT ?1,?2,?3,?4,'{',fingerprint,intent_wall,preparation_revision,NULL,NULL FROM capture_runs", rusqlite::params![uuid::Uuid::now_v7().to_string(), uuid::Uuid::now_v7().to_string(), uuid::Uuid::now_v7().to_string(), uuid::Uuid::now_v7().to_string()]).unwrap();
     store.conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     let exe = cfg.capture.as_ref().unwrap().executable.clone();
-    // Fake producer is stdlib-only and checks durable intent before reading stdin.
-    fs::write(&exe, format!("#!/usr/bin/python3\nimport sqlite3,sys,pathlib,json\np=pathlib.Path({:?})\nc=sqlite3.connect(p/'private/store.sqlite', timeout=0)\nassert c.execute('select prepared from capture_runs').fetchone()==(None,)\nc.execute('begin immediate')\nc.rollback()\n(p/'args').write_text(json.dumps(sys.argv[1:]))\n(p/'input').write_bytes(sys.stdin.buffer.read())\nsys.stdout.buffer.write((p/'response').read_bytes())\n", temp.path().to_str().unwrap())).unwrap();
+    // Python observes through READONLY so its default close cannot remove WAL
+    // sidecars. A separate native helper probes the actual writer lock with the
+    // same no-checkpoint-on-close policy as the product.
+    fs::write(&exe, format!("#!/usr/bin/python3\nimport sqlite3,sys,pathlib,json,subprocess,os\np=pathlib.Path({:?})\nc=sqlite3.connect('file:'+str(p/'private/store.sqlite')+'?mode=ro', uri=True, timeout=0)\nassert c.execute('select prepared from capture_runs').fetchone()==(None,)\nsubprocess.run([{probe:?},'--exact','capture_recovery::tests::producer_lock_probe'],env=dict(os.environ,WORK_TEST_CAPTURE_DB=str(p/'private/store.sqlite')),check=True,stdout=subprocess.PIPE)\n(p/'args').write_text(json.dumps(sys.argv[1:]))\n(p/'input').write_bytes(sys.stdin.buffer.read())\nsys.stdout.buffer.write((p/'response').read_bytes())\n", temp.path().to_str().unwrap(), probe=std::env::current_exe().unwrap().to_str().unwrap())).unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
     let original = cfg.capture.as_ref().unwrap().clone();
     cfg.capture.as_mut().unwrap().executable = "/must-not-use-current-profile".into();
@@ -1034,4 +1036,25 @@ fn reconcile_shared_guard_excludes_exclusive_until_drain() {
     assert_eq!(result.unwrap(), "metadata_reconciled");
     let other = Store::open_existing_registered_mut(&registry, &dir, &roots).unwrap();
     crate::checkout_guard::CheckoutGuard::exclusive(&other, checkout).unwrap();
+}
+
+// Separate process: no shared SQLite lock bookkeeping with the parent.
+#[test]
+fn producer_lock_probe() {
+    let Some(path) = std::env::var_os("WORK_TEST_CAPTURE_DB") else {
+        return;
+    };
+    let connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .unwrap();
+    connection
+        .set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .unwrap();
+    connection.busy_timeout(std::time::Duration::ZERO).unwrap();
+    connection
+        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .unwrap();
 }

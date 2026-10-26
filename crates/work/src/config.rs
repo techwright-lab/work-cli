@@ -67,6 +67,16 @@ pub(crate) struct ConfigDocument {
     value: toml::Value,
 }
 impl ConfigDocument {
+    pub(crate) fn default_actor(&self) -> Result<Option<String>, Error> {
+        self.value
+            .get("actor")
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| Error::Config("actor must be a string".into()))
+            })
+            .transpose()
+    }
     pub(crate) fn load() -> Result<Self, Error> {
         let text = Config::read_text()?.unwrap_or_default();
         Self::from_text(&text)

@@ -1,0 +1,12 @@
+# Replace every path with an absolute canonical path on your machine.
+actor = "alice"
+store_dir = "/home/alice/.local/state/work/store"
+trusted_registry = "/home/alice/.local/state/work/registry"
+roots = ["/home/alice/worktrees"]
+repositories = ["/home/alice/src/project"]
+
+[allocation]
+repository_limit = 8
+owner_limit = 4
+floor_bytes = 1073741824
+warn_bytes = 5368709120

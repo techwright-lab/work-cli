@@ -19,6 +19,7 @@ mod remote_proof;
 pub use remote_proof::{verify_remote, RemoteReport};
 
 mod preservation;
+pub(crate) mod removal;
 pub use preservation::{audit_preservation, PreservationReport};
 
 mod approval;

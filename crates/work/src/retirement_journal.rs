@@ -241,7 +241,7 @@ pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<b
         return Ok(false);
     }
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1)",
+        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1) OR EXISTS(SELECT 1 FROM outbox WHERE json_extract(payload,'$.type')='interactive_removal' AND json_extract(payload,'$.operation')=?1)",
         [operation],
         |r| r.get(0),
     )?)
@@ -252,7 +252,7 @@ pub(crate) fn exclude_operation(conn: &Connection, id: Uuid) -> Result<()> {
         return Ok(());
     }
     let reserved: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1 OR checkout=?1)",
+        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1 OR checkout=?1) OR EXISTS(SELECT 1 FROM outbox WHERE json_extract(payload,'$.type')='interactive_removal' AND json_extract(payload,'$.operation')=?1)",
         [id.to_string()],
         |r| r.get(0),
     )?;
@@ -264,6 +264,9 @@ pub(crate) fn exclude_operation(conn: &Connection, id: Uuid) -> Result<()> {
 }
 
 pub(crate) fn require_unfenced(conn: &Connection, checkout: Uuid) -> Result<()> {
+    if crate::removal_journal::history(conn, checkout)?.is_some() {
+        return Err(StoreError::RetirementFenced);
+    }
     crate::store::SchemaRole::Current17.validate(conn)?;
     crate::quarantine_journal::validate_all(conn)?;
     let active: bool = conn.query_row(
@@ -294,6 +297,9 @@ pub(crate) fn fence<'c>(
     let mut prepared = Vec::new();
     let mut held = false;
     for checkout in &checkouts {
+        if crate::removal_journal::history(&tx, *checkout)?.is_some() {
+            return Err(StoreError::RetirementFenced);
+        }
         // Global admission above has completed in this same IMMEDIATE
         // transaction, with no intervening writes. Strictly decode each scoped
         // history (including tombstones/held rows) before ANY update, without

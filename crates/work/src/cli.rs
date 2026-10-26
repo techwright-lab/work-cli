@@ -7,8 +7,8 @@ use crate::config::Config;
 #[command(
     name = "work",
     version,
-    about = "Managed worktree lifecycle CLI",
-    long_about = "Linux-first CLI for managed worktree lifecycle. Help and status are read-only."
+    about = "Worktrees for interactive agent tasks",
+    long_about = "Create or reuse a task worktree, run your agent there, then explicitly finish and remove it. Linux-first; help and status are read-only."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -18,24 +18,33 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Terminal capture journal reconciliation only; no runtime or task authority
-    #[command(version, propagate_version = true)]
+    #[command(version, propagate_version = true, hide = true)]
     Capture {
         #[command(subcommand)]
         command: crate::capture_cli::Command,
     },
     /// Child metadata only: no launch, writer permission or automatic handoff
-    #[command(version, propagate_version = true)]
+    #[command(version, propagate_version = true, hide = true)]
     Participant {
         #[command(subcommand)]
         command: crate::participant_cli::Command,
     },
     /// Adopted declarations only: no process control, Git identity or automatic handoff
+    #[command(hide = true)]
     Adopt {
         #[command(subcommand)]
         command: crate::adopted::Command,
     },
     /// Reserve and create a configured checkout; does not launch a writer
     Start(crate::allocate::Start),
+    /// Preview removal of a finished interactive checkout; branches are retained
+    Remove {
+        #[arg(value_name = "task-or-checkout-id")]
+        checkout: String,
+        /// Confirm that all agents, editors and other writers have stopped
+        #[arg(long)]
+        confirm_stopped: bool,
+    },
     /// Observe checkout content; no deletion permission. Only --record writes provenance
     Inspect {
         #[arg(value_name = "checkout-id", value_parser = crate::inspection::parse_checkout)]
@@ -44,21 +53,25 @@ enum Command {
         record: bool,
     },
     /// Observe configured remote ancestry once; no recording or retirement authority
+    #[command(hide = true)]
     VerifyRemote {
         #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
         checkout: uuid::Uuid,
     },
     /// Audit configured preservation and additional local work; never retirement authority
+    #[command(hide = true)]
     AuditPreservation {
         #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
         checkout: uuid::Uuid,
     },
     /// Two explicit adopted observations and operator assertion; never OS or retirement authority
+    #[command(hide = true)]
     Approve {
         #[command(subcommand)]
         command: crate::inspection::ApprovalCommand,
     },
     /// Create local recovery-ref protection; never remote backup or retirement authority
+    #[command(hide = true)]
     PrepareRecovery {
         #[arg(value_name = "checkout-uuidv7", value_parser = crate::inspection::parse_checkout)]
         checkout: uuid::Uuid,
@@ -70,24 +83,29 @@ enum Command {
         operation: Option<uuid::Uuid>,
     },
     /// Persistent retirement intent fence; never move, delete or live activation
+    #[command(hide = true)]
     Retire {
         #[command(subcommand)]
         command: RetireCommand,
     },
-    /// Explicit task completion; retirement disabled, tree and charge retained
+    /// Mark the task finished; retain checkout and charge until explicit removal
     Finish {
-        #[arg(value_name = "checkout-id")]
-        checkout: uuid::Uuid,
+        #[arg(value_name = "task-or-checkout-id")]
+        checkout: String,
     },
     /// Run an explicitly attributed command in a verified allocated checkout
+    #[command(hide = true)]
     Run(crate::supervisor::Run),
     /// Show lifecycle status without changing state
     Status {
+        #[arg(long)]
+        json: bool,
         /// Historical UUIDv7 metadata only; runtime is NOT INSPECTED
         #[arg(long)]
         run: Option<uuid::Uuid>,
     },
     /// Try fresh full-roster supervised writer handoff; never launch, signal, finish or uncharge
+    #[command(hide = true)]
     Recover {
         #[arg(value_name = "run-id")]
         run: uuid::Uuid,
@@ -138,6 +156,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             || a == "adopt"
             || a == "participant"
             || a == "retire"
+            || a == "remove"
     }) {
         match Cli::try_parse_from(argv) {
             Ok(cli) => cli,
@@ -158,6 +177,27 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Cli::parse_from(argv)
     };
     match cli.command {
+        Command::Remove {
+            checkout,
+            confirm_stopped,
+        } => {
+            let result = (|| {
+                let config = Config::load().map_err(|e| e.to_string())?;
+                let id =
+                    crate::interactive::resolve(&config, &checkout).map_err(|e| e.to_string())?;
+                crate::inspection::removal::command(&config, id, confirm_stopped)
+            })();
+            match result {
+                Ok(report) => println!(
+                    "{}",
+                    serde_json::to_string(&report).expect("removal serialization")
+                ),
+                Err(reason) => {
+                    eprintln!("remove held: {reason}; inspect status; no force or automatic retry");
+                    std::process::exit(1);
+                }
+            }
+        }
         Command::Capture { command } => {
             let result = Config::load_capture_authority()
                 .map_err(|_| crate::store::StoreError::Unsafe)
@@ -216,14 +256,26 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 }
             }
         }
-        Command::Start(request) => {
+        Command::Start(mut request) => {
             eprintln!(
                 "allocation operation: {} (retain for retries)",
                 request.operation
             );
-            let result = Config::load()
-                .map_err(|e| std::io::Error::other(e.to_string()))
-                .and_then(|config| crate::allocate::start(&config, request));
+            let result = (|| {
+                let document =
+                    crate::config::ConfigDocument::load().map_err(std::io::Error::other)?;
+                let config = document.execution().map_err(std::io::Error::other)?;
+                if request.repository.is_none() && config.repositories.len() == 1 {
+                    request.repository = config.repositories.first().cloned();
+                }
+                if request.root.is_none() && config.roots.len() == 1 {
+                    request.root = config.roots.first().cloned();
+                }
+                if request.actor.is_none() {
+                    request.actor = document.default_actor().map_err(std::io::Error::other)?;
+                }
+                crate::allocate::start(&config, request)
+            })();
             match result {
                 Ok(a) => println!(
                     "{}",
@@ -312,7 +364,10 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Command::Finish { checkout } => {
             let result = Config::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)
-                .and_then(|config| crate::finish::finish(&config, checkout));
+                .and_then(|config| {
+                    let id = crate::interactive::resolve(&config, &checkout)?;
+                    crate::finish::finish(&config, id)
+                });
             match result {
                 Ok(report) => {
                     println!(
@@ -354,8 +409,8 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 }
             }
         }
-        Command::Status { run: None } => print_status(),
-        Command::Status { run: Some(run) } => {
+        Command::Status { run: None, json } => print_status(json),
+        Command::Status { run: Some(run), .. } => {
             let result = Config::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)
                 .and_then(|config| crate::run_recovery::command_status(&config, run));
@@ -516,17 +571,53 @@ fn retire(command: RetireCommand) {
     }
 }
 
-fn print_status() {
+fn print_status(json: bool) {
     // Read-only: a missing or present config never creates files.
     let config = Config::load().unwrap_or_else(|err| {
         eprintln!("{err}");
-        Config::default()
+        std::process::exit(1);
     });
     let os = std::env::consts::OS;
     let qualification = "runtime qualification not verified";
     if config.store_dir.is_some() {
-        println!("status: lifecycle inventory not inspected (read-only placeholder)");
+        match crate::interactive::status(&config) {
+            Ok(report) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("status serialization")
+                    );
+                } else {
+                    println!("charged: {}", report.charged);
+                    for row in report.checkouts {
+                        println!(
+                            "{}  {}  owner={}  {}  {}\n  {}\n  next: {}",
+                            row.checkout,
+                            row.task,
+                            row.owner,
+                            row.state,
+                            if row.task_finished {
+                                "finished"
+                            } else {
+                                "unfinished"
+                            },
+                            row.path.display(),
+                            row.next_action
+                        );
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("status unavailable: {error}; existing authority was not initialized or repaired");
+                std::process::exit(1);
+            }
+        }
     } else {
+        if json {
+            println!("{{\"initialized\":false,\"charged\":0,\"checkouts\":[]}}");
+            return;
+        }
         println!("status: not initialized (no store configured)");
     }
     println!("platform: {os}");
