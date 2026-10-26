@@ -5,7 +5,7 @@ use crate::{
     events::Event,
     store::{Result, StoreError},
 };
-use rusqlite::Connection;
+use rusqlite::{types::ValueRef, Connection};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -26,22 +26,20 @@ pub(crate) struct History {
     pub phase: String,
 }
 pub(crate) fn history(conn: &Connection, checkout: Uuid) -> Result<Option<History>> {
-    let mut query = conn.prepare("SELECT payload FROM outbox WHERE json_extract(payload,'$.type')='interactive_removal' AND json_extract(payload,'$.checkout')=?1 ORDER BY sequence LIMIT 4")?;
-    let rows = query
-        .query_map([checkout.to_string()], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    if rows.len() > 3 {
-        return Err(StoreError::Invalid);
-    }
+    let mut query = conn.prepare("SELECT length(CAST(payload AS BLOB)),payload FROM outbox WHERE json_extract(payload,'$.type')='interactive_removal' AND json_extract(payload,'$.checkout')=?1 ORDER BY sequence LIMIT 4")?;
+    let mut rows = query.query([checkout.to_string()])?;
     let mut result: Option<History> = None;
-    for (index, body) in rows.iter().enumerate() {
-        if body.len() > 256 * 1024 {
+    let mut index = 0;
+    while let Some(row) = rows.next()? {
+        let length: i64 = row.get(0)?;
+        if index >= 3 || !(0..=256 * 1024).contains(&length) {
             return Err(StoreError::Invalid);
         }
-        let event: Event = serde_json::from_str(body).map_err(|_| StoreError::Invalid)?;
+        let body = match row.get_ref(1)? {
+            ValueRef::Text(bytes) if bytes.len() <= 256 * 1024 => bytes,
+            _ => return Err(StoreError::Invalid),
+        };
+        let event: Event = serde_json::from_slice(body).map_err(|_| StoreError::Invalid)?;
         let Event::InteractiveRemoval {
             checkout: id,
             operation,
@@ -71,25 +69,37 @@ pub(crate) fn history(conn: &Connection, checkout: Uuid) -> Result<Option<Histor
         {
             return Err(StoreError::Invalid);
         }
+        index += 1;
         result = Some(History {
             operation,
             record,
             phase,
         });
     }
-    let h = result.as_ref().ok_or(StoreError::Invalid)?;
-    let (allocation, finish, state, ready): (String,String,String,bool) = conn.query_row(
-        "SELECT a.record,f.operation,c.state,c.ready FROM allocations a JOIN task_finishes f ON f.checkout=a.checkout JOIN checkouts c ON c.id=a.checkout WHERE a.checkout=?1", [checkout.to_string()], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-    if allocation != h.record.allocation
-        || finish != h.record.finish_operation
-        || ready
-        || state
-            != if h.phase == "removed" {
+    let Some(h) = result.as_ref() else {
+        return Ok(None);
+    };
+    let mut query = conn.prepare("SELECT a.record,f.operation,c.state,c.ready FROM allocations a JOIN task_finishes f ON f.checkout=a.checkout JOIN checkouts c ON c.id=a.checkout WHERE a.checkout=?1")?;
+    let mut bindings = query.query([checkout.to_string()])?;
+    let row = bindings.next()?.ok_or(StoreError::Invalid)?;
+    // Compare borrowed values; corrupt retained columns are never copied.
+    for (column, expected) in [
+        (0, h.record.allocation.as_str()),
+        (1, h.record.finish_operation.as_str()),
+        (
+            2,
+            if h.phase == "removed" {
                 "retired"
             } else {
                 "held"
-            }
-    {
+            },
+        ),
+    ] {
+        if !matches!(row.get_ref(column)?, ValueRef::Text(bytes) if bytes == expected.as_bytes()) {
+            return Err(StoreError::Invalid);
+        }
+    }
+    if !matches!(row.get_ref(3)?, ValueRef::Integer(0)) {
         return Err(StoreError::Invalid);
     }
     Ok(result)
@@ -104,13 +114,34 @@ pub(crate) fn emit(
     phase: &str,
     record: &Record,
 ) -> Result<()> {
-    crate::store::emit(
-        conn,
-        &Event::InteractiveRemoval {
-            checkout,
-            operation,
-            phase: phase.into(),
-            record: serde_json::to_string(record).map_err(|_| StoreError::Invalid)?,
-        },
-    )
+    let event = Event::InteractiveRemoval {
+        checkout,
+        operation,
+        phase: phase.into(),
+        record: serde_json::to_string(record).map_err(|_| StoreError::Invalid)?,
+    };
+    if serde_json::to_vec(&event)
+        .map_err(|_| StoreError::Invalid)?
+        .len()
+        > 256 * 1024
+    {
+        return Err(StoreError::Invalid);
+    }
+    crate::store::emit(conn, &event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn oversized_retained_event_refuses_before_decoding_or_binding() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE outbox(sequence INTEGER, payload TEXT)")
+            .unwrap();
+        let checkout = Uuid::now_v7();
+        let body = serde_json::json!({"type":"interactive_removal", "checkout":checkout, "record":"x".repeat(256 * 1024)}).to_string();
+        conn.execute("INSERT INTO outbox VALUES(1,?1)", [body])
+            .unwrap();
+        assert!(matches!(history(&conn, checkout), Err(StoreError::Invalid)));
+    }
 }

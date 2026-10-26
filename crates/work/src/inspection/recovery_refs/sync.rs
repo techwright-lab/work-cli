@@ -5,7 +5,7 @@ use std::{collections::BTreeSet, path::Path};
 
 type Held<T> = Result<T, &'static str>;
 
-pub(super) fn persistent_manifest(manifest: &filesystem::Manifest) -> Held<()> {
+pub(in crate::inspection) fn persistent_manifest(manifest: &filesystem::Manifest) -> Held<()> {
     manifest
         .persistent_fs()
         .map_err(|_| "nonpersistent_filesystem")

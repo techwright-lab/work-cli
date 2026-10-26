@@ -60,7 +60,11 @@ pub(crate) fn db<T>(r: crate::store::Result<T>) -> io::Result<T> {
         crate::capture_diagnostics::store_error("allocate::db", &e);
         #[cfg(test)]
         crate::retirement_journal::tests::observe_mapped_error(&e);
-        err(&e.to_string())
+        if matches!(&e, crate::store::StoreError::Io(source) if source.kind() == io::ErrorKind::WouldBlock) {
+            io::Error::new(io::ErrorKind::WouldBlock, "operation would block; another lifecycle operation holds the authority")
+        } else {
+            io::Error::other(e)
+        }
     })
 }
 pub(crate) fn sql<T>(r: rusqlite::Result<T>) -> io::Result<T> {

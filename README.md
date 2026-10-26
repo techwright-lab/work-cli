@@ -67,7 +67,9 @@ reported checkout UUID when necessary.
 
 Removal supports finished, ordinary interactive checkouts. It refuses dirty,
 untracked, or ignored files; unfinished tasks; unknown private Git files; and
-historical supervised, adopted, capture, or retirement state. `work inspect UUID`
+historical supervised, adopted, capture, or retirement state. Keep the allocated
+branch checked out: detached checkouts and branch changes are unsupported and
+retain their work and charge. `work inspect UUID`
 helps investigate content holds. There is no force flag or recursive fallback.
 
 Removal keeps the branch and preserves HEAD and private reflog commit roots in

@@ -65,10 +65,10 @@ fn explicit_removal_retains_commits_and_releases_one_capacity_slot() {
     assert_eq!(preview["outcome"], "preview");
     assert!(path.exists());
     assert_eq!(json(command(&f, &["status", "--json"]))["charged"], 1);
-    assert!(!f
-        .start(&uuid::Uuid::now_v7().to_string(), "second", "second", &[])
-        .status
-        .success());
+    let blocked = f.start(&uuid::Uuid::now_v7().to_string(), "second", "second", &[]);
+    assert!(!blocked.status.success());
+    let explanation = String::from_utf8(blocked.stderr).unwrap();
+    assert!(explanation.contains(id) && explanation.contains("owner=alice"));
     let removed = json(command(&f, &["remove", "first", "--confirm-stopped"]));
     assert_eq!(removed["outcome"], "removed");
     assert!(!path.exists());
@@ -144,4 +144,85 @@ fn defaults_do_not_share_owners_and_missing_status_does_not_initialize() {
     );
     let status = json(command(&f, &["status", "--json"]));
     assert_eq!(status["checkouts"][0]["owner"], "alice");
+}
+
+#[test]
+fn uuid_shaped_task_names_resolve_and_conflicting_ids_refuse() {
+    for task in [
+        "9b3de7f4-5ae4-4f23-a00d-dce2bacb52c0".to_string(),
+        uuid::Uuid::now_v7().to_string(),
+    ] {
+        let f = Fixture::new();
+        json(f.start(&uuid::Uuid::now_v7().to_string(), &task, "topic", &[]));
+        json(command(&f, &["finish", &task]));
+        assert_eq!(json(command(&f, &["remove", &task]))["outcome"], "preview");
+    }
+    let f = Fixture::new();
+    let a = json(f.start(&uuid::Uuid::now_v7().to_string(), "first", "first", &[]));
+    let id = a["checkout"].as_str().unwrap();
+    json(f.start(&uuid::Uuid::now_v7().to_string(), id, "second", &[]));
+    assert!(!command(&f, &["finish", id]).status.success());
+    assert!(json(command(&f, &["status", "--json"]))["checkouts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["task_finished"] == false));
+}
+
+#[test]
+fn human_status_explains_allocation_holds() {
+    let f = Fixture::new();
+    let op = uuid::Uuid::now_v7().to_string();
+    let a = json(f.start(&op, "task", "topic", &[]));
+    support::git(
+        std::path::Path::new(a["destination"].as_str().unwrap()),
+        &["checkout", "-b", "changed"],
+    );
+    assert!(!f.start(&op, "task", "topic", &[]).status.success());
+    let status = json(command(&f, &["status", "--json"]));
+    let reason = status["checkouts"][0]["reason"].as_str().unwrap();
+    let human = command(&f, &["status"]);
+    assert!(human.status.success());
+    assert!(String::from_utf8(human.stdout).unwrap().contains(reason));
+}
+
+#[test]
+fn removal_requires_persistent_common_storage() {
+    let mut f = Fixture::new();
+    let volatile = tempfile::tempdir_in("/dev/shm").unwrap();
+    let repo = volatile.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    support::git(&repo, &["init", "-b", "main"]);
+    support::git(&repo, &["config", "user.name", "Test"]);
+    support::git(&repo, &["config", "user.email", "test@example.invalid"]);
+    support::git(&repo, &["commit", "--allow-empty", "-m", "initial"]);
+    f.repo = repo;
+    f.config(10, false);
+    let a = json(f.start(&uuid::Uuid::now_v7().to_string(), "task", "topic", &[]));
+    json(command(&f, &["finish", "task"]));
+    let result = command(&f, &["remove", "task", "--confirm-stopped"]);
+    assert!(!result.status.success(), "{result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("nonpersistent_filesystem"),
+        "{result:?}"
+    );
+    assert!(std::path::Path::new(a["destination"].as_str().unwrap()).is_dir());
+    assert!(support::git(&f.repo, &["for-each-ref", "refs/work-preserved/"]).is_empty());
+    assert_eq!(json(command(&f, &["status", "--json"]))["charged"], 1);
+}
+
+#[test]
+fn detached_checkout_is_explicitly_unsupported_and_retained() {
+    let f = Fixture::new();
+    let a = json(f.start(&uuid::Uuid::now_v7().to_string(), "task", "topic", &[]));
+    let path = std::path::Path::new(a["destination"].as_str().unwrap());
+    support::git(path, &["checkout", "--detach"]);
+    support::git(path, &["commit", "--allow-empty", "-m", "detached work"]);
+    let head = support::git(path, &["rev-parse", "HEAD"]);
+    assert!(!command(&f, &["finish", "task"]).status.success());
+    assert!(!command(&f, &["remove", "task", "--confirm-stopped"])
+        .status
+        .success());
+    assert_eq!(support::git(path, &["rev-parse", "HEAD"]), head);
+    assert_eq!(json(command(&f, &["status", "--json"]))["charged"], 1);
 }

@@ -35,23 +35,26 @@ pub(crate) fn open(config: &Config) -> Result<Store> {
     )
 }
 pub(crate) fn resolve(config: &Config, selector: &str) -> Result<Uuid> {
-    if let Ok(id) = Uuid::parse_str(selector) {
-        if id.get_version_num() != 7 {
-            return Err(StoreError::Invalid);
-        }
-        return Ok(id);
-    }
     let store = open(config)?;
     let _phase = store.sql_phase();
-    let mut query = store.conn.prepare("SELECT id FROM checkouts WHERE task=?1 AND (state!='retired' OR NOT EXISTS(SELECT 1 FROM checkouts WHERE task=?1 AND state!='retired')) LIMIT 2")?;
-    let ids = query
-        .query_map([selector], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if ids.len() != 1 {
+    // A UUID-shaped task is legal. Match both namespaces against existing rows
+    // and refuse a selector naming distinct checkouts instead of guessing.
+    let id = Uuid::parse_str(selector).ok().map(|id| id.to_string());
+    let mut query = store.conn.prepare("SELECT id FROM checkouts WHERE id=?2 OR (task=?1 AND (state!='retired' OR NOT EXISTS(SELECT 1 FROM checkouts WHERE task=?1 AND state!='retired'))) LIMIT 2")?;
+    let mut rows = query.query(rusqlite::params![selector, id])?;
+    let row = rows.next()?.ok_or(StoreError::Invalid)?;
+    let id = match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Text(bytes) if bytes.len() == 36 => {
+            Uuid::try_parse_ascii(bytes).map_err(|_| StoreError::Invalid)?
+        }
+        _ => return Err(StoreError::Invalid),
+    };
+    if id.get_version_num() != 7 || rows.next()?.is_some() {
         return Err(StoreError::Invalid);
     }
-    Uuid::parse_str(&ids[0]).map_err(|_| StoreError::Invalid)
+    Ok(id)
 }
+
 pub(crate) fn status(config: &Config) -> Result<Status> {
     let missing = |path: &std::path::Path| matches!(std::fs::symlink_metadata(path), Err(e) if e.kind()==std::io::ErrorKind::NotFound);
     if config.store_dir.as_deref().is_some_and(missing)
@@ -72,27 +75,30 @@ pub(crate) fn status(config: &Config) -> Result<Status> {
         return Err(StoreError::Invalid);
     }
     let mut query = store.conn.prepare("SELECT c.id,c.task,c.owner,c.state,a.record FROM checkouts c LEFT JOIN allocations a ON a.checkout=c.id ORDER BY c.id")?;
-    let rows = query.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, Option<String>>(4)?,
-        ))
-    })?;
+    let mut rows = query.query([])?;
     let mut checkouts = Vec::new();
     let mut bytes = 0usize;
-    for row in rows {
-        let (id, task, owner, state, record) = row?;
-        bytes += id.len()
-            + task.len()
-            + owner.len()
-            + state.len()
-            + record.as_ref().map_or(0, String::len);
-        if bytes > 2 * 1024 * 1024 {
+    while let Some(row) = rows.next()? {
+        // Validate all borrowed columns before allocating any of this row.
+        for column in 0..5 {
+            match row.get_ref(column)? {
+                rusqlite::types::ValueRef::Text(value) if value.len() <= 1024 * 1024 => {
+                    bytes += value.len();
+                }
+                rusqlite::types::ValueRef::Null if column == 4 => {}
+                _ => return Err(StoreError::Invalid),
+            }
+        }
+        if bytes > 2 * 1024 * 1024 || checkouts.len() >= 4096 {
             return Err(StoreError::Invalid);
         }
+        let (id, task, owner, state, record): (String, String, String, String, Option<String>) = (
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+        );
         let checkout = Uuid::parse_str(&id).map_err(|_| StoreError::Invalid)?;
         let allocation: Option<crate::allocate::Allocation> = record
             .as_deref()

@@ -74,6 +74,7 @@ fn clean(store: &mut Store, checkout: Uuid) -> Result<(Captured, Vec<String>)> {
         .as_mut()
         .ok_or("missing retained inspection")?;
     let inputs = &mut physical.before;
+    checked(recovery_refs::sync::persistent_manifest(&inputs.common))?;
     let b = &mut captured.budget;
     for name in checked(inputs.private.list(b"", b))? {
         if ![
@@ -238,6 +239,7 @@ fn absent(a: &crate::allocate::Allocation, record: &Record, b: &mut Budget) -> R
     checked(parent.sync_path(b"", true, b))?;
     checked(parent.recheck(b))?;
     let mut common = checked(filesystem::Manifest::new(&identity.common_git_dir, b))?;
+    checked(recovery_refs::sync::persistent_manifest(&common))?;
     if common.root_dev_ino() != record.common {
         return Err("common identity changed".into());
     }
@@ -246,28 +248,20 @@ fn absent(a: &crate::allocate::Allocation, record: &Record, b: &mut Budget) -> R
     match common.absent(b"worktrees", b) {
         Ok(()) => checked(common.sync_path(b"", true, b))?,
         Err(IncompleteReason::UnsupportedGit) => {
-            let mut parent = checked(filesystem::Manifest::new(
+            // Git may recreate this disposable parent for another checkout.
+            // Resolve the target under the retained common directory instead of
+            // trusting the original disposable parent's inode.
+            let mut registration = b"worktrees/".to_vec();
+            registration.extend(
                 identity
                     .private_git_dir
-                    .parent()
-                    .ok_or("missing private parent")?,
-                b,
-            ))?;
-            if parent.root_dev_ino() != record.private_parent {
-                return Err("private parent identity changed".into());
-            }
-            checked(
-                parent.absent(
-                    identity
-                        .private_git_dir
-                        .file_name()
-                        .ok_or("missing private basename")?
-                        .as_bytes(),
-                    b,
-                ),
-            )?;
-            checked(parent.sync_path(b"", true, b))?;
-            checked(parent.recheck(b))?;
+                    .file_name()
+                    .ok_or("missing private basename")?
+                    .as_bytes(),
+            );
+            checked(common.absent(&registration, b))?;
+            checked(common.sync_path(b"worktrees", true, b))?;
+            checked(common.sync_path(b"", true, b))?;
         }
         Err(e) => return Err(format!("private registration absence: {e:?}")),
     }
@@ -597,6 +591,16 @@ mod tests {
         assert!(!interrupted.status.success(), "{interrupted:?}");
         assert!(!f.allocation.destination.exists());
         assert_eq!(json(invoke(&f, &["status", "--json"], None))["charged"], 1);
+        // Cooperative Git creates a new worktrees parent after removing the last
+        // registration. That must not strand an acknowledged removal's charge.
+        let other = f.root.join("other");
+        let output = Command::new("git")
+            .current_dir(&f.repo)
+            .args(["worktree", "add", "-b", "other"])
+            .arg(&other)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
         assert_eq!(
             json(invoke(
                 &f,
@@ -610,6 +614,36 @@ mod tests {
             json(invoke(&f, &["remove", &id, "--confirm-stopped"], None))["outcome"],
             "removed"
         );
+        assert_eq!(json(invoke(&f, &["status", "--json"], None))["charged"], 0);
+    }
+    #[test]
+    fn sha256_local_history_is_preserved() {
+        let f = ManagedFixture::new("sha256", "2");
+        f.git(&[
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-m".as_ref(),
+            "local work".as_ref(),
+        ]);
+        let output = Command::new("git")
+            .current_dir(&f.allocation.destination)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let root = String::from_utf8(output.stdout).unwrap();
+        json(invoke(&f, &["finish", "inspection"], None));
+        let removed = json(invoke(
+            &f,
+            &["remove", "inspection", "--confirm-stopped"],
+            None,
+        ));
+        assert_eq!(removed["outcome"], "removed");
+        assert!(removed["preserved_refs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r.as_str().unwrap().ends_with(root.trim())));
         assert_eq!(json(invoke(&f, &["status", "--json"], None))["charged"], 0);
     }
     #[test]

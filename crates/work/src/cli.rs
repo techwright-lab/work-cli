@@ -283,6 +283,27 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 ),
                 Err(e) => {
                     eprintln!("start refused: {e}; inspect WORK_CONFIG and held allocations; retry with the same --operation UUID");
+                    if matches!(
+                        e.get_ref()
+                            .and_then(|e| e.downcast_ref::<crate::store::StoreError>()),
+                        Some(crate::store::StoreError::Capacity)
+                    ) {
+                        if let Some(status) = Config::load()
+                            .ok()
+                            .and_then(|config| crate::interactive::status(&config).ok())
+                        {
+                            for row in status.checkouts.into_iter().filter(|row| row.charged) {
+                                eprintln!(
+                                    "charged checkout: {} task={} owner={} path={}; next: {}",
+                                    row.checkout,
+                                    row.task,
+                                    row.owner,
+                                    row.path.display(),
+                                    row.next_action
+                                );
+                            }
+                        }
+                    }
                     std::process::exit(1);
                 }
             }
@@ -604,6 +625,9 @@ fn print_status(json: bool) {
                             row.path.display(),
                             row.next_action
                         );
+                        if let Some(reason) = row.reason {
+                            println!("  reason: {reason}");
+                        }
                     }
                 }
                 return;
