@@ -386,7 +386,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             let result = Config::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)
                 .and_then(|config| {
-                    let id = crate::interactive::resolve(&config, &checkout)?;
+                    let id = crate::interactive::resolve_finish(&config, &checkout)?;
                     crate::finish::finish(&config, id)
                 });
             match result {
@@ -608,7 +608,11 @@ fn print_status(json: bool) {
                         "{}",
                         serde_json::to_string(&report).expect("status serialization")
                     );
+                    return;
                 } else {
+                    if !report.initialized {
+                        println!("status: not initialized (configured authority absent)");
+                    }
                     println!("charged: {}", report.charged);
                     for row in report.checkouts {
                         println!(
@@ -630,7 +634,6 @@ fn print_status(json: bool) {
                         }
                     }
                 }
-                return;
             }
             Err(error) => {
                 eprintln!("status unavailable: {error}; existing authority was not initialized or repaired");

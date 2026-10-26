@@ -45,6 +45,7 @@ fn configured_interactive_task_can_start_reuse_list_and_finish() {
     let human = String::from_utf8(human.stdout).unwrap();
     assert!(human.contains("interactive") && human.contains("alice"));
     assert!(!human.contains("placeholder"));
+    assert!(human.contains("qualification: runtime qualification not verified"));
 }
 
 #[test]

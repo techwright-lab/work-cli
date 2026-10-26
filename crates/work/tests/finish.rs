@@ -622,6 +622,75 @@ fn active_or_orphan_journal_refusal_precedes_head_refresh() {
     }
 }
 #[test]
+fn v8_finish_resolves_tasks_without_changing_status_or_ambiguity_contracts() {
+    for case in ["task", "uuid_v4_task", "uuid_v7_task", "ambiguous"] {
+        let f = Fixture::new();
+        let task = match case {
+            "uuid_v4_task" => "9b3de7f4-5ae4-4f23-a00d-dce2bacb52c0".to_string(),
+            "uuid_v7_task" => Uuid::now_v7().to_string(),
+            _ => "task".to_string(),
+        };
+        let output = f.start(&Uuid::now_v7().to_string(), &task, "topic", &[]);
+        assert!(output.status.success(), "{output:?}");
+        let a: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let id = a["checkout"].as_str().unwrap();
+        let selector = if case == "ambiguous" {
+            let second = f.start(&Uuid::now_v7().to_string(), id, "second", &[]);
+            assert!(second.status.success(), "{second:?}");
+            id
+        } else {
+            &task
+        };
+        let sql = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
+        sql.execute_batch("DROP TABLE quarantine_actions; DROP TABLE retirement_intents; DROP TABLE gap_eligibility; DROP TABLE gap_qualifications; DROP TABLE attribution_gaps; DROP TABLE capture_readiness; DROP TABLE capture_finalizations; DROP TABLE capture_requirements; DROP TABLE capture_runs; DROP TABLE task_finishes; PRAGMA user_version=8")
+            .unwrap();
+        let files = authority_files(&f);
+        let status = Command::new(env!("CARGO_BIN_EXE_work"))
+            .args(["status", "--json"])
+            .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+            .output()
+            .unwrap();
+        assert!(!status.status.success(), "{case}: {status:?}");
+        assert!(status.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&status.stderr).contains("schema upgrade required"));
+        assert_eq!(
+            authority_files(&f),
+            files,
+            "status must not migrate: {case}"
+        );
+
+        let finished = Command::new(env!("CARGO_BIN_EXE_work"))
+            .args(["finish", selector])
+            .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            finished.status.success(),
+            case != "ambiguous",
+            "{case}: {finished:?}"
+        );
+        if case != "ambiguous" {
+            let report: serde_json::Value = serde_json::from_slice(&finished.stdout).unwrap();
+            assert_eq!(report["checkout"], id);
+            assert_eq!(report["task_finished"], true);
+            assert_eq!(report["charge_retained"], true);
+        }
+        let status = Command::new(env!("CARGO_BIN_EXE_work"))
+            .args(["status", "--json"])
+            .env("WORK_CONFIG", f.temp.path().join("config.toml"))
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{case}: {status:?}");
+        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(status["charged"], if case == "ambiguous" { 2 } else { 1 });
+        for checkout in status["checkouts"].as_array().unwrap() {
+            assert_eq!(checkout["task_finished"], case != "ambiguous");
+            assert!(std::path::Path::new(checkout["path"].as_str().unwrap()).is_dir());
+        }
+    }
+}
+
+#[test]
 fn established_v8_migrates_but_unsafe_or_incomplete_authority_is_not_repaired() {
     for case in [
         "v8",

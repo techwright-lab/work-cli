@@ -36,6 +36,29 @@ pub(crate) fn open(config: &Config) -> Result<Store> {
 }
 pub(crate) fn resolve(config: &Config, selector: &str) -> Result<Uuid> {
     let store = open(config)?;
+    resolve_in_store(&store, selector)
+}
+
+pub(crate) fn resolve_finish(config: &Config, selector: &str) -> Result<Uuid> {
+    // Finish already permits migration of validated established v8..=17
+    // authority. Use that admission path before resolving either namespace;
+    // status and removal previews keep their strictly read-only admission.
+    let store = match open(config) {
+        Ok(store) => store,
+        Err(StoreError::UpgradeRequired) => Store::open_finish_authority(
+            config
+                .trusted_registry
+                .as_deref()
+                .ok_or(StoreError::Invalid)?,
+            config.store_dir.as_deref().ok_or(StoreError::Invalid)?,
+            &config.roots,
+        )?,
+        Err(error) => return Err(error),
+    };
+    resolve_in_store(&store, selector)
+}
+
+fn resolve_in_store(store: &Store, selector: &str) -> Result<Uuid> {
     let _phase = store.sql_phase();
     // A UUID-shaped task is legal. Match both namespaces against existing rows
     // and refuse a selector naming distinct checkouts instead of guessing.
