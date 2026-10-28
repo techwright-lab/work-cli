@@ -802,7 +802,8 @@ fn missing_preparation_replays_exact_begin_and_stays_held() {
     store.conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     let exe = cfg.capture.as_ref().unwrap().executable.clone();
     // Fake producer is stdlib-only and checks durable intent before reading stdin.
-    fs::write(&exe, format!("#!/usr/bin/python3\nimport sqlite3,sys,pathlib,json\np=pathlib.Path({:?})\nc=sqlite3.connect(p/'private/store.sqlite', timeout=0)\nassert c.execute('select prepared from capture_runs').fetchone()==(None,)\nc.execute('begin immediate')\nc.rollback()\n(p/'args').write_text(json.dumps(sys.argv[1:]))\n(p/'input').write_bytes(sys.stdin.buffer.read())\nsys.stdout.buffer.write((p/'response').read_bytes())\n", temp.path().to_str().unwrap())).unwrap();
+    // The read-only guard closes last so no producer close removes the WAL sidecars.
+    fs::write(&exe, format!("#!/usr/bin/python3\nimport sqlite3,sys,pathlib,json\np=pathlib.Path({:?})\ng=sqlite3.connect((p/'private/store.sqlite').as_uri()+'?mode=ro', uri=True)\ng.execute('select count(*) from sqlite_master').fetchone()\nc=sqlite3.connect(p/'private/store.sqlite', timeout=0)\nassert c.execute('select prepared from capture_runs').fetchone()==(None,)\nc.execute('begin immediate')\nc.rollback()\nc.close()\ng.close()\n(p/'args').write_text(json.dumps(sys.argv[1:]))\n(p/'input').write_bytes(sys.stdin.buffer.read())\nsys.stdout.buffer.write((p/'response').read_bytes())\n", temp.path().to_str().unwrap())).unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
     let original = cfg.capture.as_ref().unwrap().clone();
     cfg.capture.as_mut().unwrap().executable = "/must-not-use-current-profile".into();
