@@ -53,6 +53,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # Inspection admits only source-qualified Git 2.55.0 at /usr/bin/git.
+      - name: Cache qualified Git
+        id: qualified-git
+        uses: actions/cache@v4
+        with:
+          path: ~/qualified-git
+          key: git-2.55.0-${{ matrix.runner }}-${{ matrix.target }}
+      - name: Build qualified Git
+        if: steps.qualified-git.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
+          curl --fail --location --output "$RUNNER_TEMP/git.tar.xz" \
+            https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz
+          echo "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357  $RUNNER_TEMP/git.tar.xz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/git-source"
+          tar -xJf "$RUNNER_TEMP/git.tar.xz" -C "$RUNNER_TEMP/git-source" --strip-components=1
+          make -C "$RUNNER_TEMP/git-source" -j"$(nproc)" prefix=/usr DESTDIR="$HOME/qualified-git" \
+            NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+      - name: Install qualified Git
+        run: |
+          sudo cp -a "$HOME/qualified-git/usr/." /usr/
+          test "$(/usr/bin/git --version)" = "git version 2.55.0"
+          test "$(git --version)" = "git version 2.55.0"
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
