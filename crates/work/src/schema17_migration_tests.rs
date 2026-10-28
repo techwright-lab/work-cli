@@ -565,6 +565,10 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
     // this baseline. Read-atime alone is deliberately not compared.
     fn files(path: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let meta = std::fs::symlink_metadata(path).unwrap();
+        // Any WAL connection, even read-only, re-initializes an existing SHM and
+        // bumps its times; identity, length and bytes are still compared.
+        let times = !path.to_string_lossy().ends_with("-shm");
+        let time = |value: i64| if times { value as u64 } else { 0 };
         let mut value = Vec::new();
         for number in [
             meta.dev(),
@@ -574,10 +578,10 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
             meta.gid() as u64,
             meta.nlink(),
             meta.len(),
-            meta.mtime() as u64,
-            meta.mtime_nsec() as u64,
-            meta.ctime() as u64,
-            meta.ctime_nsec() as u64,
+            time(meta.mtime()),
+            time(meta.mtime_nsec()),
+            time(meta.ctime()),
+            time(meta.ctime_nsec()),
         ] {
             value.extend_from_slice(&number.to_be_bytes());
         }
