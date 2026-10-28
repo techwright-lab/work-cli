@@ -77,7 +77,9 @@ jobs:
             NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
       - name: Install qualified Git
         run: |
-          sudo cp -a "$HOME/qualified-git/usr/." /usr/
+          ls -l /usr/bin/git "$(command -v git)" || true
+          sudo cp -a --remove-destination "$HOME/qualified-git/usr/." /usr/
+          hash -r
           test "$(/usr/bin/git --version)" = "git version 2.55.0"
           test "$(git --version)" = "git version 2.55.0"
       - name: Test
