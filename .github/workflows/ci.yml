@@ -4,226 +4,119 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
   pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  # Task10 is independent: neither parked Task8 nor Task9 results are suppressed.
-  task10-preservation:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Remote observation and lazy policy unit tests
-        run: |
-          cargo test -p work-cli --locked --lib inspection::remote_proof::tests::
-          cargo test -p work-cli --locked --lib config::remote_policy_tests::
-          cargo test -p work-cli --locked --lib inspection::preservation::tests::
-          cargo test -p work-cli --locked --lib inspection::approval::tests::
-          cargo test -p work-cli --locked --lib config::approval_policy_tests::
-          cargo test -p work-cli --locked --lib inspection::receipts::tests::approval_v2
-          cargo test -p work-cli --locked --lib inspection::receipts::tests::v2_envelope
-          cargo test -p work-cli --locked --lib inspection::recovery_refs::
-          cargo test -p work-cli --locked --lib inspection::retirement::
-          cargo test -p work-cli --locked --test run_journal closed_group_snapshot_and_empty_certify_still_reject
-      - name: Owned local remote integration tests
-        run: cargo test -p work-cli --locked --test remote_proof --test preservation --test approval --test recovery_refs --test retirement_assessment
-      - name: Workspace all-target strict Clippy
+      - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-  # Independent qualification: full-suite failures remain visible in `ci` below.
-  task9-inspection:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          components: rustfmt, clippy
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Inspection unit tests
-        run: |
-          cargo test -p work-cli --locked --lib inspection::tests::
-          cargo test -p work-cli --locked --lib inspection::receipts::tests::
-          cargo test -p work-cli --locked --lib config::inspection_policy_tests::
-      - name: Disposal unit tests
-        run: |
-          cargo test -p work-cli --locked --lib disposal::tests::
-      - name: Inspection and disposal integration tests
-        run: cargo test -p work-cli --locked --test inspection --test disposal --test inspection_receipts --test inspection_cli
-      - name: Library and inspection Clippy
-        run: cargo clippy -p work-cli --locked --lib --test inspection --test disposal --test inspection_receipts --test inspection_cli -- -D warnings
-  task10-retirement-intent:
-    runs-on: ubuntu-latest
+
+  test:
+    name: test (${{ matrix.device }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - kind: lib
-            selector: 'retirement_journal::'
-          - kind: lib
-            selector: 'checkout_guard::'
-          - kind: lib
-            selector: 'inspection::retirement_intent::'
-          - kind: lib
-            selector: 'inspection::receipts::tests::'
-          - kind: lib
-            selector: 'scope_spawn::'
-          - kind: lib
-            selector: attribution_gap::tests::lease_tests::public_revokers_cannot_commit_during_gap_kernel_gate
-          - kind: lib
-            selector: attribution_gap::tests::continuation::supported_holds_revoke_epochs_without_reversing_physical_closure
-          - kind: lib
-            selector: attribution_gap::tests::lease_tests::public_revokers_winning_during_gap_driver_observation_prevent_publication
-          - kind: lib
-            selector: attribution_gap::tests::gap_publication_reopened_store_keeps_outer_guard_until_acknowledgement
-          - kind: lib
-            selector: 'admission::allocation_tests::'
-          - kind: lib
-            selector: 'allocate::physical_tests::'
-          - kind: lib
-            selector: capture_setup::tests::begin_under_guard_refuses_unrelated_checkout_guard
-          - kind: lib
-            selector: capture_setup::tests::begin_holds_prepared_intent_before_admission_rows
-          - kind: lib
-            selector: capture_preparation::tests::prepare_under_guard_refuses_mismatched_checkout
-          - kind: lib
-            selector: capture_preparation::tests::prepare_holds_prepared_intent_before_receiver
-          - kind: lib
-            selector: capture_preparation::tests::prepare_shared_guard_excludes_exclusive_until_drain
-          - kind: lib
-            selector: capture_recovery::tests::unknown_run_refuses_without_invented_fence
-          - kind: lib
-            selector: capture_recovery::tests::reconcile_holds_prepared_intent_before_receiver
-          - kind: lib
-            selector: capture_recovery::tests::reconcile_commit_fences_after_actual_begin_without_mutating_caller_rows
-          - kind: lib
-            selector: capture_recovery::tests::reconcile_shared_guard_excludes_exclusive_until_drain
-          - kind: lib
-            selector: capture_readiness::tests::restore_holds_prepared_intent_before_certificate
-          - kind: lib
-            selector: capture_readiness::tests::restore_under_guard_refuses_mismatched_checkout
-          - kind: lib
-            selector: 'capture_finalization::tests::'
-          - kind: lib
-            selector: 'store::tests::'
-          # W1 tests-first schema participation; no public movement wiring.
-          - kind: lib
-            selector: 'store::schema_participation_tests::'
-          # W2 tests-first: existing-API schema/ACK behavior, not movement.
-          - kind: lib
-            selector: 'store::schema17_migration_tests::'
-          # Strict physical metadata only; no native movement authority.
-          - kind: lib
-            selector: 'quarantine_journal::tests::'
-          # Genuine16 fixture consumer only; no ordinary legacy preparation.
-          - kind: lib
-            selector: 'inspection::retirement::tests::legacy16_consumer_'
-          # Genuine16 offline abort and migration qualification; no movement.
-          - kind: lib
-            selector: 'inspection::retirement::tests::legacy16_qualification_'
-          - kind: lib
-            selector: 'run_participants::tests::'
-          - kind: lib
-            selector: attribution_gap::tests::strict_gap_shape_binding_and_schema14_migration
-          - kind: lib
-            selector: attribution_gap::tests::continuation::schema15_validation_preserves_sql_literal_semantics
-          - kind: lib
-            selector: attribution_gap::tests::continuation::schema15_and_strict_v2_preserve_legacy_bytes_without_backfill
-          - kind: lib
-            selector: attribution_gap::tests::continuation::historical_claims_are_passive_and_new_target_checks_are_fresh
-          - kind: lib
-            selector: attribution_gap::tests::existing_gap_rejects_cross_checkout_retirement_namespace_in_both_ack_paths
-          - kind: lib
-            selector: attribution_gap::tests::committed_gap_reader_preserves_schema15_without_retirement_table
-          - kind: lib
-            selector: attribution_gap::tests::required_gap_recovery_hold_fences_at_late_transaction
-          - kind: test
-            selector: retirement_intent
-          - kind: test
-            selector: adopted
-          - kind: test
-            selector: allocation
-          - kind: test
-            selector: allocation_crashes
-          - kind: test
-            selector: capture_finalization
-          - kind: test
-            selector: capture_preparation
-          - kind: test
-            selector: capture_supervisor
-          - kind: test
-            selector: capture_journal
-          - kind: test
-            selector: capture_materialization
-          - kind: test
-            selector: capture_readiness
-          - kind: test
-            selector: enrollment_migration
-          - kind: test
-            selector: finish
-          - kind: test
-            selector: run_journal
-          - kind: test
-            selector: run_participants
-          - kind: test
-            selector: participants
-          - kind: test
-            selector: supervisor
-          - kind: test
-            selector: capture_cli
-          - kind: test
-            selector: run_recovery
-          - kind: test
-            selector: store_recovery
-          - kind: test
-            selector: inspection_receipts
-          - kind: test
-            selector: inspection_cli
-          - kind: test
-            selector: linux_scope
-          - kind: test
-            selector: scope_launch
+          - device: x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - device: aarch64-linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt, clippy
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Scoped tests
+          key: ${{ matrix.target }}
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  build:
+    name: build (${{ matrix.device }})
+    needs: [lint, test]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - device: aarch64-linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked -p work-cli --bin work
+      - name: Package
         run: |
-          set -o pipefail
-          output="$(mktemp)"
-          if [ "${{ matrix.kind }}" = "lib" ]; then
-            cargo test -p work-cli --locked --lib ${{ matrix.selector }} | tee "$output"
-          else
-            cargo test -p work-cli --locked --test ${{ matrix.selector }} | tee "$output"
-          fi
-          if ! grep -Eq '^running [1-9][0-9]* tests?$' "$output" ||
-             ! grep -Eq '^test result: ok\. [1-9][0-9]* passed;' "$output"; then
-            echo "Scoped selector executed zero tests: ${{ matrix.selector }}" >&2
-            exit 1
-          fi
-      - name: Scoped Clippy
-        run: |
-          if [ "${{ matrix.kind }}" = "lib" ]; then
-            cargo clippy -p work-cli --locked --lib -- -D warnings
-          else
-            cargo clippy -p work-cli --locked --test ${{ matrix.selector }} -- -D warnings
-          fi
+          name="work-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/work README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: work-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+  # Single stable check name for branch rules; skipped or failed needs fail it.
   ci:
+    if: always()
+    needs: [lint, test, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
-        with:
-          components: rustfmt, clippy
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Test
-        run: cargo test --workspace --locked
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Require every job to pass
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          echo "$results"
+          ! echo "$results" | grep -qE '"(failure|cancelled|skipped)"'
