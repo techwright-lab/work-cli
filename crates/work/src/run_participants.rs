@@ -347,10 +347,20 @@ pub(crate) fn validate_orphans(conn: &rusqlite::Connection) -> Result<()> {
     }
 }
 fn namespace_conflict(conn: &rusqlite::Connection, request: &ChildRequest) -> Result<bool> {
+    Ok(
+        crate::retirement_journal::operation_reserved(conn, &request.run.to_string())?
+            || non_retirement_namespace_conflict(conn, request)?,
+    )
+}
+// Roster validation batches retirement/removal checks in the same snapshot;
+// new candidates still go through the complete single-ID check above.
+fn non_retirement_namespace_conflict(
+    conn: &rusqlite::Connection,
+    request: &ChildRequest,
+) -> Result<bool> {
     if crate::attribution_gap::event_reserved(conn, &request.run.to_string())?
         || crate::finish::operation_reserved(conn, &request.run.to_string())?
         || crate::capture_journal::operation_reserved(conn, &request.run.to_string())?
-        || crate::retirement_journal::operation_reserved(conn, &request.run.to_string())?
     {
         return Ok(true);
     }
@@ -458,6 +468,14 @@ fn validate_roster(
     let count: i64 = conn
         .prepare_cached("SELECT child_count FROM run_groups WHERE id=?1")?
         .query_row([root.identity().group.to_string()], |r| r.get(0))?;
+    if !rows.is_empty()
+        && crate::retirement_journal::participant_operations_reserved(
+            conn,
+            &root.identity().group.to_string(),
+        )?
+    {
+        return Err(StoreError::Invalid);
+    }
     let mut records = Vec::new();
     for row in rows {
         let body = row.body;
@@ -493,7 +511,7 @@ fn validate_roster(
             || request.checkout != root.identity().checkout
             || request.group != root.identity().group
             || (request.expected_host.is_none() && enrollment != Enrollment::Unverified)
-            || namespace_conflict(conn, &request)?
+            || non_retirement_namespace_conflict(conn, &request)?
         {
             return Err(StoreError::Invalid);
         }

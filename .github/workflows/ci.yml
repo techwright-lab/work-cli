@@ -2,10 +2,8 @@ name: ci
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
   pull_request:
   merge_group:
   workflow_dispatch:
@@ -56,7 +54,6 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
-      # Inspection admits only source-qualified Git 2.55.0 at /usr/bin/git.
       - name: Cache qualified Git
         id: qualified-git
         uses: actions/cache@v4
@@ -77,7 +74,6 @@ jobs:
             NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
       - name: Install qualified Git
         run: |
-          ls -l /usr/bin/git "$(command -v git)" || true
           sudo cp -a --remove-destination "$HOME/qualified-git/usr/." /usr/
           hash -r
           test "$(/usr/bin/git --version)" = "git version 2.55.0"
@@ -85,9 +81,32 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
 
+  qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned Linux qualification environment
+        run: docker build -f tools/qualification/Dockerfile -t work-cli-qualification:rust-1.98.1-git-2.55.0 .
+      - name: Fetch locked dependencies
+        run: tools/qualification/container.sh fetch --locked
+      - name: Complete workspace suite
+        run: tools/qualification/container.sh test --workspace --locked --no-fail-fast -- --test-threads=4
+      - name: Qualification helper tests
+        run: tools/qualification/container.sh -- python3 -m unittest discover -s tests/qualification
+      - name: Package supported Linux artifact
+        run: tools/qualification/container.sh -- tools/package-linux.sh
+      - name: Artifact workflow smoke
+        run: tools/qualification/container.sh -- python3 tools/qualification/smoke.py target/dist/work-cli-0.1.0-linux-x86_64.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: work-cli-linux-x86_64-qualified
+          path: target/dist/*
+          if-no-files-found: error
+
   build:
     name: build (${{ matrix.device }})
-    needs: [lint, test]
+    needs: [lint, test, qualification]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -104,7 +123,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
         with:
           toolchain: 1.98.1
-      # Release artifacts are built from a clean cache-free environment.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
@@ -114,8 +132,10 @@ jobs:
       - name: Package
         run: |
           name="work-${{ matrix.target }}"
-          mkdir -p "dist/$name"
-          cp target/release/work README.md "dist/$name/"
+          mkdir -p "dist/$name/bin" "dist/$name/examples"
+          cp target/release/work "dist/$name/bin/"
+          cp README.md LICENSE "dist/$name/"
+          cp examples/work.toml "dist/$name/examples/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
       - uses: actions/upload-artifact@v4
@@ -133,19 +153,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Publish only the archive exercised by the pinned-container smoke test.
+      # Native matrix builds remain CI coverage, not qualified release assets.
       - uses: actions/download-artifact@v4
         with:
+          name: work-cli-linux-x86_64-qualified
           path: dist
-          merge-multiple: true
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+        run: |
+          cd dist
+          sha256sum --check work-cli-*.tar.gz.sha256
+          gh release create "$GITHUB_REF_NAME" work-cli-*.tar.gz work-cli-*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
 
-  # Single stable check name for branch rules; skipped or failed needs fail it.
   ci:
     if: always()
-    needs: [lint, test, build]
+    needs: [lint, test, qualification, build]
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to pass

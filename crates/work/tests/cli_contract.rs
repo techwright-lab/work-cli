@@ -307,19 +307,46 @@ fn status_does_not_create_files_or_write_config() {
 fn configured_status_does_not_claim_initialization_or_runtime_qualification() {
     let root = IsolatedRoot::new();
     fs::create_dir_all(root.root.join("config/work")).unwrap();
-    fs::write(
-        root.root.join("config/work/config.toml"),
-        format!("store_dir={:?}\n", root.root.join("state/not-created")),
-    )
-    .unwrap();
+    let config_path = root.root.join("config/work/config.toml");
+    let config = format!(
+        "store_dir={:?}\ntrusted_registry={:?}\n",
+        root.root.join("state/not-created"),
+        root.root.join("state/registry-not-created")
+    );
+    fs::write(&config_path, &config).unwrap();
     let before = root.snapshot();
     let output = run_work(&root, &["status"]);
-    assert!(output.status.success());
+    assert!(output.status.success(), "{}", combined(&output));
     let text = stdout_str(&output);
-    assert!(!text.contains("status: not initialized"));
-    assert!(text.contains("not inspected"));
+    assert!(text.contains("status: not initialized"));
+    assert!(!text.contains("not inspected"));
     assert!(text.contains("runtime qualification not verified"));
     assert_eq!(before, root.snapshot());
+    assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+}
+
+#[test]
+fn configured_status_without_registry_refuses_without_initializing_or_leaking_paths() {
+    let root = IsolatedRoot::new();
+    fs::create_dir_all(root.root.join("config/work")).unwrap();
+    let config_path = root.root.join("config/work/config.toml");
+    let config = format!(
+        "store_dir={:?}\n",
+        root.root.join("state/private-store-secret")
+    );
+    fs::write(&config_path, &config).unwrap();
+    let before = root.snapshot();
+    for args in [&["status"][..], &["status", "--json"]] {
+        let output = run_work(&root, args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "status unavailable: invalid store record; existing authority was not initialized or repaired\n"
+        );
+        assert_eq!(before, root.snapshot());
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
+    }
 }
 #[test]
 fn run_parse_errors_do_not_echo_raw_command_or_emit_protocol_stdout() {
@@ -370,12 +397,20 @@ fn malformed_config_reports_only_safe_location() {
         "token = \"private-config-secret\" unexpected-secret\n",
     )
     .unwrap();
-    let output = run_work(&root, &["status"]);
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr),
-        "config error: invalid TOML at line 1, column 33\n"
-    );
+    let before = root.snapshot();
+    let config_path = root.root.join("config/work/config.toml");
+    let config = fs::read(&config_path).unwrap();
+    for args in [&["status"][..], &["status", "--json"]] {
+        let output = run_work(&root, args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "config error: invalid TOML at line 1, column 33\n"
+        );
+        assert_eq!(before, root.snapshot());
+        assert_eq!(fs::read(&config_path).unwrap(), config);
+    }
 }
 
 #[cfg(target_os = "linux")]

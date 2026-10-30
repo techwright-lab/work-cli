@@ -562,14 +562,17 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
 
     // Include directory entries/identities and every native fixture file. Any
     // new WAL/SHM/journal, replaced inode, cookie, claim or history write changes
-    // this baseline. Read-atime alone is deliberately not compared.
+    // this baseline. Read-atime and ephemeral SHM read marks are not compared;
+    // complete logical equality below still protects data, journals and quotas.
     fn files(path: &std::path::Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
         let meta = std::fs::symlink_metadata(path).unwrap();
-        // Any WAL connection, even read-only, re-initializes an existing SHM and
-        // bumps its times; identity, length and bytes are still compared.
-        let times = !path.to_string_lossy().ends_with("-shm");
-        let time = |value: i64| if times { value as u64 } else { 0 };
         let mut value = Vec::new();
+        // SQLite readers legitimately update WAL-index read marks in SHM.
+        // Keep its identity/type/mode/size and the exact sidecar set, but do not
+        // treat transient read-mark bytes/timestamps as durable user state.
+        let shm = path
+            .file_name()
+            .is_some_and(|name| name == "store.sqlite-shm" || name == "authorities.sqlite-shm");
         for number in [
             meta.dev(),
             meta.ino(),
@@ -578,14 +581,14 @@ fn pending_existing_storage_refuses_before_either_journal_transition() {
             meta.gid() as u64,
             meta.nlink(),
             meta.len(),
-            time(meta.mtime()),
-            time(meta.mtime_nsec()),
-            time(meta.ctime()),
-            time(meta.ctime_nsec()),
+            if shm { 0 } else { meta.mtime() as u64 },
+            if shm { 0 } else { meta.mtime_nsec() as u64 },
+            if shm { 0 } else { meta.ctime() as u64 },
+            if shm { 0 } else { meta.ctime_nsec() as u64 },
         ] {
             value.extend_from_slice(&number.to_be_bytes());
         }
-        if meta.is_file() {
+        if meta.is_file() && !shm {
             value.extend_from_slice(&Sha256::digest(std::fs::read(path).unwrap()));
         }
         out.insert(path.to_owned(), value);

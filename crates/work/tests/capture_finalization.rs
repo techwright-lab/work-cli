@@ -866,17 +866,13 @@ fn readme_current_authority_requirements_match_actual_schema() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     let readme = include_str!("../../../README.md");
-    for phrase in [
-        format!("existing initialized trusted schema-{version} authority"),
-        format!("store to schema {version}; malformed schemas"),
-        format!("Status is read-only existing-schema-{version}-authority metadata"),
-        format!("Existing-authority reads require schema {version}."),
-    ] {
-        assert!(
-            readme.contains(&phrase),
-            "stale README requirement: {phrase}"
-        );
-    }
+    // The concise quickstart states compatibility once. Keep the documented
+    // version coupled to an actual initialized store, not historical prose.
+    let phrase = format!("Schema-{version} state");
+    assert!(
+        readme.contains(&phrase),
+        "stale README requirement: {phrase}"
+    );
 }
 
 #[test]

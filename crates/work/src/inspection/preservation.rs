@@ -632,6 +632,28 @@ fn parse_reflog(
     Ok(())
 }
 
+/// Roots that native worktree removal would erase from private administration.
+/// All other private artifacts are refused by the removal collector.
+pub(super) fn interactive_roots(inputs: &mut GitInputs, b: &mut Budget) -> Held<Vec<String>> {
+    let mut roots = Roots::new();
+    roots.entry(inputs.head.clone()).or_default();
+    if let Some(bytes) = checked(inputs.private.optional(b"ORIG_HEAD", b))? {
+        roots
+            .entry(checked(oid(checked(line(&bytes))?, inputs.format))?)
+            .or_default();
+    }
+    if let Some(bytes) = checked(inputs.private.optional(b"logs/HEAD", b))? {
+        parse_reflog(b"logs/HEAD", &bytes, inputs.format, &mut roots, b)?;
+    }
+    if roots.len() > 1024 {
+        return Err("too_many_private_roots");
+    }
+    roots
+        .into_keys()
+        .map(|root| String::from_utf8(root).map_err(|_| "invalid_root"))
+        .collect()
+}
+
 // Sealed retained admin census, not reconstructible from the public report.
 pub(super) struct ApprovalLocal {
     local: Local,

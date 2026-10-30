@@ -563,8 +563,27 @@ fn entire_tree_is_bounded_and_missing_or_orphaned_members_fail_closed() {
     for _ in 16..256 {
         store.register_child(&r, &child(&r)).unwrap();
     }
-    assert!(store.register_child(&r, &child(&r)).is_err(), "child 257");
+    let full = store.run_snapshot(&r.identity().run).unwrap().unwrap();
+    assert_eq!(full.children.len(), 256);
+    assert_eq!(
+        store
+            .register_child(&r, &full.children[255].request)
+            .unwrap(),
+        BeginRun::Existing
+    );
     let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+    let before = ["run_groups", "run_participants", "outbox"].map(|table| table_rows(&sql, table));
+    assert!(
+        matches!(
+            store.register_child(&r, &child(&r)),
+            Err(work_cli::store::StoreError::Invalid)
+        ),
+        "child 257 must refuse on the roster limit, not SQL exhaustion"
+    );
+    assert_eq!(
+        ["run_groups", "run_participants", "outbox"].map(|table| table_rows(&sql, table)),
+        before
+    );
     // Observe the entire outbox without validating the deliberately damaged roster.
     let events = table_rows(&sql, "outbox");
     sql.execute(
@@ -584,6 +603,80 @@ fn entire_tree_is_bounded_and_missing_or_orphaned_members_fail_closed() {
     drop(store);
     assert!(reopen(&dir).is_err(), "orphan must fail schema preflight");
     assert_eq!(table_rows(&sql, "outbox"), events);
+}
+
+#[test]
+fn removal_operations_reserve_child_names_on_admission_and_entire_roster_retry() {
+    use work_cli::store::StoreError;
+
+    for phase in ["intent", "native_succeeded", "removed"] {
+        for acknowledged in [0, 1] {
+            let (dir, mut store, checkout) = fixture();
+            let root = request(checkout);
+            let bound = binding(&root);
+            store.begin_run(&root).unwrap();
+            store.record_bound(&root, &bound).unwrap();
+            store.record_permit_attempt(&root, &bound).unwrap();
+            let collision = child(&root);
+            let control = child(&root);
+            store.register_child(&root, &control).unwrap();
+            let sql = Connection::open(dir.path().join("private/store.sqlite")).unwrap();
+            // Even malformed retained records reserve their operation. A different
+            // checkout avoids the target's removal fence and exercises namespaces.
+            let payload = serde_json::json!({
+                "type": "interactive_removal",
+                "checkout": uuid::Uuid::now_v7(),
+                "operation": collision.run.to_string(),
+                "phase": phase,
+                "record": "{malformed"
+            })
+            .to_string();
+            let insert = || {
+                sql.execute(
+                    "INSERT INTO outbox(version,payload,acknowledged) VALUES(1,?1,?2)",
+                    (&payload, acknowledged),
+                )
+                .unwrap();
+                sql.last_insert_rowid()
+            };
+            let event = insert();
+            let tables = [
+                "checkouts",
+                "writers",
+                "runs",
+                "run_groups",
+                "run_participants",
+                "outbox",
+            ];
+            let before = tables.map(|table| table_rows(&sql, table));
+            assert!(matches!(
+                store.register_child(&root, &collision),
+                Err(StoreError::Conflict)
+            ));
+            assert_eq!(
+                store.register_child(&root, &control).unwrap(),
+                BeginRun::Existing
+            );
+            assert_eq!(tables.map(|table| table_rows(&sql, table)), before);
+
+            sql.execute("DELETE FROM outbox WHERE sequence=?1", [event])
+                .unwrap();
+            store.register_child(&root, &collision).unwrap();
+            insert();
+            let before = tables.map(|table| table_rows(&sql, table));
+            // A collision in any existing child must block fresh admission and
+            // retries of both that child and an otherwise noncolliding sibling.
+            for candidate in [&collision, &control, &child(&root)] {
+                assert!(matches!(
+                    store.register_child(&root, candidate),
+                    Err(StoreError::Invalid)
+                ));
+            }
+            assert!(store.run_snapshot(&root.identity().run).is_err());
+            assert!(store.recovery_runs().is_err());
+            assert_eq!(tables.map(|table| table_rows(&sql, table)), before);
+        }
+    }
 }
 
 #[test]

@@ -3,6 +3,12 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    InteractiveRemoval {
+        checkout: Uuid,
+        operation: Uuid,
+        phase: String,
+        record: String,
+    },
     AttributionGapRecorded {
         checkout: Uuid,
         group: Uuid,

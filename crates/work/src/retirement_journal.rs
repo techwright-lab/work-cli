@@ -241,8 +241,28 @@ pub(crate) fn operation_reserved(conn: &Connection, operation: &str) -> Result<b
         return Ok(false);
     }
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1)",
+        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1) OR EXISTS(SELECT 1 FROM outbox WHERE json_extract(payload,'$.type')='interactive_removal' AND json_extract(payload,'$.operation')=?1)",
         [operation],
+        |r| r.get(0),
+    )?)
+}
+
+/// Check every child in one roster in the caller's existing read snapshot.
+/// The append-only outbox has no operation index: scan it once, probing the
+/// participant primary key, rather than rescanning all events for each child.
+/// EXISTS streams the evidence without collecting historical operation IDs.
+pub(crate) fn participant_operations_reserved(conn: &Connection, group: &str) -> Result<bool> {
+    if schema_version(conn)? < 16 {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT
+        EXISTS(SELECT 1 FROM run_participants p JOIN retirement_intents r ON r.operation=p.id WHERE p.group_id=?1)
+        OR EXISTS(SELECT 1 FROM outbox o
+            WHERE json_extract(o.payload,'$.type')='interactive_removal'
+            AND EXISTS(SELECT 1 FROM run_participants p
+                WHERE p.id=json_extract(o.payload,'$.operation') AND p.group_id=?1))",
+        [group],
         |r| r.get(0),
     )?)
 }
@@ -252,7 +272,7 @@ pub(crate) fn exclude_operation(conn: &Connection, id: Uuid) -> Result<()> {
         return Ok(());
     }
     let reserved: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1 OR checkout=?1)",
+        "SELECT EXISTS(SELECT 1 FROM retirement_intents WHERE operation=?1 OR checkout=?1) OR EXISTS(SELECT 1 FROM outbox WHERE json_extract(payload,'$.type')='interactive_removal' AND json_extract(payload,'$.operation')=?1)",
         [id.to_string()],
         |r| r.get(0),
     )?;
@@ -264,6 +284,9 @@ pub(crate) fn exclude_operation(conn: &Connection, id: Uuid) -> Result<()> {
 }
 
 pub(crate) fn require_unfenced(conn: &Connection, checkout: Uuid) -> Result<()> {
+    if crate::removal_journal::history(conn, checkout)?.is_some() {
+        return Err(StoreError::RetirementFenced);
+    }
     crate::store::SchemaRole::Current17.validate(conn)?;
     crate::quarantine_journal::validate_all(conn)?;
     let active: bool = conn.query_row(
@@ -294,6 +317,9 @@ pub(crate) fn fence<'c>(
     let mut prepared = Vec::new();
     let mut held = false;
     for checkout in &checkouts {
+        if crate::removal_journal::history(&tx, *checkout)?.is_some() {
+            return Err(StoreError::RetirementFenced);
+        }
         // Global admission above has completed in this same IMMEDIATE
         // transaction, with no intervening writes. Strictly decode each scoped
         // history (including tombstones/held rows) before ANY update, without

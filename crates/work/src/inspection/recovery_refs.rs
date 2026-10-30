@@ -11,7 +11,7 @@ use std::{
 };
 
 mod storage;
-mod sync;
+pub(super) mod sync;
 
 type Held<T> = Result<T, &'static str>;
 
