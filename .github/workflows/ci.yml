@@ -3,11 +3,85 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  ci:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.device }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - device: aarch64-linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - name: Cache qualified Git
+        id: qualified-git
+        uses: actions/cache@v4
+        with:
+          path: ~/qualified-git
+          key: git-2.55.0-${{ matrix.runner }}-${{ matrix.target }}
+      - name: Build qualified Git
+        if: steps.qualified-git.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libexpat1-dev libssl-dev zlib1g-dev
+          curl --fail --location --output "$RUNNER_TEMP/git.tar.xz" \
+            https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz
+          echo "457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357  $RUNNER_TEMP/git.tar.xz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/git-source"
+          tar -xJf "$RUNNER_TEMP/git.tar.xz" -C "$RUNNER_TEMP/git-source" --strip-components=1
+          make -C "$RUNNER_TEMP/git-source" -j"$(nproc)" prefix=/usr DESTDIR="$HOME/qualified-git" \
+            NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+      - name: Install qualified Git
+        run: |
+          sudo cp -a --remove-destination "$HOME/qualified-git/usr/." /usr/
+          hash -r
+          test "$(/usr/bin/git --version)" = "git version 2.55.0"
+          test "$(git --version)" = "git version 2.55.0"
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
+  qualification:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -16,12 +90,8 @@ jobs:
         run: docker build -f tools/qualification/Dockerfile -t work-cli-qualification:rust-1.98.1-git-2.55.0 .
       - name: Fetch locked dependencies
         run: tools/qualification/container.sh fetch --locked
-      - name: Format
-        run: tools/qualification/container.sh fmt --all -- --check
       - name: Complete workspace suite
-        run: tools/qualification/container.sh test --workspace --locked -- --test-threads=4
-      - name: Strict all-target Clippy
-        run: tools/qualification/container.sh clippy --workspace --all-targets --locked -- -D warnings
+        run: tools/qualification/container.sh test --workspace --locked --no-fail-fast -- --test-threads=4
       - name: Qualification helper tests
         run: tools/qualification/container.sh -- python3 -m unittest discover -s tests/qualification
       - name: Package supported Linux artifact
@@ -30,5 +100,81 @@ jobs:
         run: tools/qualification/container.sh -- python3 tools/qualification/smoke.py target/dist/work-cli-0.1.0-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: work-cli-linux-x86_64
+          name: work-cli-linux-x86_64-qualified
           path: target/dist/*
+          if-no-files-found: error
+
+  build:
+    name: build (${{ matrix.device }})
+    needs: [lint, test, qualification]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: x86_64-linux
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - device: aarch64-linux
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked -p work-cli --bin work
+      - name: Package
+        run: |
+          name="work-${{ matrix.target }}"
+          mkdir -p "dist/$name/bin" "dist/$name/examples"
+          cp target/release/work "dist/$name/bin/"
+          cp README.md LICENSE "dist/$name/"
+          cp examples/work.toml "dist/$name/examples/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: work-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Publish only the archive exercised by the pinned-container smoke test.
+      # Native matrix builds remain CI coverage, not qualified release assets.
+      - uses: actions/download-artifact@v4
+        with:
+          name: work-cli-linux-x86_64-qualified
+          path: dist
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum --check work-cli-*.tar.gz.sha256
+          gh release create "$GITHUB_REF_NAME" work-cli-*.tar.gz work-cli-*.tar.gz.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+  ci:
+    if: always()
+    needs: [lint, test, qualification, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every job to pass
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          echo "$results"
+          ! echo "$results" | grep -qE '"(failure|cancelled|skipped)"'

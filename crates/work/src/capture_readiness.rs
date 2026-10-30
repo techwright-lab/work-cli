@@ -1866,10 +1866,11 @@ pub(crate) mod tests {
                 .execute("DELETE FROM capture_finalizations", [])
                 .unwrap();
             let producer = &cfg.capture.as_ref().unwrap().executable;
+            // Read-only: a read-write close would checkpoint away the WAL sidecars.
             std::fs::write(producer, format!(r#"#!/usr/bin/python3
-import sqlite3,json,sys
+import sqlite3,json,sys,pathlib
 r=json.load(sys.stdin)
-c=sqlite3.connect("file:"+{database:?}+"?mode=ro", uri=True)
+c=sqlite3.connect(pathlib.Path({database:?}).as_uri()+'?mode=ro', uri=True)
 assert c.execute('SELECT count(*) FROM task_finishes').fetchone()[0]==1
 assert c.execute('SELECT count(*) FROM capture_finalizations').fetchone()[0]==c.execute('SELECT count(*) FROM capture_runs').fetchone()[0]
 p=json.loads(c.execute("SELECT prepared FROM capture_runs WHERE json_extract(prepared,'$.capture_id')=?",(r['capture_id'],)).fetchone()[0])

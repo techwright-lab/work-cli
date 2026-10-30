@@ -12,6 +12,9 @@ or remote-preservation configuration is required.
 The qualified environment is Linux x86_64, Rust 1.98.1, and **Git 2.55.0 at
 `/usr/bin/git`**. Removal refuses other Git versions and unsupported layouts.
 The packaged binary requires glibc 2.36 or newer. Git is a separate prerequisite.
+Tagged releases publish only the x86_64 archive tested in the pinned qualification
+container. Native x86_64 and ARM64 CI builds are additional coverage, not supported
+release artifacts.
 
 Build and test in the disposable qualification container:
 
