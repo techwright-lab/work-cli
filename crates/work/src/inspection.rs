@@ -15,6 +15,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod pack_metadata;
 mod remote_proof;
 pub use remote_proof::{verify_remote, RemoteReport};
 
@@ -1874,11 +1875,22 @@ fn object_storage(
     b: &mut Budget,
 ) -> Result<(), IncompleteReason> {
     let names = m.list(b"objects", b)?;
+    let mut pack_names = BTreeSet::new();
+    let mut info_packs = None;
     for name in names {
         let path = joined(b"objects", &name);
         if name == b"info" {
-            if !m.list(&path, b)?.is_empty() {
-                return Err(IncompleteReason::UnsupportedGit);
+            for entry in m.list(&path, b)? {
+                if entry == b"commit-graphs" {
+                    let graphs = b"objects/info/commit-graphs";
+                    if !m.is_directory(graphs, b)? || !m.list(graphs, b)?.is_empty() {
+                        return Err(IncompleteReason::UnsupportedGit);
+                    }
+                } else if entry == b"packs" {
+                    info_packs = Some(m.required(b"objects/info/packs", b)?);
+                } else {
+                    return Err(IncompleteReason::UnsupportedGit);
+                }
             }
             continue;
         }
@@ -1889,21 +1901,35 @@ fn object_storage(
                 let Some(base) = name.strip_prefix(b"pack-") else {
                     return Err(IncompleteReason::UnsupportedGit);
                 };
-                let (id, suffix) = if let Some(id) = base.strip_suffix(b".pack") {
-                    (id, b".idx".as_slice())
-                } else if let Some(id) = base.strip_suffix(b".idx") {
-                    (id, b".pack".as_slice())
-                } else {
-                    return Err(IncompleteReason::UnsupportedGit);
-                };
+                let id = base
+                    .strip_suffix(b".pack")
+                    .or_else(|| base.strip_suffix(b".idx"))
+                    .or_else(|| base.strip_suffix(b".rev"))
+                    .ok_or(IncompleteReason::UnsupportedGit)?;
                 oid(id, format)?;
-                let mut partner = b"pack-".to_vec();
-                partner.extend(id);
-                partner.extend(suffix);
-                if !set.contains(&partner) {
+                let file = |suffix: &[u8]| {
+                    let mut name = b"pack-".to_vec();
+                    name.extend(id);
+                    name.extend(suffix);
+                    name
+                };
+                let pack_name = file(b".pack");
+                let index_name = file(b".idx");
+                if !set.contains(&pack_name) || !set.contains(&index_name) {
                     return Err(IncompleteReason::UnsupportedGit);
                 }
-                m.required(&joined(&path, &name), b)?;
+                // Read each pair once, with optional auxiliary bytes retained in
+                // the same descriptor manifest, budget and final rechecks.
+                if name == pack_name {
+                    let pack = m.required(&joined(&path, &pack_name), b)?;
+                    let index = m.required(&joined(&path, &index_name), b)?;
+                    let reverse_name = file(b".rev");
+                    if set.contains(&reverse_name) {
+                        let reverse = m.required(&joined(&path, &reverse_name), b)?;
+                        pack_metadata::reverse_index(id, &pack, &index, &reverse, format, b)?;
+                    }
+                    pack_names.insert(pack_name);
+                }
             }
             continue;
         }
@@ -1920,6 +1946,9 @@ fn object_storage(
             oid(&object, format)?;
             m.required(&joined(&path, &file), b)?;
         }
+    }
+    if let Some(info) = info_packs {
+        pack_metadata::pack_list(&info, &pack_names)?;
     }
     Ok(())
 }

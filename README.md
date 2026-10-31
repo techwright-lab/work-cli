@@ -14,6 +14,12 @@ use Rust 1.98.1. Version admission accepts canonical `git version MAJOR.MINOR.PA
 output, including newer minor and major releases. Older versions, prereleases,
 vendor-suffixed or unparseable version strings are refused as `UnsupportedGit`.
 Unsupported repository layouts are still refused regardless of Git version.
+Native packed stores may include validated `.rev` reverse indexes and
+`objects/info/packs`, plus an ordinary empty `objects/info/commit-graphs` directory. Reverse indexes must match their pack/index contents,
+checksums and offset ordering; the pack list must exactly name the current packs.
+Unknown, stale, malformed or replaced metadata still holds. This does not add
+support for remote-HEAD symrefs, bitmaps, multi-pack indexes, nonempty commit-graph
+storage, cruft-pack mtimes or object alternates.
 
 CI tests Git 2.55.0 (the minimum) and 2.56.0. Newer stable versions are accepted,
 not automatically claimed as tested. Version admission never substitutes for

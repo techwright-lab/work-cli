@@ -50,7 +50,34 @@ fn configured_interactive_task_can_start_reuse_list_and_finish() {
 
 #[test]
 fn explicit_removal_retains_commits_and_releases_one_capacity_slot() {
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    // A real clone creates native pack/reverse-index metadata, unlike the
+    // loose-object fixture which previously hid the host-pilot refusal.
+    let cloned = f.temp.path().join("cloned");
+    support::git(
+        f.temp.path(),
+        &[
+            "-c",
+            "pack.writeReverseIndex=true",
+            "clone",
+            "--no-local",
+            "--no-hardlinks",
+            f.repo.to_str().unwrap(),
+            cloned.to_str().unwrap(),
+        ],
+    );
+    f.repo = cloned;
+    // Match the isolated host pilot: no remote HEAD symref or remote routing.
+    support::git(&f.repo, &["remote", "remove", "origin"]);
+    support::git(&f.repo, &["config", "user.name", "Test"]);
+    support::git(&f.repo, &["config", "user.email", "test@example.invalid"]);
+    assert!(std::fs::read_dir(f.repo.join(".git/objects/pack"))
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|e| e == "rev")));
     f.config(1, false);
     let first = json(f.start(&uuid::Uuid::now_v7().to_string(), "first", "first", &[]));
     let id = first["checkout"].as_str().unwrap();

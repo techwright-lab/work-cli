@@ -61,6 +61,142 @@ fn native_sha1_sha256_v2_v3_positive() {
 }
 
 #[test]
+fn native_repack_metadata_is_readonly() {
+    for format in ["sha1", "sha256"] {
+        let mut f = fixture::ManagedFixture::new(format, "2");
+        f.git(&[
+            "-c".as_ref(),
+            "pack.writeReverseIndex=true".as_ref(),
+            "repack".as_ref(),
+            "-ad".as_ref(),
+        ]);
+        // Native maintenance may leave this empty directory even with no graph.
+        fs::create_dir_all(f.repo.join(".git/objects/info/commit-graphs")).unwrap();
+        let pack_dir = f.repo.join(".git/objects/pack");
+        let mut paths: Vec<_> = fs::read_dir(&pack_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert!(paths
+            .iter()
+            .any(|p| p.extension().is_some_and(|e| e == "rev")));
+        paths.push(f.repo.join(".git/objects/info/packs"));
+        let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
+        let events = f.store.pending_events(100).unwrap();
+        let observation = f.inspect(&empty());
+        assert_eq!(
+            observation.coverage(),
+            Coverage::Complete,
+            "{format}: {:?}",
+            observation.reasons()
+        );
+        assert!(observation.findings().is_empty());
+        for (path, bytes) in paths.iter().zip(before) {
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+        assert_eq!(f.store.pending_events(100).unwrap(), events);
+    }
+}
+
+#[test]
+fn auxiliary_pack_metadata_refuses_unsafe_or_unknown_inputs() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    f.git(&[
+        "-c".as_ref(),
+        "pack.writeReverseIndex=true".as_ref(),
+        "repack".as_ref(),
+        "-ad".as_ref(),
+    ]);
+    let pack = f.common().join("objects/pack");
+    let reverse = fs::read_dir(&pack)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "rev"))
+        .unwrap();
+    let info = f.common().join("objects/info/packs");
+    let graphs = f.common().join("objects/info/commit-graphs");
+    let rev_bytes = fs::read(&reverse).unwrap();
+    let info_bytes = fs::read(&info).unwrap();
+    let sentinel = f.temp.path().join("sentinel");
+    fs::write(&sentinel, b"do not read as metadata").unwrap();
+    for case in [
+        "rev-link",
+        "rev-hardlink",
+        "rev-fifo",
+        "info-link",
+        "info-stale",
+        "graphs-link",
+        "graphs-nonempty",
+        "orphan",
+        "unknown",
+    ] {
+        let extra = pack.join(if case == "orphan" {
+            format!("pack-{}.rev", "1".repeat(40))
+        } else {
+            "foreign.bitmap".into()
+        });
+        match case {
+            "rev-link" => {
+                fs::remove_file(&reverse).unwrap();
+                symlink(&sentinel, &reverse).unwrap();
+            }
+            "rev-hardlink" => {
+                fs::remove_file(&reverse).unwrap();
+                fs::hard_link(&sentinel, &reverse).unwrap();
+            }
+            "rev-fifo" => {
+                fs::remove_file(&reverse).unwrap();
+                rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &reverse,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::RUSR,
+                    0,
+                )
+                .unwrap();
+            }
+            "info-link" => {
+                fs::remove_file(&info).unwrap();
+                symlink(&sentinel, &info).unwrap();
+            }
+            "info-stale" => {
+                fs::write(&info, format!("P pack-{}.pack\n\n", "1".repeat(40))).unwrap()
+            }
+            "graphs-link" => symlink(&sentinel, &graphs).unwrap(),
+            "graphs-nonempty" => {
+                fs::create_dir(&graphs).unwrap();
+                fs::write(graphs.join("commit-graph-chain"), b"unsupported graph").unwrap();
+            }
+            "orphan" | "unknown" => fs::write(&extra, b"unrecognized").unwrap(),
+            _ => unreachable!(),
+        }
+        let observation = f.inspect(&empty());
+        assert_eq!(observation.coverage(), Coverage::Incomplete, "{case}");
+        assert_eq!(observation.counters().repository_launches, 0, "{case}");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"do not read as metadata");
+        if case.starts_with("rev-") {
+            fs::remove_file(&reverse).unwrap();
+            fs::write(&reverse, &rev_bytes).unwrap();
+        }
+        if case.starts_with("info-") {
+            fs::remove_file(&info).unwrap();
+            fs::write(&info, &info_bytes).unwrap();
+        }
+        if case == "orphan" || case == "unknown" {
+            fs::remove_file(&extra).unwrap();
+        }
+        if case == "graphs-link" {
+            fs::remove_file(&graphs).unwrap();
+        }
+        if case == "graphs-nonempty" {
+            fs::remove_file(graphs.join("commit-graph-chain")).unwrap();
+            fs::remove_dir(&graphs).unwrap();
+        }
+    }
+    assert_eq!(f.inspect(&empty()).coverage(), Coverage::Complete);
+}
+
+#[test]
 fn raw_names_and_ignored_descendants_are_all_observed() {
     let mut f = fixture::ManagedFixture::new("sha1", "2");
     fs::create_dir_all(f.path(b"cache/empty")).unwrap();
