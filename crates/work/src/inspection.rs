@@ -2185,16 +2185,25 @@ impl GitInputs {
         frame(&mut out, 5, &self.head);
         Sha256::digest(out).to_vec()
     }
+    // Repository-wide preservation retains its original full-envelope policy.
     fn native_read_reservation(&self) -> Result<u64, IncompleteReason> {
-        let size = self
+        self.native_command_read_reservation(&[])
+    }
+    fn native_command_read_reservation(&self, args: &[&str]) -> Result<u64, IncompleteReason> {
+        // Keep the complete retained common store (including packed objects),
+        // private index/admin and checkout .git bytes even for metadata queries.
+        let metadata = self
             .common
             .read_size()
             .checked_add(self.private.read_size())
             .and_then(|n| n.checked_add(self.checkout.read_size()))
-            .and_then(|n| n.checked_add(self.checkout_bytes))
             .ok_or(IncompleteReason::ReadBudget)?;
-        size.checked_mul(self.registrations.len() as u64 + 1)
-            .ok_or(IncompleteReason::ReadBudget)
+        native_command_reservation(
+            args,
+            metadata,
+            self.checkout_bytes,
+            self.registrations.len(),
+        )
     }
     fn fingerprint(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -2344,6 +2353,49 @@ fn check_status(
     }
     Ok(())
 }
+/// Explicit, private command envelopes under git_command's sanitized config.
+/// Metadata queries do not scan checkout payloads. Only worktree listing scans
+/// registration endpoints. Object/status/ignore queries retain the entire store
+/// AND payload envelope. New/unrecognized argv keeps the original full repeated
+/// envelope; matching a command prefix is deliberately insufficient.
+fn native_command_reservation(
+    args: &[&str],
+    metadata: u64,
+    payload: u64,
+    registrations: usize,
+) -> Result<u64, IncompleteReason> {
+    let invalid = IncompleteReason::ReadBudget;
+    let repeated = |bytes: u64| {
+        let count = u64::try_from(registrations)
+            .map_err(|_| invalid)?
+            .checked_add(1)
+            .ok_or(invalid)?;
+        bytes.checked_mul(count).ok_or(invalid)
+    };
+    match args {
+        ["rev-parse", "--show-object-format"]
+        | ["rev-parse", "--verify", "HEAD"]
+        | ["ls-files", "--stage", "-z"]
+        | ["ls-files", "-v", "-z"] => Ok(metadata),
+        ["worktree", "list", "--porcelain", "-z"] => repeated(metadata),
+        ["ls-tree", "-r", "-z", "--full-tree", head]
+            if matches!(head.len(), 40 | 64)
+                && head
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) =>
+        {
+            metadata.checked_add(payload).ok_or(invalid)
+        }
+        ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=matching", "--no-renames", "--ignore-submodules=none"]
+        | ["cat-file", "--batch-check"]
+        | ["cat-file", "--batch"]
+        | ["--no-literal-pathspecs", "check-ignore", "--no-index", "--stdin", "-z", "--verbose", "--non-matching"] => {
+            metadata.checked_add(payload).ok_or(invalid)
+        }
+        _ => repeated(metadata.checked_add(payload).ok_or(invalid)?),
+    }
+}
+
 struct GitProof {
     index: IndexMap,
     tree: IndexMap,
@@ -2370,10 +2422,10 @@ impl GitProof {
                            ignore_exit: bool,
                            b: &mut Budget|
          -> Result<Vec<u8>, IncompleteReason> {
-            // Reserve the entire admitted native input envelope per command,
-            // including repeated ref stores in worktree listing. This is a
-            // conservative charge, NOT measurement of Git's internal reads.
-            let charge = inputs.native_read_reservation()?;
+            // Reserve the exact private command's conservative input envelope
+            // before dispatch. This is NOT measured or kernel-bounded Git I/O;
+            // repeated collections/commands still pay independently.
+            let charge = inputs.native_command_read_reservation(args)?;
             b.reserve(charge)?;
             b.counters.native_input_reserved_bytes += charge;
             let result = git(Some(path), args, input, b)?;

@@ -1,6 +1,88 @@
 //! Test source authored before the corresponding A2/A3 logic. CI-only; no RED/GREEN claim.
 
 #[test]
+fn native_command_envelopes_are_exact_and_unknown_argv_stays_conservative() {
+    let head = "1".repeat(40);
+    for (args, expected) in [
+        (vec!["rev-parse", "--show-object-format"], 10),
+        (vec!["rev-parse", "--verify", "HEAD"], 10),
+        (vec!["ls-files", "--stage", "-z"], 10),
+        (vec!["ls-files", "-v", "-z"], 10),
+        (vec!["worktree", "list", "--porcelain", "-z"], 30),
+        (
+            vec!["ls-tree", "-r", "-z", "--full-tree", head.as_str()],
+            110,
+        ),
+        (vec!["cat-file", "--batch-check"], 110),
+        (vec!["cat-file", "--batch"], 110),
+        (
+            vec![
+                "status",
+                "--porcelain=v2",
+                "-z",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--no-renames",
+                "--ignore-submodules=none",
+            ],
+            110,
+        ),
+        (
+            vec![
+                "--no-literal-pathspecs",
+                "check-ignore",
+                "--no-index",
+                "--stdin",
+                "-z",
+                "--verbose",
+                "--non-matching",
+            ],
+            110,
+        ),
+        (vec!["ls-files", "--stage", "-z", "--eol"], 330),
+        (vec!["rev-parse", "--verify", "HEAD:payload"], 330),
+        (vec!["ls-tree", "-r", "-z", "--full-tree", "HEAD"], 330),
+        (vec!["cat-file", "--filters", "--batch"], 330),
+        (vec!["worktree", "list"], 330),
+        (vec!["future-command"], 330),
+    ] {
+        assert_eq!(
+            native_command_reservation(&args, 10, 100, 2),
+            Ok(expected),
+            "{args:?}"
+        );
+    }
+    assert!(native_command_reservation(&["future-command"], u64::MAX, 1, 2).is_err());
+    assert!(
+        native_command_reservation(&["worktree", "list", "--porcelain", "-z"], u64::MAX, 0, 2)
+            .is_err()
+    );
+    assert!(native_command_reservation(&["cat-file", "--batch"], u64::MAX, 1, 2).is_err());
+}
+
+#[test]
+fn exhausted_native_input_stops_before_child_and_repeats_remain_charged() {
+    for args in [
+        vec!["ls-files", "--stage", "-z"],
+        vec!["cat-file", "--batch"],
+        vec!["future-command"],
+    ] {
+        let charge = native_command_reservation(&args, 10, 100, 2).unwrap();
+        let mut b = Budget::new();
+        b.counters.charged_read_bytes = MAX_CHARGED_BYTES - charge * 2;
+        b.reserve(charge).unwrap();
+        b.reserve(charge).unwrap();
+        assert_eq!(b.counters.charged_read_bytes, MAX_CHARGED_BYTES);
+        assert_eq!(b.reserve(charge), Err(IncompleteReason::ReadBudget));
+        assert_eq!(
+            git_success(None, &["--version"], b"", &mut b).err(),
+            Some(IncompleteReason::ReadBudget)
+        );
+        assert_eq!(b.counters.child_launches, 0);
+    }
+}
+
+#[test]
 fn stable_git_minimum_version_policy() {
     for (version, accepted) in [
         ("git version 2.55.0\n", true),
