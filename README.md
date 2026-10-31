@@ -33,6 +33,15 @@ cruft-pack mtimes or object alternates.
 CI tests Git 2.55.0 (the minimum) and 2.56.0. Newer stable versions are accepted,
 not automatically claimed as tested. Version admission never substitutes for
 fresh repository, object, preservation and removal safety checks.
+
+Inspection keeps a 128 MiB aggregate read-accounting allowance. Exact internal
+metadata queries reserve retained administration/object-store bytes, without
+charging checkout payload they do not scan. Object/status/ignore queries still
+reserve administration plus payload; worktree listing retains repeated
+registration charges. Unknown argv keeps the full repeated envelope. Commands
+and repeated observations are charged independently; these conservative input
+estimates are not measurements or kernel-enforced limits on Git's actual I/O.
+Large repositories can still hold at the existing file/read/output/deadline limits.
 The packaged binary requires glibc 2.36 or newer. Git is a separate prerequisite.
 Tagged releases publish only the x86_64 archive tested in the pinned qualification
 container. Native x86_64 and ARM64 CI builds are additional coverage, not supported

@@ -342,6 +342,42 @@ fn auxiliary_pack_metadata_refuses_unsafe_or_unknown_inputs() {
 }
 
 #[test]
+fn modest_tracked_payload_fits_read_budget_without_hiding_changes() {
+    let mut f = fixture::ManagedFixture::new("sha1", "2");
+    // Four MiB reproduces the real host checkout's failure with one file,
+    // well below the unchanged 16 MiB file and 128 MiB invocation limits.
+    let path = f.path(b"payload");
+    let mut bytes = vec![b'a'; 4 * 1024 * 1024];
+    fs::write(&path, &bytes).unwrap();
+    f.git(&["add".as_ref(), "payload".as_ref()]);
+    f.git(&["commit".as_ref(), "-m".as_ref(), "tracked payload".as_ref()]);
+    let observation = f.inspect(&empty());
+    assert_eq!(
+        observation.coverage(),
+        Coverage::Complete,
+        "{:?}; {:?}",
+        observation.reasons(),
+        observation.counters()
+    );
+    assert!(observation.findings().is_empty());
+    assert!(observation.counters().charged_read_bytes <= 128 * 1024 * 1024);
+    bytes[0] = b'b';
+    fs::write(&path, &bytes).unwrap();
+    let changed = f.inspect(&empty());
+    assert_eq!(
+        changed.coverage(),
+        Coverage::Complete,
+        "{:?}",
+        changed.reasons()
+    );
+    assert!(changed
+        .findings()
+        .iter()
+        .any(|finding| finding.path().as_bytes() == b"payload"));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
 fn raw_names_and_ignored_descendants_are_all_observed() {
     let mut f = fixture::ManagedFixture::new("sha1", "2");
     fs::create_dir_all(f.path(b"cache/empty")).unwrap();
