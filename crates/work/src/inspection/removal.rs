@@ -48,6 +48,13 @@ fn history(store: &Store, checkout: Uuid) -> Result<Option<journal::History>> {
     let _phase = store.sql_phase();
     checked(journal::history(&store.conn, checkout))
 }
+fn incomplete_inspection(reasons: &[IncompleteReason]) -> String {
+    let mut message = format!("inspection incomplete: {reasons:?}");
+    if reasons.contains(&IncompleteReason::UnsupportedGit) {
+        message.push_str("; requires stable Git >=2.55.0 at /usr/bin/git (canonical MAJOR.MINOR.PATCH version) and a supported repository layout");
+    }
+    message
+}
 fn clean(store: &mut Store, checkout: Uuid) -> Result<(Captured, Vec<String>)> {
     let policies = checked(crate::disposal::validate(crate::disposal::PolicyDocument {
         format: 1,
@@ -61,10 +68,7 @@ fn clean(store: &mut Store, checkout: Uuid) -> Result<(Captured, Vec<String>)> {
         None,
     ))?;
     if captured.observation.coverage() != Coverage::Complete {
-        return Err(format!(
-            "inspection incomplete: {:?}",
-            captured.observation.reasons()
-        ));
+        return Err(incomplete_inspection(captured.observation.reasons()));
     }
     if !captured.observation.findings().is_empty() {
         return Err("dirty, untracked or ignored content; commit or move it before removal".into());
@@ -526,6 +530,16 @@ mod tests {
         } else {
             Ok(())
         }
+    }
+    #[test]
+    fn unsupported_git_explains_minimum_without_mislabeling_other_holds() {
+        let message = incomplete_inspection(&[IncompleteReason::UnsupportedGit]);
+        assert!(message.contains("stable Git >=2.55.0"), "{message}");
+        assert!(message.contains("supported repository layout"), "{message}");
+        assert_eq!(
+            incomplete_inspection(&[IncompleteReason::Changed]),
+            "inspection incomplete: [Changed]"
+        );
     }
     #[test]
     fn cli_child() {

@@ -21,6 +21,12 @@ fn empty() -> work_cli::disposal::ValidatedPolicies {
 
 #[test]
 fn native_sha1_sha256_v2_v3_positive() {
+    let git_version = std::process::Command::new("/usr/bin/git")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(git_version.status.success());
+    let git_version = String::from_utf8(git_version.stdout).unwrap();
     for (format, version) in [
         ("sha1", "2"),
         ("sha1", "3"),
@@ -47,7 +53,7 @@ fn native_sha1_sha256_v2_v3_positive() {
             observation.reasons()
         );
         assert!(observation.findings().is_empty());
-        assert_eq!(observation.git_version(), Some("git version 2.55.0"));
+        assert_eq!(observation.git_version(), Some(git_version.trim_end()));
         assert_eq!(before, fs::read(f.private().join("index")).unwrap());
         assert_eq!(events, f.store.pending_events(100).unwrap());
         assert_eq!(f.store.charged(&f.repo, None).unwrap(), 1);
