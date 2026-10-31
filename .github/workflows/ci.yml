@@ -108,7 +108,7 @@ jobs:
       - name: Package supported Linux artifact
         run: tools/qualification/container.sh -- tools/package-linux.sh
       - name: Artifact workflow smoke
-        run: tools/qualification/container.sh -- python3 tools/qualification/smoke.py target/dist/work-cli-0.1.0-linux-x86_64.tar.gz
+        run: tools/qualification/container.sh -- python3 tools/qualification/smoke.py target/dist/work-cli-0.1.1-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
