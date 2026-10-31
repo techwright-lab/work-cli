@@ -6,27 +6,32 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct IsolatedRoot {
     root: PathBuf,
+    _owned: tempfile::TempDir,
 }
 
 impl IsolatedRoot {
     fn new() -> Self {
-        let unique = format!(
-            "work-cli-contract-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        );
-        let root = std::env::temp_dir().join(unique);
+        Self::with_prefix("work-cli-contract-")
+    }
+
+    fn with_prefix(prefix: &str) -> Self {
+        // Atomically reserve an owned directory; clock resolution and thread
+        // scheduling must never let two tests share a cleanup boundary.
+        let owned = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("reserve isolated root");
+        let root = owned.path().to_path_buf();
         for dir in ["home", "config", "data", "state", "cache", "tmp", "cwd"] {
             fs::create_dir_all(root.join(dir)).expect("create isolated dir");
         }
-        Self { root }
+        Self {
+            root,
+            _owned: owned,
+        }
     }
 
     fn cwd(&self) -> PathBuf {
@@ -37,12 +42,6 @@ impl IsolatedRoot {
         let mut out = BTreeSet::new();
         collect_relative(&self.root, &self.root, &mut out);
         out
-    }
-}
-
-impl Drop for IsolatedRoot {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -97,6 +96,23 @@ fn combined(output: &Output) -> String {
     let mut text = stdout_str(output);
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     text
+}
+
+#[test]
+fn identical_sandbox_name_inputs_cannot_share_or_delete_another_fixture() {
+    let prefix = format!("work-cli-contract-collision-{}", std::process::id());
+    let first = IsolatedRoot::with_prefix(&prefix);
+    let second = IsolatedRoot::with_prefix(&prefix);
+    let before = second.snapshot();
+    assert!(!before.is_empty());
+    drop(first);
+    assert_eq!(
+        second.snapshot(),
+        before,
+        "one fixture removed another fixture's directory"
+    );
+    let output = run_work(&second, &["status"]);
+    assert!(output.status.success(), "{:?}", output);
 }
 
 #[test]
