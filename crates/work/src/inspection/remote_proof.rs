@@ -1131,7 +1131,10 @@ fn bare_manifest(path: &Path, format: ObjectFormat, b: &mut Budget) -> Held<file
     ] {
         input(manifest.absent(name, b))?;
     }
-    input(object_storage(&mut manifest, format, b))?;
+    if input(object_storage(&mut manifest, format, b))? {
+        input(super::commit_graph::verify(path, manifest.read_size(), b))?;
+        input(manifest.recheck(b))?;
+    }
     let mut refs = match input(manifest.optional(b"packed-refs", b))? {
         Some(bytes) => input(packed_refs(&bytes, format))?,
         None => BTreeMap::new(),

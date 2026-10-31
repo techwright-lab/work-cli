@@ -15,11 +15,20 @@ output, including newer minor and major releases. Older versions, prereleases,
 vendor-suffixed or unparseable version strings are refused as `UnsupportedGit`.
 Unsupported repository layouts are still refused regardless of Git version.
 Native packed stores may include validated `.rev` reverse indexes and
-`objects/info/packs`, plus an ordinary empty `objects/info/commit-graphs` directory. Reverse indexes must match their pack/index contents,
-checksums and offset ordering; the pack list must exactly name the current packs.
-Unknown, stale, malformed or replaced metadata still holds. This does not add
-support for remote-HEAD symrefs, bitmaps, multi-pack indexes, nonempty commit-graph
-storage, cruft-pack mtimes or object alternates.
+`objects/info/packs`. Standalone commit graphs and split commit-graph chains
+are also admitted within the existing file/read limits, at most 64 layers and
+4,096 total graph commits. Graphs require valid checksums, bounded known chunks,
+exact chain/base bindings and native read-only verification against commit
+objects. Ordinary proof commands disable commit-graph acceleration; verified
+graph metadata never replaces object evidence. Bloom-filter/unknown graph
+extensions, simultaneous standalone/nonempty split storage and stale extra
+chain files hold. An ordinary empty graph directory is supported.
+
+Reverse indexes must match their pack/index contents, checksums and offset
+ordering; the pack list must exactly name the current packs. Unknown, stale,
+malformed or replaced metadata still holds. This does not add support for
+remote-HEAD symrefs, bitmaps, multi-pack indexes, Bloom-filter graph chunks,
+cruft-pack mtimes or object alternates.
 
 CI tests Git 2.55.0 (the minimum) and 2.56.0. Newer stable versions are accepted,
 not automatically claimed as tested. Version admission never substitutes for

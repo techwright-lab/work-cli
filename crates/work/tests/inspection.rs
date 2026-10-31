@@ -99,6 +99,151 @@ fn native_repack_metadata_is_readonly() {
 }
 
 #[test]
+fn native_commit_graphs_are_verified_without_mutation() {
+    for format in ["sha1", "sha256"] {
+        let mut f = fixture::ManagedFixture::new(format, "2");
+        // Exercise one standalone graph and a genuine two-layer split chain.
+        for split in [false, true] {
+            if split {
+                fs::remove_file(f.common().join("objects/info/commit-graph")).unwrap();
+            }
+            let mut args = vec![
+                "commit-graph".as_ref(),
+                "write".as_ref(),
+                "--reachable".as_ref(),
+            ];
+            if split {
+                args.push("--split=no-merge".as_ref());
+            }
+            f.git(&args);
+            f.git(&[
+                "commit".as_ref(),
+                "--allow-empty".as_ref(),
+                "-m".as_ref(),
+                "second".as_ref(),
+            ]);
+            f.git(&args);
+            let info = f.common().join("objects/info");
+            let paths: Vec<_> = if split {
+                fs::read_dir(info.join("commit-graphs"))
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect()
+            } else {
+                vec![info.join("commit-graph")]
+            };
+            if split {
+                assert_eq!(paths.len(), 3);
+            }
+            let before: Vec<_> = paths.iter().map(|p| fs::read(p).unwrap()).collect();
+            let observation = f.inspect(&empty());
+            assert_eq!(
+                observation.coverage(),
+                Coverage::Complete,
+                "{format}/split={split}: {:?}",
+                observation.reasons()
+            );
+            for (path, bytes) in paths.iter().zip(before) {
+                assert_eq!(fs::read(path).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn commit_graph_corruption_and_semantic_mismatches_hold() {
+    for format in ["sha1", "sha256"] {
+        let mut f = fixture::ManagedFixture::new(format, "2");
+        f.git(&[
+            "commit-graph".as_ref(),
+            "write".as_ref(),
+            "--reachable".as_ref(),
+        ]);
+        let path = f.common().join("objects/info/commit-graph");
+        let bytes = fs::read(&path).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let width = if format == "sha1" { 20 } else { 32 };
+        let data = (0..bytes[6] as usize)
+            .find_map(|i| {
+                let at = 8 + i * 12;
+                (&bytes[at..at + 4] == b"CDAT").then(|| {
+                    u64::from_be_bytes(bytes[at + 4..at + 12].try_into().unwrap()) as usize
+                })
+            })
+            .unwrap();
+        for case in [
+            "checksum",
+            "offset",
+            "duplicate-chunk",
+            "hash",
+            "parent",
+            "tree",
+        ] {
+            let mut bad = bytes.clone();
+            match case {
+                "checksum" => bad[0] ^= 1,
+                "offset" => bad[12..20].copy_from_slice(&u64::MAX.to_be_bytes()),
+                "duplicate-chunk" => {
+                    let id = bad[8..12].to_vec();
+                    bad[20..24].copy_from_slice(&id);
+                }
+                "hash" => bad[5] = 0,
+                "parent" => bad[data + width..data + width + 4]
+                    .copy_from_slice(&0xffff_ffffu32.to_be_bytes()),
+                // Keep the envelope valid, but disagree with the actual commit.
+                "tree" => bad[data] ^= 1,
+                _ => unreachable!(),
+            }
+            if case != "checksum" {
+                let file = f.temp.path().join("checksum-input");
+                fs::write(&file, &bad[..bad.len() - width]).unwrap();
+                let hash = if format == "sha1" {
+                    let output = std::process::Command::new("/usr/bin/sha1sum")
+                        .arg(&file)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    String::from_utf8(output.stdout).unwrap()[..40].to_string()
+                } else {
+                    let output = std::process::Command::new("/usr/bin/sha256sum")
+                        .arg(&file)
+                        .output()
+                        .unwrap();
+                    assert!(output.status.success());
+                    String::from_utf8(output.stdout).unwrap()[..64].to_string()
+                };
+                let digest: Vec<_> = (0..hash.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hash[i..i + 2], 16).unwrap())
+                    .collect();
+                let end = bad.len() - width;
+                bad[end..].copy_from_slice(&digest);
+            }
+            fs::write(&path, &bad).unwrap();
+            let observation = f.inspect(&empty());
+            assert_eq!(
+                observation.coverage(),
+                Coverage::Incomplete,
+                "{format}/{case}"
+            );
+            if case == "tree" {
+                assert!(observation.counters().repository_launches > 0);
+            } else {
+                assert_eq!(
+                    observation.counters().repository_launches,
+                    0,
+                    "{format}/{case}"
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), bad);
+        }
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(f.inspect(&empty()).coverage(), Coverage::Complete);
+    }
+}
+
+#[test]
 fn auxiliary_pack_metadata_refuses_unsafe_or_unknown_inputs() {
     let mut f = fixture::ManagedFixture::new("sha1", "2");
     f.git(&[

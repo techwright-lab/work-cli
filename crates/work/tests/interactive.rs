@@ -78,6 +78,10 @@ fn explicit_removal_retains_commits_and_releases_one_capacity_slot() {
             .path()
             .extension()
             .is_some_and(|e| e == "rev")));
+    support::git(
+        &f.repo,
+        &["commit-graph", "write", "--reachable", "--split=no-merge"],
+    );
     f.config(1, false);
     let first = json(f.start(&uuid::Uuid::now_v7().to_string(), "first", "first", &[]));
     let id = first["checkout"].as_str().unwrap();
