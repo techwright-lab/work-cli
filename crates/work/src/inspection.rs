@@ -90,6 +90,36 @@ pub enum IncompleteReason {
     InvalidObject,
     ContextConflict,
 }
+/// Version admission is a compatibility floor, not proof of repository safety.
+/// Accept canonical stable releases only; every existing physical/layout check
+/// still runs. Vendor suffixes and prereleases need an explicit parsing policy.
+fn require_supported_git_version(output: &[u8]) -> Result<(), IncompleteReason> {
+    let invalid = IncompleteReason::UnsupportedGit;
+    let version = output
+        .strip_prefix(b"git version ")
+        .and_then(|v| v.strip_suffix(b"\n"))
+        .ok_or(invalid)?;
+    let mut components = version.split(|c| *c == b'.');
+    let mut numbers = [0u32; 3];
+    for number in &mut numbers {
+        let digits = components.next().ok_or(invalid)?;
+        if digits.is_empty()
+            || !digits.iter().all(u8::is_ascii_digit)
+            || (digits.len() > 1 && digits[0] == b'0')
+        {
+            return Err(invalid);
+        }
+        *number = std::str::from_utf8(digits)
+            .map_err(|_| invalid)?
+            .parse()
+            .map_err(|_| invalid)?;
+    }
+    if components.next().is_some() || numbers < [2, 55, 0] {
+        return Err(invalid);
+    }
+    Ok(())
+}
+
 /// Exact file observations and conservative directory charges are distinct.
 /// No exact directory-byte metric is available from RawDir.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2081,11 +2111,7 @@ impl GitInputs {
                 b.git_version = std::str::from_utf8(value).ok().map(str::to_owned);
             }
         }
-        // Only the source-qualified version is admitted, never inferred from a
-        // broadly compatible major/minor. Isolated CI must provide this Git.
-        if version != b"git version 2.55.0\n" {
-            return Err(IncompleteReason::UnsupportedGit);
-        }
+        require_supported_git_version(&version)?;
         let result = Self {
             common,
             private,

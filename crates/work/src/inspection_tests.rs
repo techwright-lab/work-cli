@@ -1,6 +1,36 @@
 //! Test source authored before the corresponding A2/A3 logic. CI-only; no RED/GREEN claim.
 
 #[test]
+fn stable_git_minimum_version_policy() {
+    for (version, accepted) in [
+        ("git version 2.55.0\n", true),
+        ("git version 2.55.1\n", true),
+        ("git version 2.56.0\n", true),
+        ("git version 2.100.0\n", true),
+        ("git version 3.0.0\n", true),
+        ("git version 2.54.9\n", false),
+        ("git version 1.99.99\n", false),
+        ("git version 2.55.0-rc0\n", false),
+        ("git version 2.56.0.rc1\n", false),
+        ("git version 2.56.0.windows.1\n", false),
+        ("git version 2.56\n", false),
+        ("git version 02.56.0\n", false),
+        ("git version 2.+56.0\n", false),
+        ("git version 2.4294967296.0\n", false),
+        ("git version 2.56.0\nextra\n", false),
+        ("git version 2.56.0", false),
+        ("unknown\n", false),
+    ] {
+        let result = require_supported_git_version(version.as_bytes());
+        assert_eq!(result.is_ok(), accepted, "{version:?}");
+        if !accepted {
+            assert_eq!(result, Err(IncompleteReason::UnsupportedGit));
+        }
+    }
+    assert!(require_supported_git_version(b"git version 2.56.\xff\n").is_err());
+}
+
+#[test]
 fn sha1_index_and_blob_known_vectors() {
     for (input, expected) in [
         (b"".as_slice(), "da39a3ee5e6b4b0d3255bfef95601890afd80709"),

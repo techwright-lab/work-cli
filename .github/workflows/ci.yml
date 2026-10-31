@@ -82,12 +82,23 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
 
   qualification:
+    name: qualification (Git ${{ matrix.git }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - git: '2.55.0'
+            artifact: work-cli-linux-x86_64-qualified
+          - git: '2.56.0'
+            artifact: work-cli-linux-x86_64-git-2.56.0
+    env:
+      WORK_QUALIFICATION_GIT_VERSION: ${{ matrix.git }}
     steps:
       - uses: actions/checkout@v4
       - name: Build pinned Linux qualification environment
-        run: docker build -f tools/qualification/Dockerfile -t work-cli-qualification:rust-1.98.1-git-2.55.0 .
+        run: docker build --build-arg GIT_VERSION="$WORK_QUALIFICATION_GIT_VERSION" -f tools/qualification/Dockerfile -t "work-cli-qualification:rust-1.98.1-git-$WORK_QUALIFICATION_GIT_VERSION" .
       - name: Fetch locked dependencies
         run: tools/qualification/container.sh fetch --locked
       - name: Complete workspace suite
@@ -100,7 +111,7 @@ jobs:
         run: tools/qualification/container.sh -- python3 tools/qualification/smoke.py target/dist/work-cli-0.1.0-linux-x86_64.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: work-cli-linux-x86_64-qualified
+          name: ${{ matrix.artifact }}
           path: target/dist/*
           if-no-files-found: error
 

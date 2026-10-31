@@ -9,8 +9,15 @@ or remote-preservation configuration is required.
 
 ## Requirements and build
 
-The qualified environment is Linux x86_64, Rust 1.98.1, and **Git 2.55.0 at
-`/usr/bin/git`**. Removal refuses other Git versions and unsupported layouts.
+Requires Linux x86_64 and **stable Git ≥2.55.0 at `/usr/bin/git`**; source builds
+use Rust 1.98.1. Version admission accepts canonical `git version MAJOR.MINOR.PATCH`
+output, including newer minor and major releases. Older versions, prereleases,
+vendor-suffixed or unparseable version strings are refused as `UnsupportedGit`.
+Unsupported repository layouts are still refused regardless of Git version.
+
+CI tests Git 2.55.0 (the minimum) and 2.56.0. Newer stable versions are accepted,
+not automatically claimed as tested. Version admission never substitutes for
+fresh repository, object, preservation and removal safety checks.
 The packaged binary requires glibc 2.36 or newer. Git is a separate prerequisite.
 Tagged releases publish only the x86_64 archive tested in the pinned qualification
 container. Native x86_64 and ARM64 CI builds are additional coverage, not supported
@@ -26,6 +33,12 @@ tools/qualification/container.sh test --workspace --locked -- --test-threads=4
 tools/qualification/container.sh clippy --workspace --all-targets --locked -- -D warnings
 tools/qualification/container.sh -- tools/package-linux.sh
 ```
+
+To exercise the same suite with Git 2.56.0, build the qualification image with
+`--build-arg GIT_VERSION=2.56.0` and tag it
+`work-cli-qualification:rust-1.98.1-git-2.56.0`, then prefix the container commands
+with `WORK_QUALIFICATION_GIT_VERSION=2.56.0`. This test-only selector does not alter
+the installed Git or the product's fixed `/usr/bin/git` executable.
 
 Archives and SHA-256 checksums appear in `target/dist/`. Extract an archive and
 put its `bin/work` on your PATH. Nothing in these scripts installs a host binary
