@@ -3,9 +3,30 @@
 `work` manages Git worktrees for interactive agent tasks. Create or reuse a
 checkout, run your agent there, then explicitly finish and remove it.
 
-The v0.1 workflow is `start → status → finish → remove`. Agents run in your
+The interactive workflow is `start → status → finish → remove`. Agents run in your
 terminal or editor. No process supervisor, capture service, background cleanup,
 or remote-preservation configuration is required.
+
+## Install, update and agent setup
+
+See [the distribution runbook](docs/distribution.md) for verified downloads,
+user-scoped installation, updates, rollback and maintainer publication gates.
+The v0.2.4 package includes the `work-install` helper (Python 3.11+) and the
+portable [work-cli agent skill](skills/work-cli/SKILL.md).
+
+From a reviewed checkout/tag, install a published version with:
+
+```sh
+python3 tools/work_install.py install --version v0.2.4 \
+  --skills-dir "$HOME/.agents/skills" --skills-dir "$HOME/.claude/skills"
+# After stopping Work operations, upgrade explicitly:
+work-install update --version latest --confirm-stopped
+```
+
+Only published releases can be downloaded. A version-bump PR is not a release.
+The helper preserves existing authority/state, refuses foreign binary/skill targets,
+verifies archive checksum and binary version, and keeps previous versions.
+Reload the agent's skill catalog after registration; discovery paths vary by agent.
 
 ## Requirements and build
 
