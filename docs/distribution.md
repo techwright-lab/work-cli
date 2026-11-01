@@ -48,24 +48,39 @@ a schema downgrade, authority repair, identity rebinding or quota release. Do no
 mix a direct installation with the optional helper's managed links without an
 explicit ownership migration.
 
-## Optional agent skill, without a repository checkout
+## Install the agent skill directly from the binary
 
-Download and checksum-verify the full release bundle. Extract it to a permanent
-user-owned location, then link its `skills/work-cli` directory into the agent's
-documented discovery directory. Preserve existing targets; plain `ln -s` refuses
-collisions instead of overwriting them. For example, after extracting the bundle:
+After installing the v0.2.0+ executable, choose one registration command:
 
 ```sh
-mkdir -p "$HOME/.agents/skills"
-ln -s /absolute/permanent/work-cli-0.2.0-linux-x86_64/skills/work-cli \
-  "$HOME/.agents/skills/work-cli"
+work skill install          # standard ~/.agents/skills discovery
+work skill install --all    # also ~/.claude/skills and ~/.codex/skills
 ```
 
-Keep the complete bundle so the skill's relative references remain valid.
-`.agents/skills` is standard Agent Skills discovery; Claude Code uses
-`.claude/skills`. Reload/restart agent catalogs. Other agents can read SKILL.md
-explicitly or use project guidance that points to it. Portable instructions are
-not a universal hook or automatic invocation guarantee.
+The binary embeds SKILL.md, its setup reference and this runbook. Registration
+needs no Python, Git, network, source checkout or extracted bundle. It creates a
+content-addressed snapshot under `${XDG_DATA_HOME:-$HOME/.local/share}/work-cli`,
+then registers links through `skill-current`. Old snapshots remain. Repeating the
+command verifies the cached snapshot instead of overwriting changed instructions.
+After a direct binary update, rerun registration to select that binary's skill.
+
+Registration preserves unrelated targets, rejects symlinked installation
+directories, and shares its lock and managed-link layout with the optional helper.
+`--all` preflights all targets before changing active skill links; resolve any
+conflict explicitly rather than forcing replacement. Errors after activation
+require checking current links before retrying. This is cooperative user-scoped
+installation, not hostile-same-UID containment or power-loss certification.
+
+Only this explicit command installs skills. Help, version, status and task
+commands do not register them implicitly. Work configuration, authorities,
+checkouts and capacity are untouched. The command needs HOME for discovery and
+uses XDG_DATA_HOME for snapshots; paths must be absolute, UTF-8 user-owned directories.
+
+Reload/restart agent catalogs after registration. `.agents/skills` is standard
+Agent Skills discovery; Claude Code uses `.claude/skills`. Other agents can read
+the installed SKILL.md explicitly or use project routing. Portable instructions
+are not a universal hook or automatic invocation guarantee. Pre-v0.2.0 binaries
+can register the skill from a permanently retained full bundle instead.
 
 ## Optional managed installation and updater
 
@@ -145,7 +160,8 @@ Finish, preview and operator-confirmed removal remain separate steps.
    Run tools/release_version.py and qualify both tested Git versions: full locked
    Rust tests, formatting, strict Clippy, Python helpers, packaging and smoke.
    Smoke proves the standalone binary is byte-identical to the tested bundle CLI,
-   verifies both version/checksum and optional package/helper/skill installation.
+   verifies native skill registration with no Python/Git on PATH before bundle
+   extraction, then checks optional helper interoperability and retained snapshots.
 3. Merge and require green exact-SHA main CI, including ARM64, both qualifications,
    builds and CodeQL. Fetch origin; verify the selected clean release HEAD equals
    that tested origin/main. Passing results from an older SHA do not qualify it.

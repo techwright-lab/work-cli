@@ -25,10 +25,20 @@ below. Standalone assets arrive with v0.2.0 after publication; existing releases
 already include the native executable at `bin/work` inside their release archive.
 A version-bump PR is not a published release.
 
-The full bundle optionally includes the portable [agent skill](skills/work-cli/SKILL.md)
-and Python `work-install` helper for managed updates/rollback. Neither is required
-to run the CLI. See [download, install, update and release instructions](docs/distribution.md)
-for skill registration, direct binary updates and the optional helper. Preserve an
+Install the [agent skill](skills/work-cli/SKILL.md) directly from the binary:
+
+```sh
+work skill install          # ~/.agents/skills/work-cli
+work skill install --all    # also ~/.claude/skills and ~/.codex/skills
+```
+
+Choose one command. The skill and its references are embedded: no Python, bundle
+or repository checkout is needed. Registration is explicit, preserves unrelated
+skills and keeps old snapshots. Reload your agent's skill catalog afterward.
+
+The optional full bundle includes a Python `work-install` helper for managed
+updates/rollback. See [download, install, update and release instructions](docs/distribution.md)
+for direct binary updates, native skill registration and the optional helper. Preserve an
 existing installation until its ownership/update method is known; do not overwrite
 an installer-managed link with the direct-install command.
 
