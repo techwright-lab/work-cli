@@ -8,9 +8,10 @@
    `work --version`. Use `bin/work` from the release bundle when that release
    predates the standalone asset. Keep repository cloning, Rust builds and Python
    out of the ordinary binary-install path.
-4. Register the portable skill from a permanently retained release bundle in the
-   target agent's documented discovery directory. Use `.agents/skills` for standard
-   Agent Skills discovery and `.claude/skills` for Claude Code. Preserve existing
+4. For v0.2.0+ binaries, register embedded instructions with `work skill install`
+   for standard `.agents/skills` discovery; use `--all` for the operator-selected
+   inclusion of `.claude/skills` and `.codex/skills`. For binaries without this
+   command, register from a permanently retained release bundle. Preserve unrelated
    targets and ask the operator to resolve conflicts. Reload the skill catalog.
 5. Offer the bundled Python `work-install` helper only for operator-selected
    managed updates, rollback or instruction snapshots. For an existing managed

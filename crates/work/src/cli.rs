@@ -35,6 +35,11 @@ enum Command {
         #[command(subcommand)]
         command: crate::adopted::Command,
     },
+    /// Install embedded agent instructions without Python or a source checkout
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
     /// Reserve and create a configured checkout; does not launch a writer
     Start(crate::allocate::Start),
     /// Preview removal of a finished interactive checkout; branches are retained
@@ -125,6 +130,16 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Register the bundled skill in ~/.agents/skills; preserves unrelated targets
+    Install {
+        /// Also register in ~/.claude/skills and ~/.codex/skills
+        #[arg(long)]
+        all: bool,
+    },
+}
+
 /// Parse arguments and dispatch. Help/version parsing is read-only.
 pub fn run() {
     // Parse the private entry point without Clap diagnostics echoing sensitive argv.
@@ -177,6 +192,18 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Cli::parse_from(argv)
     };
     match cli.command {
+        Command::Skill {
+            command: SkillCommand::Install { all },
+        } => match crate::skill_install::install(all) {
+            Ok(report) => println!(
+                "{}",
+                serde_json::to_string(&report).expect("skill report serialization")
+            ),
+            Err(reason) => {
+                eprintln!("skill installation held: {reason}; no Work authority modified");
+                std::process::exit(1);
+            }
+        },
         Command::Remove {
             checkout,
             confirm_stopped,
