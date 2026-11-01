@@ -7,26 +7,30 @@ The interactive workflow is `start → status → finish → remove`. Agents run
 terminal or editor. No process supervisor, capture service, background cleanup,
 or remote-preservation configuration is required.
 
-## Install, update and agent setup
+## Download the binary
 
-See [the distribution runbook](docs/distribution.md) for verified downloads,
-user-scoped installation, updates, rollback and maintainer publication gates.
-The v0.2.4 package includes the `work-install` helper (Python 3.11+) and the
-portable [work-cli agent skill](skills/work-cli/SKILL.md).
-
-From a reviewed checkout/tag, install a published version with:
+Get `work-0.2.0-linux-x86_64` and its `.sha256` file from
+[GitHub Releases](https://github.com/techwright-lab/work-cli/releases). For a fresh
+installation:
 
 ```sh
-python3 tools/work_install.py install --version v0.2.4 \
-  --skills-dir "$HOME/.agents/skills" --skills-dir "$HOME/.claude/skills"
-# After stopping Work operations, upgrade explicitly:
-work-install update --version latest --confirm-stopped
+mkdir -p "$HOME/.local/bin"
+sha256sum --check work-0.2.0-linux-x86_64.sha256 &&
+  install -m 755 work-0.2.0-linux-x86_64 "$HOME/.local/bin/work" &&
+  work --version
 ```
 
-Only published releases can be downloaded. A version-bump PR is not a release.
-The helper preserves existing authority/state, refuses foreign binary/skill targets,
-verifies archive checksum and binary version, and keeps previous versions.
-Reload the agent's skill catalog after registration; discovery paths vary by agent.
+**No repository clone, Rust or Python is required.** Keep Git installed as described
+below. Standalone assets arrive with v0.2.0 after publication; existing releases
+already include the native executable at `bin/work` inside their release archive.
+A version-bump PR is not a published release.
+
+The full bundle optionally includes the portable [agent skill](skills/work-cli/SKILL.md)
+and Python `work-install` helper for managed updates/rollback. Neither is required
+to run the CLI. See [download, install, update and release instructions](docs/distribution.md)
+for skill registration, direct binary updates and the optional helper. Preserve an
+existing installation until its ownership/update method is known; do not overwrite
+an installer-managed link with the direct-install command.
 
 ## Requirements and build
 
@@ -64,9 +68,9 @@ and repeated observations are charged independently; these conservative input
 estimates are not measurements or kernel-enforced limits on Git's actual I/O.
 Large repositories can still hold at the existing file/read/output/deadline limits.
 The packaged binary requires glibc 2.36 or newer. Git is a separate prerequisite.
-Tagged releases publish only the x86_64 archive tested in the pinned qualification
-container. Native x86_64 and ARM64 CI builds are additional coverage, not supported
-release artifacts.
+Tagged releases publish the qualified x86_64 executable, its full bundle and their
+checksums. Smoke tests prove both contain identical binary bytes. Native x86_64
+and ARM64 CI builds are additional coverage, not supported release artifacts.
 
 Build and test in the disposable qualification container:
 
@@ -85,8 +89,8 @@ To exercise the same suite with Git 2.56.0, build the qualification image with
 with `WORK_QUALIFICATION_GIT_VERSION=2.56.0`. This test-only selector does not alter
 the installed Git or the product's fixed `/usr/bin/git` executable.
 
-Archives and SHA-256 checksums appear in `target/dist/`. Extract an archive and
-put its `bin/work` on your PATH. Nothing in these scripts installs a host binary
+Standalone executables, full bundles and SHA-256 checksums appear in `target/dist/`.
+Install the executable directly or extract a bundle's `bin/work` onto your PATH. Nothing in these scripts installs a host binary
 or uses a live work registry. Tests create their own disposable repositories.
 
 For a source build on a supported host: `cargo build --release --locked -p work-cli`.

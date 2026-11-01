@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Extract the built archive and complete two disposable tasks at quota one."""
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -10,11 +11,16 @@ import tomllib
 workspace = Path(__file__).resolve().parents[2]
 version = tomllib.loads((workspace / "Cargo.toml").read_text())["workspace"]["package"]["version"]
 archive = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else workspace / "target/dist" / f"work-cli-{version}-linux-x86_64.tar.gz"
+standalone = archive.parent / f"work-{version}-linux-x86_64"
+assert standalone.is_file(), "Missing standalone release binary"
+assert standalone.with_name(standalone.name + ".sha256").read_text() == f"{hashlib.sha256(standalone.read_bytes()).hexdigest()}  {standalone.name}\n"
+assert subprocess.check_output([str(standalone), "--version"], text=True) == f"work {version}\n"
 with tempfile.TemporaryDirectory(prefix="work-release-smoke-") as scratch:
     base = Path(scratch)
     subprocess.run(["tar", "-xzf", str(archive), "-C", str(base)], check=True)
     binaries = list(base.glob("work-cli-*/bin/work"))
     assert len(binaries) == 1
+    assert hashlib.sha256(binaries[0].read_bytes()).digest() == hashlib.sha256(standalone.read_bytes()).digest(), "Standalone binary differs from qualified bundle"
     repo, root = base / "repo", base / "root"
     repo.mkdir()
     root.mkdir()

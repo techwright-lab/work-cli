@@ -24,3 +24,7 @@ cp docs/distribution.md "$work_cli_stage/$work_cli_name/docs/"
 cp -R skills "$work_cli_stage/$work_cli_name/"
 tar -C "$work_cli_stage" -czf "target/dist/$work_cli_name.tar.gz" "$work_cli_name"
 (cd target/dist && sha256sum "$work_cli_name.tar.gz" > "$work_cli_name.tar.gz.sha256")
+# Publish the exact same qualified executable separately for binary-only users.
+work_cli_binary="work-$work_cli_version-linux-x86_64"
+install -m 755 "$work_cli_target/release/work" "target/dist/$work_cli_binary"
+(cd target/dist && sha256sum "$work_cli_binary" > "$work_cli_binary.sha256")

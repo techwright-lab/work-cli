@@ -177,8 +177,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          sha256sum --check work-cli-*.tar.gz.sha256
-          gh release create "$GITHUB_REF_NAME" work-cli-*.tar.gz work-cli-*.tar.gz.sha256 \
+          version="${GITHUB_REF_NAME#v}"
+          binary="work-$version-linux-x86_64"
+          bundle="work-cli-$version-linux-x86_64.tar.gz"
+          sha256sum --check "$binary.sha256" "$bundle.sha256"
+          gh release create "$GITHUB_REF_NAME" "$binary" "$binary.sha256" "$bundle" "$bundle.sha256" \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
 
   ci:
