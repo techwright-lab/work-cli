@@ -34,41 +34,85 @@ with tempfile.TemporaryDirectory(prefix="work-release-smoke-") as scratch:
     binaries = list(base.glob("work-cli-*/bin/work"))
     assert len(binaries) == 1
     assert hashlib.sha256(binaries[0].read_bytes()).digest() == hashlib.sha256(standalone.read_bytes()).digest(), "Standalone binary differs from qualified bundle"
-    repo, root = base / "repo", base / "root"
+    repo, root, home = base / "repo", base / "root", base / "home"
     repo.mkdir()
     root.mkdir()
+    home.mkdir()
     environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
     for args in [["init", "-b", "main"], ["config", "user.name", "Smoke"], ["config", "user.email", "smoke@example.invalid"], ["commit", "--allow-empty", "-m", "initial"]]:
         subprocess.run(["/usr/bin/git", *args], cwd=repo, env=environment, check=True, capture_output=True)
-    config = base / "work.toml"
-    config.write_text(f'''actor="smoke"
-store_dir={json.dumps(str(base / "store"))}
-trusted_registry={json.dumps(str(base / "registry"))}
-roots=[{json.dumps(str(root))}]
-repositories=[{json.dumps(str(repo))}]
-[allocation]
-repository_limit=1
-owner_limit=1
-floor_bytes=0
-warn_bytes=0
-''')
-    environment["WORK_CONFIG"] = str(config)
+    setup_env = {"HOME": str(home), "PATH": "/no-tools", "LC_ALL": "C", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+    setup = subprocess.run(
+        [str(standalone), "setup", "--actor", "smoke", "--repository", str(repo), "--root", str(root),
+         "--repository-limit", "1", "--owner-limit", "1", "--floor-bytes", "0", "--warn-bytes", "0", "--yes"],
+        cwd=base, env=setup_env, capture_output=True, text=True)
+    assert setup.returncode == 0, (setup.stdout, setup.stderr)
+    report = json.loads(setup.stdout)
+    assert report["config_written"] is True
+    assert report["authority_modified"] is False
+    config_path = home / ".config/work/config.toml"
+    assert report["config_path"] == str(config_path)
+    assert config_path.is_file()
+    store, registry = home / ".local/state/work/store", home / ".local/state/work/registry"
+    assert store.parent.is_dir()
+    assert not store.exists()
+    assert not registry.exists()
+    environment["HOME"] = str(home)
 
-    def work(*args):
+    def work(*args, check=True):
         result = subprocess.run([str(binaries[0]), *args], cwd=repo, env=environment, capture_output=True, text=True)
+        if not check:
+            return result
         assert result.returncode == 0, (args, result.stdout, result.stderr)
         return json.loads(result.stdout)
+
+    def assert_quota_hold(allocation, task, *, task_finished=False):
+        status = work("status", "--json")
+        assert status["initialized"] is True
+        assert status["charged"] == 1
+        matches = [item for item in status["checkouts"] if item["checkout"] == allocation["checkout"]]
+        assert len(matches) == 1
+        row = matches[0]
+        assert row["task"] == task
+        assert row["charged"] is True
+        assert row["task_finished"] is task_finished
+        probe = "other"
+        refused = work("start", "--task", probe, check=False)
+        assert refused.returncode != 0, ("unexpected allocation", refused.stdout, refused.stderr)
+        assert "start refused: capacity unavailable" in refused.stderr, refused.stderr
+        assert f"charged checkout: {row['checkout']} task={row['task']} owner={row['owner']} path={row['path']}; next: {row['next_action']}" in refused.stderr, refused.stderr
+        assert not (root / probe).exists()
+        held = work("status", "--json")
+        assert held["initialized"] is True
+        assert held["charged"] == 1
+        held_matches = [item for item in held["checkouts"] if item["checkout"] == allocation["checkout"]]
+        assert len(held_matches) == 1
+        assert held_matches[0]["task"] == task
+        assert held_matches[0]["charged"] is True
+        assert held_matches[0]["task_finished"] is task_finished
 
     for task in ["first", "second"]:
         allocation = work("start", "--task", task)
         assert work("start", "--task", task)["checkout"] == allocation["checkout"]
-        assert work("status", "--json")["charged"] == 1
+        status = work("status", "--json")
+        assert status["initialized"] is True
+        assert status["charged"] == 1
+        if task == "first":
+            explicit = subprocess.run([str(binaries[0]), "status", "--json"], cwd=repo,
+                env={**environment, "WORK_CONFIG": str(config_path)}, capture_output=True, text=True)
+            assert explicit.returncode == 0, (explicit.stdout, explicit.stderr)
+            assert json.loads(explicit.stdout) == status
+        assert_quota_hold(allocation, task)
         checkout = Path(allocation["destination"])
         (checkout / "work.txt").write_text(f"Completed {task}\n")
         for args in [["add", "work.txt"], ["commit", "-m", f"Complete {task}"]]:
             subprocess.run(["/usr/bin/git", *args], cwd=checkout, env=environment, check=True, capture_output=True)
         commit = subprocess.check_output(["/usr/bin/git", "rev-parse", "HEAD"], cwd=checkout, env=environment, text=True).strip()
-        assert work("finish", task)["task_finished"]
+        finished = work("finish", task)
+        assert finished["task_finished"]
+        assert finished["charge_retained"] is True
+        assert finished["checkout"] == allocation["checkout"]
+        assert_quota_hold(allocation, task, task_finished=True)
         assert work("remove", task)["outcome"] == "preview"
         assert Path(allocation["destination"]).is_dir()
         removed = work("remove", task, "--confirm-stopped")

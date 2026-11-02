@@ -436,18 +436,20 @@ fn linked_metadata_parent_components_cannot_hide_symlinks() {
 #[test]
 fn report_config_special_and_oversized_inputs_fail_promptly_without_secrets() {
     for discovered in [false, true] {
-        for kind in ["fifo", "oversized"] {
+        for kind in ["fifo", "oversized", "malformed"] {
             let f = Fixture::new();
             fs::create_dir(f.p("work")).unwrap();
             let path = f.p("work/config.toml");
-            if kind == "fifo" {
-                assert!(Command::new("/usr/bin/mkfifo")
+            match kind {
+                "fifo" => assert!(Command::new("/usr/bin/mkfifo")
                     .arg(&path)
                     .status()
                     .unwrap()
-                    .success());
-            } else {
-                fs::write(
+                    .success()),
+                "malformed" => {
+                    fs::write(&path, "token = \"private-secret\" unexpected-secret\n").unwrap()
+                }
+                _ => fs::write(
                     &path,
                     format!(
                         "roots = [{:?}]\nrepositories = [{:?}]\n# private-secret\n{}",
@@ -456,7 +458,7 @@ fn report_config_special_and_oversized_inputs_fail_promptly_without_secrets() {
                         " ".repeat(1024 * 1024 + 1)
                     ),
                 )
-                .unwrap();
+                .unwrap(),
             }
             let mut cmd = Command::new("/usr/bin/timeout");
             cmd.args(["2", env!("CARGO_BIN_EXE_work"), "doctor", "--json"]);
@@ -468,8 +470,15 @@ fn report_config_special_and_oversized_inputs_fail_promptly_without_secrets() {
             let o = cmd.output().unwrap();
             assert_ne!(o.status.code(), Some(124), "blocked on {kind}");
             assert!(!o.status.success());
-            assert!(!String::from_utf8_lossy(&o.stderr).contains("private-secret"));
-            assert!(String::from_utf8_lossy(&o.stderr).contains("configuration"));
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            assert!(!stderr.contains("private-secret"));
+            assert!(stderr.contains("configuration"), "{kind}: {stderr}");
+            if kind == "malformed" {
+                assert!(
+                    !stderr.contains("unexpected-secret"),
+                    "location-only parser diagnostics: {stderr}"
+                );
+            }
         }
     }
 }
@@ -542,4 +551,147 @@ fn config_supplies_explicit_scope_and_empty_doctor_fails() {
         .unwrap();
     assert!(o.status.success());
     assert_eq!(before, snapshot(f.temp.path()));
+}
+
+fn doctor_env(home: &Path, xdg: Option<&Path>, work_config: Option<&Path>) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_work"));
+    cmd.args(["doctor", "--json"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home);
+    match xdg {
+        Some(path) => {
+            cmd.env("XDG_CONFIG_HOME", path);
+        }
+        None => {
+            cmd.env_remove("XDG_CONFIG_HOME");
+        }
+    }
+    match work_config {
+        Some(path) => {
+            cmd.env("WORK_CONFIG", path);
+        }
+        None => {
+            cmd.env_remove("WORK_CONFIG");
+        }
+    }
+    cmd
+}
+
+#[test]
+fn config_selectors_home_empty_xdg_and_empty_explicit() {
+    let f = Fixture::new();
+    let home = f.p("home");
+    let xdg = f.p("xdg");
+    let body = format!(
+        "roots = [{:?}]\nrepositories = [{:?}]\nstore_dir = {:?}\ntrusted_registry = {:?}\n",
+        f.p("roots"),
+        f.p("repo"),
+        f.p("store"),
+        f.p("registry")
+    );
+    fs::create_dir_all(home.join(".config/work")).unwrap();
+    fs::write(home.join(".config/work/config.toml"), &body).unwrap();
+    fs::create_dir_all(xdg.join("work")).unwrap();
+    fs::write(
+        xdg.join("work/config.toml"),
+        "token = \"private-secret\" unexpected-secret\n",
+    )
+    .unwrap();
+
+    let home_only = doctor_env(&home, None, None).output().unwrap();
+    assert!(
+        home_only.status.success(),
+        "HOME fallback: {}",
+        String::from_utf8_lossy(&home_only.stderr)
+    );
+
+    let empty_xdg = doctor_env(&home, Some(Path::new("")), None)
+        .output()
+        .unwrap();
+    assert!(
+        empty_xdg.status.success(),
+        "empty XDG falls through to HOME: {}",
+        String::from_utf8_lossy(&empty_xdg.stderr)
+    );
+
+    let empty_explicit = doctor_env(&home, None, Some(Path::new("")))
+        .output()
+        .unwrap();
+    assert!(
+        !empty_explicit.status.success(),
+        "empty explicit must disable HOME discovery"
+    );
+
+    let xdg_wins = doctor_env(&home, Some(&xdg), None).output().unwrap();
+    assert!(!xdg_wins.status.success());
+    let stderr = String::from_utf8_lossy(&xdg_wins.stderr);
+    assert!(!stderr.contains("private-secret"));
+    assert!(!stderr.contains("unexpected-secret"));
+    assert!(stderr.contains("configuration"), "{stderr}");
+
+    let missing_explicit = doctor_env(&home, None, Some(&f.p("missing.toml")))
+        .output()
+        .unwrap();
+    assert!(!missing_explicit.status.success());
+}
+
+#[test]
+fn precheck_accepts_unrelated_linked_repository_and_rejects_unsafe_common_metadata() {
+    let f = Fixture::new();
+    let unrelated = f.p("unrelated");
+    git(
+        &f.p("repo"),
+        &[
+            "worktree",
+            "add",
+            "-qb",
+            "other",
+            unrelated.to_str().unwrap(),
+        ],
+    );
+    let accepted = work_cli::doctor::report(&work_cli::config::Config {
+        repositories: vec![unrelated.clone()],
+        roots: vec![f.p("roots")],
+        ..Default::default()
+    })
+    .unwrap();
+    let accepted = serde_json::to_value(accepted).unwrap();
+    assert_eq!(
+        accepted["repositories"].as_array().unwrap().len(),
+        1,
+        "{accepted}"
+    );
+    assert!(
+        accepted["inventory"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["path"] == unrelated.to_str().unwrap() && e["registered"] == true),
+        "{accepted}"
+    );
+    assert!(
+        accepted["uncertainties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| !s.as_str().unwrap().contains("unsafe Git metadata")),
+        "linked worktrees outside the managed root stay supported: {accepted}"
+    );
+
+    for name in ["HEAD", "config"] {
+        let f = Fixture::new();
+        let path = f.p(&format!("repo/.git/{name}"));
+        fs::remove_file(&path).unwrap();
+        symlink(f.p("repo/.git/objects"), &path).unwrap();
+        let v = f.report(&[]);
+        assert!(
+            v["uncertainties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("unsafe Git metadata")),
+            "{name}: {v}"
+        );
+    }
 }

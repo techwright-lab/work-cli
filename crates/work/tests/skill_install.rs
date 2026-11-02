@@ -76,6 +76,10 @@ fn native_skill_installs_embedded_files_and_references_idempotently() {
             f.data.join("work-cli/skill-current")
         );
     }
+    assert_eq!(
+        fs::read_to_string(f.home.join("invalid-config.toml")).unwrap(),
+        "invalid=["
+    );
 }
 
 #[test]
@@ -142,6 +146,7 @@ fn help_version_and_parse_errors_never_install_skills() {
 fn foreign_targets_and_symlinked_directories_are_preserved() {
     for case in ["foreign-skill", "symlink-parent", "authority-root"] {
         let f = Fixture::new();
+        fs::write(f.home.join("invalid-config.toml"), "invalid=[").unwrap();
         let foreign = f.home.join(".claude/skills/work-cli");
         let outside = f.home.join("outside");
         match case {
@@ -161,6 +166,10 @@ fn foreign_targets_and_symlinked_directories_are_preserved() {
         }
         let result = f.run(&["skill", "install", "--all"]);
         assert!(!result.status.success(), "{case}: {result:?}");
+        assert_eq!(
+            fs::read_to_string(f.home.join("invalid-config.toml")).unwrap(),
+            "invalid=["
+        );
         assert!(!f.home.join(".agents/skills/work-cli").exists());
         if case == "foreign-skill" {
             assert_eq!(

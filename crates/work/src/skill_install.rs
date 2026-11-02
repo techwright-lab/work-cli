@@ -2,6 +2,8 @@
 //! No config loader, Git child, Python, authority access or implicit startup hook.
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -44,7 +46,10 @@ fn uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-fn directory(path: &Path) -> Result<()> {
+fn directory(path: &Path, progress: &mut InstallProgress) -> Result<()> {
+    ensure_directory(path, progress)
+}
+fn ensure_directory(path: &Path, progress: &mut InstallProgress) -> Result<()> {
     if !path.is_absolute() {
         return Err(error("HOME and XDG_DATA_HOME must be absolute"));
     }
@@ -59,7 +64,19 @@ fn directory(path: &Path) -> Result<()> {
             None => {
                 let mut builder = fs::DirBuilder::new();
                 std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-                io(builder.create(&current))?;
+                if let Err(reason) = io(builder.create(&current)) {
+                    progress.record(
+                        InstallActionKind::Directory,
+                        &current,
+                        InstallActionStatus::Failed,
+                    );
+                    return Err(reason);
+                }
+                progress.record(
+                    InstallActionKind::Directory,
+                    &current,
+                    InstallActionStatus::Completed,
+                );
                 io(fs::symlink_metadata(&current))?
             }
         };
@@ -135,16 +152,66 @@ fn managed_link(path: &Path, expected: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn atomic_link(path: &Path, target: &Path) -> Result<()> {
-    let parent = path.parent().ok_or_else(|| error("missing skill parent"))?;
+fn atomic_link(path: &Path, target: &Path, progress: &mut InstallProgress) -> Result<()> {
+    let parent = match path.parent() {
+        Some(parent) => parent,
+        None => {
+            progress.record(
+                InstallActionKind::Pointer,
+                path,
+                InstallActionStatus::Failed,
+            );
+            return Err(error("missing skill parent"));
+        }
+    };
     let temporary = parent.join(format!(".work-skill-{}", uuid::Uuid::now_v7()));
-    io(symlink(target, &temporary))?;
+    if let Err(reason) = io(symlink(target, &temporary)) {
+        progress.record(
+            InstallActionKind::Pointer,
+            path,
+            InstallActionStatus::Failed,
+        );
+        return Err(reason);
+    }
     let result = io(fs::rename(&temporary, path));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
+        progress.record(
+            InstallActionKind::Pointer,
+            path,
+            InstallActionStatus::Failed,
+        );
+        return result;
     }
-    result?;
-    sync(parent)
+    #[cfg(test)]
+    if current_fault() == Some(Fault::AfterPointerUncertain) {
+        progress.record(
+            InstallActionKind::Pointer,
+            path,
+            InstallActionStatus::Unknown,
+        );
+        return Err(error(
+            "skill installation I/O failed (pointer durability unknown); check current links before retrying",
+        ));
+    }
+    match sync(parent) {
+        Ok(()) => {
+            progress.record(
+                InstallActionKind::Pointer,
+                path,
+                InstallActionStatus::Completed,
+            );
+            Ok(())
+        }
+        Err(reason) => {
+            progress.record(
+                InstallActionKind::Pointer,
+                path,
+                InstallActionStatus::Unknown,
+            );
+            Err(reason)
+        }
+    }
 }
 fn snapshot_id() -> String {
     let mut hash = Sha256::new();
@@ -204,9 +271,9 @@ fn snapshot_files(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>
     }
     Ok(())
 }
-fn snapshot(data: &Path) -> Result<PathBuf> {
+fn snapshot(data: &Path, progress: &mut InstallProgress) -> Result<PathBuf> {
     let snapshots = data.join("skill-snapshots");
-    directory(&snapshots)?;
+    directory(&snapshots, progress)?;
     let id = snapshot_id();
     let target = snapshots.join(&id);
     let expected: BTreeMap<_, _> = FILES
@@ -215,48 +282,161 @@ fn snapshot(data: &Path) -> Result<PathBuf> {
         .collect();
     if let Some(meta) = metadata(&target)? {
         if !meta.is_dir() || meta.uid() != uid() || meta.mode() & 0o022 != 0 {
+            progress.record(
+                InstallActionKind::Snapshot,
+                &target,
+                InstallActionStatus::Failed,
+            );
             return Err(error("unsafe cached skill snapshot"));
         }
         let mut actual = BTreeMap::new();
-        snapshot_files(&target, &target, &mut actual)?;
+        if let Err(reason) = snapshot_files(&target, &target, &mut actual) {
+            progress.record(
+                InstallActionKind::Snapshot,
+                &target,
+                InstallActionStatus::Failed,
+            );
+            return Err(reason);
+        }
         if actual != expected {
+            progress.record(
+                InstallActionKind::Snapshot,
+                &target,
+                InstallActionStatus::Failed,
+            );
             return Err(error(
                 "cached skill snapshot changed; refusing to replace it",
             ));
         }
+        progress.record(
+            InstallActionKind::Snapshot,
+            &target,
+            InstallActionStatus::Completed,
+        );
+    } else if let Err(reason) = publish_snapshot(&snapshots, &target, progress) {
+        return Err(reason);
     } else {
-        let stage = io(tempfile::Builder::new()
-            .prefix(".skill-")
-            .tempdir_in(&snapshots))?;
-        for (name, body) in FILES {
-            let path = stage.path().join(name);
-            let parent = path
-                .parent()
-                .ok_or_else(|| error("invalid embedded path"))?;
-            directory(parent)?;
-            let mut file = io(fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path))?;
-            io(file.write_all(body.as_bytes()))?;
-            io(file.sync_all())?;
-        }
-        for name in [
-            "skills/work-cli/reference",
-            "skills/work-cli",
-            "skills",
-            "docs",
-            "",
-        ] {
-            sync(&stage.path().join(name))?;
-        }
-        io(fs::rename(stage.path(), &target))?;
-        sync(&snapshots)?;
+        progress.record(
+            InstallActionKind::Snapshot,
+            &target,
+            InstallActionStatus::Completed,
+        );
     }
     Ok(PathBuf::from("skill-snapshots")
         .join(id)
         .join("skills/work-cli"))
+}
+fn publish_snapshot(snapshots: &Path, target: &Path, progress: &mut InstallProgress) -> Result<()> {
+    let stage = match io(tempfile::Builder::new()
+        .prefix(".skill-")
+        .tempdir_in(snapshots))
+    {
+        Ok(stage) => stage,
+        Err(reason) => {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return Err(reason);
+        }
+    };
+    for (name, body) in FILES {
+        let path = stage.path().join(name);
+        let Some(parent) = path.parent() else {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return Err(error("invalid embedded path"));
+        };
+        if let Err(reason) = directory(parent, progress) {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return Err(reason);
+        }
+        let mut file = match io(fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path))
+        {
+            Ok(file) => file,
+            Err(reason) => {
+                progress.record(
+                    InstallActionKind::Snapshot,
+                    target,
+                    InstallActionStatus::Failed,
+                );
+                return Err(reason);
+            }
+        };
+        #[cfg(test)]
+        if current_fault() == Some(Fault::SnapshotFileWrite) {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return io(Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "injected snapshot write",
+            )));
+        }
+        if let Err(reason) = io(file.write_all(body.as_bytes())) {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return Err(reason);
+        }
+        if let Err(reason) = io(file.sync_all()) {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return Err(reason);
+        }
+    }
+    for name in [
+        "skills/work-cli/reference",
+        "skills/work-cli",
+        "skills",
+        "docs",
+        "",
+    ] {
+        if let Err(reason) = sync(&stage.path().join(name)) {
+            progress.record(
+                InstallActionKind::Snapshot,
+                target,
+                InstallActionStatus::Failed,
+            );
+            return Err(reason);
+        }
+    }
+    if let Err(reason) = io(fs::rename(stage.path(), target)) {
+        progress.record(
+            InstallActionKind::Snapshot,
+            target,
+            InstallActionStatus::Failed,
+        );
+        return Err(reason);
+    }
+    if let Err(reason) = sync(snapshots) {
+        progress.record(
+            InstallActionKind::Snapshot,
+            target,
+            InstallActionStatus::Unknown,
+        );
+        return Err(reason);
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -268,17 +448,127 @@ pub(crate) struct Report {
     authority_modified: bool,
     binary_changed: bool,
 }
-pub(crate) fn install(all: bool) -> Result<Report> {
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallActionKind {
+    Directory,
+    Snapshot,
+    Pointer,
+    Registration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InstallActionStatus {
+    Completed,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstallAction {
+    kind: InstallActionKind,
+    target: PathBuf,
+    status: InstallActionStatus,
+}
+
+#[allow(dead_code)]
+impl InstallAction {
+    pub(crate) fn kind(&self) -> InstallActionKind {
+        self.kind
+    }
+    pub(crate) fn target(&self) -> &Path {
+        &self.target
+    }
+    pub(crate) fn status(&self) -> InstallActionStatus {
+        self.status
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InstallProgress {
+    actions: Vec<InstallAction>,
+}
+
+impl InstallProgress {
+    #[allow(dead_code)]
+    pub(crate) fn actions(&self) -> &[InstallAction] {
+        &self.actions
+    }
+    fn record(&mut self, kind: InstallActionKind, target: &Path, status: InstallActionStatus) {
+        self.actions.push(InstallAction {
+            kind,
+            target: target.to_path_buf(),
+            status,
+        });
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstallError {
+    progress: InstallProgress,
+    message: String,
+}
+
+impl InstallError {
+    #[allow(dead_code)]
+    pub(crate) fn progress(&self) -> &InstallProgress {
+        &self.progress
+    }
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+fn discovery() -> Result<(PathBuf, PathBuf)> {
     let home = PathBuf::from(
         env::var_os("HOME").ok_or_else(|| error("HOME is required for agent discovery"))?,
     );
-    if !home.is_absolute() {
-        return Err(error("HOME must be absolute"));
-    }
     let data_home = env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
+    Ok((home, data_home))
+}
+
+pub(crate) fn install(all: bool) -> Result<Report> {
+    install_with_progress(all)
+        .map(|(report, _)| report)
+        .map_err(|err| err.message().to_owned())
+}
+
+pub(crate) fn install_with_progress(
+    all: bool,
+) -> std::result::Result<(Report, InstallProgress), InstallError> {
+    match discovery() {
+        Ok((home, data_home)) => install_with_progress_at(all, &home, &data_home),
+        Err(message) => Err(InstallError {
+            progress: InstallProgress::default(),
+            message,
+        }),
+    }
+}
+
+fn install_with_progress_at(
+    all: bool,
+    home: &Path,
+    data_home: &Path,
+) -> std::result::Result<(Report, InstallProgress), InstallError> {
+    let mut progress = InstallProgress::default();
+    match install_body(all, home, data_home, &mut progress) {
+        Ok(report) => Ok((report, progress)),
+        Err(message) => Err(InstallError { progress, message }),
+    }
+}
+
+fn install_body(
+    all: bool,
+    home: &Path,
+    data_home: &Path,
+    progress: &mut InstallProgress,
+) -> Result<Report> {
+    if !home.is_absolute() {
+        return Err(error("HOME must be absolute"));
+    }
     if !data_home.is_absolute() {
         return Err(error("XDG_DATA_HOME must be absolute"));
     }
@@ -288,7 +578,7 @@ pub(crate) fn install(all: bool) -> Result<Report> {
         ));
     }
     let data = data_home.join("work-cli");
-    directory(&data)?;
+    directory(&data, progress)?;
     let _lock = lock(&data)?;
     let current = data.join("skill-current");
     if let Some(meta) = metadata(&current)? {
@@ -308,26 +598,15 @@ pub(crate) fn install(all: bool) -> Result<Report> {
     // Preflight every target before publishing or replacing any skill link.
     for agent in agents {
         let root = home.join(agent).join("skills");
-        directory(&root)?;
+        directory(&root, progress)?;
         let target = root.join("work-cli");
         managed_link(&target, &current)?;
         targets.push(target);
     }
-    let relative = snapshot(&data)?;
-    atomic_link(&current, &relative)?;
+    let relative = snapshot(&data, progress)?;
+    atomic_link(&current, &relative, progress)?;
     for target in &targets {
-        managed_link(target, &current)?;
-        if metadata(target)?.is_none() {
-            // Creation itself is atomic and must not replace a target that
-            // appeared after preflight (another installer can use a different
-            // data directory and therefore hold a different installer lock).
-            io(symlink(&current, target))?;
-            sync(
-                target
-                    .parent()
-                    .ok_or_else(|| error("missing discovery parent"))?,
-            )?;
-        }
+        register_target(target, &current, progress)?;
     }
     Ok(Report {
         skill: "work-cli",
@@ -338,3 +617,122 @@ pub(crate) fn install(all: bool) -> Result<Report> {
         binary_changed: false,
     })
 }
+
+fn register_target(target: &Path, current: &Path, progress: &mut InstallProgress) -> Result<()> {
+    managed_link(target, current)?;
+    if metadata(target)?.is_some() {
+        progress.record(
+            InstallActionKind::Registration,
+            target,
+            InstallActionStatus::Completed,
+        );
+        return Ok(());
+    }
+    #[cfg(test)]
+    if current_fault() == Some(Fault::AfterFirstRegistration)
+        && progress.actions().iter().any(|action| {
+            action.kind == InstallActionKind::Registration
+                && action.status == InstallActionStatus::Completed
+        })
+    {
+        progress.record(
+            InstallActionKind::Registration,
+            target,
+            InstallActionStatus::Failed,
+        );
+        return Err(error(
+            "skill installation I/O failed (discovery registration); check current links before retrying",
+        ));
+    }
+    // Creation itself is atomic and must not replace a target that appeared
+    // after preflight (another installer can use a different data directory).
+    if let Err(reason) = io(symlink(current, target)) {
+        progress.record(
+            InstallActionKind::Registration,
+            target,
+            InstallActionStatus::Failed,
+        );
+        return Err(reason);
+    }
+    let parent = match target.parent() {
+        Some(parent) => parent,
+        None => {
+            progress.record(
+                InstallActionKind::Registration,
+                target,
+                InstallActionStatus::Unknown,
+            );
+            return Err(error("missing discovery parent"));
+        }
+    };
+    match sync(parent) {
+        Ok(()) => {
+            progress.record(
+                InstallActionKind::Registration,
+                target,
+                InstallActionStatus::Completed,
+            );
+            Ok(())
+        }
+        Err(reason) => {
+            progress.record(
+                InstallActionKind::Registration,
+                target,
+                InstallActionStatus::Unknown,
+            );
+            Err(reason)
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Fault {
+    AfterPointerUncertain,
+    AfterFirstRegistration,
+    SnapshotFileWrite,
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAULT: Cell<Option<Fault>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn current_fault() -> Option<Fault> {
+    FAULT.with(|slot| slot.get())
+}
+
+#[cfg(test)]
+struct FaultGuard;
+#[cfg(test)]
+impl Drop for FaultGuard {
+    fn drop(&mut self) {
+        FAULT.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+pub(super) fn observe_install(
+    all: bool,
+    home: &Path,
+    data_home: &Path,
+) -> std::result::Result<(Report, InstallProgress), InstallError> {
+    install_with_progress_at(all, home, data_home)
+}
+
+#[cfg(test)]
+pub(super) fn observe_install_failing(
+    all: bool,
+    home: &Path,
+    data_home: &Path,
+    fault: Fault,
+) -> std::result::Result<(Report, InstallProgress), InstallError> {
+    FAULT.with(|slot| slot.set(Some(fault)));
+    let _guard = FaultGuard;
+    install_with_progress_at(all, home, data_home)
+}
+
+#[cfg(test)]
+#[path = "skill_install_tests.rs"]
+mod tests;

@@ -62,7 +62,12 @@ fn collect_relative(root: &Path, current: &Path, out: &mut BTreeSet<PathBuf>) {
 }
 
 fn run_work(root: &IsolatedRoot, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_work"))
+    run_work_with(root, args, &[])
+}
+
+fn run_work_with(root: &IsolatedRoot, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_work"));
+    command
         .args(args)
         .current_dir(root.cwd())
         .env_clear()
@@ -76,9 +81,18 @@ fn run_work(root: &IsolatedRoot, args: &[&str]) -> Output {
         .env("GITHUB_TOKEN", "ghp_secret_value_12345")
         .env("WORK_TOKEN", "work_secret_value_12345")
         .env("OPENAI_API_KEY", "sk-secret-value-12345")
-        .envs(locale_env())
-        .output()
-        .expect("spawn work")
+        .envs(locale_env());
+    for (key, value) in env {
+        match value {
+            Some(value) => {
+                command.env(key, value);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+    command.output().expect("spawn work")
 }
 
 fn locale_env() -> Vec<(OsString, OsString)> {
@@ -466,4 +480,215 @@ fn unimplemented_commands_do_not_silently_succeed() {
             combined(&output)
         );
     }
+}
+
+fn write_file(path: &Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent");
+    }
+    fs::write(path, contents).expect("write file");
+}
+
+fn classify_status(output: &Output) -> &'static str {
+    let text = combined(output);
+    if !output.status.success() {
+        if text.contains("invalid store record") {
+            "invalid-store"
+        } else if text.contains("expected absolute canonical path") {
+            "invalid-path"
+        } else if text.contains("cannot read configuration safely") {
+            "unreadable"
+        } else if text.contains("invalid TOML") {
+            "invalid-toml"
+        } else {
+            "fail"
+        }
+    } else if stdout_str(output).contains("configured authority absent") {
+        "configured-absent"
+    } else if stdout_str(output).contains("no store configured") {
+        "passive"
+    } else {
+        "other"
+    }
+}
+
+fn git(path: &Path, args: &[&str]) {
+    let output = Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn config_selection_honors_explicit_xdg_and_home_precedence() {
+    let root = IsolatedRoot::new();
+    let explicit = root.root.join("explicit.toml");
+    let xdg = root.root.join("config/work/config.toml");
+    let home = root.root.join("home/.config/work/config.toml");
+    let relative = root.cwd().join("relative.toml");
+    let missing = root.root.join("missing.toml");
+    write_file(
+        &explicit,
+        &format!("store_dir = {:?}\n", root.root.join("explicit-store")),
+    );
+    write_file(
+        &xdg,
+        &format!(
+            "store_dir = {:?}\ntrusted_registry = {:?}\n",
+            root.root.join("xdg-store"),
+            root.root.join("xdg-registry"),
+        ),
+    );
+    write_file(
+        &home,
+        "store_dir = \"relative-home-store\"\ntrusted_registry = \"relative-home-registry\"\n",
+    );
+    write_file(
+        &relative,
+        &format!("store_dir = {:?}\n", root.root.join("relative-store")),
+    );
+    let explicit_s = explicit.to_str().unwrap();
+    let missing_s = missing.to_str().unwrap();
+    let status =
+        |env: &[(&str, Option<&str>)]| classify_status(&run_work_with(&root, &["status"], env));
+
+    assert_eq!(
+        status(&[("WORK_CONFIG", Some(explicit_s))]),
+        "invalid-store",
+        "explicit wins"
+    );
+    assert_eq!(
+        status(&[]),
+        "configured-absent",
+        "xdg wins without explicit"
+    );
+    assert_eq!(
+        status(&[("XDG_CONFIG_HOME", None)]),
+        "invalid-path",
+        "home wins without xdg"
+    );
+    assert_eq!(
+        status(&[("XDG_CONFIG_HOME", Some(""))]),
+        "invalid-path",
+        "empty xdg falls through to home"
+    );
+    assert_eq!(
+        status(&[("WORK_CONFIG", Some(""))]),
+        "passive",
+        "empty explicit disables all discovery"
+    );
+    assert_eq!(
+        status(&[("HOME", Some("")), ("XDG_CONFIG_HOME", None)]),
+        "passive",
+        "no usable HOME/XDG stays passive"
+    );
+    assert_eq!(
+        status(&[("WORK_CONFIG", Some(missing_s))]),
+        "unreadable",
+        "explicit missing fails"
+    );
+    assert_eq!(
+        status(&[("WORK_CONFIG", Some("relative.toml"))]),
+        "invalid-store",
+        "explicit relative reader path"
+    );
+
+    let blank = IsolatedRoot::new();
+    assert_eq!(
+        classify_status(&run_work(&blank, &["status"])),
+        "passive",
+        "missing implicit remains passive"
+    );
+    write_file(
+        &blank.root.join("home/.config/work/config.toml"),
+        "token = \"private-config-secret\" unexpected-secret\n",
+    );
+    let malformed = run_work_with(&blank, &["status"], &[("XDG_CONFIG_HOME", None)]);
+    assert!(!malformed.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&malformed.stderr),
+        "config error: invalid TOML at line 1, column 33\n"
+    );
+    assert!(!combined(&malformed).contains("private-config-secret"));
+}
+
+#[test]
+fn home_default_status_matches_explicit_initialized_inventory() {
+    let root = IsolatedRoot::new();
+    let repo = root.root.join("repo");
+    let managed = root.root.join("worktrees");
+    fs::create_dir(&repo).unwrap();
+    fs::create_dir(&managed).unwrap();
+    git(&repo, &["init", "-b", "main", "-q"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
+    let config_path = root.root.join("home/.config/work/config.toml");
+    write_file(
+        &config_path,
+        &format!(
+            "actor = \"alice\"\nstore_dir = {:?}\ntrusted_registry = {:?}\nroots = [{:?}]\nrepositories = [{:?}]\n[allocation]\nrepository_limit = 8\nowner_limit = 4\nfloor_bytes = 0\nwarn_bytes = 0\n",
+            root.root.join("state/store"),
+            root.root.join("state/registry"),
+            managed,
+            repo,
+        ),
+    );
+    let config_s = config_path.to_str().unwrap();
+    let repo_s = repo.to_str().unwrap();
+    let managed_s = managed.to_str().unwrap();
+    let started = run_work_with(
+        &root,
+        &[
+            "start",
+            "--repository",
+            repo_s,
+            "--root",
+            managed_s,
+            "--actor",
+            "alice",
+            "--task",
+            "topic",
+            "--base",
+            "HEAD",
+        ],
+        &[("WORK_CONFIG", Some(config_s))],
+    );
+    assert!(
+        started.status.success(),
+        "start fixture task: {}",
+        combined(&started)
+    );
+    let status_json = |env: &[(&str, Option<&str>)]| {
+        let output = run_work_with(&root, &["status", "--json"], env);
+        assert!(
+            output.status.success(),
+            "status --json: {}",
+            combined(&output)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("status json")
+    };
+    let explicit = status_json(&[("WORK_CONFIG", Some(config_s))]);
+    let home = status_json(&[("WORK_CONFIG", None), ("XDG_CONFIG_HOME", None)]);
+    assert_eq!(explicit["initialized"], true, "{explicit}");
+    assert!(
+        explicit["charged"].as_u64().unwrap_or(0) > 0,
+        "charged inventory required: {explicit}"
+    );
+    assert_eq!(home["initialized"], true, "{home}");
+    assert!(
+        home["charged"].as_u64().unwrap_or(0) > 0,
+        "HOME default must see charged inventory, not an uninitialized fallback: {home}"
+    );
+    assert_eq!(explicit["charged"], home["charged"]);
+    assert_eq!(explicit["checkouts"], home["checkouts"]);
 }

@@ -3,12 +3,22 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[2] / "tools/release_version.py"
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "tools/release_version.py"
 
 
 class ReleaseVersionTests(unittest.TestCase):
+    def test_checkout_workspace_and_local_lockfile_versions_are_0_3_0(self):
+        manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
+        self.assertEqual(manifest["workspace"]["package"]["version"], "0.3.0")
+        packages = tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]
+        for name in ("work-cli", "work-contract"):
+            entries = [package["version"] for package in packages if package["name"] == name]
+            self.assertEqual(entries, ["0.3.0"], name)
+
     def test_workspace_lockfile_and_tag_must_match(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

@@ -1,10 +1,16 @@
-# Replace every path with an absolute canonical path on your machine.
+# Advanced manual template aligned with v0.3.0+ `work setup` new-install defaults.
+# Prefer `work setup` for first-time configuration. Setup does not migrate existing
+# paths or limits. For a manual copy, replace every path with an absolute canonical
+# path on your machine.
 actor = "alice"
 store_dir = "/home/alice/.local/state/work/store"
 trusted_registry = "/home/alice/.local/state/work/registry"
 roots = ["/home/alice/worktrees"]
 repositories = ["/home/alice/src/project"]
 
+# Allocation defaults: repository_limit 8, owner_limit 4, floor_bytes 1073741824
+# (1 GiB), warn_bytes 5368709120 (5 GiB). warn_bytes must be >= floor_bytes. Zero
+# is an explicit capacity hold.
 [allocation]
 repository_limit = 8
 owner_limit = 4
