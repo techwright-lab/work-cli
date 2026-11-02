@@ -40,6 +40,8 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Guided or headless configuration without initializing Work authority
+    Setup(crate::setup::SetupArgs),
     /// Reserve and create a configured checkout; does not launch a writer
     Start(crate::allocate::Start),
     /// Preview removal of a finished interactive checkout; branches are retained
@@ -192,6 +194,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Cli::parse_from(argv)
     };
     match cli.command {
+        Command::Setup(args) => crate::setup::command(args),
         Command::Skill {
             command: SkillCommand::Install { all },
         } => match crate::skill_install::install(all) {
