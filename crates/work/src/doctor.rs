@@ -51,7 +51,7 @@ pub struct Headroom {
 
 fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>, &'static str> {
     let o = crate::bounded_process::output(
-        Command::new("git")
+        Command::new("/usr/bin/git")
             .arg("--no-optional-locks")
             .arg("-C")
             .arg(path)
@@ -107,7 +107,7 @@ fn precheck_private(path: &Path) -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn precheck(path: &Path) -> Result<(), &'static str> {
+pub(crate) fn precheck(path: &Path) -> Result<(), &'static str> {
     let marker = path.join(".git");
     let m = fs::symlink_metadata(&marker).map_err(|_| UNSAFE_METADATA)?;
     let common = if m.is_dir() && !m.file_type().is_symlink() {

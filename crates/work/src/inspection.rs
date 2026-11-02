@@ -95,7 +95,7 @@ pub enum IncompleteReason {
 /// Version admission is a compatibility floor, not proof of repository safety.
 /// Accept canonical stable releases only; every existing physical/layout check
 /// still runs. Vendor suffixes and prereleases need an explicit parsing policy.
-fn require_supported_git_version(output: &[u8]) -> Result<(), IncompleteReason> {
+pub(crate) fn require_supported_git_version(output: &[u8]) -> Result<(), IncompleteReason> {
     let invalid = IncompleteReason::UnsupportedGit;
     let version = output
         .strip_prefix(b"git version ")

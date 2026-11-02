@@ -66,6 +66,16 @@ impl SupervisorConfig {
 pub(crate) struct ConfigDocument {
     value: toml::Value,
 }
+/// Setup-owned first-time document fields. Not an execution Config.
+#[allow(dead_code)]
+pub(crate) struct InstallDocument {
+    pub actor: String,
+    pub repositories: Vec<PathBuf>,
+    pub roots: Vec<PathBuf>,
+    pub store_dir: PathBuf,
+    pub trusted_registry: PathBuf,
+    pub allocation: AllocationPolicy,
+}
 impl ConfigDocument {
     pub(crate) fn default_actor(&self) -> Result<Option<String>, Error> {
         self.value
@@ -110,6 +120,93 @@ impl ConfigDocument {
             return Err(unreadable());
         }
         Self::from_text(&text)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn repositories(&self) -> Result<Vec<PathBuf>, Error> {
+        string_path_list(&self.value, "repositories")
+    }
+    #[allow(dead_code)]
+    pub(crate) fn roots(&self) -> Result<Vec<PathBuf>, Error> {
+        string_path_list(&self.value, "roots")
+    }
+    #[allow(dead_code)]
+    pub(crate) fn allocation(&self) -> Result<Option<AllocationPolicy>, Error> {
+        self.value
+            .get("allocation")
+            .map(|v| {
+                v.clone()
+                    .try_into()
+                    .map_err(|_| Error::Config("invalid allocation policy".into()))
+            })
+            .transpose()
+    }
+    #[allow(dead_code)]
+    pub(crate) fn render(&self) -> Result<String, Error> {
+        toml::to_string(&self.value)
+            .map_err(|_| Error::Config("cannot render configuration".into()))
+    }
+    #[allow(dead_code)]
+    pub(crate) fn add_repository(&mut self, path: PathBuf) -> Result<bool, Error> {
+        let path = validate_path(&path, true)?;
+        let displayed = path.to_str().ok_or_else(invalid_path)?.to_owned();
+        let table = self
+            .value
+            .as_table_mut()
+            .ok_or_else(|| Error::Config("expected configuration table".into()))?;
+        if !table.contains_key("repositories") {
+            table.insert(
+                "repositories".into(),
+                toml::Value::Array(vec![toml::Value::String(displayed)]),
+            );
+            return Ok(true);
+        }
+        let array = table
+            .get_mut("repositories")
+            .and_then(toml::Value::as_array_mut)
+            .ok_or_else(|| Error::Config("repositories must be an array of strings".into()))?;
+        let mut duplicate = false;
+        for item in array.iter() {
+            let existing = item
+                .as_str()
+                .ok_or_else(|| Error::Config("repositories must be an array of strings".into()))?;
+            if existing == displayed {
+                duplicate = true;
+            }
+        }
+        if duplicate {
+            return Ok(false);
+        }
+        array.push(toml::Value::String(displayed));
+        Ok(true)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn validate_prospective_path(path: &std::path::Path) -> Result<PathBuf, Error> {
+        validate_path(path, false)
+    }
+    #[allow(dead_code)]
+    pub(crate) fn from_install(install: InstallDocument) -> Result<Self, Error> {
+        if !crate::allocate::component(&install.actor) {
+            return Err(Error::Config("unsafe actor/owner/task component".into()));
+        }
+        let mut table = toml::Table::new();
+        table.insert("actor".into(), toml::Value::String(install.actor));
+        table.insert(
+            "repositories".into(),
+            toml::Value::Array(path_values(&install.repositories, true)?),
+        );
+        table.insert(
+            "roots".into(),
+            toml::Value::Array(path_values(&install.roots, false)?),
+        );
+        table.insert("store_dir".into(), path_value(&install.store_dir, false)?);
+        table.insert(
+            "trusted_registry".into(),
+            path_value(&install.trusted_registry, false)?,
+        );
+        table.insert("allocation".into(), allocation_value(&install.allocation)?);
+        Ok(Self {
+            value: toml::Value::Table(table),
+        })
     }
     pub(crate) fn retirement_prepare_intents(&self) -> Result<bool, Error> {
         let invalid = || Error::Config("invalid retirement policy".into());
@@ -297,17 +394,26 @@ impl Config {
 
     pub(crate) fn discover_path() -> Option<PathBuf> {
         if let Some(explicit) = std::env::var_os("WORK_CONFIG") {
-            let path = PathBuf::from(explicit);
-            if path.as_os_str().is_empty() {
+            if explicit.is_empty() {
                 return None;
             }
-            return Some(path);
+            return Some(PathBuf::from(explicit));
         }
-        let base = std::env::var_os("XDG_CONFIG_HOME")?;
-        if base.is_empty() {
+        if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
+            if !base.is_empty() {
+                return Some(PathBuf::from(base).join("work").join("config.toml"));
+            }
+        }
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
             return None;
         }
-        Some(PathBuf::from(base).join("work").join("config.toml"))
+        Some(
+            PathBuf::from(home)
+                .join(".config")
+                .join("work")
+                .join("config.toml"),
+        )
     }
 
     fn from_toml(text: &str) -> Result<Self, Error> {
@@ -401,6 +507,61 @@ fn many_paths(value: &toml::Value, key: &str) -> Result<Vec<PathBuf>, Error> {
 
 fn invalid_path() -> Error {
     Error::Config("expected absolute canonical path(s) without symlinks".into())
+}
+
+#[allow(dead_code)]
+fn string_path_list(value: &toml::Value, key: &str) -> Result<Vec<PathBuf>, Error> {
+    let Some(v) = value.get(key) else {
+        return Ok(Vec::new());
+    };
+    v.as_array()
+        .ok_or_else(|| Error::Config(format!("{key} must be an array of strings")))?
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(PathBuf::from)
+                .ok_or_else(|| Error::Config(format!("{key} must be an array of strings")))
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn path_value(path: &std::path::Path, required: bool) -> Result<toml::Value, Error> {
+    let path = validate_path(path, required)?;
+    Ok(toml::Value::String(
+        path.to_str().ok_or_else(invalid_path)?.to_owned(),
+    ))
+}
+
+#[allow(dead_code)]
+fn path_values(paths: &[PathBuf], required: bool) -> Result<Vec<toml::Value>, Error> {
+    paths
+        .iter()
+        .map(|path| path_value(path, required))
+        .collect()
+}
+
+#[allow(dead_code)]
+fn allocation_value(policy: &AllocationPolicy) -> Result<toml::Value, Error> {
+    if policy.warn_bytes < policy.floor_bytes {
+        return Err(Error::Config("warn_bytes below floor_bytes".into()));
+    }
+    let mut table = toml::Table::new();
+    for (key, value) in [
+        ("repository_limit", policy.repository_limit),
+        ("owner_limit", policy.owner_limit),
+        ("floor_bytes", policy.floor_bytes),
+        ("warn_bytes", policy.warn_bytes),
+    ] {
+        table.insert(
+            key.to_owned(),
+            toml::Value::Integer(
+                i64::try_from(value)
+                    .map_err(|_| Error::Config("invalid allocation policy".into()))?,
+            ),
+        );
+    }
+    Ok(toml::Value::Table(table))
 }
 
 /// Validate every existing component without following symlinks. Missing store
@@ -765,5 +926,232 @@ mod inspection_policy_tests {
                 .unwrap_err();
             assert!(!error.to_string().contains("DO_NOT_ECHO"));
         }
+    }
+}
+
+#[cfg(test)]
+mod document_helper_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn dir(temp: &tempfile::TempDir, name: &str) -> PathBuf {
+        let path = temp.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        path
+    }
+
+    fn policy() -> AllocationPolicy {
+        AllocationPolicy {
+            repository_limit: 8,
+            owner_limit: 4,
+            floor_bytes: 1,
+            warn_bytes: 2,
+            capture_sink: None,
+        }
+    }
+
+    #[test]
+    fn document_round_trips_protected_fields_unknown_tables_and_repository_addition() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_a = dir(&temp, "repo-a");
+        let repo_b = dir(&temp, "repo-b");
+        let root = dir(&temp, "root");
+        let store = dir(&temp, "store");
+        let registry = dir(&temp, "registry");
+        let text = format!(
+            "actor = \"alice\"\nrepositories = [{:?}]\nroots = [{:?}]\nstore_dir = {:?}\ntrusted_registry = {:?}\n[allocation]\nrepository_limit = 8\nowner_limit = 4\nfloor_bytes = 1\nwarn_bytes = 2\n[mystery]\nkeep = true\nflag = 7\n[inspection]\nformat = false\n",
+            repo_a, root, store, registry
+        );
+        let mut document = ConfigDocument::from_text(&text).unwrap();
+        assert_eq!(document.default_actor().unwrap().as_deref(), Some("alice"));
+        assert_eq!(document.repositories().unwrap(), vec![repo_a.clone()]);
+        assert_eq!(document.roots().unwrap(), vec![root.clone()]);
+        assert_eq!(document.allocation().unwrap(), Some(policy()));
+        assert!(document.execution().is_ok());
+        assert!(document.inspection_policies().is_err());
+        assert!(document.add_repository(repo_b.clone()).unwrap());
+        assert!(!document.add_repository(repo_a.clone()).unwrap());
+        assert_eq!(
+            document.repositories().unwrap(),
+            vec![repo_a.clone(), repo_b.clone()]
+        );
+        let rendered = document.render().unwrap();
+        let round = ConfigDocument::from_text(&rendered).unwrap();
+        let original = parse_toml(&text).unwrap();
+        let updated = parse_toml(&rendered).unwrap();
+        for key in [
+            "actor",
+            "roots",
+            "store_dir",
+            "trusted_registry",
+            "allocation",
+            "mystery",
+            "inspection",
+        ] {
+            assert_eq!(updated.get(key), original.get(key), "{key}");
+        }
+        assert_eq!(round.default_actor().unwrap().as_deref(), Some("alice"));
+        assert_eq!(round.repositories().unwrap(), vec![repo_a, repo_b]);
+        assert_eq!(round.roots().unwrap(), vec![root]);
+        assert_eq!(round.allocation().unwrap(), Some(policy()));
+        assert!(round.execution().is_ok());
+        assert!(round.inspection_policies().is_err());
+    }
+
+    #[test]
+    fn add_repository_validates_every_entry_before_duplicate_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = dir(&temp, "repo");
+        let other = dir(&temp, "other");
+        let text = format!(
+            "actor = \"alice\"\nrepositories = [{:?}, 42]\n[mystery]\nkeep = true\n",
+            repo
+        );
+        let mut document = ConfigDocument::from_text(&text).unwrap();
+        let before = document.render().unwrap();
+        let error = match document.add_repository(repo.clone()) {
+            Err(error) => error,
+            Ok(added) => panic!("duplicate no-op skipped later array validation: {added}"),
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("repositories must be an array of strings"),
+            "{message}"
+        );
+        assert!(!message.contains("alice"), "{message}");
+        assert!(!message.contains("keep"), "{message}");
+        assert_eq!(document.render().unwrap(), before);
+        assert_eq!(document.default_actor().unwrap().as_deref(), Some("alice"));
+        assert!(document.add_repository(other.clone()).is_err());
+        assert_eq!(document.render().unwrap(), before);
+
+        let mut valid = ConfigDocument::from_text(&format!(
+            "actor = \"alice\"\nrepositories = [{:?}]\n[mystery]\nkeep = true\n",
+            repo
+        ))
+        .unwrap();
+        assert!(!valid.add_repository(repo.clone()).unwrap());
+        assert_eq!(valid.repositories().unwrap(), vec![repo.clone()]);
+        assert_eq!(valid.default_actor().unwrap().as_deref(), Some("alice"));
+        assert!(valid.add_repository(PathBuf::from("/x")).is_err());
+        assert_eq!(valid.repositories().unwrap(), vec![repo]);
+    }
+
+    #[test]
+    fn document_rejects_wrong_actor_and_repository_types() {
+        for text in ["actor = 42\n", "actor = []\n"] {
+            assert!(ConfigDocument::from_text(text)
+                .unwrap()
+                .default_actor()
+                .is_err());
+        }
+        for text in ["repositories = \"/x\"\n", "repositories = [42]\n"] {
+            let mut document = ConfigDocument::from_text(text).unwrap();
+            assert!(document.repositories().is_err());
+            assert!(document.add_repository(PathBuf::from("/x")).is_err());
+        }
+        assert!(ConfigDocument::from_install(InstallDocument {
+            actor: String::new(),
+            repositories: Vec::new(),
+            roots: Vec::new(),
+            store_dir: PathBuf::from("/store"),
+            trusted_registry: PathBuf::from("/registry"),
+            allocation: policy(),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn prospective_missing_root_does_not_change_execution_required_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("not-created");
+        assert!(!missing.exists());
+        assert_eq!(
+            ConfigDocument::validate_prospective_path(&missing).unwrap(),
+            missing
+        );
+        let document = ConfigDocument::from_text(&format!("roots = [{missing:?}]\n")).unwrap();
+        assert_eq!(document.roots().unwrap(), vec![missing.clone()]);
+        assert!(document.execution().is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn new_install_constructs_document_over_toml_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = dir(&temp, "repo");
+        let root = temp.path().join("missing-root");
+        let store = temp.path().join("store");
+        let registry = temp.path().join("registry");
+        let document = ConfigDocument::from_install(InstallDocument {
+            actor: "alice".into(),
+            repositories: vec![repo.clone()],
+            roots: vec![root.clone()],
+            store_dir: store.clone(),
+            trusted_registry: registry.clone(),
+            allocation: policy(),
+        })
+        .unwrap();
+        assert_eq!(document.default_actor().unwrap().as_deref(), Some("alice"));
+        assert_eq!(document.repositories().unwrap(), vec![repo]);
+        assert_eq!(document.roots().unwrap(), vec![root.clone()]);
+        assert_eq!(document.allocation().unwrap(), Some(policy()));
+        assert!(document.execution().is_err());
+        assert_eq!(
+            ConfigDocument::validate_prospective_path(&root).unwrap(),
+            root
+        );
+        assert!(!Path::new(&store).exists());
+        let round = ConfigDocument::from_text(&document.render().unwrap()).unwrap();
+        assert_eq!(
+            round.default_actor().unwrap(),
+            document.default_actor().unwrap()
+        );
+        assert_eq!(round.roots().unwrap(), document.roots().unwrap());
+        assert_eq!(round.allocation().unwrap(), document.allocation().unwrap());
+    }
+
+    #[test]
+    fn new_install_rejects_warning_below_floor() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut allocation = policy();
+        allocation.floor_bytes = 2;
+        allocation.warn_bytes = 1;
+        let result = ConfigDocument::from_install(InstallDocument {
+            actor: "alice".into(),
+            repositories: vec![dir(&temp, "repo")],
+            roots: vec![temp.path().join("missing-root")],
+            store_dir: temp.path().join("store"),
+            trusted_registry: temp.path().join("registry"),
+            allocation,
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected warning below floor to be refused"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("warn_bytes"), "{message}");
+        assert!(message.contains("floor_bytes"), "{message}");
+        assert!(!message.contains("alice"), "{message}");
+    }
+
+    #[test]
+    fn new_install_does_not_emit_historical_capture_selection() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut allocation = policy();
+        allocation.capture_sink = Some("devdiary".into());
+        let document = ConfigDocument::from_install(InstallDocument {
+            actor: "alice".into(),
+            repositories: vec![dir(&temp, "repo")],
+            roots: vec![temp.path().join("missing-root")],
+            store_dir: temp.path().join("store"),
+            trusted_registry: temp.path().join("registry"),
+            allocation,
+        })
+        .unwrap();
+        let rendered = document.render().unwrap();
+        assert!(!rendered.contains("capture_sink"), "{rendered}");
+        assert!(!rendered.contains("devdiary"), "{rendered}");
+        assert_eq!(document.allocation().unwrap(), Some(policy()));
     }
 }

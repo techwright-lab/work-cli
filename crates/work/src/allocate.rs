@@ -70,7 +70,7 @@ pub(crate) fn db<T>(r: crate::store::Result<T>) -> io::Result<T> {
 pub(crate) fn sql<T>(r: rusqlite::Result<T>) -> io::Result<T> {
     r.map_err(|e| err(&e.to_string()))
 }
-fn component(s: &str) -> bool {
+pub(crate) fn component(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && !s.starts_with(['-', '.'])
