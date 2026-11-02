@@ -539,46 +539,84 @@ fn live_context_revalidation_detects_actual_replacement_content_links_and_direct
 }
 #[test]
 fn actual_receiver_delay_does_not_block_independent_checkout_allocation_or_sql_writer() {
-    let h = Harness::new();
+    let mut h = Harness::new();
+    // This receiver waits for a whole allocation, not just a protocol response.
+    // Budget 2s for entry, 5s for SQL/allocation, 2s for acknowledgement and 1s
+    // for the response. Keep the 1s default for all other receiver fixtures.
+    h.cfg.capture.as_mut().unwrap().timeout_ms = 10_000;
+    h.reseal();
     let exe = &h.cfg.capture.as_ref().unwrap().executable;
     let script = fs::read_to_string(exe).unwrap();
     let entered = h.f.temp.path().join("entered");
     let release = h.f.temp.path().join("release");
+    let probe = h.f.temp.path().join("probe");
+    let waiting = h.f.temp.path().join("waiting");
     file(
         exe,
         script.replace(
-            "/usr/bin/cat >",
+            "printf called >>",
             &format!(
-                "touch '{}'\nwhile [ ! -f '{}' ]; do /usr/bin/sleep 0.01; done\n/usr/bin/cat >",
+                "touch '{}'\nwhile [ ! -f '{}' ]; do\n  if [ -f '{}' ]; then touch '{}'; fi\n  /usr/bin/sleep 0.01\ndone\nprintf called >>",
                 entered.display(),
-                release.display()
+                release.display(),
+                probe.display(),
+                waiting.display()
             ),
         ),
         0o700,
     );
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| capture_preparation::prepare(&h.cfg, &h.root, &h.spec));
-        let start = std::time::Instant::now();
-        while !entered.exists() && start.elapsed() < std::time::Duration::from_secs(2) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        // Release and explicitly join even if a concurrency assertion panics.
+        let checks = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let wait_for = |path: &std::path::Path| {
+                let start = std::time::Instant::now();
+                while !path.exists()
+                    && !worker.is_finished()
+                    && start.elapsed() < std::time::Duration::from_secs(2)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(path.exists(), "receiver did not signal {path:?}");
+            };
+            wait_for(&entered);
+            let db = h.sql();
+            db.busy_timeout(std::time::Duration::ZERO).unwrap();
+            db.execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+                .expect("capture holds SQL writer lock");
+            let other = h.f.start(
+                &Uuid::now_v7().to_string(),
+                "independent-task",
+                "independent-branch",
+                &[],
+            );
+            assert!(
+                other.status.success(),
+                "capture holds allocator flock: {other:?}"
+            );
+            // An old entry marker survives a killed receiver. Demand a fresh
+            // acknowledgement after BOTH checks, before permitting any response.
+            file(&probe, b"probe", 0o600);
+            wait_for(&waiting);
+            assert!(
+                !release.exists(),
+                "receiver released before concurrency checks"
+            );
+            assert!(!h.f.temp.path().join("calls").exists());
+            assert!(!worker.is_finished(), "preparation finished before release");
+        }));
+        let released = fs::write(&release, b"release");
+        let result = worker.join();
+        if let Ok(Err(error)) = &result {
+            eprintln!("delayed receiver preparation failed: {error:?}");
         }
-        assert!(entered.exists(), "receiver never entered");
-        let db = h.sql();
-        db.busy_timeout(std::time::Duration::ZERO).unwrap();
-        db.execute_batch("BEGIN IMMEDIATE; ROLLBACK")
-            .expect("capture holds SQL writer lock");
-        let other = h.f.start(
-            &Uuid::now_v7().to_string(),
-            "independent-task",
-            "independent-branch",
-            &[],
-        );
-        assert!(
-            other.status.success(),
-            "capture holds allocator flock: {other:?}"
-        );
-        file(&release, b"release", 0o600);
-        assert!(worker.join().unwrap().is_ok());
+        if let Err(panic) = checks {
+            std::panic::resume_unwind(panic);
+        }
+        released.expect("release receiver");
+        result
+            .expect("preparation worker panicked")
+            .unwrap_or_else(|error| panic!("delayed receiver preparation failed: {error:?}"));
     });
 }
 #[test]
