@@ -637,10 +637,6 @@ fn missing_headless_actor_repository_or_confirmation_fails_without_changes() {
         assert!(parsed["skills"]["actions"].as_array().unwrap().is_empty());
         assert!(parsed["error"].is_object(), "{args:?}: {parsed}");
         assert!(stderr_str(&output).is_empty() || !stdout_str(&output).is_empty());
-        assert_eq!(
-            stdout_str(&output).trim().matches('{').count(),
-            stdout_str(&output).trim().matches('{').count()
-        );
         let _: Value = serde_json::from_str(stdout_str(&output).trim()).unwrap();
         assert_unchanged(&before, &fixture.snapshot());
         assert!(!fixture.config_path().exists());
@@ -2686,7 +2682,7 @@ fn overlapping_authority_destinations_refuse_before_mutation() {
         ),
         (
             "skill in store",
-            fixture.home.clone(),
+            fixture.home.join(".agents"),
             registry.clone(),
             fixture.config_path(),
             "store_dir",
@@ -2695,7 +2691,7 @@ fn overlapping_authority_destinations_refuse_before_mutation() {
         (
             "skill in registry",
             store.clone(),
-            fixture.data.clone(),
+            fixture.data.join("work-cli"),
             fixture.config_path(),
             "store_dir",
             "skill destinations",
@@ -2711,6 +2707,9 @@ fn overlapping_authority_destinations_refuse_before_mutation() {
                 args[index + 1] = path_str(value);
             }
             *args.last_mut().unwrap() = mode.into();
+            if label.starts_with("skill in") {
+                args.extend(["--skills".into(), "standard".into()]);
+            }
             let before = fixture.snapshot();
             let output = fixture.run_with(
                 &args.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2728,6 +2727,283 @@ fn overlapping_authority_destinations_refuse_before_mutation() {
             assert!(parsed["created_directories"].as_array().unwrap().is_empty());
             assert_unchanged(&before, &fixture.snapshot());
         }
+    }
+}
+
+#[test]
+fn writer_artifact_authority_endpoint_refuses_preview_and_apply() {
+    for endpoint in ["--store-dir", "--trusted-registry"] {
+        for artifact in [".work-setup.lock", ".work-setup-stage-reserved/endpoint"] {
+            for mode in ["--dry-run", "--yes"] {
+                let fixture = Fixture::new();
+                let authority = fixture.config_path().parent().unwrap().join(artifact);
+                let mut args = fixture.create_args();
+                let index = args.iter().position(|arg| arg == endpoint).unwrap();
+                args[index + 1] = path_str(&authority);
+                *args.last_mut().unwrap() = mode.into();
+                let before = fixture.snapshot();
+                let output = fixture.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                assert!(
+                    !output.status.success(),
+                    "{endpoint}/{artifact}/{mode}: {output:?}"
+                );
+                let parsed = report(&output);
+                assert!(
+                    parsed["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("writer artifacts"),
+                    "{parsed}"
+                );
+                assert_eq!(parsed["config_written"], false);
+                assert!(parsed["created_directories"].as_array().unwrap().is_empty());
+                assert!(parsed["skills"]["actions"].as_array().unwrap().is_empty());
+                assert!(!authority.exists());
+                assert_unchanged(&before, &fixture.snapshot());
+            }
+        }
+    }
+}
+
+#[test]
+fn selected_skill_authority_endpoint_refuses_preview_and_apply() {
+    for existing in [false, true] {
+        for (selection, base, relative) in [
+            ("standard", "home", ".agents/skills"),
+            ("standard", "home", ".agents/skills/work-cli/nested"),
+            ("all", "home", ".claude/skills"),
+            ("all", "home", ".codex/skills/work-cli"),
+            ("standard", "data", "work-cli/.install.lock"),
+            ("standard", "data", "work-cli/skill-current/nested"),
+            ("standard", "data", "work-cli/skill-snapshots/nested"),
+            ("standard", "data", "work-cli/.work-skill-reserved/nested"),
+        ] {
+            for mode in ["--dry-run", "--yes"] {
+                let fixture = Fixture::new();
+                if existing {
+                    apply(&fixture);
+                }
+                let authority = if base == "home" {
+                    &fixture.home
+                } else {
+                    &fixture.data
+                }
+                .join(relative);
+                let mut args = if existing {
+                    let text = fs::read_to_string(fixture.config_path()).unwrap();
+                    let text = text.replace(&path_str(&fixture.store_dir()), &path_str(&authority));
+                    fs::write(fixture.config_path(), text).unwrap();
+                    vec!["setup".into(), mode.into()]
+                } else {
+                    let mut args = fixture.create_args();
+                    let index = args.iter().position(|arg| arg == "--store-dir").unwrap();
+                    args[index + 1] = path_str(&authority);
+                    *args.last_mut().unwrap() = mode.into();
+                    args
+                };
+                args.extend(["--skills".into(), selection.into()]);
+                let before = fixture.snapshot();
+                let output = fixture.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+                assert!(
+                    !output.status.success(),
+                    "{existing}/{selection}/{relative}/{mode}: {output:?}"
+                );
+                let parsed = report(&output);
+                assert!(
+                    parsed["error"]["reason"]
+                        .as_str()
+                        .unwrap()
+                        .contains("skill destinations"),
+                    "{parsed}"
+                );
+                assert_eq!(parsed["config_written"], false);
+                assert!(parsed["created_directories"].as_array().unwrap().is_empty());
+                assert!(parsed["skills"]["actions"].as_array().unwrap().is_empty());
+                assert!(!authority.exists());
+                assert_unchanged(&before, &fixture.snapshot());
+            }
+        }
+    }
+}
+
+#[test]
+fn registered_authority_in_backup_tree_refuses_repository_update_before_artifacts() {
+    let fixture = Fixture::new();
+    let store = fixture
+        .config_path()
+        .parent()
+        .unwrap()
+        .join(".work-setup-backups");
+    let mut args = fixture.apply_args();
+    let index = args.iter().position(|arg| arg == "--store-dir").unwrap();
+    args[index + 1] = path_str(&store);
+    let output = fixture.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(
+        output.status.success(),
+        "first-time setup does not write backups: {output:?}"
+    );
+    assert!(!store.exists());
+    let started = start_task(&fixture, "backup-tree-authority");
+    prime_readonly(&fixture, &started);
+    for mode in ["--dry-run", "--yes"] {
+        // Positively identify only the two existing coordination files belonging
+        // to this public start's configured databases; no suffix-wide exemption.
+        assert_eq!(
+            parse_config(&fixture.config_path()).store_dir.as_ref(),
+            Some(&store)
+        );
+        let mut identified = BTreeMap::new();
+        for database in [
+            store.join("store.sqlite"),
+            fixture.registry_dir().join("authorities.sqlite"),
+        ] {
+            let db = snapshot_entry(&database);
+            assert_eq!(db.kind, "file");
+            assert_eq!(db.uid, fs::metadata(&fixture.home).unwrap().uid());
+            assert_eq!(db.nlink, 1);
+            assert_eq!(db.mode & 0o077, 0);
+            assert!(db.bytes.unwrap().starts_with(b"SQLite format 3\0"));
+            let shm = PathBuf::from(format!("{}-shm", database.display()));
+            let entry = snapshot_entry(&shm);
+            assert_eq!(entry.kind, "file");
+            assert_eq!(entry.uid, db.uid);
+            assert_eq!(entry.nlink, 1);
+            assert_eq!(entry.mode & 0o077, 0);
+            identified.insert(
+                shm.strip_prefix(&fixture.root).unwrap().to_path_buf(),
+                entry,
+            );
+        }
+        let coordination = CoordinationFiles(identified);
+        let before = fixture.snapshot();
+        let output = fixture.run(&[
+            "setup",
+            "--add-repository",
+            fixture.extra_repo.to_str().unwrap(),
+            mode,
+        ]);
+        let after = fixture.snapshot();
+        assert!(!output.status.success(), "{mode}: {output:?}");
+        let parsed = report(&output);
+        assert!(
+            parsed["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("writer artifacts"),
+            "{parsed}"
+        );
+        assert_eq!(parsed["config_written"], false);
+        assert!(parsed["created_directories"].as_array().unwrap().is_empty());
+        assert!(parsed["backup_path"].is_null());
+        assert_warm_unchanged(&coordination, &before, &after);
+    }
+}
+
+#[test]
+fn nonoverlapping_selected_writes_allow_shared_parents_and_unselected_trees() {
+    for (base, relative, selection) in [
+        ("config", ".work-setup-backups", "none"),
+        ("config", "authority", "none"),
+        ("home", ".agents/skills", "none"),
+        ("home", ".claude/skills", "standard"),
+        ("home", ".local/share/work-cli/skill-snapshots", "standard"),
+        ("home", ".agents/skills/other", "standard"),
+        ("data", "work-cli/releases", "standard"),
+    ] {
+        let fixture = Fixture::new();
+        let parent = match base {
+            "config" => fixture.config_path().parent().unwrap().to_path_buf(),
+            "home" => fixture.home.clone(),
+            _ => fixture.data.clone(),
+        };
+        let authority = parent.join(relative);
+        let mut args = fixture.create_args();
+        let index = args.iter().position(|arg| arg == "--store-dir").unwrap();
+        args[index + 1] = path_str(&authority);
+        args.extend(["--skills".into(), selection.into()]);
+        let before = fixture.snapshot();
+        let preview = fixture.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(
+            preview.status.success(),
+            "{base}/{relative}/{selection}: {preview:?}"
+        );
+        assert_unchanged(&before, &fixture.snapshot());
+        let index = args.iter().position(|arg| arg == "--dry-run").unwrap();
+        args[index] = "--yes".into();
+        let output = fixture.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(
+            output.status.success(),
+            "{base}/{relative}/{selection}: {output:?}"
+        );
+        assert_eq!(report(&output)["config_written"], true);
+        assert!(!authority.exists());
+        assert!(!fixture.registry_dir().exists());
+    }
+}
+
+#[test]
+fn oversized_rendered_repository_addition_refuses_without_writer_artifacts() {
+    const LIMIT: usize = 1024 * 1024;
+    let fixture = Fixture::new();
+    apply(&fixture);
+    let started = start_task(&fixture, "size-admission");
+    let mut document: toml::Value =
+        toml::from_str(&fs::read_to_string(fixture.config_path()).unwrap()).unwrap();
+    document.as_table_mut().unwrap().insert(
+        "unrelated".into(),
+        toml::Value::Table(toml::Table::from_iter([(
+            "private".into(),
+            toml::Value::String(String::new()),
+        )])),
+    );
+    let base = toml::to_string(&document).unwrap().len();
+    let padding = "é".repeat((LIMIT - base - 8) / 2);
+    document["unrelated"]["private"] = toml::Value::String(padding.clone());
+    let original = toml::to_string(&document).unwrap();
+    assert!(original.len() <= LIMIT);
+    let mut enlarged = document.clone();
+    enlarged["repositories"]
+        .as_array_mut()
+        .unwrap()
+        .push(toml::Value::String(path_str(&fixture.extra_repo)));
+    assert!(toml::to_string(&enlarged).unwrap().len() > LIMIT);
+    fs::write(fixture.config_path(), &original).unwrap();
+    let check = fixture.run(&["setup", "--check"]);
+    assert!(
+        check.status.success(),
+        "initial document must be readable: {check:?}"
+    );
+    prime_readonly(&fixture, &started);
+    for mode in ["--dry-run", "--yes"] {
+        let coordination = CoordinationFiles::identify(&fixture, &started);
+        let before = fixture.snapshot();
+        let output = fixture.run(&[
+            "setup",
+            "--add-repository",
+            fixture.extra_repo.to_str().unwrap(),
+            mode,
+        ]);
+        let after = fixture.snapshot();
+        assert!(!output.status.success(), "{mode}: {output:?}");
+        let parsed = report(&output);
+        assert!(
+            parsed["error"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("size limit"),
+            "{parsed}"
+        );
+        assert!(!stdout_str(&output).contains(&padding));
+        assert_eq!(parsed["config_written"], false);
+        assert!(parsed["created_directories"].as_array().unwrap().is_empty());
+        assert!(parsed["backup_path"].is_null());
+        assert_eq!(
+            fs::read(fixture.config_path()).unwrap(),
+            original.as_bytes()
+        );
+        let changes = coordination.changes(&before, &after);
+        assert!(changes.is_empty(), "unexpected changes: {changes:?}");
+        assert_warm_unchanged(&coordination, &before, &after);
     }
 }
 

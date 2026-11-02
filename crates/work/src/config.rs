@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use crate::error::Error;
 
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 /// Host-supplied configuration. Compiled defaults do not include any machine,
 /// user, or organization paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -98,7 +100,6 @@ impl ConfigDocument {
     }
     pub(crate) fn load_from_path(path: &std::path::Path) -> Result<Self, Error> {
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
-        const MAX_BYTES: u64 = 1024 * 1024;
         let unreadable =
             || Error::Config("cannot read configuration safely within size limit".into());
         let file = std::fs::OpenOptions::new()
@@ -109,14 +110,14 @@ impl ConfigDocument {
             .open(path)
             .map_err(|_| unreadable())?;
         let metadata = file.metadata().map_err(|_| unreadable())?;
-        if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
             return Err(unreadable());
         }
         let mut text = String::new();
-        file.take(MAX_BYTES + 1)
+        file.take(MAX_CONFIG_BYTES + 1)
             .read_to_string(&mut text)
             .map_err(|_| unreadable())?;
-        if text.len() as u64 > MAX_BYTES {
+        if text.len() as u64 > MAX_CONFIG_BYTES {
             return Err(unreadable());
         }
         Self::from_text(&text)
@@ -142,8 +143,12 @@ impl ConfigDocument {
     }
     #[allow(dead_code)]
     pub(crate) fn render(&self) -> Result<String, Error> {
-        toml::to_string(&self.value)
-            .map_err(|_| Error::Config("cannot render configuration".into()))
+        let rendered = toml::to_string(&self.value)
+            .map_err(|_| Error::Config("cannot render configuration".into()))?;
+        if rendered.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(Error::Config("configuration exceeds size limit".into()));
+        }
+        Ok(rendered)
     }
     #[allow(dead_code)]
     pub(crate) fn add_repository(&mut self, path: PathBuf) -> Result<bool, Error> {
@@ -368,7 +373,6 @@ impl Config {
             return Ok(None);
         }
         use std::{io::Read, os::unix::fs::OpenOptionsExt};
-        const MAX_BYTES: u64 = 1024 * 1024;
         let unreadable =
             || Error::Config("cannot read configuration safely within size limit".into());
         let file = std::fs::OpenOptions::new()
@@ -379,14 +383,14 @@ impl Config {
             .open(&path)
             .map_err(|_| unreadable())?;
         let metadata = file.metadata().map_err(|_| unreadable())?;
-        if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
             return Err(unreadable());
         }
         let mut text = String::new();
-        file.take(MAX_BYTES + 1)
+        file.take(MAX_CONFIG_BYTES + 1)
             .read_to_string(&mut text)
             .map_err(|_| unreadable())?;
-        if text.len() as u64 > MAX_BYTES {
+        if text.len() as u64 > MAX_CONFIG_BYTES {
             return Err(unreadable());
         }
         Ok(Some(text))
@@ -459,7 +463,7 @@ impl Config {
     }
 }
 fn parse_toml(text: &str) -> Result<toml::Value, Error> {
-    if text.len() > 1024 * 1024 {
+    if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(Error::Config("configuration exceeds size limit".into()));
     }
     let value: toml::Value = toml::from_str(text).map_err(|err: toml::de::Error| {
@@ -1109,6 +1113,24 @@ mod document_helper_tests {
         );
         assert_eq!(round.roots().unwrap(), document.roots().unwrap());
         assert_eq!(round.allocation().unwrap(), document.allocation().unwrap());
+    }
+
+    #[test]
+    fn render_admits_exact_reader_byte_limit_and_rejects_utf8_overflow() {
+        let mut document = ConfigDocument::from_text("private = \"\"\n").unwrap();
+        let overhead = document.render().unwrap().len();
+        let mut private = "x".repeat(MAX_CONFIG_BYTES as usize - overhead - "é".len());
+        private.push('é');
+        document.value["private"] = toml::Value::String(private.clone());
+        let rendered = document.render().unwrap();
+        assert_eq!(rendered.len() as u64, MAX_CONFIG_BYTES);
+        assert!(ConfigDocument::from_text(&rendered).is_ok());
+        private.push('é');
+        document.value["private"] = toml::Value::String(private);
+        assert_eq!(
+            document.render().unwrap_err().to_string(),
+            "config error: configuration exceeds size limit"
+        );
     }
 
     #[test]

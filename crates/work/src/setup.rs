@@ -1,6 +1,8 @@
 //! Consent-gated native setup. Never initializes or mutates Work authority.
 use crate::{
-    config::{validate_path, AllocationPolicy, Config, ConfigDocument, InstallDocument},
+    config::{
+        validate_path, AllocationPolicy, Config, ConfigDocument, InstallDocument, MAX_CONFIG_BYTES,
+    },
     skill_install::{InstallActionKind, InstallActionStatus},
 };
 use clap::{Args, ValueEnum};
@@ -19,7 +21,6 @@ const DEFAULT_OWNER_LIMIT: u64 = 4;
 const DEFAULT_FLOOR_BYTES: u64 = 1_073_741_824;
 const DEFAULT_WARN_BYTES: u64 = 5_368_709_120;
 const AFFIRM: &str = "yes";
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const GIT: &str = "/usr/bin/git";
 const LOCK_NAME: &str = ".work-setup.lock";
 const BACKUP_DIR_NAME: &str = ".work-setup-backups";
@@ -931,6 +932,9 @@ fn apply_plan(
     stdin: &mut dyn BufRead,
     stderr: &mut dyn Write,
 ) -> SetupReport {
+    if let Err(err) = validate_prospective_writes(&plan) {
+        return err.into_report(Some(&plan.config_path));
+    }
     if let Err(err) = preview(&plan, stderr) {
         return io_fail(&plan, "preview", err);
     }
@@ -1745,32 +1749,122 @@ fn validate_overlaps(
             "configuration cannot be placed inside authority data",
         ));
     }
-    for dest in skill_destinations() {
-        if contained(&dest, store) || contained(&dest, registry) {
-            return Err(fail_val(
-                SetupAction::Inspect,
-                Some("store_dir"),
-                Some(store),
-                "skill destinations cannot be placed inside authority data",
-            ));
+    Ok(())
+}
+
+/// Trees/files can neither contain an authority endpoint nor lie inside it.
+/// Directory preparation is different: an empty shared parent is allowed, but
+/// creating an endpoint itself (or anything below it) is not. Reserve dynamic
+/// artifact families by their first component, without banning unrelated siblings.
+#[derive(Default)]
+struct ProspectiveWrites {
+    trees: Vec<PathBuf>,
+    directories: Vec<PathBuf>,
+    families: Vec<(PathBuf, &'static str)>,
+}
+
+impl ProspectiveWrites {
+    fn overlaps(&self, endpoint: &Path) -> bool {
+        self.trees
+            .iter()
+            .any(|path| contained(path, endpoint) || contained(endpoint, path))
+            || self
+                .directories
+                .iter()
+                .any(|path| contained(path, endpoint))
+            || self.families.iter().any(|(parent, prefix)| {
+                contained(parent, endpoint)
+                    || endpoint
+                        .strip_prefix(parent)
+                        .ok()
+                        .and_then(|relative| relative.components().next())
+                        .is_some_and(|part| {
+                            part.as_os_str()
+                                .as_encoded_bytes()
+                                .starts_with(prefix.as_bytes())
+                        })
+            })
+    }
+}
+
+fn validate_prospective_writes(plan: &SetupPlan) -> Result<(), Fail> {
+    let mut writer = ProspectiveWrites {
+        directories: plan.create_directories.clone(),
+        ..ProspectiveWrites::default()
+    };
+    // Skills-only, inspection and duplicate-only actions never open a config lock
+    // or allocate stage/backup artifacts. Existing additions do, but only updates
+    // have backups; first-time setup must not reserve an unused backup tree.
+    if plan.rendered.is_some() {
+        let family = writer_family(&plan.config_path);
+        writer.trees.extend([plan.config_path.clone(), family.lock]);
+        if plan.original.is_some() {
+            writer.trees.push(family.backup_dir);
+        }
+        if let Some(parent) = plan.config_path.parent() {
+            writer
+                .families
+                .push((parent.to_path_buf(), family.stage_prefix));
+        }
+    }
+    let skills = prospective_skill_writes(plan.skills);
+    for endpoint in plan.store_dir.iter().chain(&plan.trusted_registry) {
+        for (writes, reason) in [
+            (
+                &writer,
+                "authority endpoint overlaps setup writer artifacts or created directories",
+            ),
+            (
+                &skills,
+                "authority endpoint overlaps selected skill destinations",
+            ),
+        ] {
+            if writes.overlaps(endpoint) {
+                return Err(fail_val(
+                    plan.action,
+                    Some("store_dir"),
+                    Some(endpoint),
+                    reason,
+                ));
+            }
         }
     }
     Ok(())
 }
 
-fn skill_destinations() -> Vec<PathBuf> {
-    let mut out = Vec::new();
+fn prospective_skill_writes(selection: SkillsSelection) -> ProspectiveWrites {
+    let mut writes = ProspectiveWrites::default();
+    if selection == SkillsSelection::None {
+        return writes;
+    }
+    // Mirror install_body/ensure_directory/atomic_link/snapshot's actual write
+    // destinations. Do not reserve unselected discovery catalogs, the unused
+    // fallback data home, or unrelated children of a discovery directory.
     if let Some(home) = nonempty("HOME") {
         let home = PathBuf::from(home);
-        out.push(home.join(".agents"));
-        out.push(home.join(".claude"));
-        out.push(home.join(".codex"));
-        out.push(home.join(".local/share/work-cli"));
+        let data_home = nonempty("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        let data = data_home.join("work-cli");
+        push_missing_chain(&data, &mut writes.directories);
+        writes.trees.extend([
+            data.join(".install.lock"),
+            data.join("skill-current"),
+            data.join("skill-snapshots"),
+        ]);
+        writes.families.push((data, ".work-skill-"));
+        let agents: &[&str] = if selection == SkillsSelection::All {
+            &[".agents", ".claude", ".codex"]
+        } else {
+            &[".agents"]
+        };
+        for agent in agents {
+            let root = home.join(agent).join("skills");
+            push_missing_chain(&root, &mut writes.directories);
+            writes.trees.push(root.join("work-cli"));
+        }
     }
-    if let Some(data) = nonempty("XDG_DATA_HOME") {
-        out.push(PathBuf::from(data).join("work-cli"));
-    }
-    out
+    writes
 }
 
 fn endpoint_absent(path: &Path, field: &'static str) -> Result<(), Fail> {
@@ -2886,92 +2980,6 @@ mod tests {
     }
 
     #[test]
-    fn writer_steps_record_backup_sync_before_replace_and_parent_sync_after_both_modes() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = temp.path().join("cfg");
-        fs::create_dir(&parent).unwrap();
-        let config = parent.join("config.toml");
-        OBSERVED.with(|o| o.borrow_mut().clear());
-        FAIL_STEP.with(|f| f.set(None));
-        let plan = SetupPlan {
-            action: SetupAction::Create,
-            config_path: config.clone(),
-            rendered: Some("actor = \"alice\"\n".into()),
-            original: None,
-            create_directories: Vec::new(),
-            skills: SkillsSelection::None,
-            actor: Some("alice".into()),
-            repositories: Vec::new(),
-            roots: Vec::new(),
-            store_dir: None,
-            trusted_registry: None,
-            repository_limit: None,
-            owner_limit: None,
-            floor_bytes: None,
-            warn_bytes: None,
-            guidance_root: None,
-        };
-        let mut backup = None;
-        publish(&plan, &mut backup, &mut Vec::new()).unwrap();
-        step(WriterStep::ParentSync).unwrap();
-        sync_path(&parent).unwrap();
-        let observed = OBSERVED.with(|o| o.borrow().clone());
-        let stage_sync = observed.iter().position(|s| *s == WriterStep::StageSync);
-        let noreplace = observed
-            .iter()
-            .position(|s| *s == WriterStep::RenameNoreplace);
-        let parent_sync = observed.iter().position(|s| *s == WriterStep::ParentSync);
-        assert!(
-            stage_sync < noreplace && noreplace < parent_sync,
-            "{observed:?}"
-        );
-        fs::write(&config, "actor = \"alice\"\nsecret = 1\n").unwrap();
-        let original = read_original(&config).unwrap().0;
-        OBSERVED.with(|o| o.borrow_mut().clear());
-        let plan = SetupPlan {
-            action: SetupAction::AddRepositories,
-            config_path: config.clone(),
-            rendered: Some("actor = \"alice\"\nsecret = 1\n".into()),
-            original: Some(original),
-            create_directories: Vec::new(),
-            skills: SkillsSelection::None,
-            actor: Some("alice".into()),
-            repositories: Vec::new(),
-            roots: Vec::new(),
-            store_dir: None,
-            trusted_registry: None,
-            repository_limit: None,
-            owner_limit: None,
-            floor_bytes: None,
-            warn_bytes: None,
-            guidance_root: None,
-        };
-        let mut backup = None;
-        publish(&plan, &mut backup, &mut Vec::new()).unwrap();
-        step(WriterStep::ParentSync).unwrap();
-        sync_path(&parent).unwrap();
-        let observed = OBSERVED.with(|o| o.borrow().clone());
-        let backup_sync = observed.iter().position(|s| *s == WriterStep::BackupSync);
-        let backup_dir = observed
-            .iter()
-            .position(|s| *s == WriterStep::BackupDirSync);
-        let replace = observed
-            .iter()
-            .position(|s| *s == WriterStep::RenameReplace);
-        let parent_sync = observed.iter().position(|s| *s == WriterStep::ParentSync);
-        assert!(
-            backup_sync < backup_dir && backup_dir < replace && replace < parent_sync,
-            "{observed:?}"
-        );
-        let backup = backup.expect("backup path");
-        assert_eq!(
-            fs::read(&backup).unwrap(),
-            b"actor = \"alice\"\nsecret = 1\n"
-        );
-        assert_eq!(fs::symlink_metadata(&config).unwrap().mode() & 0o777, 0o600);
-    }
-
-    #[test]
     fn injected_writer_failures_preserve_unknown_bytes_and_set_partial_after_publish() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("cfg");
@@ -3448,48 +3456,147 @@ mod tests {
     }
 
     #[test]
-    fn mutate_orders_parent_sync_after_both_publication_modes() {
+    fn prospective_writer_set_tracks_publication_mode_and_created_parents() {
         let temp = tempfile::tempdir().unwrap();
-        let parent = temp.path().join("cfg");
-        fs::create_dir(&parent).unwrap();
-        let config = parent.join("config.toml");
-        OBSERVED.with(|o| o.borrow_mut().clear());
-        FAIL_STEP.with(|f| f.set(None));
-        let report = mutate(plan_with(
-            SetupAction::Create,
-            config.clone(),
-            Some("actor = \"alice\"\n".into()),
-            None,
-        ));
-        assert_eq!(report.outcome, SetupOutcome::Success);
-        let observed = OBSERVED.with(|o| o.borrow().clone());
-        let noreplace = observed
-            .iter()
-            .position(|s| *s == WriterStep::RenameNoreplace);
-        let parent_sync = observed.iter().position(|s| *s == WriterStep::ParentSync);
-        assert!(noreplace < parent_sync, "{observed:?}");
-        fs::write(&config, "actor = \"alice\"\nsecret = 1\n").unwrap();
+        let config = temp.path().join("config.toml");
+        fs::write(&config, "actor = \"alice\"\n").unwrap();
         let original = read_original(&config).unwrap().0;
-        OBSERVED.with(|o| o.borrow_mut().clear());
-        let report = mutate(plan_with(
-            SetupAction::AddRepositories,
-            config,
-            Some("actor = \"alice\"\nsecret = 1\n".into()),
-            Some(original),
-        ));
-        assert_eq!(report.outcome, SetupOutcome::Success);
-        let observed = OBSERVED.with(|o| o.borrow().clone());
-        let backup_dir = observed
-            .iter()
-            .position(|s| *s == WriterStep::BackupDirSync);
-        let replace = observed
-            .iter()
-            .position(|s| *s == WriterStep::RenameReplace);
-        let parent_sync = observed.iter().position(|s| *s == WriterStep::ParentSync);
-        assert!(
-            backup_dir < replace && replace < parent_sync,
-            "{observed:?}"
-        );
+        let family = writer_family(&config);
+        for (endpoint, create, update, passive) in [
+            (config.clone(), true, true, false),
+            (family.lock, true, true, false),
+            (
+                temp.path()
+                    .join(format!("{}reserved/endpoint", family.stage_prefix)),
+                true,
+                true,
+                false,
+            ),
+            (family.backup_dir.join("endpoint"), false, true, false),
+            (
+                temp.path().join("shared-parent/authority"),
+                false,
+                false,
+                false,
+            ),
+        ] {
+            for (rendered, retained, should_refuse) in [
+                (Some("actor = \"alice\"\n".into()), None, create),
+                (
+                    Some("actor = \"alice\"\n".into()),
+                    Some(original.clone()),
+                    update,
+                ),
+                (None, Some(original.clone()), passive),
+            ] {
+                let mut plan = plan_with(
+                    SetupAction::AddRepositories,
+                    config.clone(),
+                    rendered,
+                    retained,
+                );
+                plan.store_dir = Some(endpoint.clone());
+                assert_eq!(
+                    validate_prospective_writes(&plan).is_err(),
+                    should_refuse,
+                    "{endpoint:?}"
+                );
+            }
+        }
+        let authority = temp.path().join("absent-authority");
+        let mut plan = plan_with(SetupAction::Create, config, None, None);
+        plan.store_dir = Some(authority.clone());
+        plan.create_directories.push(authority.join("parent"));
+        assert!(validate_prospective_writes(&plan).is_err());
+        plan.create_directories = vec![temp.path().to_path_buf()];
+        assert!(validate_prospective_writes(&plan).is_ok());
+    }
+
+    #[test]
+    fn mutate_orders_parent_sync_after_both_publication_modes() {
+        for update in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent = temp.path().join("cfg");
+            fs::create_dir(&parent).unwrap();
+            let parent_mode = fs::metadata(&parent).unwrap().mode();
+            let config = parent.join("config.toml");
+            let original_bytes = b"actor = \"alice\"\nsecret = 1\n";
+            let original = if update {
+                fs::write(&config, original_bytes).unwrap();
+                Some(read_original(&config).unwrap().0)
+            } else {
+                None
+            };
+            OBSERVED.with(|o| o.borrow_mut().clear());
+            FAIL_STEP.with(|f| f.set(None));
+            let report = mutate(plan_with(
+                if update {
+                    SetupAction::AddRepositories
+                } else {
+                    SetupAction::Create
+                },
+                config.clone(),
+                Some("actor = \"alice\"\nsecret = 1\nadded = true\n".into()),
+                original,
+            ));
+            assert_eq!(report.outcome, SetupOutcome::Success);
+            let observed = OBSERVED.with(|o| o.borrow().clone());
+            let position = |step| {
+                observed
+                    .iter()
+                    .position(|s| *s == step)
+                    .expect("required writer step")
+            };
+            let publication = if update {
+                WriterStep::RenameReplace
+            } else {
+                WriterStep::RenameNoreplace
+            };
+            assert!(
+                position(WriterStep::StageWrite) < position(WriterStep::StageFlush),
+                "{observed:?}"
+            );
+            assert!(
+                position(WriterStep::StageFlush) < position(WriterStep::StageSync),
+                "{observed:?}"
+            );
+            assert!(
+                position(WriterStep::StageSync) < position(publication),
+                "{observed:?}"
+            );
+            assert!(
+                position(publication) < position(WriterStep::ParentSync),
+                "{observed:?}"
+            );
+            assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o600);
+            let family = writer_family(&config);
+            assert_eq!(fs::metadata(&family.lock).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&parent).unwrap().mode(), parent_mode);
+            if update {
+                assert!(
+                    position(WriterStep::BackupWrite) < position(WriterStep::BackupSync),
+                    "{observed:?}"
+                );
+                assert!(
+                    position(WriterStep::BackupSync) < position(WriterStep::BackupDirSync),
+                    "{observed:?}"
+                );
+                assert!(
+                    position(WriterStep::BackupDirSync) < position(publication),
+                    "{observed:?}"
+                );
+                let backup = PathBuf::from(report.backup_path.expect("backup path"));
+                assert_eq!(fs::read(&backup).unwrap(), original_bytes);
+                assert_eq!(fs::metadata(&backup).unwrap().mode() & 0o777, 0o600);
+                assert_eq!(
+                    fs::metadata(&family.backup_dir).unwrap().mode() & 0o777,
+                    0o700
+                );
+            } else {
+                assert!(report.backup_path.is_none());
+                assert!(!family.backup_dir.exists());
+            }
+        }
     }
 
     #[test]
