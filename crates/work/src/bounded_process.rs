@@ -92,6 +92,8 @@ fn output_mode(
     use std::os::unix::process::CommandExt;
     const IO_ERROR: &str = "Git process I/O unavailable; inventory incomplete";
     let start = Instant::now();
+    #[cfg(test)]
+    let start = tests::DeadlineClock::new(start);
     command
         .process_group(0)
         .stdin(if input.is_some() {
@@ -103,6 +105,8 @@ fn output_mode(
         .stderr(Stdio::piped());
     let mut child = loop {
         let elapsed = start.elapsed();
+        #[cfg(test)]
+        let elapsed = start.check(elapsed, timeout, None);
         if elapsed >= timeout {
             #[cfg(test)]
             if let Some(p) = progress.as_deref_mut() {
@@ -142,6 +146,8 @@ fn output_mode(
             Err(_) => return Err(IO_ERROR),
         }
     };
+    #[cfg(test)]
+    let mut child = tests::ObservedChild::new(&mut child, &start);
     let group = rustix::process::Pid::from_raw(child.id() as i32).ok_or(IO_ERROR)?;
     #[cfg(test)]
     if let Some(p) = progress.as_deref_mut() {
@@ -179,6 +185,8 @@ fn output_mode(
         }
         loop {
             let elapsed = start.elapsed();
+            #[cfg(test)]
+            let elapsed = start.check(elapsed, timeout, Some((&out, stdin.is_none())));
             if elapsed >= timeout {
                 #[cfg(test)]
                 if let Some(p) = progress.as_deref_mut() {
@@ -346,6 +354,275 @@ fn output_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{cell::RefCell, path::PathBuf, process::Child, rc::Rc};
+
+    // A one-invocation, thread-local opt-in. Other tests keep the real clock.
+    thread_local! {
+        static NEXT_DEADLINE: RefCell<Option<Rc<RefCell<DeadlineState>>>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BirthIdentity {
+        pid: u32,
+        parent: u32,
+        group: u32,
+        start_ticks: u64,
+        namespace: PathBuf,
+    }
+
+    fn identity(pid: u32) -> io::Result<(BirthIdentity, bool)> {
+        // Only independently owned positive numeric PIDs reach procfs.
+        if pid == 0 {
+            return Err(io::Error::other("zero is not a process identity"));
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .ok_or_else(|| io::Error::other("missing proc comm terminator"))?
+            .1
+            .split_whitespace()
+            .collect();
+        let number = |index: usize| -> io::Result<u64> {
+            fields
+                .get(index)
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| io::Error::other("unverifiable proc identity"))
+        };
+        Ok((
+            BirthIdentity {
+                pid,
+                parent: u32::try_from(number(1)?).map_err(io::Error::other)?,
+                group: u32::try_from(number(2)?).map_err(io::Error::other)?,
+                start_ticks: number(19)?,
+                namespace: std::fs::read_link(format!("/proc/{pid}/ns/pid"))?,
+            },
+            fields.first() == Some(&"T"),
+        ))
+    }
+
+    #[derive(Debug)]
+    struct DeadlineState {
+        publication: PathBuf,
+        empty: bool,
+        owned: Option<BirthIdentity>,
+        errors: Vec<String>,
+        ready: bool,
+        expired: Option<(Duration, Instant)>,
+    }
+
+    struct DeadlineScope(Rc<RefCell<DeadlineState>>);
+
+    impl DeadlineScope {
+        fn new(publication: PathBuf, empty: bool) -> Self {
+            let state = Rc::new(RefCell::new(DeadlineState {
+                publication,
+                empty,
+                owned: None,
+                errors: Vec::new(),
+                ready: false,
+                expired: None,
+            }));
+            NEXT_DEADLINE.with(|slot| {
+                assert!(slot.borrow().is_none(), "nested deadline scope");
+                *slot.borrow_mut() = Some(state.clone());
+            });
+            Self(state)
+        }
+
+        fn assert_cleaned(&self, progress: &TransportProgress) {
+            let state = self.0.borrow();
+            // Sample immediately on helper return, before publication/assertions.
+            let after = state.owned.as_ref().map(|owned| {
+                match std::fs::metadata(format!("/proc/{}", owned.pid)) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                    Ok(_) => identity(owned.pid).map(Some),
+                }
+            });
+            eprintln!("controlled cleanup: {state:?}; after={after:?}; progress={progress:?}");
+            let owned = state
+                .owned
+                .as_ref()
+                .expect("owned birth identity unobserved");
+            match after.expect("missing owned identity") {
+                Ok(None) => {}
+                Ok(Some((now, _))) => assert!(
+                    (now.pid, now.start_ticks, &now.namespace)
+                        != (owned.pid, owned.start_ticks, &owned.namespace),
+                    "same owned leader survived: {now:?}; {progress:?}"
+                ),
+                Err(e) => panic!("cannot verify immediate owned leader absence: {e}; {progress:?}"),
+            }
+            assert!(
+                state.errors.is_empty(),
+                "hook failure after cleanup: {state:?}"
+            );
+            assert!(state.ready, "readiness guard expired: {state:?}");
+            assert_eq!(progress.group_kill_ok, Some(true));
+            assert_eq!(progress.child_kill_ok, Some(true));
+            assert_eq!(progress.leader_wait_ok, Some(true));
+        }
+    }
+
+    impl Drop for DeadlineScope {
+        fn drop(&mut self) {
+            NEXT_DEADLINE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) struct DeadlineClock {
+        real: Instant,
+        state: Option<Rc<RefCell<DeadlineState>>>,
+    }
+
+    impl DeadlineClock {
+        pub(super) fn new(real: Instant) -> Self {
+            Self {
+                real,
+                state: NEXT_DEADLINE.with(|slot| slot.borrow_mut().take()),
+            }
+        }
+
+        pub(super) fn elapsed(&self) -> Duration {
+            match &self.state {
+                None => self.real.elapsed(),
+                Some(state) => state
+                    .borrow()
+                    .expired
+                    .map_or(Duration::ZERO, |(budget, at)| {
+                        budget.saturating_add(at.elapsed())
+                    }),
+            }
+        }
+
+        pub(super) fn check(
+            &self,
+            real_elapsed: Duration,
+            budget: Duration,
+            io: Option<(&[u8], bool)>,
+        ) -> Duration {
+            let Some(shared) = &self.state else {
+                return real_elapsed;
+            };
+            let mut state = shared.borrow_mut();
+            if state.expired.is_none() {
+                if let Some((out, closed)) = io {
+                    let readiness = (|| -> io::Result<bool> {
+                        let owned = state
+                            .owned
+                            .as_ref()
+                            .ok_or_else(|| io::Error::other("no owned identity"))?;
+                        let (now, stopped) = identity(owned.pid)?;
+                        if &now != owned {
+                            return Err(io::Error::other("owned identity changed before expiry"));
+                        }
+                        if !stopped {
+                            return Ok(false);
+                        }
+                        let raw = std::fs::read(&state.publication)?;
+                        let expected = if state.empty {
+                            Vec::new()
+                        } else {
+                            owned.pid.to_string().into_bytes()
+                        };
+                        if raw != expected {
+                            return Err(io::Error::other(format!(
+                                "unexpected publication: {raw:?}"
+                            )));
+                        }
+                        Ok(closed
+                            && if state.empty {
+                                out.is_empty()
+                            } else {
+                                out == b"partial"
+                            })
+                    })();
+                    match readiness {
+                        Ok(ready) => state.ready = ready,
+                        Err(e) => state.errors.push(e.to_string()),
+                    }
+                }
+                // Independent REAL wall-clock guard; no sleeps are readiness evidence.
+                if self.real.elapsed() >= Duration::from_secs(5) {
+                    state.errors.push("real readiness guard expired".into());
+                }
+                if state.ready || !state.errors.is_empty() {
+                    state.expired = Some((budget, Instant::now()));
+                }
+            }
+            drop(state);
+            self.elapsed()
+        }
+    }
+
+    // Exclusive Child borrow gives the targeted seam an unwind-safe kill/wait
+    // owner without threads, pre_exec callbacks, or numeric-PID cleanup after reap.
+    pub(super) struct ObservedChild<'a> {
+        child: &'a mut Child,
+        armed: bool,
+    }
+
+    impl<'a> ObservedChild<'a> {
+        pub(super) fn new(child: &'a mut Child, clock: &DeadlineClock) -> Self {
+            let owner = Self {
+                child,
+                armed: clock.state.is_some(),
+            };
+            if let Some(shared) = &clock.state {
+                let observed = identity(owner.child.id()).and_then(|(birth, _)| {
+                    if birth.parent != std::process::id()
+                        || birth.group != birth.pid
+                        || birth.start_ticks == 0
+                        || birth.namespace != std::fs::read_link("/proc/self/ns/pid")?
+                    {
+                        return Err(io::Error::other(format!(
+                            "unverifiable owned child: {birth:?}"
+                        )));
+                    }
+                    Ok(birth)
+                });
+                let mut state = shared.borrow_mut();
+                match observed {
+                    Ok(birth) => state.owned = Some(birth),
+                    Err(e) => state.errors.push(e.to_string()),
+                }
+            }
+            owner
+        }
+
+        pub(super) fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            // Normal cleanup already killed the group/child. Never send a new
+            // numeric-PID signal after a wait attempt with uncertain ownership.
+            self.armed = false;
+            self.child.wait()
+        }
+    }
+
+    impl std::ops::Deref for ObservedChild<'_> {
+        type Target = Child;
+        fn deref(&self) -> &Child {
+            self.child
+        }
+    }
+
+    impl std::ops::DerefMut for ObservedChild<'_> {
+        fn deref_mut(&mut self) -> &mut Child {
+            self.child
+        }
+    }
+
+    impl Drop for ObservedChild<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                if let Some(group) = rustix::process::Pid::from_raw(self.child.id() as i32) {
+                    let _ =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                }
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
 
     #[test]
     fn transport_progress_preserves_partial_reads_at_cap() {
@@ -462,15 +739,17 @@ mod tests {
         );
         no_child(&busy);
 
-        // Natural scheduling qualification, not a deterministic timeout seam.
-        // The owned shell publishes its PID/output then execs a native sleeper.
+        // Freeze this invocation's logical clock until the stopped owned shell
+        // published its identity AND real transport read all seven bytes.
+        // The zero/ETXTBSY cases above and other timeout tests use real clocks.
         let pid = temp.path().join("leader");
+        let scope = DeadlineScope::new(pid.clone(), false);
         let mut io = TransportProgress::default();
         let result = output_with_input_aggregate_observed(
             Command::new("/bin/sh")
                 .args([
                     "-c",
-                    "printf '%s' $$ > \"$1\"; printf partial; exec /usr/bin/sleep 30",
+                    "printf '%s' $$ > \"$1\"; printf partial; kill -STOP $$",
                     "transport-fixture",
                 ])
                 .arg(&pid),
@@ -479,12 +758,18 @@ mod tests {
             b"",
             &mut io,
         );
-        assert_eq!(result.unwrap_err(), TIMEOUT);
-        let leader = std::fs::read_to_string(pid).unwrap();
-        assert!(
-            !std::path::Path::new(&format!("/proc/{leader}")).exists(),
-            "leader not reaped"
+        scope.assert_cleaned(&io);
+        assert_eq!(
+            io.stdout_bytes_read, 7,
+            "deadline must follow actual partial read"
         );
+        assert_eq!(result.unwrap_err(), TIMEOUT);
+        let publication = std::fs::read_to_string(pid).unwrap();
+        let leader = publication
+            .parse::<u32>()
+            .expect("positive numeric publication");
+        assert!(leader > 0, "zero publication: {publication:?}; {io:?}");
+        assert_eq!(leader, scope.0.borrow().owned.as_ref().unwrap().pid);
         assert_eq!(io.timeout_site, Some(TransportTimeoutSite::IoLoop));
         assert_eq!(io.phase, TransportPhase::IoLoop);
         assert_eq!(io.spawn_attempts, 1);
@@ -505,8 +790,52 @@ mod tests {
         assert!(io.cleanup_start_us <= io.cleanup_end_us);
         assert!(io.cleanup_end_us.is_some());
         assert_eq!(io.group_kill_ok, Some(true));
-        assert!(io.child_kill_ok.is_some());
+        assert_eq!(io.child_kill_ok, Some(true));
         assert_eq!(io.leader_wait_ok, Some(true));
+    }
+
+    #[test]
+    fn empty_publication_still_reaps_independently_owned_leader() {
+        let temp = tempfile::tempdir().unwrap();
+        let pid = temp.path().join("leader");
+        let scope = DeadlineScope::new(pid.clone(), true);
+        let mut progress = TransportProgress::default();
+        let result = output_with_input_aggregate_observed(
+            Command::new("/bin/sh")
+                .args(["-c", "exec 3>\"$1\"; kill -STOP $$", "empty-publication"])
+                .arg(&pid),
+            Duration::from_millis(100),
+            1024,
+            b"",
+            &mut progress,
+        );
+        scope.assert_cleaned(&progress);
+        let publication = std::fs::read_to_string(pid).unwrap();
+        assert!(
+            publication.is_empty(),
+            "expected deliberately truncated file"
+        );
+        // Empty publication carries no PID. Cleanup was proved from the actual
+        // Child's birth identity above; never interpolate these bytes into procfs.
+        assert_eq!(
+            result.unwrap_err(),
+            "Git runtime limit reached; inventory incomplete"
+        );
+        assert_eq!(progress.timeout_site, Some(TransportTimeoutSite::IoLoop));
+        assert_eq!(progress.phase, TransportPhase::IoLoop);
+        assert!(progress.spawned && progress.input_complete_closed && progress.helper_returned);
+        assert_eq!(
+            (
+                progress.stdin_bytes_written,
+                progress.stdout_bytes_read,
+                progress.stderr_bytes_read
+            ),
+            (0, 0, 0)
+        );
+        assert!(!progress.stdout_eof && !progress.stderr_eof && !progress.exit_observed);
+        assert!(progress.spawn_return_us <= progress.timeout_observed_us);
+        assert!(progress.timeout_observed_us <= progress.cleanup_start_us);
+        assert!(progress.cleanup_start_us <= progress.cleanup_end_us);
     }
 
     fn writable_script(temp: &tempfile::TempDir, body: &str) -> (Command, std::fs::File) {
