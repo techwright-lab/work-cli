@@ -1,7 +1,7 @@
 # Native setup and default configuration discovery
 
 **Goal:** Make the native CLI discover its documented default configuration and provide safe guided or headless onboarding without initializing or changing Work authority.
-**Amend-grant:** none
+**Amend-grant:** 1 more fix rounds
 **Engine:** waves
 **Release preparation:** v0.3.0; publication and host upgrade are separate operator actions.
 
@@ -184,7 +184,7 @@ Enumerated input/validation failures: missing headless actor/repository/default 
 
 Enumerated filesystem failures: unsafe config/lock/backup ownership, symlinks, hardlinks or special files; an appearing config during new publication; detected changed original during an update; a concurrent setup writer; staging/sync/publication errors. Retain existing/unknown bytes, report actual partial actions where applicable, and offer no force/repair fallback. Do not follow an unsafe destination merely to make setup succeed.
 
-Cancellation, help, --check and --dry-run preserve these write families: configuration file/parents, managed root, storage parents/endpoints, writer lock/backups/staging, skill discovery/data, runtime pointers and Work authority/task records. Validation/dry-run uses prospective checks without creating missing directories.
+Cancellation, help, --check and --dry-run preserve these write families: configuration file/parents, managed root, storage parents/endpoints, writer lock/backups/staging, skill discovery/data, runtime pointers and Work authority/task records. Validation/dry-run uses prospective checks without creating missing directories. Required non-initializing read-only authority admission may change only the contents and associated timestamps of existing authority-owned SQLite `-shm` coordination files. Their identities, ownership, permissions and regular-file type must remain unchanged. This exception permits no file creation, deletion or replacement; database/WAL changes; authority/task-record, binding or quota changes; initialization, registration, migration, repair or rebinding. Every other enumerated destination remains unchanged. No checkpoint, journal-mode change or cache cleanup is authorized.
 
 A new config cannot silently adopt pre-existing authority data when its binding/configuration is unknown. Existing-mode setup does not move, recreate, initialize, migrate or rebind an authority. Inaccessible evidence is an error/hold, not empty-state proof.
 
@@ -198,7 +198,7 @@ Run public CLI tests in disposable owned homes/repositories; use actual commands
 - Explicit/XDG/HOME precedence, empty XDG, empty explicit disable, missing implicit file, explicit missing file and location-only malformed-TOML behavior - cli_contract.rs and doctor.rs.
 - All first-time fields, example defaults and overrides, guided preview/confirmation and JSON result - crates/work/tests/setup.rs.
 - Headless complete flags and missing-input/confirmation refusal without prompts - setup.rs.
-- Cancellation/EOF, help, inspection and dry-run preserve the enumerated write families - setup.rs.
+- Cancellation/EOF, help, inspection and dry-run preserve the enumerated write families - setup.rs. Exercise cold reads without priming before the baseline, and warm reads. Compare all destinations; allow only the specified coordination-file effects. Verify unchanged database/WAL contents, records, bindings and charges. Do not broadly ignore `-shm` files or rely solely on warm snapshots.
 - Brand-new home with missing config/state parents becomes usable for later start while store/registry endpoints remain absent after setup - setup.rs.
 - Existing add-repository preserves protected fields, unknown TOML values, registered-root/authority identity and an active charged fixture task; setup-then-add-before-start refuses without mutation because registration evidence is absent - setup.rs.
 - Duplicate additions without other actions preserve config/backup/skill bytes and identities - setup.rs.
