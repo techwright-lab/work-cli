@@ -6,13 +6,13 @@
 is required to run it.** Require Linux x86_64, glibc >=2.36 and stable Git >=2.55.0
 at `/usr/bin/git`. Git 2.55.0 and 2.56.0 are tested.
 
-Download these files from
+Published v0.2.0 files are on
 [GitHub Releases](https://github.com/techwright-lab/work-cli/releases):
 
 - `work-0.2.0-linux-x86_64` - standalone executable.
 - `work-0.2.0-linux-x86_64.sha256` - checksum for that executable.
 
-For a fresh installation:
+For a fresh installation of that published release:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
@@ -21,15 +21,19 @@ sha256sum --check work-0.2.0-linux-x86_64.sha256 &&
   work --version
 ```
 
+After a qualified v0.3.0 publication, use `work-0.3.0-linux-x86_64` and
+`work-0.3.0-linux-x86_64.sha256` with the same steps. Do not use 0.3.0 download
+names until that GitHub Release exists. Native `work setup` requires v0.3.0+.
+
 Add ~/.local/bin to PATH when the shell does not already include it. Keep an
 existing installation intact until its ownership and update method are known;
 use the helper for an installer-managed `work` link instead of overwriting it.
 
-These standalone assets become available after v0.2.0 is published, not when its
-PR opens. Earlier releases already contain the same native executable at
-`bin/work` inside `work-cli-VERSION-linux-x86_64.tar.gz`: verify that archive's
-sidecar, extract it and install `bin/work`. No clone or Python is needed for that
-path either.
+Standalone assets become available after their version is published, not when a
+PR opens. v0.2.0 standalone assets are published. Earlier releases already contain
+the same native executable at `bin/work` inside
+`work-cli-VERSION-linux-x86_64.tar.gz`: verify that archive's sidecar, extract it
+and install `bin/work`. No clone or Python is needed for that path either.
 
 The optional full bundle adds configuration examples, the agent skill, installer
 and this runbook. Checksums detect corruption; GitHub/publisher access remains the
@@ -88,12 +92,18 @@ Choose the bundled Python 3.11+ helper for cached versions, atomic activation,
 managed skill snapshots and rollback. **It is optional, not the binary bootstrap
 requirement.** Use the script in an extracted, verified release bundle:
 
+Published v0.2.0 helper example:
+
 ```sh
 python3 /absolute/work-cli-0.2.0-linux-x86_64/tools/work_install.py install \
   --version v0.2.0 --archive /downloads/work-cli-0.2.0-linux-x86_64.tar.gz \
   --checksum /downloads/work-cli-0.2.0-linux-x86_64.tar.gz.sha256 \
   --skills-dir "$HOME/.agents/skills" --skills-dir "$HOME/.claude/skills"
 ```
+
+After a qualified v0.3.0 publication, substitute `0.3.0` / `v0.3.0` in those
+paths and `--version`. Do not fetch 0.3.0 archives until that GitHub Release
+exists.
 
 Omit archive/checksum for an anonymous HTTPS download of an explicitly selected
 version. `download --version VERSION --output-dir DIR` verifies files without
@@ -139,11 +149,122 @@ migrate the same managed links. Treat unpublished instructions as a candidate.
 
 ## Configure everyday work
 
-Choose actor, source repositories, capacity and a persistent managed root. Use the
-packaged examples/work.toml at `${XDG_CONFIG_HOME:-~/.config}/work/config.toml`,
-with literal absolute paths. Create the root; keep store/registry outside it and
-repositories. Exclude the root from unrelated cleaners. WORK_CONFIG selects a
-different authority explicitly.
+On v0.3.0+, `work setup` is the normal guided new-install path. It is not `init`,
+a fullscreen UI, a shell bootstrap or a Python installer. In an interactive
+terminal it collects actor, repositories, root, store, registry, quotas,
+thresholds and skills in that order, prints the complete preview on stderr, and
+applies only after the operator types `yes` (default: no). EOF or any other
+answer cancels the whole proposal and exits nonzero. The final SetupReport is
+JSON on stdout.
+
+```sh
+work setup
+work setup --actor alice --repository /home/alice/src/project --yes
+work setup --actor alice --repository /home/alice/src/project --dry-run
+work setup --check
+work setup --actor alice --repository /home/alice/src/project --skills standard --yes
+work setup --add-repository /home/alice/src/other --root /home/alice/worktrees --yes
+```
+
+Headless creation requires explicit `--actor`, at least one `--repository`, and
+`--yes` (or `--dry-run` without `--yes`). Other new-install fields derive only
+from usable HOME/state paths; otherwise pass them explicitly. Do not infer actor
+from Git or passwd. Interactive mode may suggest a valid `USER` for the operator
+to accept. `--interactive` selects the same prompts for controlled input.
+Non-terminal stdin without `--interactive`, and a terminal with `--yes`, never
+prompt. `--yes` confirms a validated proposal; it is not permission to overwrite
+protected settings. `--dry-run` must not combine with `--yes`. `--check` is
+inspection-only and rejects action flags.
+
+Configuration selection: a present nonempty `WORK_CONFIG` selects that path. A
+present empty `WORK_CONFIG` disables discovery with no fallback. Otherwise select
+nonempty `XDG_CONFIG_HOME/work/config.toml`, else nonempty
+`HOME/.config/work/config.toml`. Treat empty `XDG_CONFIG_HOME` as unset. Legacy
+explicit relative paths remain readable; setup writes require absolute paths with
+safe ancestry. A missing implicit config is not an authority initializer. v0.2.0
+has no HOME fallback, so set explicit `WORK_CONFIG` on that release.
+
+New-install suggestions, not migrations of existing paths or limits:
+
+| Field | Default |
+|---|---|
+| root | `HOME/worktrees` |
+| store | `XDG_STATE_HOME/work/store`, else `HOME/.local/state/work/store` |
+| registry | `XDG_STATE_HOME/work/registry`, else `HOME/.local/state/work/registry` |
+| repository_limit | 8 |
+| owner_limit | 4 |
+| floor_bytes | 1073741824 (1 GiB) |
+| warn_bytes | 5368709120 (5 GiB) |
+
+Nonempty `XDG_STATE_HOME` chooses `XDG_STATE_HOME/work/{store,registry}`; empty
+or absent `XDG_STATE_HOME` falls back to nonempty
+`HOME/.local/state/work/{store,registry}`. Missing both bases requires
+operator-supplied explicit absolute values.
+
+`warn_bytes` must be >= `floor_bytes`. Zero is an explicit capacity hold, not a
+raised default.
+
+After consent, setup creates the config file, the approved managed root and
+necessary empty storage-parent directories. It does not create store or registry
+endpoint directories, SQLite files, markers or checkouts. Later `work start`
+initializes and allocates under operator authority. Setup does not start a task.
+
+Existing configuration is read-only inspection by default. Guided mode inspects
+prerequisites before offering additions or skills. `--add-repository` appends
+only canonical repositories when a positively identified registered root admits
+read-only. Before the first `start`, absent endpoints are not registration proof;
+addition refuses without mutation. `--root` selects an existing registered root
+for next-step guidance only; it does not change the root list. Actor, roots,
+store, registry and allocation are protected. There is no adopt, migrate, repair,
+rebind, force or prune path. Unknown TOML is preserved. A duplicate addition
+without another action is a no-op (no lock, backup or skill install); a
+separately selected skill action remains actionable. `--yes` alone, and
+`--skills none` alone, stay inspection.
+
+Readable configs whose ancestors include symlinks can still be inspected. Setup
+writes refuse symlink ancestors, including a symlinked `HOME/.config`, rather
+than rebinding to another path. Unknown unsafe ownership, file type, links or
+permissions are holds. Adjacent private lock, stage and backup files protect
+cooperative users: new files use no-replace publication; updates re-check the
+original snapshot under the lock, sync an exact original private backup, then
+replace; the config parent is fsynced after publication. This is not hostile
+same-UID or power-loss certification.
+
+`config_written` in the JSON report is true only when the config was actually
+published. Parent-sync or lock-release uncertainty after that is a later
+failure: do not roll back and do not claim no change. Directories, backups and
+skill actions already completed stay and are reported. Unknown outcomes need
+read-only state inspection, not automatic retry or force.
+
+Default skill selection is none. `standard` or `all` run only after a confirmed
+action or publication (`standard` is `.agents`; `all` also adds Claude and Codex).
+Native skill install needs no Python, network or source checkout. A later skill
+failure keeps the written config and reports typed completed, failed or unknown
+actions. When skills succeeded, the report may include a catalog-reload next
+step; that is guidance, not a claim that reload ran or that every harness
+invokes the skill.
+
+Help, `--check`, `--dry-run`, cancellation and EOF leave setup write destinations
+unchanged, with one narrow exception during required non-initializing read-only
+authority admission: that admission may change only the contents and associated
+timestamps of existing authority-owned SQLite `-shm` coordination files. Those
+files keep their identities, ownership, permissions and regular-file type. The
+exception permits no creation, deletion or replacement; no database, WAL, record,
+binding or quota changes; no initialization, registration, migration, repair or
+rebinding; no checkpoint, journal-mode change or cache cleanup. Every other
+destination remains unchanged. This is not a broad `-shm` exemption.
+
+Publication of a GitHub Release and confirmed stopped-writer removal remain
+separate operator gates. Setup does not publish assets, upgrade the host, finish
+a task or remove a checkout.
+
+Advanced alternative: copy [examples/work.toml](../examples/work.toml) from a
+separately obtained retained release bundle or source checkout, replace
+its absolute paths, create the managed root, and keep store/registry outside it
+and repositories. That relative link works in source and the full bundle only;
+native skill snapshots embed SKILL.md, its setup reference and this runbook, not
+`examples/work.toml`. Exclude the root from unrelated cleaners. `WORK_CONFIG` still
+selects a different authority explicitly.
 
 Verify `work status --json` before allocation: missing authority stays uninitialized.
 Start with an intended base, for example `work start --task TASK --base origin/main`.

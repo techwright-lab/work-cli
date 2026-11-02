@@ -1,6 +1,6 @@
 ---
 name: work-cli
-description: Use before starting code changes in a repository configured for work-cli, when creating or reusing task worktrees, when finishing a task or removing a checkout, and when installing or updating work-cli. Load for Git worktree ownership, capacity holds, or interrupted removal.
+description: Use before starting code changes in a repository configured for work-cli, when creating or reusing task worktrees, when finishing a task or removing a checkout, when configuration is absent or onboarding is requested, and when installing or updating work-cli. Load for Git worktree ownership, capacity holds, or interrupted removal.
 ---
 
 # Work CLI task lifecycle
@@ -12,11 +12,16 @@ task completion, stopped-writer confirmation and removal as separate decisions.
 
 1. Read `work --version`, `work start --help` and `work status --json`. Use v0.1.2
    or newer on Linux x86_64 with stable Git >=2.55.0 at `/usr/bin/git`.
-2. Locate the operator-selected configuration through `WORK_CONFIG` or
-   `${XDG_CONFIG_HOME:-$HOME/.config}/work/config.toml`. For absent configuration
-   or an unavailable binary, read [setup and updates](reference/setup.md); ask the
-   operator to choose repository, actor, managed root, registry and capacity.
-   Keep analysis read-only until those choices are explicit.
+2. Locate the operator-selected configuration. A present nonempty `WORK_CONFIG`
+   selects that path. A present empty `WORK_CONFIG` disables discovery with no
+   fallback. Otherwise select nonempty `XDG_CONFIG_HOME/work/config.toml`, else
+   nonempty `HOME/.config/work/config.toml`. Treat empty `XDG_CONFIG_HOME` as
+   unset. For absent configuration or an unavailable binary, read
+   [setup and updates](reference/setup.md). Ask the operator to authorize actor,
+   repository, root, registry and capacity, or guided `work setup`, before any
+   onboarding write. Keep analysis read-only until those choices are explicit.
+   Do not treat missing configuration as setup authority or silently reconfigure
+   an existing machine.
 3. Check the current checkout and status inventory. Use an existing feature
    worktree explicitly supplied by the operator; do not create a nested worktree
    or replace the operator's checkout. For a new managed task, choose a stable

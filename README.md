@@ -9,9 +9,9 @@ or remote-preservation configuration is required.
 
 ## Download the binary
 
-Get `work-0.2.0-linux-x86_64` and its `.sha256` file from
+Published v0.2.0 assets are on
 [GitHub Releases](https://github.com/techwright-lab/work-cli/releases). For a fresh
-installation:
+installation of that published release:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
@@ -20,10 +20,14 @@ sha256sum --check work-0.2.0-linux-x86_64.sha256 &&
   work --version
 ```
 
+After a qualified v0.3.0 publication, install with `work-0.3.0-linux-x86_64` and
+`work-0.3.0-linux-x86_64.sha256` the same way. Do not use 0.3.0 download names
+until that GitHub Release exists. Native `work setup` requires v0.3.0+.
+
 **No repository clone, Rust or Python is required.** Keep Git installed as described
-below. Standalone assets arrive with v0.2.0 after publication; existing releases
-already include the native executable at `bin/work` inside their release archive.
-A version-bump PR is not a published release.
+below. Standalone assets arrive with their tagged version after publication;
+existing releases already include the native executable at `bin/work` inside their
+release archive. A version-bump PR is not a published release.
 
 Install the [agent skill](skills/work-cli/SKILL.md) directly from the binary:
 
@@ -107,10 +111,40 @@ For a source build on a supported host: `cargo build --release --locked -p work-
 
 ## Configure once
 
-Copy [examples/work.toml](examples/work.toml), replace its absolute paths, and set
-`WORK_CONFIG` to that file. Create the managed root directory first. Keep the
-store and registry outside repositories and managed roots. `start` initializes
-them; `status` does not.
+On v0.3.0+, `work setup` is the normal guided new-install path. It is not `init`,
+a fullscreen UI, a shell bootstrap or a Python installer. In a terminal it collects
+actor, repositories, root, store, registry, quotas, thresholds and skills, prints
+the complete preview on stderr, and applies only after an explicit `yes` (default:
+no). EOF or any other answer cancels the whole proposal with a nonzero exit. Final
+JSON goes to stdout.
+
+```sh
+work setup
+work setup --actor alice --repository /home/alice/src/project --yes
+work setup --actor alice --repository /home/alice/src/project --dry-run
+work setup --check
+work setup --actor alice --repository /home/alice/src/project --skills standard --yes
+work setup --add-repository /home/alice/src/other --root /home/alice/worktrees --yes
+```
+
+Headless apply needs `--actor`, at least one `--repository`, and `--yes`.
+`--dry-run` must not combine with `--yes`. `--check` is inspection-only and
+rejects action flags. `--interactive` enables the same prompts on non-terminal
+input. A terminal with `--yes` never prompts. `--yes` confirms a valid proposal;
+it does not overwrite protected settings. Setup does not infer actor from Git or
+passwd; interactive mode may suggest a valid `USER` for the operator to accept.
+Discovery, defaults, existing-config limits, writer safety and the passive `-shm`
+exception are in [download, install, update and release instructions](docs/distribution.md).
+
+Setup creates the config, the approved root and empty storage parents. It does not
+create store or registry endpoints, SQLite files, markers or checkouts. `start`
+initializes them later; `status` does not. Setup does not allocate a task.
+
+On v0.2.0, copy [examples/work.toml](examples/work.toml), replace its absolute
+paths, and set `WORK_CONFIG` to that file; that release has no `work setup` and
+no HOME fallback. Copying the example remains an advanced alternative on v0.3.0+.
+Create the managed root first. Keep the store and registry outside repositories
+and managed roots.
 
 A single configured repository/root and the top-level `actor` supply defaults.
 With multiple repositories or roots, pass `--repository` and `--root` explicitly.
@@ -118,6 +152,10 @@ With multiple repositories or roots, pass `--repository` and `--root` explicitly
 `-`, or `.`, with no leading dot/dash or consecutive dots.
 
 ## Daily workflow
+
+On v0.3.0+, omit `WORK_CONFIG` to use default discovery. An empty `WORK_CONFIG`
+disables discovery. The explicit export below remains valid on every supported
+release, including v0.2.0.
 
 ```sh
 export WORK_CONFIG=/absolute/path/to/work.toml
