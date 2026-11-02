@@ -2605,18 +2605,19 @@ pub(crate) struct WriterFamily {
 use std::cell::{Cell, RefCell};
 
 #[cfg(test)]
+type InstallerStubResult = Result<Vec<SkillActionReport>, (Vec<SkillActionReport>, String)>;
+
+#[cfg(test)]
 thread_local! {
     static BACKUP_NAMES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static FOREIGN_FILE: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
     static FAIL_STEP: Cell<Option<WriterStep>> = const { Cell::new(None) };
     static OBSERVED: RefCell<Vec<WriterStep>> = const { RefCell::new(Vec::new()) };
-    static INSTALLER: RefCell<Option<Result<Vec<SkillActionReport>, (Vec<SkillActionReport>, String)>>> =
-        const { RefCell::new(None) };
+    static INSTALLER: RefCell<Option<InstallerStubResult>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
-fn take_installer_stub() -> Option<Result<Vec<SkillActionReport>, (Vec<SkillActionReport>, String)>>
-{
+fn take_installer_stub() -> Option<InstallerStubResult> {
     INSTALLER.with(|slot| slot.borrow_mut().take())
 }
 
@@ -3087,10 +3088,11 @@ mod tests {
                     rustix::fs::flock(&alias, rustix::fs::FlockOperation::Unlock).unwrap();
                 }
                 "error" => {
-                    let result = (move || -> io::Result<()> {
+                    fn early_return(owner: SetupLock) -> io::Result<()> {
                         let _owner = owner;
                         Err(io::Error::other("early return"))
-                    })();
+                    }
+                    let result = early_return(owner);
                     assert!(result.is_err());
                 }
                 "unwind" => {
@@ -3181,6 +3183,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .mode(0o600)
             .open(&family.lock)
             .unwrap();
@@ -3820,7 +3823,7 @@ mod tests {
         fs::create_dir(dir.join("directory")).unwrap();
         rustix::fs::mknodat(
             rustix::fs::CWD,
-            &dir.join("fifo"),
+            dir.join("fifo"),
             rustix::fs::FileType::Fifo,
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
             0,
