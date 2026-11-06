@@ -305,3 +305,71 @@ fn passive_store_admission_is_not_replaced_by_mutable_backend_refusal() {
         .contains("native mutable authority backend incomplete"));
     assert_eq!(snapshot(&root), before);
 }
+
+// Each PATH-injected probe runs in its own test process; no process-global env mutation.
+#[test]
+fn linux_scope_probe_child() {
+    let Some(case) = std::env::var_os("WORK_TEST_NATIVE_SCOPE_CASE") else {
+        return;
+    };
+    let error = if case == "inspect" {
+        work_cli::linux_scope::inspect_host().err()
+    } else {
+        let options = work_cli::linux_scope::QualificationOptions {
+            run_id: if case == "invalid" {
+                "secret\nvalue"
+            } else {
+                "native-refusal"
+            },
+            adapter: "fixture",
+            opt_in_fixture: case == "opt-in",
+        };
+        work_cli::linux_scope::qualify(options).err()
+    };
+    assert!(
+        !Path::new(&std::env::var_os("WORK_TEST_NATIVE_SCOPE_SENTINEL").unwrap()).exists(),
+        "unsupported native probe must not execute helpers"
+    );
+    assert_eq!(
+        error.expect("native probe must refuse").kind(),
+        std::io::ErrorKind::Unsupported,
+    );
+}
+
+#[test]
+fn linux_scope_public_probes_refuse_before_any_helper_execution() {
+    use std::os::unix::fs::PermissionsExt;
+    for case in ["inspect", "passive", "opt-in", "invalid"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(root.join("tmp")).unwrap();
+        for name in ["systemctl", "git", "systemd-run"] {
+            let helper = bin.join(name);
+            fs::write(
+                &helper,
+                b"#!/bin/sh\nprintf executed >> \"$WORK_TEST_NATIVE_SCOPE_SENTINEL\"\nexit 1\n",
+            )
+            .unwrap();
+            fs::set_permissions(helper, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let before = snapshot(&root);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "linux_scope_probe_child", "--nocapture"])
+            .env_clear()
+            .env("PATH", &bin)
+            .env("HOME", &root)
+            .env("TMPDIR", root.join("tmp"))
+            .env("WORK_TEST_NATIVE_SCOPE_CASE", case)
+            .env(
+                "WORK_TEST_NATIVE_SCOPE_SENTINEL",
+                root.join("helper-executed"),
+            )
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{case}: {output:?}");
+        assert_eq!(snapshot(&root), before);
+    }
+}
