@@ -188,3 +188,120 @@ fn scope_child_library_refuses_before_collecting_or_publishing() {
     );
     assert_eq!(snapshot(fixture.path()), before);
 }
+
+#[test]
+fn mutable_store_admission_refuses_before_creating_registry_or_authority() {
+    for method in ["open", "open_registered", "open_existing_registered_mut"] {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let managed = root.join("managed");
+        fs::create_dir(&managed).unwrap();
+        let registry = root.join(".work-authorities");
+        let authority = root.join("authority");
+        let before = snapshot(&root);
+        let result = match method {
+            "open" => work_cli::store::Store::open(&authority, &[managed]),
+            "open_registered" => {
+                work_cli::store::Store::open_registered(&registry, &authority, &[managed])
+            }
+            _ => work_cli::store::Store::open_existing_registered_mut(
+                &registry,
+                &authority,
+                &[managed],
+            ),
+        };
+        assert!(!registry.exists(), "{method} must not bootstrap a registry");
+        assert!(
+            !authority.exists(),
+            "{method} must not create authority storage"
+        );
+        assert_eq!(
+            snapshot(&root),
+            before,
+            "{method} must leave fixture unchanged"
+        );
+        let error = result.err().expect("native mutable authority must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("native mutable authority backend incomplete"),
+            "{method}: {error}"
+        );
+    }
+}
+
+#[test]
+fn native_allocation_refuses_before_registry_bootstrap() {
+    use work_cli::{
+        allocate::{self, Start},
+        config::{AllocationPolicy, Config},
+    };
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let managed = root.join("managed");
+    let repository = root.join("repository");
+    fs::create_dir(&managed).unwrap();
+    fs::create_dir(&repository).unwrap(); // Not a Git repository: no Git may be dispatched.
+    let registry = root.join("registry");
+    let authority = root.join("authority");
+    let config = Config {
+        store_dir: Some(authority.clone()),
+        trusted_registry: Some(registry.clone()),
+        roots: vec![managed.clone()],
+        repositories: vec![repository.clone()],
+        allocation: Some(AllocationPolicy {
+            repository_limit: 2,
+            owner_limit: 2,
+            floor_bytes: 1,
+            warn_bytes: 2,
+            capture_sink: None,
+        }),
+        ..Default::default()
+    };
+    let request = Start {
+        operation: uuid::Uuid::parse_str("019281b2-67de-7000-8000-000000000001").unwrap(),
+        repository: Some(repository),
+        root: Some(managed),
+        actor: Some("fixture".into()),
+        owner: None,
+        task: "native-refusal".into(),
+        branch: None,
+        base: "main".into(),
+        reuse_branch: false,
+    };
+    let before = snapshot(&root);
+    let result = allocate::start_observed(&config, request, |_| {
+        panic!("must not reach persisted allocation boundary")
+    });
+    assert!(
+        !registry.exists(),
+        "allocation must not bootstrap a registry"
+    );
+    assert!(!authority.exists());
+    assert_eq!(snapshot(&root), before);
+    let error = result.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native mutable authority backend incomplete"),
+        "{error}"
+    );
+}
+
+#[test]
+fn passive_store_admission_is_not_replaced_by_mutable_backend_refusal() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let before = snapshot(&root);
+    let error = work_cli::store::Store::open_existing_registered_readonly(
+        &root.join("registry"),
+        &root.join("authority"),
+        &[],
+    )
+    .err()
+    .expect("absent authority must not initialize");
+    assert!(!error
+        .to_string()
+        .contains("native mutable authority backend incomplete"));
+    assert_eq!(snapshot(&root), before);
+}
