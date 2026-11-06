@@ -1,4 +1,6 @@
 //! Test source authored before the corresponding A2/A3 logic. CI-only; no RED/GREEN claim.
+#[path = "../tests/support/fifo.rs"]
+mod fifo;
 
 #[test]
 fn native_command_envelopes_are_exact_and_unknown_argv_stays_conservative() {
@@ -1162,14 +1164,10 @@ fn stable_links_specials_and_nested_git_never_reach_data_open() {
                 fs::write(f.temp.path().join("outside"), b"x").unwrap();
                 fs::hard_link(f.temp.path().join("outside"), f.path(b"a")).unwrap();
             }
-            "fifo" => rustix::fs::mknodat(
-                rustix::fs::CWD,
-                f.path(b"a"),
-                rustix::fs::FileType::Fifo,
+            "fifo" => fifo::create_fifo(
+                &f.path(b"a"),
                 rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-                0,
-            )
-            .unwrap(),
+            ),
             "socket" => {
                 socket = Some(std::os::unix::net::UnixListener::bind(f.path(b"a")).unwrap())
             }

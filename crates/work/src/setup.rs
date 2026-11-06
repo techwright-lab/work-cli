@@ -2716,6 +2716,10 @@ fn take_installer_stub() -> Option<InstallerStubResult> {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/fifo.rs"]
+mod fifo;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -3928,14 +3932,10 @@ mod tests {
         fs::hard_link(&target, dir.join("hardlink")).unwrap();
         symlink(&target, dir.join("symlink")).unwrap();
         fs::create_dir(dir.join("directory")).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            dir.join("fifo"),
-            rustix::fs::FileType::Fifo,
+        fifo::create_fifo(
+            &dir.join("fifo"),
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .unwrap();
+        );
         let _socket = UnixListener::bind(dir.join("socket")).unwrap();
         let before = physical_snapshot(temp.path());
         let names = [

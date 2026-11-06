@@ -5646,14 +5646,19 @@ mod tests {
                     .unwrap_err(),
                     "assertion_invalidated"
                 );
-                // Real wall/boottime samples AFTER rejection prove this is an
+                // Real time samples AFTER rejection prove this is an
                 // otherwise-unexpired published claim, not the expiry fault test.
                 let claim: serde_json::Value = serde_json::from_slice(&original_claim).unwrap();
-                let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
-                let now_ns = u64::try_from(now.tv_sec).unwrap() * 1_000_000_000
-                    + u64::try_from(now.tv_nsec).unwrap();
                 assert!(wall_time().unwrap() < claim["claim_expiry"]["wall_ms"].as_u64().unwrap());
-                assert!(now_ns < claim["claim_expiry"]["boottime_ns"].as_u64().unwrap());
+                // The stored claim currently uses Linux CLOCK_BOOTTIME. Do not
+                // fabricate a native clock or omit the remaining history checks.
+                #[cfg(target_os = "linux")]
+                {
+                    let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+                    let now_ns = u64::try_from(now.tv_sec).unwrap() * 1_000_000_000
+                        + u64::try_from(now.tv_nsec).unwrap();
+                    assert!(now_ns < claim["claim_expiry"]["boottime_ns"].as_u64().unwrap());
+                }
                 assert_eq!(
                     original_claim,
                     receipts::read_receipt(&f.store, original_assertion)

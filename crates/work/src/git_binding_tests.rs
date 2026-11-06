@@ -1,4 +1,6 @@
 //! Controlled fake-Git services, not supported-Git matrix qualification.
+#[path = "../tests/support/fifo.rs"]
+mod fifo;
 use super::*;
 use std::ffi::OsStr;
 use std::os::unix::{
@@ -341,14 +343,7 @@ fn fake_git_unsafe_nonregular_nonexec_refused_before_execution() {
             }
             "fifo" => {
                 fs::remove_file(&f.program).unwrap();
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &f.program,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&f.program, rustix::fs::Mode::RUSR);
             }
             "parent" => {
                 fs::set_permissions(f.root.path(), fs::Permissions::from_mode(0o777)).unwrap()

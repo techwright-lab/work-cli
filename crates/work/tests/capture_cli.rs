@@ -1,5 +1,7 @@
 #[path = "support/capture_finalization_fixture.rs"]
 mod capture_fixture;
+#[path = "support/fifo.rs"]
+mod fifo;
 #[path = "support/run_fixture.rs"]
 mod fixture_support;
 use capture_fixture::Fixture;
@@ -449,8 +451,7 @@ fn capture_authority_loader_rejects_unsafe_inputs_without_creation() {
         let unsafe_config = f.dir.path().join(format!("SECRET-{kind}"));
         match kind {
             "symlink" => std::os::unix::fs::symlink(&config, &unsafe_config).unwrap(),
-            "fifo" => rustix::fs::mkfifoat(rustix::fs::CWD, &unsafe_config, rustix::fs::Mode::RUSR)
-                .unwrap(),
+            "fifo" => fifo::create_fifo(&unsafe_config, rustix::fs::Mode::RUSR),
             "directory" => fs::create_dir(&unsafe_config).unwrap(),
             _ => unreachable!(),
         }

@@ -1975,8 +1975,10 @@ mod tests {
             Err(ReceiptError::Corrupt)
         ));
     }
+    // This exercises Linux O_PATH acquisition, not the portable envelope model.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn native_authority_metadata_and_readable_opens_share_bound_identity() {
+    fn linux_authority_metadata_and_readable_opens_share_bound_identity() {
         let f = fixture::ManagedFixture::new("sha1", "2");
         let parent = File::open(f.temp.path().join("authority")).unwrap();
         let authority = f.store.authority_identity();
@@ -2009,6 +2011,18 @@ mod tests {
         // These are real native descriptors, not a synthetic freshness proof.
         reservation.check(&f.store, false).unwrap();
     }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn native_receipt_open_refuses_without_an_anchored_backend() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("receipt"), b"owned fixture").unwrap();
+        let parent = File::open(temp.path()).unwrap();
+        assert_eq!(
+            open_relative(&parent, "receipt", OFlags::RDONLY).unwrap_err(),
+            ReceiptError::NativeIncomplete
+        );
+    }
+
     #[test]
     fn original_context_conflict_leaves_charged_pending_no_final() {
         let mut f = fixture::ManagedFixture::new("sha1", "2");
