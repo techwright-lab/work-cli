@@ -1,0 +1,32 @@
+
+CASE name=event-regular metadata_flags=0x8000 replacement=regular
+retained metadata handle: fd=4 dev=16777232 inode=197537649 type=100000 flags=0x8000 flags_errno=0
+pathname readable-open after replacement: fd=5 dev=16777232 inode=197537650 type=100000 flags=0x4 flags_errno=0
+/dev/fd readable-open: fd=5 dev=16777232 inode=197537649 type=100000 flags=0x8000 flags_errno=0
+/dev/fd synthetic read: read=23 errno=0 (Undefined error: 0) content=ORIGINAL-SYNTHETIC-DATA
+dup retained handle: fd=5 dev=16777232 inode=197537649 type=100000 flags=0x8000 flags_errno=0
+dup synthetic read: read=0 errno=0 (Undefined error: 0) content=<none>
+
+CASE name=event-fifo metadata_flags=0x8000 replacement=fifo
+retained metadata handle: fd=4 dev=16777232 inode=197537651 type=100000 flags=0x8000 flags_errno=0
+pathname readable-open after replacement: fd=5 dev=16777232 inode=197537652 type=10000 flags=0x4 flags_errno=0
+/dev/fd readable-open: fd=5 dev=16777232 inode=197537651 type=100000 flags=0x8000 flags_errno=0
+/dev/fd synthetic read: read=23 errno=0 (Undefined error: 0) content=ORIGINAL-SYNTHETIC-DATA
+dup retained handle: fd=5 dev=16777232 inode=197537651 type=100000 flags=0x8000 flags_errno=0
+dup synthetic read: read=0 errno=0 (Undefined error: 0) content=<none>
+
+CASE name=event-symlink metadata_flags=0x8000 replacement=symlink
+retained metadata handle: fd=4 dev=16777232 inode=197537653 type=100000 flags=0x8000 flags_errno=0
+pathname readable-open after replacement: OPEN FAILED errno=62 (Too many levels of symbolic links)
+/dev/fd readable-open: fd=5 dev=16777232 inode=197537653 type=100000 flags=0x8000 flags_errno=0
+/dev/fd synthetic read: read=23 errno=0 (Undefined error: 0) content=ORIGINAL-SYNTHETIC-DATA
+dup retained handle: fd=5 dev=16777232 inode=197537653 type=100000 flags=0x8000 flags_errno=0
+dup synthetic read: read=0 errno=0 (Undefined error: 0) content=<none>
+
+CASE name=symlink-handle-regular metadata_flags=0x200000 replacement=regular
+retained metadata handle: fd=4 dev=16777232 inode=197537655 type=100000 flags=0x0 flags_errno=0
+pathname readable-open after replacement: fd=5 dev=16777232 inode=197537656 type=100000 flags=0x4 flags_errno=0
+/dev/fd readable-open: fd=5 dev=16777232 inode=197537655 type=100000 flags=0x0 flags_errno=0
+/dev/fd synthetic read: read=23 errno=0 (Undefined error: 0) content=ORIGINAL-SYNTHETIC-DATA
+dup retained handle: fd=5 dev=16777232 inode=197537655 type=100000 flags=0x0 flags_errno=0
+dup synthetic read: read=0 errno=0 (Undefined error: 0) content=<none>

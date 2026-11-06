@@ -1,0 +1,11 @@
+ProductName:		macOS
+ProductVersion:		27.0.1
+BuildVersion:		26A434
+arm64
+Apple clang version 21.0.0 (clang-2100.3.34.2)
+Target: arm64-apple-darwin27.0.0
+Thread model: posix
+InstalledDir: /Library/Developer/CommandLineTools/usr/bin
+/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
+736561bd18eb289d2fc1883f803be11eb897b739cd2d23481986fa691fae8018  <scratch>/inspection-prototype.c
+4c35e9f8c4e5679096865bbc342c4f0dbe7c880b748222cb43578310601d7a4f  <scratch>/inspection-prototype
