@@ -179,14 +179,18 @@ fn git_candidates_preserve_unqualified_absolute_path_bytes() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
-    // Qualification, canonicalization and executable validation belong to G2.
     for bytes in [
         b"/opt/homebrew/bin/git".as_slice(),
         b"/somewhere/../git",
+        b"/somewhere/./git",
+        b"//somewhere//git",
         b"/git with spaces",
         b"/non-utf8-\xff/git",
     ] {
         let path = Path::new(OsStr::from_bytes(bytes));
+        let candidates = git_candidates(GitPlatform::MacOs, Some(path), None).unwrap();
+        // Path equality normalizes some spellings; the diagnostic input must not.
+        assert_eq!(candidates[0].path.as_os_str().as_bytes(), bytes);
         assert_eq!(
             git_candidates(GitPlatform::MacOs, Some(path), None),
             Ok(vec![GitCandidate {

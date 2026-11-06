@@ -1,6 +1,6 @@
-//! Pure Git version admission and deterministic candidate planning.
+//! Deterministic Git candidate planning and invocation-owned qualification.
 //!
-//! Candidates are inputs to qualification, not proof of executable safety.
+//! Candidates alone are not proof of executable safety.
 
 use std::path::{Path, PathBuf};
 
@@ -121,3 +121,9 @@ pub(crate) fn git_candidates(
 #[cfg(test)]
 #[path = "git_tests.rs"]
 mod tests;
+
+include!("git_binding.rs");
+
+#[cfg(test)]
+#[path = "git_binding_tests.rs"]
+mod binding_tests;
