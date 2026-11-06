@@ -13,27 +13,33 @@ import subprocess
 import sys
 
 HELP = """Usage: native-macos.sh --destination /absolute/new/path
-  [--source /absolute/source] --toolchain VERSION
-  --toolchain-dir /absolute/installed/toolchain
+  [--source /absolute/source] [--development] --toolchain VERSION
+  --toolchain-dir /absolute/installed/toolchain [--sdk-root /absolute/existing/sdk]
   (--git-version VERSION --git /absolute/path | --without-git) -- COMMAND...
 
 Qualification candidates require native arm64 macOS 15/26, installed Rust 1.98.1,
 and exact canonical native Git 2.55.0 or 2.56.0 with its installed helpers.
---without-git is DEVELOPMENT/NON-GATE: no repository operations; native macOS 27
-and explicitly selected installed Rust 1.99.1 are also permitted. Git on PATH is
-blocked in this mode. This is not a sandbox: do not pass repository operations,
-absolute Git invocations, credentials, or commands that access real host state.
+--development is DEVELOPMENT/NON-GATE: native macOS 27 and explicitly selected
+installed Rust 1.98.1/1.99.1 are permitted, still requiring exact selected Git and
+its helper/identity checks. Only disposable owned repository operations may run.
+--without-git implies DEVELOPMENT/NON-GATE and prohibits repository operations;
+Git on PATH is blocked. This is not a sandbox: do not pass absolute Git invocations
+in --without-git mode, credentials, or commands that access real host state.
 
 No Git/toolchain is installed or downloaded. CARGO_HOME starts empty; commands
 must use offline dependencies or explicitly reviewed cache paths, never user
 credentials. Invoke installed cargo/rustc directly, not rustup shims.
+--sdk-root sets SDKROOT to the resolved explicitly supplied existing directory.
+No SDK discovery or provisioning occurs; this records selection, not qualification.
 
 The new private destination and evidence are retained on success and failure;
 existing destinations and symlink parents are refused. No automatic cleanup.
 Source allowlist: Cargo.toml, Cargo.lock, rust-toolchain.toml, README.md, LICENSE,
-AGENTS.md, crates, doc, docs, examples, skills, tests, tools. Recursively exclude
-.git*, target, credential/config directories, .env*, credentials*, *.pem, *.key,
-*.p12 and *.pfx; refuse remaining symlinks/special files, never follow them.
+AGENTS.md, crates, doc, docs, examples, skills, tests, tools, vendor, patches.
+Recursively exclude .git*, target, credential/config directories, .env*,
+credentials*, *.pem, *.key, *.p12 and *.pfx. The only .git* exception is the
+regular source file vendor/libsqlite3-sys/.gitignore required by pinned provenance.
+Refuse remaining symlinks/special files, never follow them.
 This copies source bytes into owned files, not repository refs or authority state.
 Allowlisting cannot identify arbitrary secrets hidden in source: select reviewed
 source only. Retained stdout/stderr are command evidence, not environment dumps.
@@ -57,16 +63,16 @@ def parse(argv):
         sys.exit(0)
     options = {}
     valued = {"--destination", "--source", "--toolchain", "--toolchain-dir",
-              "--git-version", "--git"}
+              "--git-version", "--git", "--sdk-root"}
     index = 0
     while index < len(argv) and argv[index] != "--":
         key = argv[index]
-        if key not in valued | {"--without-git"}:
+        if key not in valued | {"--without-git", "--development"}:
             refuse("unknown option: " + key)
         if key in options:
             refuse("duplicate option: " + key)
         index += 1
-        if key == "--without-git":
+        if key in {"--without-git", "--development"}:
             options[key] = True
         else:
             if index == len(argv) or argv[index].startswith("--"):
@@ -76,19 +82,20 @@ def parse(argv):
     for key in ("--destination", "--toolchain", "--toolchain-dir"):
         if key not in options:
             refuse("required " + key)
-    development = options.get("--without-git", False)
-    if development and ("--git" in options or "--git-version" in options):
+    without_git = options.get("--without-git", False)
+    development = options.get("--development", False) or without_git
+    if without_git and ("--git" in options or "--git-version" in options):
         refuse("--without-git and Git selection are exclusive")
-    if not development and not all(k in options for k in ("--git", "--git-version")):
+    if not without_git and not all(k in options for k in ("--git", "--git-version")):
         refuse("required --git-version and --git, or explicit --without-git")
-    if not development and options["--git-version"] not in ("2.55.0", "2.56.0"):
+    if not without_git and options["--git-version"] not in ("2.55.0", "2.56.0"):
         refuse("unsupported Git fixture")
     versions = ("1.98.1", "1.99.1") if development else ("1.98.1",)
     if options["--toolchain"] not in versions:
         refuse("qualification requires Rust 1.98.1; development permits 1.98.1/1.99.1")
     if index == len(argv) or not argv[index + 1:]:
         refuse("required -- COMMAND...")
-    for key in ("--destination", "--source", "--toolchain-dir", "--git"):
+    for key in ("--destination", "--source", "--toolchain-dir", "--git", "--sdk-root"):
         if key in options and not Path(options[key]).is_absolute():
             refuse(key + " must be absolute")
     return options, argv[index + 1:], development
@@ -150,7 +157,7 @@ def owned_parent(path):
 
 SOURCE_NAMES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md",
                 "LICENSE", "AGENTS.md", "crates", "doc", "docs", "examples",
-                "skills", "tests", "tools")
+                "skills", "tests", "tools", "vendor", "patches")
 
 
 def excluded(name):
@@ -165,11 +172,15 @@ def snapshot(source, destination):
     digest = hashlib.sha256()
 
     def copy(path, output):
-        if excluded(path.name):
+        # This reviewed crate member is pinned source, not Git state or config.
+        pinned_gitignore = path.relative_to(source) == Path("vendor/libsqlite3-sys/.gitignore")
+        if excluded(path.name) and not pinned_gitignore:
             return
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
             refuse("source symlink refused: " + str(path.relative_to(source)))
+        if pinned_gitignore and not stat.S_ISREG(info.st_mode):
+            refuse("vendored .gitignore must be a regular source file")
         if stat.S_ISDIR(info.st_mode):
             output.mkdir(mode=0o700)
             for child in sorted(path.iterdir()):
@@ -239,7 +250,7 @@ def run(options, command, development, host):
     evidence = destination / "evidence"
     evidence.mkdir(mode=0o700)
     mode = "DEVELOPMENT/NON-GATE" if development else "QUALIFICATION-CANDIDATE"
-    metadata = {"mode": mode, "host": host, "git": None,
+    metadata = {"mode": mode, "host": host, "git": None, "sdk": None,
                 "command": command, "exit_code": None,
                 "support_claim": False,
                 "qualification_gates": {
@@ -260,6 +271,13 @@ def run(options, command, development, host):
             directory = destination / relative
             directory.mkdir(mode=0o700)
             env[key] = str(directory)
+        if "--sdk-root" in options:
+            sdk = Path(options["--sdk-root"])
+            if not sdk.is_dir():
+                refuse("--sdk-root must be an existing directory")
+            sdk = sdk.resolve(strict=True)
+            env["SDKROOT"] = str(sdk)
+            metadata["sdk"] = {"selection": options["--sdk-root"], "directory": str(sdk)}
         metadata["snapshot_sha256"] = snapshot(source, destination / "source")
         toolchain = Path(options["--toolchain-dir"]).resolve(strict=True)
         cargo = executable(toolchain / "bin/cargo", "installed toolchain cargo")
@@ -280,7 +298,7 @@ def run(options, command, development, host):
             refuse("installed toolchain version/native host mismatch")
         metadata["toolchain"] = {"directory": str(toolchain), "version": release,
                                  "cargo": cargo_version, "rustc": rustc_version}
-        if development:
+        if options.get("--without-git", False):
             blocked = destination / "no-git-bin"
             blocked.mkdir(mode=0o700)
             blocker = blocked / "git"
