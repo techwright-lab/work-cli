@@ -1,0 +1,171 @@
+THROWAWAY synthetic hardlink protocol matrix
+OS Darwin 27.0.1 arm64
+source_sha256 57ee064629357f7f1ef8f8cb1238c73a2b619f6859b6a31822a198d45af22161
+strict_compile=PASS
+COMMAND run
+filesystem=apfs
+
+CASE clean
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=1 gen_before=2 gen_linked=2 gen_now=2
+read=ORIGINAL
+post_read_validation=1
+completion_nlink=1 mtime_equal_initial=1 ctime_equal_initial=0
+outcome=COMPLETE data_open_calls=1 data_bytes=8 capture_charge=0 link_retained=0
+
+CASE foreign-preexisting
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=0
+
+CASE directory-substitution
+link_result=-1 errno=1
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=0
+
+CASE fifo-substitution
+link_result=0 errno=0
+capture_identity_match=0 nlink_before=1 nlink_linked=2 mtime_equal=0 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=1 gen_now=1
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE symlink-substitution
+link_result=0 errno=0
+capture_identity_match=0 nlink_before=1 nlink_linked=2 mtime_equal=0 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=1 gen_now=1
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE stage-mode-before
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=0
+
+CASE source-replaced
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE content-mutated
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=3
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE content-ABA
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=4
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE stage-replaced
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE link-replaced
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE link-fifo
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE stage-mode-after
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE foreign-added
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE path-ABA
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE stage-ACL
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE open-gap-counterexample
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=1 gen_before=2 gen_linked=2 gen_now=2
+opened_stamp_changed=1 bytes_refused=1
+post_read_validation=0
+outcome=HOLD data_open_calls=1 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE handoff-mutation
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=1 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+
+CASE read-gap-counterexample
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+pre_read_validation=1 gen_before=2 gen_linked=2 gen_now=2
+read=MUTATED!
+post_read_validation=0
+outcome=HOLD data_open_calls=1 data_bytes=8 capture_charge=1 link_retained=1
+
+CASE regular-substitution
+link_result=0 errno=0
+capture_identity_match=0 nlink_before=1 nlink_linked=2 mtime_equal=0 ctime_equal=0
+pre_read_validation=0 gen_before=2 gen_linked=2 gen_now=2
+outcome=HOLD data_open_calls=0 data_bytes=0 capture_charge=1 link_retained=1
+exit_status 0
+COMMAND crash-linked
+link_result=0 errno=0
+capture_identity_match=1 nlink_before=1 nlink_linked=2 mtime_equal=1 ctime_equal=0
+CONTROLLED_EXIT phase=LINKED link_left=1 charge=1
+exit_status 70
+COMMAND reinspect-linked
+REINSPECT capture=crash-linked phase=LINKED identity_consistent=1 outcome=HOLD data_open_calls=0 data_bytes=0 unlinks=0 capture_charge=1
+exit_status 0
+MANIFEST sample=linked-leftover
+THROWAWAY-HARDLINK-1 capture=crash-linked phase=LINKED charge=1
+root=16777232:197844512 source_dir=16777232:197844513 stage=16777232:197844514
+entry=payload source=payload initial=16777232:197844515 initial_nlink=1 linked=16777232:197844515 linked_nlink=2
+generation_before=2 generation_linked=2 stream_before=197844515 stream_linked=197844515
+size=8 mtime=1793980299.835351663 ctime_linked=1793980299.835733122
+COMMAND replace-leftover-link
+exit_status 0
+COMMAND reinspect-linked
+REINSPECT capture=crash-linked phase=LINKED identity_consistent=0 outcome=HOLD data_open_calls=0 data_bytes=0 unlinks=0 capture_charge=1
+exit_status 0
+COMMAND replace-leftover-stage
+exit_status 0
+COMMAND reinspect-linked
+REINSPECT capture=crash-linked phase=LINKED identity_consistent=0 outcome=HOLD data_open_calls=0 data_bytes=0 unlinks=0 capture_charge=1
+exit_status 0
+COMMAND crash-intent
+CONTROLLED_EXIT phase=INTENT link_left=1 charge=1
+exit_status 70
+COMMAND reinspect-intent
+REINSPECT capture=crash-intent phase=INTENT identity_consistent=0 outcome=HOLD data_open_calls=0 data_bytes=0 unlinks=0 capture_charge=1
+exit_status 0
+MANIFEST sample=unreceipted-link
+THROWAWAY-HARDLINK-1 capture=crash-intent phase=INTENT charge=1
+root=16777232:197844526 source_dir=16777232:197844527 stage=16777232:197844528
+entry=payload source=payload initial=16777232:197844529 initial_nlink=1 linked=0:0 linked_nlink=0
+generation_before=2 generation_linked=0 stream_before=197844529 stream_linked=0
+size=0 mtime=0.000000000 ctime_linked=0.000000000
+COMMAND crash-untracked
+CONTROLLED_EXIT phase=INTENT link_left=1 charge=1
+exit_status 70
+COMMAND reinspect-untracked
+REINSPECT capture=crash-untracked manifest_unavailable=1 outcome=HOLD data_open_calls=0 data_bytes=0 unlinks=0 capture_charge=1
+exit_status 0
+ASSERTIONS PASS: 20 active cases; 3 controlled process exits; 5 nonmutating reinspections; no cleanup outside one proven active link
+Collector totals: 3 data open calls, 16 data bytes; mutation-actor/manifest/directory IO excluded
+All fixtures/binary retained locally; fixture path deliberately omitted
