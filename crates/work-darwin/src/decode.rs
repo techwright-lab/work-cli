@@ -11,6 +11,8 @@ pub(crate) const GENERATION: u32 = 0x0008_0000;
 pub(crate) const FILE_ID: u32 = 0x0200_0000;
 pub(crate) const IDENTITY: u32 = RETURNED | GENERATION | FILE_ID;
 pub(crate) const BULK: u32 = IDENTITY | NAME | ERROR;
+// Enumeration is not payload-generation evidence. Keep the A1 schema unchanged.
+pub(crate) const CENSUS: u32 = RETURNED | NAME | ERROR | FILE_ID;
 
 /// Space for length, returned attribute_set_t, generation and file ID.
 pub const ATTRIBUTE_BUFFER_SIZE: usize = 36;
@@ -131,6 +133,65 @@ pub fn decode_bulk<'a>(
     result
 }
 
+/// A name/file-ID observation, NOT proof of payload generation or safe access.
+/// Deliberately distinct from BulkEntry: census cannot satisfy mandatory
+/// generation checks before an accepted payload read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CensusEntry<'a> {
+    pub name: Component<'a>,
+    pub returned: AttributeSet,
+    pub file_id: u64,
+}
+
+/// Decode exactly one native census batch (NAME, FILEID, RETURNED_ATTRS, ERROR).
+/// Generation is neither requested nor fabricated. As with decode_bulk, all
+/// slots clear on error; count zero alone is EOF, and stale bytes are ignored.
+/// Missing identities, per-entry errors and budget exhaustion are NOT clean EOF.
+pub fn decode_census<'a>(
+    buffer: &'a [u8],
+    returned_count: usize,
+    output: &mut [Option<CensusEntry<'a>>],
+) -> Result<usize, DecodeError> {
+    output.fill(None);
+    if returned_count > output.len() {
+        return Err(DecodeError::EntryBudget);
+    }
+    let result = (|| {
+        let mut remaining = buffer;
+        for slot in &mut output[..returned_count] {
+            let record = group(remaining, 8)?;
+            let mut reader = Reader {
+                bytes: record,
+                at: 4,
+            };
+            let returned = reader.attribute_set(CENSUS)?;
+            if returned.common & ERROR != 0 {
+                let errno = reader.u32()?;
+                if errno != 0 {
+                    return Err(DecodeError::EntryError(errno));
+                }
+            }
+            require(returned.common, RETURNED | NAME | FILE_ID)?;
+            let reference = reader.name_reference()?;
+            let file_id = u64::from_ne_bytes(reader.array()?);
+            if file_id == 0 {
+                return Err(DecodeError::UnavailableIdentity);
+            }
+            *slot = Some(CensusEntry {
+                name: reference.decode(record, reader.at)?,
+                returned,
+                file_id,
+            });
+            remaining = &remaining[record.len()..];
+        }
+        Ok(returned_count)
+    })();
+    if result.is_err() {
+        output.fill(None);
+    }
+    result
+}
+
 fn group(buffer: &[u8], alignment: usize) -> Result<&[u8], DecodeError> {
     let mut reader = Reader {
         bytes: buffer,
@@ -159,32 +220,43 @@ fn bulk_entry(record: &[u8]) -> Result<BulkEntry<'_>, DecodeError> {
         }
     }
     require(returned.common, IDENTITY | NAME)?;
-    let reference = reader.at;
-    let offset = i32::from_ne_bytes(reader.array()?);
-    let length = usize::try_from(reader.u32()?).map_err(|_| DecodeError::InvalidReference)?;
+    let reference = reader.name_reference()?;
     let attributes = reader.identity(returned)?;
-    if offset % 4 != 0 {
-        return Err(DecodeError::Misaligned);
-    }
-    let offset = isize::try_from(offset).map_err(|_| DecodeError::InvalidReference)?;
-    let start = reference
-        .checked_add_signed(offset)
-        .ok_or(DecodeError::InvalidReference)?;
-    let end = start
-        .checked_add(length)
-        .ok_or(DecodeError::InvalidReference)?;
-    // The sole variable field must not alias the fixed attributes or another group.
-    if start < reader.at || length == 0 {
-        return Err(DecodeError::InvalidReference);
-    }
-    let name = record
-        .get(start..end)
-        .ok_or(DecodeError::InvalidReference)?;
-    let name = name.strip_suffix(&[0]).ok_or(DecodeError::InvalidName)?;
     Ok(BulkEntry {
-        name: Component::new(name)?,
+        name: reference.decode(record, reader.at)?,
         attributes,
     })
+}
+
+struct NameReference {
+    at: usize,
+    offset: i32,
+    length: usize,
+}
+
+impl NameReference {
+    fn decode(self, record: &[u8], fixed_end: usize) -> Result<Component<'_>, DecodeError> {
+        if self.offset % 4 != 0 {
+            return Err(DecodeError::Misaligned);
+        }
+        let offset = isize::try_from(self.offset).map_err(|_| DecodeError::InvalidReference)?;
+        let start = self
+            .at
+            .checked_add_signed(offset)
+            .ok_or(DecodeError::InvalidReference)?;
+        let end = start
+            .checked_add(self.length)
+            .ok_or(DecodeError::InvalidReference)?;
+        // No alias of fixed fields, another record, or stale batch storage.
+        if start < fixed_end || self.length == 0 {
+            return Err(DecodeError::InvalidReference);
+        }
+        let name = record
+            .get(start..end)
+            .ok_or(DecodeError::InvalidReference)?;
+        let name = name.strip_suffix(&[0]).ok_or(DecodeError::InvalidName)?;
+        Component::new(name)
+    }
 }
 
 fn require(actual: u32, required: u32) -> Result<(), DecodeError> {
@@ -210,6 +282,14 @@ impl Reader<'_> {
             .map_err(|_| DecodeError::Truncated)?;
         self.at = end;
         Ok(array)
+    }
+
+    fn name_reference(&mut self) -> Result<NameReference, DecodeError> {
+        Ok(NameReference {
+            at: self.at,
+            offset: i32::from_ne_bytes(self.array()?),
+            length: usize::try_from(self.u32()?).map_err(|_| DecodeError::InvalidReference)?,
+        })
     }
 
     fn u32(&mut self) -> Result<u32, DecodeError> {

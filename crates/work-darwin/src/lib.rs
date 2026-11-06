@@ -17,6 +17,16 @@ mod ffi;
 
 mod decode;
 pub use decode::{
-    decode_attributes, decode_bulk, AttributeSet, Attributes, BulkEntry, Component, DecodeError,
-    ATTRIBUTE_BUFFER_SIZE,
+    decode_attributes, decode_bulk, decode_census, AttributeSet, Attributes, BulkEntry,
+    CensusEntry, Component, DecodeError, ATTRIBUTE_BUFFER_SIZE,
 };
+
+#[cfg(target_os = "macos")]
+mod census;
+#[cfg(target_os = "macos")]
+pub use census::DirectoryCursor;
+
+mod boot;
+#[cfg(target_os = "macos")]
+pub use boot::boot_session_uuid;
+pub use boot::{parse_boot_session_uuid, BootSessionError, BootSessionUuid};
