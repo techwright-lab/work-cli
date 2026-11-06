@@ -1,0 +1,19 @@
+
+CASE empty precheck_type=100000 precheck_size=9 precheck_capture_object_budget=1 replacement=empty-directory
+clone_result=0 errno=0 (Undefined error: 0)
+captured_root_type=40000 regular_candidate_decision=REFUSE readable_payload_opens=0
+actual_captured_objects=1 budget_exceeded=0
+
+CASE populated precheck_type=100000 precheck_size=9 precheck_capture_object_budget=1 replacement=directory-with-9-descendants
+clone_result=0 errno=0 (Undefined error: 0)
+captured_root_type=40000 regular_candidate_decision=REFUSE readable_payload_opens=0
+ captured depth=0 name=file-1 type=100000
+ captured depth=0 name=file-0 type=100000
+ captured depth=0 name=file-2 type=100000
+ captured depth=0 name=file-3 type=100000
+ captured depth=0 name=nested type=40000
+ captured depth=1 name=child-3 type=100000
+ captured depth=1 name=child-2 type=100000
+ captured depth=1 name=child-0 type=100000
+ captured depth=1 name=child-1 type=100000
+actual_captured_objects=10 budget_exceeded=1
