@@ -146,7 +146,10 @@ enum SkillCommand {
 pub fn run() {
     // Parse the private entry point without Clap diagnostics echoing sensitive argv.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(target_os = "macos")]
+    refuse_incomplete_native_command(&args);
     if args.first().is_some_and(|a| a == "__scope-child") {
+        #[cfg(not(target_os = "macos"))]
         if args.len() >= 5 && args[1] == "--context" && args[3] == "--" {
             let _ = crate::scope_child::run(std::path::Path::new(&args[2]), &args[4..]);
         }
@@ -156,8 +159,33 @@ pub fn run() {
     dispatch_public(&args);
 }
 
+// Refuse before parsing identifiers or touching config/context/history. Never echo argv.
+// These are development-build boundaries, not implemented Darwin capabilities.
+#[cfg(target_os = "macos")]
+fn refuse_incomplete_native_command(args: &[std::ffi::OsString]) {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("__scope-child" | "run" | "recover") => {
+            eprintln!("execution/supervision unsupported on macOS; no runtime action taken");
+            std::process::exit(1);
+        }
+        Some(
+            "setup" | "start" | "finish" | "remove" | "inspect" | "verify-remote"
+            | "audit-preservation" | "prepare-recovery" | "approve" | "retire" | "capture"
+            | "participant" | "adopt",
+        ) => {
+            eprintln!(
+                "native backend incomplete; managed operation refused before authority access"
+            );
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+}
+
 /// Shared public argv boundary; the private scope-child entry remains in `run`.
 pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
+    #[cfg(target_os = "macos")]
+    refuse_incomplete_native_command(args);
     let argv = std::iter::once(std::ffi::OsString::from("work")).chain(args.iter().cloned());
     let cli = if args.first().is_some_and(|a| {
         a == "capture"
