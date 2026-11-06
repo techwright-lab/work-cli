@@ -125,3 +125,57 @@ fn topology_names_unavailable_mandatory_masks_separately_from_contradiction() {
     b[20..24].copy_from_slice(&0xe0u32.to_ne_bytes());
     assert_eq!(decode_topology(&b), Err(AccessError::Inconsistent));
 }
+
+fn packet_with_relocated_path(reference_at: usize, start: usize) -> Vec<u8> {
+    let mut bytes = packet();
+    bytes.resize(80, 0);
+    bytes[60..].fill(0);
+    let (path, other_reference, other_path) = if reference_at == 32 {
+        (b"/a\0", 44, b"/b\0")
+    } else {
+        (b"/b\0", 32, b"/a\0")
+    };
+    bytes[start..start + 3].copy_from_slice(path);
+    bytes[72..75].copy_from_slice(other_path);
+    bytes[reference_at..reference_at + 4]
+        .copy_from_slice(&(start as i32 - reference_at as i32).to_ne_bytes());
+    bytes[other_reference..other_reference + 4]
+        .copy_from_slice(&(72i32 - other_reference as i32).to_ne_bytes());
+    bytes[..4].copy_from_slice(&80u32.to_ne_bytes());
+    bytes
+}
+
+#[test]
+fn topology_rejects_misaligned_ordinary_path_wire_offsets() {
+    for shift in 1..4 {
+        assert_eq!(
+            decode_topology(&packet_with_relocated_path(32, 60 + shift)),
+            Err(AccessError::Malformed),
+            "ordinary path shift {shift}"
+        );
+    }
+}
+
+#[test]
+fn topology_rejects_misaligned_no_firmlink_path_wire_offsets() {
+    for shift in 1..4 {
+        assert_eq!(
+            decode_topology(&packet_with_relocated_path(44, 64 + shift)),
+            Err(AccessError::Malformed),
+            "no-firmlink path shift {shift}"
+        );
+    }
+}
+
+#[test]
+fn topology_aligned_wire_offsets_allow_unaligned_slice_bases() {
+    for reference_at in [32, 44] {
+        let bytes = packet_with_relocated_path(reference_at, 64);
+        let expected = decode_topology(&bytes).unwrap();
+        for prefix in 1..4 {
+            let mut storage = vec![0; prefix];
+            storage.extend_from_slice(&bytes);
+            assert_eq!(decode_topology(&storage[prefix..]), Ok(expected));
+        }
+    }
+}

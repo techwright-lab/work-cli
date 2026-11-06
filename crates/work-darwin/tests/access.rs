@@ -86,8 +86,7 @@ fn acl_grants_separate_object_mutation_from_deletion_and_parent_namespace() {
     );
 }
 
-#[test]
-fn access_packet_preserves_effective_rights_and_refuses_missing_or_inconsistent_evidence() {
+fn access_packet() -> Vec<u8> {
     let mut b = vec![0; 56];
     b[4..8].copy_from_slice(&0x8263_8000u32.to_ne_bytes());
     b[24..28].copy_from_slice(&501u32.to_ne_bytes());
@@ -99,6 +98,12 @@ fn access_packet_preserves_effective_rights_and_refuses_missing_or_inconsistent_
     b[48..56].copy_from_slice(&42u64.to_ne_bytes());
     b.extend_from_slice(&empty());
     b[..4].copy_from_slice(&100u32.to_ne_bytes());
+    b
+}
+
+#[test]
+fn access_packet_preserves_effective_rights_and_refuses_missing_or_inconsistent_evidence() {
+    let b = access_packet();
     let observation = work_darwin::decode_access(&b).unwrap();
     assert_eq!(
         (
@@ -163,4 +168,37 @@ fn sdk27_missing_security_mask_is_unknown_not_acl_absence() {
             extended: 0
         })
     );
+}
+
+#[test]
+fn access_rejects_misaligned_acl_wire_offsets() {
+    for shift in 1..4 {
+        let mut bytes = access_packet();
+        bytes.resize(104, 0);
+        bytes.copy_within(56..100, 56 + shift);
+        bytes[56..56 + shift].fill(0);
+        bytes[..4].copy_from_slice(&104u32.to_ne_bytes());
+        bytes[40..44].copy_from_slice(&(16 + shift as i32).to_ne_bytes());
+        assert_eq!(
+            work_darwin::decode_access(&bytes),
+            Err(AccessError::Malformed),
+            "ACL shift {shift}"
+        );
+    }
+}
+
+#[test]
+fn access_aligned_wire_offsets_allow_unaligned_slice_bases() {
+    let mut bytes = access_packet();
+    bytes.resize(104, 0);
+    bytes.copy_within(56..100, 60);
+    bytes[56..60].fill(0);
+    bytes[..4].copy_from_slice(&104u32.to_ne_bytes());
+    bytes[40..44].copy_from_slice(&20i32.to_ne_bytes());
+    let expected = work_darwin::decode_access(&bytes).unwrap();
+    for prefix in 1..4 {
+        let mut storage = vec![0; prefix];
+        storage.extend_from_slice(&bytes);
+        assert_eq!(work_darwin::decode_access(&storage[prefix..]), Ok(expected));
+    }
 }

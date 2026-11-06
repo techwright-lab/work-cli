@@ -43,6 +43,10 @@ fn reference_range(
     fixed: usize,
 ) -> Result<std::ops::Range<usize>, AccessError> {
     let relative = i32::from_ne_bytes(word(bytes, at)?.to_ne_bytes());
+    // getattrlist(2) aligns wire offsets, not the caller's byte-slice address.
+    if relative % 4 != 0 {
+        return Err(AccessError::Malformed);
+    }
     let start = at
         .checked_add_signed(relative as isize)
         .ok_or(AccessError::Malformed)?;
