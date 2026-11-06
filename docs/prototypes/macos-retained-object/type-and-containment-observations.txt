@@ -1,0 +1,18 @@
+event-only path=plain flags=0x8104 result=5 errno=0 (Undefined error: 0) type=100000 inode=197568489 actual_flags=0x8004
+execute-only path=plain flags=0x40000104 result=-1 errno=13 (Permission denied)
+event-only path=executable flags=0x8104 result=5 errno=0 (Undefined error: 0) type=100000 inode=197568490 actual_flags=0x8004
+execute-only path=executable flags=0x40000104 result=5 errno=0 (Undefined error: 0) type=100000 inode=197568490 actual_flags=0x40000004
+event-only path=fifo flags=0x8104 result=5 errno=0 (Undefined error: 0) type=10000 inode=197568491 actual_flags=0x8004
+execute-only path=fifo flags=0x40000104 result=-1 errno=13 (Permission denied)
+event-only path=socket flags=0x8104 result=-1 errno=102 (Operation not supported on socket)
+execute-only path=socket flags=0x40000104 result=-1 errno=102 (Operation not supported on socket)
+event-only path=link flags=0x8104 result=-1 errno=62 (Too many levels of symbolic links)
+execute-only path=link flags=0x40000104 result=-1 errno=62 (Too many levels of symbolic links)
+event-only path=directory flags=0x8104 result=5 errno=0 (Undefined error: 0) type=40000 inode=197568492 actual_flags=0x8004
+execute-only path=directory flags=0x40000104 result=-1 errno=21 (Is a directory)
+containment regular path=plain flags=0x20001000 result=5 errno=0 (Undefined error: 0) type=100000 inode=197568489 actual_flags=0x0
+containment symlink path=link flags=0x20001000 result=-1 errno=62 (Too many levels of symbolic links)
+containment parent escape path=../outside-synthetic flags=0x20001000 result=-1 errno=107 (Capabilities insufficient)
+containment absolute path=/var/folders/r5/7v3d4mjx71vf7q150bkk570r0000gn/T/work-macos-inspection.X8fzf1/fixture2/plain flags=0x20001000 result=-1 errno=107 (Capabilities insufficient)
+root lookup moved anchor path=anchor/anchored flags=0x20001000 result=-1 errno=2 (No such file or directory)
+retained anchor now outside root path=anchored flags=0x20001000 result=6 errno=0 (Undefined error: 0) type=100000 inode=197568496 actual_flags=0x0
