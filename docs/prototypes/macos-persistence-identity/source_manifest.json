@@ -1,0 +1,32 @@
+[
+  {
+    "name": "rust-unix.rs",
+    "url": "https://raw.githubusercontent.com/rust-lang/rust/1.98.1/library/std/src/sys/fs/unix.rs",
+    "sha256": "b8a72cfd2af073ee9eaa5acddc0b6c95a2f6d9e69cbdad18ba1ee4ae2fa7b800"
+  },
+  {
+    "name": "fsync.2",
+    "url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/man/man2/fsync.2",
+    "sha256": "2399c28e11ea3a1e71b85d0002ac96b540372d405926657a101025f70ae10006"
+  },
+  {
+    "name": "fcntl.2",
+    "url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/man/man2/fcntl.2",
+    "sha256": "cbb0c4e1e2778eb1c7be8ccca7bbdb7c4e5e73c41b5823118992441d540fd205"
+  },
+  {
+    "name": "kern_sysctl.c",
+    "url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sysctl.c",
+    "sha256": "1cc5d1e7b46df0b2fad33449eb7df948207b7bc4c760119ed33624e7d2750df8"
+  },
+  {
+    "name": "pragma.html",
+    "url": "https://sqlite.org/pragma.html",
+    "sha256": "af75d7d7ab00c29e6eea98618cb1259a3919c308af60a6173215bf9798706034"
+  },
+  {
+    "name": "libsqlite3-sys-0.36.0.crate",
+    "url": "https://static.crates.io/crates/libsqlite3-sys/libsqlite3-sys-0.36.0.crate",
+    "sha256": "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
+  }
+]

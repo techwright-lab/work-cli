@@ -1,0 +1,344 @@
+{
+  "scope": "throwaway scratch matrix; not native reboot or power-loss qualification",
+  "environment": {
+    "macos_version": "27.0.1",
+    "macos_build": "26A434",
+    "kernel": "Darwin 27.0.0 Darwin Kernel Version 27.0.0: Tue Aug 11 21:05:48 PDT 2026; root:xnu-13432.1.9~1/RELEASE_ARM64_T6041 arm64",
+    "compiler": [
+      "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+      "Target: arm64-apple-darwin27.0.0"
+    ],
+    "sdk": "27.0 (explicit existing SDK directory)",
+    "python": "Python 3.9.6"
+  },
+  "native": [
+    {
+      "kind": "filesystem",
+      "type": "apfs"
+    },
+    {
+      "kind": "sync",
+      "object": "regular-rw",
+      "stage": "after-write",
+      "call": "fsync",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "regular-rw",
+      "stage": "after-write",
+      "call": "F_FULLFSYNC",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "directory-ro",
+      "stage": "after-create",
+      "call": "fsync",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "directory-ro",
+      "stage": "after-create",
+      "call": "F_FULLFSYNC",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "directory-ro",
+      "stage": "after-rename",
+      "call": "fsync",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "directory-ro",
+      "stage": "after-rename",
+      "call": "F_FULLFSYNC",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "regular-ro",
+      "stage": "after-rename",
+      "call": "fsync",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "regular-ro",
+      "stage": "after-rename",
+      "call": "F_FULLFSYNC",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "directory-ro",
+      "stage": "after-unlink",
+      "call": "fsync",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "directory-ro",
+      "stage": "after-unlink",
+      "call": "F_FULLFSYNC",
+      "rc": 0,
+      "errno": 0
+    },
+    {
+      "kind": "sync",
+      "object": "invalid-fd",
+      "stage": "negative-control",
+      "call": "fsync",
+      "rc": -1,
+      "errno": 9
+    },
+    {
+      "kind": "sync",
+      "object": "invalid-fd",
+      "stage": "negative-control",
+      "call": "F_FULLFSYNC",
+      "rc": -1,
+      "errno": 9
+    }
+  ],
+  "sqlite_system": [
+    {
+      "configuration": "default",
+      "observations": [
+        {
+          "kind": "sqlite-settings",
+          "library": "system",
+          "version": "3.54.0",
+          "synchronous": 2,
+          "fullfsync": 0,
+          "checkpoint_fullfsync": 1
+        },
+        {
+          "kind": "sqlite-checkpoint",
+          "commit_rc": 0,
+          "checkpoint_rc": 0,
+          "wal_frames": 3,
+          "checkpointed": 3
+        }
+      ],
+      "syscall_trace": false,
+      "bundled_library_tested": false
+    },
+    {
+      "configuration": "checkpoint-only",
+      "observations": [
+        {
+          "kind": "sqlite-settings",
+          "library": "system",
+          "version": "3.54.0",
+          "synchronous": 2,
+          "fullfsync": 0,
+          "checkpoint_fullfsync": 1
+        },
+        {
+          "kind": "sqlite-checkpoint",
+          "commit_rc": 0,
+          "checkpoint_rc": 0,
+          "wal_frames": 3,
+          "checkpointed": 3
+        }
+      ],
+      "syscall_trace": false,
+      "bundled_library_tested": false
+    },
+    {
+      "configuration": "all-fullsync",
+      "observations": [
+        {
+          "kind": "sqlite-settings",
+          "library": "system",
+          "version": "3.54.0",
+          "synchronous": 2,
+          "fullfsync": 1,
+          "checkpoint_fullfsync": 1
+        },
+        {
+          "kind": "sqlite-checkpoint",
+          "commit_rc": 0,
+          "checkpoint_rc": 0,
+          "wal_frames": 3,
+          "checkpointed": 3
+        }
+      ],
+      "syscall_trace": false,
+      "bundled_library_tested": false
+    }
+  ],
+  "process_exit": [
+    {
+      "phase": "before-commit",
+      "child_exit": 77,
+      "sync_observations": [],
+      "reopen": [
+        {
+          "kind": "process-crash-reopen",
+          "rows": 0,
+          "integrity_ok": 1,
+          "marker": false
+        }
+      ]
+    },
+    {
+      "phase": "after-commit",
+      "child_exit": 77,
+      "sync_observations": [],
+      "reopen": [
+        {
+          "kind": "process-crash-reopen",
+          "rows": 1,
+          "integrity_ok": 1,
+          "marker": false
+        }
+      ]
+    },
+    {
+      "phase": "after-marker",
+      "child_exit": 77,
+      "sync_observations": [
+        {
+          "kind": "sync",
+          "object": "directory-ro",
+          "stage": "crash-marker-after-rename",
+          "call": "F_FULLFSYNC",
+          "rc": 0,
+          "errno": 0
+        }
+      ],
+      "reopen": [
+        {
+          "kind": "process-crash-reopen",
+          "rows": 1,
+          "integrity_ok": 1,
+          "marker": true
+        }
+      ]
+    }
+  ],
+  "sqlite_extracted_synthetic": [
+    {
+      "kind": "extracted-sqlite-synthetic",
+      "case": "ordinary-only",
+      "fullsync_calls": 0,
+      "fsync_calls": 1,
+      "rc": 0
+    },
+    {
+      "kind": "extracted-sqlite-synthetic",
+      "case": "fullsync-success",
+      "fullsync_calls": 1,
+      "fsync_calls": 0,
+      "rc": 0
+    },
+    {
+      "kind": "extracted-sqlite-synthetic",
+      "case": "fullsync-EINVAL-fsync-success",
+      "fullsync_calls": 1,
+      "fsync_calls": 1,
+      "rc": 0
+    },
+    {
+      "kind": "extracted-sqlite-synthetic",
+      "case": "fullsync-EINVAL-fsync-EIO",
+      "fullsync_calls": 1,
+      "fsync_calls": 1,
+      "rc": -1
+    }
+  ],
+  "identity": [
+    {
+      "kind": "native-boot-read-only",
+      "reads": 5,
+      "returned_bytes": [
+        37,
+        37,
+        37,
+        37,
+        37
+      ],
+      "nul_terminated": true,
+      "uppercase_text": true,
+      "canonical_values_equal": true,
+      "raw_identity_omitted": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "absent",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "missing-nul",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "trailing-newline",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "embedded-nul",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "bad-hex",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "nil",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "legacy-linux-provider",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "boot-changed-during-collection",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "copied-store",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "changed-boot-needs-reconciliation",
+      "refused": true
+    },
+    {
+      "kind": "synthetic-refusal",
+      "case": "historical-unversioned-schema",
+      "refused": true
+    },
+    {
+      "kind": "identity-summary",
+      "synthetic_refusals": 11,
+      "json_round_trip": true,
+      "case_normalization": true,
+      "same_fixture_admitted": true,
+      "actual_store_opened": false
+    }
+  ]
+}

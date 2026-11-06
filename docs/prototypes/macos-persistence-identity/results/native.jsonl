@@ -1,0 +1,13 @@
+{"kind":"filesystem","type":"apfs"}
+{"kind":"sync","object":"regular-rw","stage":"after-write","call":"fsync","rc":0,"errno":0}
+{"kind":"sync","object":"regular-rw","stage":"after-write","call":"F_FULLFSYNC","rc":0,"errno":0}
+{"kind":"sync","object":"directory-ro","stage":"after-create","call":"fsync","rc":0,"errno":0}
+{"kind":"sync","object":"directory-ro","stage":"after-create","call":"F_FULLFSYNC","rc":0,"errno":0}
+{"kind":"sync","object":"directory-ro","stage":"after-rename","call":"fsync","rc":0,"errno":0}
+{"kind":"sync","object":"directory-ro","stage":"after-rename","call":"F_FULLFSYNC","rc":0,"errno":0}
+{"kind":"sync","object":"regular-ro","stage":"after-rename","call":"fsync","rc":0,"errno":0}
+{"kind":"sync","object":"regular-ro","stage":"after-rename","call":"F_FULLFSYNC","rc":0,"errno":0}
+{"kind":"sync","object":"directory-ro","stage":"after-unlink","call":"fsync","rc":0,"errno":0}
+{"kind":"sync","object":"directory-ro","stage":"after-unlink","call":"F_FULLFSYNC","rc":0,"errno":0}
+{"kind":"sync","object":"invalid-fd","stage":"negative-control","call":"fsync","rc":-1,"errno":9}
+{"kind":"sync","object":"invalid-fd","stage":"negative-control","call":"F_FULLFSYNC","rc":-1,"errno":9}
