@@ -741,7 +741,7 @@ pub(super) fn authority_bytes_for_recovery(store: &Store) -> Vec<u8> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) fn read_raw(store: &Store, id: Uuid, budget: &super::Budget) -> Result<Vec<u8>> {
+pub(super) fn read_raw(store: &Store, id: Uuid, budget: &mut super::Budget) -> Result<Vec<u8>> {
     let _ = (store, id, budget);
     Err(ReceiptError::NativeIncomplete)
 }
@@ -947,7 +947,7 @@ fn publish_reserved(
     id: Uuid,
     length: u64,
     context: &super::Context,
-    budget: &super::Budget,
+    budget: &mut super::Budget,
 ) -> Result<PersistedReceipt> {
     let _ = (store, guard, id, length, context, budget);
     Err(ReceiptError::NativeIncomplete)
@@ -1058,7 +1058,7 @@ fn publish_reserved(
 fn restart_recovery_result(
     store: &mut Store,
     publication: &super::recovery_refs::RecoveryResultPublication<'_>,
-    budget: &super::Budget,
+    budget: &mut super::Budget,
 ) -> Result<()> {
     let _ = (store, publication, budget);
     Err(ReceiptError::NativeIncomplete)
@@ -1157,7 +1157,7 @@ fn reserve_with_budget(
     store: &Store,
     id: Uuid,
     length: u64,
-    budget: Option<&super::Budget>,
+    budget: Option<&mut super::Budget>,
 ) -> Result<Reservation> {
     let _ = (store, id, length, budget);
     Err(ReceiptError::NativeIncomplete)
