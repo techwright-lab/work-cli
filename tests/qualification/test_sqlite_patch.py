@@ -1,12 +1,16 @@
-"""Offline provenance and extracted pinned-source tests, not Work-linked VFS tests."""
+"""Provenance, extracted seams, and real Cargo/build.rs tests; not Work VFS faults."""
+import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import tarfile
+import tomllib
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -122,6 +126,77 @@ class SqlitePatchTests(unittest.TestCase):
         for name in ("sqlite3/sqlite3.c", "sqlite3/sqlite3.h", "sqlite3/sqlite3ext.h",
                      "sqlite3/bindgen_bundled_version.rs", "sqlite3/bindgen_bundled_version_ext.rs"):
             self.assertIn(pin["vendored_files"][name], build)
+
+    def test_real_build_guard_fixture(self):
+        if sys.platform != "linux":
+            self.skipTest("native execution requires the reviewed H2 wrapper and explicit SDK/cache")
+        registry = Path(os.environ["CARGO_HOME"]) / "registry"
+        unchanged_paths = [ROOT / "Cargo.toml", ROOT / "Cargo.lock", VENDOR / "build.rs"]
+        before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in unchanged_paths}
+        # Keep source, mutations, logs and binaries, including on failure. Its
+        # explicit [workspace] gives this fixture independent Cargo membership.
+        parent = ROOT / "target/sqlite-guard-evidence"
+        parent.mkdir(parents=True, exist_ok=True)
+        retained = Path(tempfile.mkdtemp(prefix="test-", dir=parent))
+        destination = retained / "fixture"
+        context = {"fixture_git": subprocess.check_output(["/usr/bin/git", "--version"], text=True).strip(),
+                   "platform": sys.platform}
+        (retained / "runner-context.json").write_text(json.dumps(context, indent=2) + "\n")
+        print(f"{context['fixture_git']}: retained SQLite evidence at {retained}", flush=True)
+        result = subprocess.run(
+            [sys.executable, str(TOOLS / "build_guard.py"),
+             "--destination", str(destination), "--registry", str(registry),
+             "--cargo", "/usr/local/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo",
+             "--rustc", "/usr/local/rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc"],
+            capture_output=True, text=True, timeout=600)
+        self.assertEqual(result.returncode, 0,
+                         f"retained: {retained}\n{result.stdout}{result.stderr}")
+        report = json.loads((destination / "evidence/report.json").read_text())
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["scope"], "real Cargo bundled SQL smoke; bounded real build.rs executions")
+        self.assertFalse(report["work_vfs_faults_tested"])
+        self.assertEqual(report["cargo_dependency"], "libsqlite3-sys 0.36.0 (path copy)")
+        cases = {case["name"]: case for case in report["cases"]}
+        self.assertEqual(len(cases), 23)
+        for name in ("cargo-bundled-sql", "permitted-unset", "permitted-zero",
+                     "reject-env-one", "reject-env-empty", "reject-env-other",
+                     "reject-no-bundled", "reject-sqlcipher", "reject-bundled-sqlcipher",
+                     "reject-in_gecko", "reject-loadable_extension",
+                     "target-macos-host-linux", "target-linux-host-macos"):
+            self.assertEqual(cases[name]["status"], "passed", name)
+        for name in ("sqlite3.c", "sqlite3.h", "sqlite3ext.h",
+                     "bindgen_bundled_version.rs", "bindgen_bundled_version_ext.rs"):
+            for fault in ("altered", "missing"):
+                case = cases[f"{fault}-{name}"]
+                self.assertEqual(case["status"], "passed")
+                self.assertFalse(case["alternate_tools_executed"])
+                self.assertEqual(case["execution"], "compiled real build.rs, not a Cargo fault transaction")
+        self.assertTrue((destination / "dependency/Cargo.toml").read_text().startswith("[workspace]\n"))
+        self.assertTrue(report["root_inputs_unchanged"])
+        self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in unchanged_paths})
+        self.assertEqual(report["standalone_workspace"], str(destination / "dependency"))
+        self.assertIn("static=sqlite3", report["cargo_build_script"]["cargo_execution"]["linked_libs"])
+        approved = {(p["name"], p["version"], p.get("checksum"))
+                    for p in tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]}
+        self.assertTrue(all((p["name"], p["version"], p["checksum"]) in approved
+                            for p in report["registry_packages"]))
+        for name, variant in report["bounded_variants"].items():
+            self.assertEqual(variant["source_sha256"], before[VENDOR / "build.rs"], name)
+
+    def test_build_guard_refuses_existing_destination(self):
+        parent = ROOT / "target/sqlite-guard-evidence"
+        parent.mkdir(parents=True, exist_ok=True)
+        retained = Path(tempfile.mkdtemp(prefix="existing-", dir=parent))
+        sentinel = retained / "sentinel"
+        sentinel.write_bytes(b"unchanged")
+        result = subprocess.run(
+            [sys.executable, str(TOOLS / "build_guard.py"),
+             "--destination", str(retained), "--registry", str(retained),
+             "--cargo", "/not/executed/cargo", "--rustc", "/not/executed/rustc"],
+            capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("destination already exists", result.stderr)
+        self.assertEqual(sentinel.read_bytes(), b"unchanged")
 
     def test_darwin_c_rejects_disabled_required_sync(self):
         source = (VENDOR / "sqlite3/sqlite3.c").read_text()
