@@ -256,6 +256,16 @@ fn observe_route(
         if !meta.is_dir() {
             return Err(error(&current, GitBindingReason::InvalidLayout));
         }
+        // Ownership/write protection does not prove effective search access.
+        // Check the kernel before any traversal, especially dot/parent steps
+        // that would otherwise erase an inaccessible directory from the path.
+        rustix::fs::accessat(
+            rustix::fs::CWD,
+            &current,
+            rustix::fs::Access::EXEC_OK,
+            rustix::fs::AtFlags::EACCESS,
+        )
+        .map_err(|_| error(&current, GitBindingReason::UnsafeAccess))?;
         match Path::new(&next).components().next() {
             Some(Component::ParentDir) => {
                 current.pop();

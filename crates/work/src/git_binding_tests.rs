@@ -240,6 +240,86 @@ fn fake_git_directory_suffixes_and_ordinary_symlinks_remain_qualified() {
 }
 
 #[test]
+fn fake_git_unsearchable_directory_before_parent_refuses_explicit_path_before_probes() {
+    let mut outcomes = Vec::new();
+    for traversal in ["../git", "./../git"] {
+        let f = FakeGit::new();
+        let marker = f.root.path().join("executed");
+        f.script(
+            "git version 2.55.0",
+            &format!("touch '{}'", marker.display()),
+        );
+        let directory = f.root.path().join(OsStr::from_bytes(b"no-search-\xff"));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o600)).unwrap();
+        let spelling = directory.join(traversal);
+        // Require actual kernel denial in this fixture, not an assumed mode-bit
+        // outcome under root/capabilities or a simulated access service.
+        assert_eq!(
+            fs::metadata(&spelling).unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+        let candidate = GitCandidate {
+            path: spelling.clone(),
+            source: GitSelectionSource::Cli,
+        };
+        let result = qualify_candidates(std::slice::from_ref(&candidate), &ACCESS);
+        outcomes.push((result.is_err(), marker.exists()));
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(fs::metadata(&spelling).unwrap().is_file());
+        let selected = qualify_candidates(&[candidate], &ACCESS).unwrap();
+        assert_eq!(
+            selected.binding.candidate().path.as_os_str().as_bytes(),
+            spelling.as_os_str().as_bytes()
+        );
+        assert_eq!(selected.binding.canonical_program(), f.program);
+        selected.binding.revalidate().unwrap();
+        let output = selected
+            .binding
+            .command(["status"], |_| {})
+            .unwrap()
+            .output_aggregate(Duration::from_secs(1), 1024)
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"dispatch");
+    }
+    assert_eq!(outcomes, vec![(true, false), (true, false)]);
+}
+
+#[test]
+fn fake_git_unsearchable_directory_before_parent_refuses_helper_symlink_target() {
+    let mut rejected = Vec::new();
+    for traversal in ["../actual-upload-pack", "./../actual-upload-pack"] {
+        let f = FakeGit::new();
+        let helper = f.helpers.join("git-upload-pack");
+        fs::rename(&helper, f.helpers.join("actual-upload-pack")).unwrap();
+        let directory = f.helpers.join("no-search");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(Path::new("no-search").join(traversal), &helper).unwrap();
+        assert_eq!(
+            fs::metadata(&helper).unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::ACCESS.raw_os_error())
+        );
+        rejected
+            .push(qualify_candidates(&[f.candidate(GitSelectionSource::Cli)], &ACCESS).is_err());
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(fs::metadata(&helper).unwrap().is_file());
+        let selected = bind(&f);
+        selected.binding.revalidate().unwrap();
+        let output = selected
+            .binding
+            .command(["status"], |_| {})
+            .unwrap()
+            .output_aggregate(Duration::from_secs(1), 1024)
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"dispatch");
+    }
+    assert_eq!(rejected, vec![true, true]);
+}
+
+#[test]
 fn fake_git_unsafe_nonregular_nonexec_refused_before_execution() {
     for kind in ["writable", "nonexec", "directory", "fifo", "parent"] {
         let f = FakeGit::new();
