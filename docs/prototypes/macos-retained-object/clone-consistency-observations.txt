@@ -1,0 +1,20 @@
+
+CASE unchanged
+before inode=197610626 size=8 mtime=1793975233.072394040 ctime=1793975233.072394040 nlink=1
+after inode=197610626 size=8 mtime=1793975233.072394040 ctime=1793975233.072394040 nlink=1
+identity_only_accepts=1 full_stamp_accepts=1
+captured_content=ORIGINAL
+
+CASE pathname ABA (original inode restored)
+before inode=197610628 size=8 mtime=1793975233.072650499 ctime=1793975233.072650499 nlink=1
+after inode=197610628 size=8 mtime=1793975233.072650499 ctime=1793975233.098187396 nlink=1
+identity_only_accepts=1 full_stamp_accepts=0
+captured_content=REPLACED
+
+CASE content ABA (inode, size and mtime restored)
+before inode=197610631 size=8 mtime=1793975233.098382396 ctime=1793975233.098382396 nlink=1
+after inode=197610631 size=8 mtime=1793975233.098382396 ctime=1793975233.123727793 nlink=1
+identity_only_accepts=1 full_stamp_accepts=0
+captured_content=REPLACED
+
+LIMIT: deliberate time separation makes timestamp changes observable; not a proof at clock granularity, all races, all metadata or other OS versions.
