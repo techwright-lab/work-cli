@@ -456,6 +456,55 @@ fn fake_git_executable_change_during_rejected_helper_observation_aborts_selectio
 }
 
 #[test]
+fn fake_git_completed_helper_change_during_later_helper_rejection_aborts_selection() {
+    #[derive(Debug)]
+    struct ChangingAccess {
+        observed_helper: PathBuf,
+        rejected_helper: PathBuf,
+    }
+    impl GitAccessProof for ChangingAccess {
+        fn prove(&self, path: &Path, metadata: &fs::Metadata) -> Result<(), GitBindingError> {
+            if path == self.rejected_helper {
+                fs::set_permissions(&self.observed_helper, fs::Permissions::from_mode(0o600))
+                    .unwrap();
+            }
+            ACCESS.prove(path, metadata)
+        }
+    }
+    let bad = FakeGit::new();
+    let good = FakeGit::new();
+    let access = ChangingAccess {
+        observed_helper: bad.helpers.join("git-upload-pack"),
+        rejected_helper: bad.helpers.join("git-receive-pack"),
+    };
+    fs::set_permissions(&access.rejected_helper, fs::Permissions::from_mode(0o777)).unwrap();
+    let marker = good.root.path().join("executed");
+    good.script(
+        "git version 2.55.0",
+        &format!("touch '{}'", marker.display()),
+    );
+    let result = qualify_candidates(
+        &[
+            bad.candidate(GitSelectionSource::PlatformDefault),
+            good.candidate(GitSelectionSource::PlatformDefault),
+        ],
+        &access,
+    );
+    assert!(
+        !marker.exists(),
+        "next candidate executed after a known helper changed"
+    );
+    let failure = result.unwrap_err();
+    assert!(failure.ambiguous);
+    assert_eq!(failure.rejections.len(), 1);
+    assert_eq!(failure.rejections[0].error.path, access.observed_helper);
+    assert_eq!(
+        failure.rejections[0].error.reason,
+        GitBindingReason::Changed
+    );
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn linux_git_access_proof_accepts_masked_acl_modes_and_rejects_foreign_writers() {
     let path = Path::new("/fixture");

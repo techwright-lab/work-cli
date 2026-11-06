@@ -464,22 +464,26 @@ fn qualify_candidate<'a>(
             &candidate.path,
         )?;
         let helper_route = observe_route(&helper_spelling, RequiredObject::Directory, access)?;
-        let helpers = REQUIRED_HELPERS
-            .into_iter()
-            .map(|name| {
+        let mut helpers = Vec::new();
+        let helper_result: Result<(), GitBindingError> =
+            REQUIRED_HELPERS.into_iter().try_for_each(|name| {
                 let path = helper_route.canonical.join(name);
                 let route = observe_route(&path, RequiredObject::Executable, access)?;
-                Ok((path, route))
-            })
-            .collect::<Result<Vec<_>, GitBindingError>>();
-        // Validate on rejection as well as acceptance. A concurrent installation
-        // change must not be misclassified as an ordinary layout rejection.
+                helpers.push((path, route));
+                Ok(())
+            });
+        // Retain and validate completed observations even if a later helper is
+        // rejected. A known change must not become an ordinary layout rejection.
         validate_route(
             &helper_spelling,
             RequiredObject::Directory,
             &helper_route,
             access,
         )?;
+        for (path, route) in &helpers {
+            validate_route(path, RequiredObject::Executable, route, access)?;
+        }
+        helper_result?;
         let binding = GitBinding {
             candidate: candidate.clone(),
             canonical_program: executable.canonical.clone(),
@@ -488,7 +492,7 @@ fn qualify_candidate<'a>(
             executable: executable.clone(),
             helper_spelling,
             helper_route,
-            helpers: helpers?,
+            helpers,
             access,
         };
         binding.revalidate()?;
