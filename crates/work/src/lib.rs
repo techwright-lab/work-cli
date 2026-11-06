@@ -38,6 +38,7 @@ pub mod error;
 pub mod events;
 pub mod finish;
 mod gap_continuation;
+mod git;
 pub mod identity;
 pub mod inspection;
 mod interactive;

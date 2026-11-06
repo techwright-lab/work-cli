@@ -1426,6 +1426,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "work-darwin"
+version = "0.3.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
