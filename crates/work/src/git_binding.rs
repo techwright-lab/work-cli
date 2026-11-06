@@ -142,9 +142,24 @@ enum RequiredObject {
 }
 
 fn components(path: &Path) -> VecDeque<OsString> {
-    path.components()
-        .map(|part| part.as_os_str().to_owned())
-        .collect()
+    let bytes = path.as_os_str().as_bytes();
+    let mut parts = VecDeque::new();
+    if path.is_absolute() {
+        parts.push_back(OsString::from("/"));
+    }
+    // Path::components drops terminal dots and separators. Preserve dot steps
+    // and represent a trailing slash as one: both require the preceding object
+    // to be a directory, including when expanding a symlink target.
+    parts.extend(
+        bytes
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+            .map(|part| OsStr::from_bytes(part).to_owned()),
+    );
+    if bytes.ends_with(b"/") {
+        parts.push_back(OsString::from("."));
+    }
+    parts
 }
 
 fn observe_route(

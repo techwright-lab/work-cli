@@ -111,6 +111,134 @@ fn fake_git_binding_retains_original_canonical_version_helpers_and_profile() {
     assert!(env.contains(&(OsStr::new("PATH"), Some(OsStr::new("/usr/bin:/bin")))));
 }
 
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut spelling = path.as_os_str().to_owned();
+    spelling.push(suffix);
+    PathBuf::from(spelling)
+}
+
+#[test]
+fn fake_git_file_directory_suffixes_are_refused_before_probes() {
+    let mut outcomes = Vec::new();
+    for suffix in ["/", "/."] {
+        let f = FakeGit::new();
+        let marker = f.root.path().join("executed");
+        f.script(
+            "git version 2.55.0",
+            &format!("touch '{}'", marker.display()),
+        );
+        let spelling = path_with_suffix(&f.program, suffix);
+        assert_eq!(
+            fs::metadata(&spelling).unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        let result = qualify_candidates(
+            &[GitCandidate {
+                path: spelling,
+                source: GitSelectionSource::Cli,
+            }],
+            &ACCESS,
+        );
+        outcomes.push((result.is_err(), marker.exists()));
+    }
+    assert_eq!(outcomes, vec![(true, false), (true, false)]);
+}
+
+#[test]
+fn fake_git_program_symlink_file_directory_targets_are_refused_before_probes() {
+    let mut outcomes = Vec::new();
+    for suffix in ["/", "/."] {
+        let f = FakeGit::new();
+        let marker = f.root.path().join("executed");
+        f.script(
+            "git version 2.55.0",
+            &format!("touch '{}'", marker.display()),
+        );
+        let alias = f.root.path().join("alias");
+        let target = path_with_suffix(&f.program, suffix);
+        symlink(&target, &alias).unwrap();
+        assert_eq!(
+            fs::read_link(&alias).unwrap().as_os_str().as_bytes(),
+            target.as_os_str().as_bytes()
+        );
+        assert_eq!(
+            fs::metadata(&alias).unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        let result = qualify_candidates(
+            &[GitCandidate {
+                path: alias,
+                source: GitSelectionSource::Cli,
+            }],
+            &ACCESS,
+        );
+        outcomes.push((result.is_err(), marker.exists()));
+    }
+    assert_eq!(outcomes, vec![(true, false), (true, false)]);
+}
+
+#[test]
+fn fake_git_helper_symlink_file_directory_targets_are_refused() {
+    let mut rejected = Vec::new();
+    for suffix in ["/", "/."] {
+        let f = FakeGit::new();
+        let helper = f.helpers.join("git-upload-pack");
+        let actual_helper = f.root.path().join("actual-upload-pack");
+        fs::rename(&helper, &actual_helper).unwrap();
+        symlink(path_with_suffix(&actual_helper, suffix), &helper).unwrap();
+        assert_eq!(
+            fs::metadata(&helper).unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        rejected
+            .push(qualify_candidates(&[f.candidate(GitSelectionSource::Cli)], &ACCESS).is_err());
+    }
+    assert_eq!(rejected, vec![true, true]);
+}
+
+#[test]
+fn fake_git_directory_suffixes_and_ordinary_symlinks_remain_qualified() {
+    for suffix in ["/", "/."] {
+        let mut f = FakeGit::new();
+        let actual_helpers = f.helpers.clone();
+        let helper_alias = f.root.path().join("helper-alias");
+        symlink(path_with_suffix(&actual_helpers, suffix), &helper_alias).unwrap();
+        f.helpers = path_with_suffix(&helper_alias, suffix);
+        f.script("git version 2.55.0", "");
+        let directory = f.root.path().join(OsStr::from_bytes(b"bin-\xff"));
+        fs::create_dir(&directory).unwrap();
+        symlink("../git", directory.join("git")).unwrap();
+        let directory_alias = f.root.path().join("bin-alias");
+        symlink(path_with_suffix(&directory, suffix), &directory_alias).unwrap();
+        let spelling = directory_alias.join("./git");
+        assert!(fs::metadata(&spelling).unwrap().is_file());
+        assert!(fs::metadata(&f.helpers).unwrap().is_dir());
+        let selected = qualify_candidates(
+            &[GitCandidate {
+                path: spelling.clone(),
+                source: GitSelectionSource::Cli,
+            }],
+            &ACCESS,
+        )
+        .unwrap();
+        assert_eq!(
+            selected.binding.candidate().path.as_os_str().as_bytes(),
+            spelling.as_os_str().as_bytes()
+        );
+        assert_eq!(selected.binding.canonical_program(), f.program);
+        assert_eq!(selected.binding.helper_directory(), actual_helpers);
+        selected.binding.revalidate().unwrap();
+        let output = selected
+            .binding
+            .command(["status"], |_| {})
+            .unwrap()
+            .output_aggregate(Duration::from_secs(1), 1024)
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"dispatch");
+    }
+}
+
 #[test]
 fn fake_git_unsafe_nonregular_nonexec_refused_before_execution() {
     for kind in ["writable", "nonexec", "directory", "fifo", "parent"] {
