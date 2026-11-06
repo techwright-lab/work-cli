@@ -142,3 +142,158 @@ pub(crate) fn boot_session_uuid(buffer: &mut [u8; 37]) -> io::Result<usize> {
     }
     Ok(length)
 }
+
+// SDK27 sys/attr.h: these schemas deliberately request neither generation nor
+// NAME census fields. Mandatory payload generation remains a separate API.
+const _: () = {
+    assert!(
+        crate::access::ACCESS_COMMON
+            == libc::ATTR_CMN_RETURNED_ATTRS
+                | libc::ATTR_CMN_OWNERID
+                | libc::ATTR_CMN_GRPID
+                | libc::ATTR_CMN_ACCESSMASK
+                | libc::ATTR_CMN_USERACCESS
+                | libc::ATTR_CMN_EXTENDED_SECURITY
+                | libc::ATTR_CMN_FILEID
+    );
+    assert!(
+        crate::topology::TOPOLOGY_COMMON
+            == libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FILEID | libc::ATTR_CMN_FULLPATH
+    );
+    assert!(crate::topology::TOPOLOGY_DIRECTORY == libc::ATTR_DIR_MOUNTSTATUS);
+    assert!(
+        crate::topology::TOPOLOGY_EXTENDED
+            == libc::ATTR_CMNEXT_NOFIRMLINKPATH | libc::ATTR_CMNEXT_REALFSID
+    );
+    assert!(std::mem::size_of::<libc::fsid_t>() == std::mem::size_of::<[i32; 2]>());
+};
+
+fn observe_list(
+    fd: BorrowedFd<'_>,
+    name: Option<&CStr>,
+    mut requested: libc::attrlist,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    // SAFETY: fd is borrowed live, optional name is a live CStr validated as one
+    // component by the safe caller. requested is initialized. Caller buffer is
+    // initialized, exclusively borrowed and writable for exactly its len bytes.
+    // No typed result dereferences, retries, allocation or raw pointer escape.
+    let result = unsafe {
+        match name {
+            Some(name) => libc::getattrlistat(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                (&mut requested as *mut libc::attrlist).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                (libc::FSOPT_NOFOLLOW | libc::FSOPT_ATTR_CMN_EXTENDED).into(),
+            ),
+            None => libc::fgetattrlist(
+                fd.as_raw_fd(),
+                (&mut requested as *mut libc::attrlist).cast(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::FSOPT_ATTR_CMN_EXTENDED,
+            ),
+        }
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if result != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected attribute observation result",
+        ));
+    }
+    Ok(())
+}
+fn list(commonattr: u32, dirattr: u32, forkattr: u32) -> libc::attrlist {
+    libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr,
+        volattr: 0,
+        dirattr,
+        fileattr: 0,
+        forkattr,
+    }
+}
+pub(crate) fn access_fd(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<()> {
+    observe_list(fd, None, list(crate::access::ACCESS_COMMON, 0, 0), buffer)
+}
+pub(crate) fn access_at(fd: BorrowedFd<'_>, name: &CStr, buffer: &mut [u8]) -> io::Result<()> {
+    observe_list(
+        fd,
+        Some(name),
+        list(crate::access::ACCESS_COMMON, 0, 0),
+        buffer,
+    )
+}
+pub(crate) fn topology(
+    fd: BorrowedFd<'_>,
+    name: Option<&CStr>,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    observe_list(
+        fd,
+        name,
+        list(
+            crate::topology::TOPOLOGY_COMMON,
+            crate::topology::TOPOLOGY_DIRECTORY,
+            crate::topology::TOPOLOGY_EXTENDED,
+        ),
+        buffer,
+    )
+}
+
+unsafe extern "C" {
+    // SDK27 membership.h. Unlike ordinary syscalls this returns errno directly.
+    fn mbr_uuid_to_id(uuid: *const u8, id: *mut libc::id_t, kind: *mut libc::c_int) -> libc::c_int;
+}
+pub(crate) fn principal(uuid: &[u8; 16]) -> io::Result<crate::Principal> {
+    if *uuid == [0; 16] {
+        return Ok(crate::Principal::Unknown);
+    }
+    let mut id: libc::id_t = 0;
+    let mut kind: libc::c_int = -1;
+    // SAFETY: uuid is exactly the SDK's 16-byte uuid_t input. Both output
+    // pointers designate initialized, exclusively borrowed correctly typed locals.
+    // No result is consumed after a nonzero return; no retries/retained pointers.
+    let result = unsafe { mbr_uuid_to_id(uuid.as_ptr(), &mut id, &mut kind) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    Ok(match kind {
+        0 => crate::Principal::User(id),
+        1 => crate::Principal::Group(id),
+        _ => crate::Principal::Unknown,
+    })
+}
+
+pub(crate) fn mounted_volume(fd: BorrowedFd<'_>) -> io::Result<crate::MountedVolume> {
+    // SAFETY: statfs is a C POD of integer scalars and fixed arrays, for which
+    // zero is valid. Initialization also prevents stale bytes on partial writes.
+    let mut value: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: live borrowed fd and exclusive writable correctly sized statfs.
+    let result = unsafe { libc::fstatfs(fd.as_raw_fd(), &mut value) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if result != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected fstatfs result",
+        ));
+    }
+    // SAFETY: SDK sys/mount.h defines fsid_t as two int32 values. libc keeps the
+    // field private; sizes are asserted above. All bit patterns are valid i32s.
+    let fsid = unsafe { std::mem::transmute::<libc::fsid_t, [i32; 2]>(value.f_fsid) };
+    crate::MountedVolume::new(
+        fsid,
+        value.f_flags,
+        value.f_mntonname.map(|b| b as u8),
+        value.f_fstypename.map(|b| b as u8),
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}

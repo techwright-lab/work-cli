@@ -5,6 +5,15 @@
 
 #![deny(unsafe_code)]
 
+mod topology;
+pub use topology::{decode_topology, DirectoryTopology, MountedVolume, TOPOLOGY_BUFFER_SIZE};
+
+mod access;
+pub use access::{
+    decode_access, decode_filesec, AccessError, AccessObservation, Ace, Acl, GrantExposure,
+    Principal, ACCESS_BUFFER_SIZE,
+};
+
 mod attributes;
 #[cfg(target_os = "macos")]
 pub use attributes::attributes_at;
@@ -30,3 +39,11 @@ mod boot;
 #[cfg(target_os = "macos")]
 pub use boot::boot_session_uuid;
 pub use boot::{parse_boot_session_uuid, BootSessionError, BootSessionUuid};
+
+#[cfg(target_os = "macos")]
+pub use access::{access_at, access_fd, principal};
+
+#[cfg(target_os = "macos")]
+pub use topology::{
+    directory_topology_at, directory_topology_fd, mounted_volume_fd, open_directory_at,
+};
