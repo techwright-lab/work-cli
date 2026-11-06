@@ -1,0 +1,176 @@
+#!/bin/sh
+# I1 ONLY -- NOT FOR RELEASE PUBLICATION. Activation/ownership and native
+# candidate verification are not implemented; every operation fails closed.
+RELEASE_VERSION=@RELEASE_VERSION@
+DEVELOPER_ID=@DEVELOPER_ID@
+# End release identity.
+set -eu
+set -f
+LC_ALL=C
+export LC_ALL
+umask 077
+
+fail() {
+    printf 'work installer: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    printf '%s\n' 'usage: install.sh install [--bin-dir DIR]' \
+        '       install.sh update --confirm-stopped [--bin-dir DIR]' \
+        '       install.sh rollback --version VERSION --confirm-stopped [--bin-dir DIR]' >&2
+    exit 2
+}
+
+stable_version() {
+    case "$1" in ''|*[!0-9.]*|.*|*.) return 1 ;; esac
+    saved_ifs=$IFS
+    IFS=.
+    set -- $1
+    IFS=$saved_ifs
+    [ "$#" -eq 3 ] || return 1
+    for component do
+        case "$component" in ''|0[0-9]*) return 1 ;; esac
+    done
+}
+
+safe_directory() {
+    # Lexical path validation only; I2 must bind actual canonical ancestry and
+    # ownership before using any destination or claiming direct-install state.
+    case "$1" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    case "$1" in
+        /|*/|*//*|*/./*|*/../*|*/.|*/..|*[[:cntrl:]]*) return 1 ;;
+    esac
+}
+
+[ "$#" -gt 0 ] || usage
+operation=$1
+shift
+case "$operation" in install|update|rollback) ;; *) usage ;; esac
+bin_dir=
+confirmed=no
+rollback_version=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --bin-dir)
+            [ -z "$bin_dir" ] && [ "$#" -ge 2 ] || usage
+            safe_directory "$2" || usage
+            bin_dir=$2
+            shift 2 ;;
+        --confirm-stopped)
+            [ "$confirmed" = no ] || usage
+            confirmed=yes
+            shift ;;
+        --version)
+            [ "$operation" = rollback ] && [ -z "$rollback_version" ] && [ "$#" -ge 2 ] || usage
+            stable_version "$2" || usage
+            rollback_version=$2
+            shift 2 ;;
+        *) usage ;;
+    esac
+done
+case "$operation" in
+    install) [ "$confirmed" = no ] || usage ;;
+    update) [ "$confirmed" = yes ] || usage ;;
+    rollback) [ "$confirmed" = yes ] && [ -n "$rollback_version" ] || usage ;;
+esac
+if [ -z "$bin_dir" ]; then
+    [ -n "${HOME:-}" ] || usage
+    bin_dir=$HOME/.local/bin
+    safe_directory "$bin_dir" || usage
+fi
+
+require() {
+    for utility do
+        command -v "$utility" >/dev/null 2>&1 || fail "required utility unavailable: $utility"
+    done
+}
+
+require uname curl mktemp rm wc cat
+system=$(uname -s) || fail 'unsupported system: uname failed'
+case "$system" in
+    Linux)
+        require getconf sha256sum
+        architecture=$(uname -m) || fail 'unsupported architecture: uname failed'
+        [ "$architecture" = x86_64 ] || fail 'unsupported Linux architecture'
+        libc=$(getconf GNU_LIBC_VERSION) || fail 'unsupported libc'
+        case "$libc" in 'glibc '*) libc=${libc#glibc } ;; *) fail 'unsupported libc' ;; esac
+        case "$libc" in ''|*[!0-9.]*|*.*.*|.*|*.) fail 'unsupported libc version' ;; esac
+        major=${libc%%.*}
+        minor=${libc#*.}
+        # Bound numeric input before shell integer comparisons.
+        [ "${#major}" -le 3 ] && [ "${#minor}" -le 3 ] && [ "$major" != "$libc" ] || fail 'unsupported libc version'
+        { [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 36 ]; }; } || fail 'unsupported libc version (need glibc >=2.36)'
+        platform=linux-x86_64 ;;
+    Darwin)
+        require sysctl sw_vers shasum codesign spctl lipo
+        # hw.optional.arm64 describes physical capability even under Rosetta.
+        arm64=$(sysctl -n hw.optional.arm64) || fail 'unsupported physical architecture'
+        [ "$arm64" = 1 ] || fail 'unsupported Intel Mac'
+        os_version=$(sw_vers -productVersion) || fail 'unsupported macOS version'
+        case "$os_version" in ''|*[!0-9.]*|.*|*.|*..*) fail 'unsupported macOS version' ;; esac
+        os_major=${os_version%%.*}
+        case "$os_major" in 15|26) ;; *) fail 'unsupported/unqualified macOS version (require 15 or 26)' ;; esac
+        platform=macos-arm64 ;;
+    *) fail 'unsupported operating system' ;;
+esac
+
+# Rollback belongs to retained, verified direct-install records, not downloads.
+# No helper-managed state is read or adopted here.
+[ "$operation" != rollback ] || fail "activation is not implemented; rollback refused for $bin_dir/work"
+
+stage=
+cleanup() {
+    if [ -n "$stage" ]; then
+        rm -rf -- "$stage"
+    fi
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+created_stage=$(mktemp -d "${TMPDIR:-/tmp}/work-install.XXXXXXXXXX") || fail 'private download staging failed'
+safe_directory "$created_stage" && [ -d "$created_stage" ] || fail 'unsafe private download staging'
+stage=$created_stage
+asset=work-$RELEASE_VERSION-$platform
+release_url=https://github.com/techwright-lab/work-cli/releases/download/v$RELEASE_VERSION
+
+download() {
+    # --disable must be first: do not inherit ~/.curlrc protocol/output overrides.
+    curl --disable --fail --silent --show-error --location \
+        --proto '=https' --proto-redir '=https' --max-redirs 5 \
+        --connect-timeout 15 --max-time 300 --max-filesize "$3" \
+        --output "$2" "$1" || fail 'HTTPS download failed'
+}
+
+download "$release_url/$asset.sha256" "$stage/checksum" 4096
+size=$(wc -c < "$stage/checksum") || fail 'checksum size unavailable'
+# wc may pad its decimal output; field splitting here is intentional.
+set -- $size
+[ "$#" -eq 1 ] || fail 'checksum size invalid'
+case "$1" in ''|*[!0-9]*) fail 'checksum size invalid' ;; esac
+[ "${#1}" -le 4 ] && [ "$1" -gt 0 ] && [ "$1" -le 4096 ] || fail 'checksum sidecar exceeds bound'
+# Shell variables cannot retain NUL bytes. Exact byte count plus exact text
+# framing below prevents a shell from silently discarding an injected NUL.
+[ "$1" -eq "$((67 + ${#asset}))" ] || fail 'checksum sidecar byte count invalid'
+# A sentinel preserves all trailing newlines, so extra lines are not discarded
+# by command substitution. Only the exact sha256sum-format release line passes.
+sidecar=$(cat "$stage/checksum" && printf '.') || fail 'checksum read failed'
+expected_digest=${sidecar%% *}
+[ "${#expected_digest}" -eq 64 ] || fail 'checksum digest length invalid'
+case "$expected_digest" in *[!0-9a-f]*) fail 'checksum digest invalid' ;; esac
+[ "$sidecar" = "$expected_digest  $asset
+." ] || fail 'checksum filename or framing invalid'
+download "$release_url/$asset" "$stage/candidate" 268435456
+case "$platform" in
+    linux-x86_64) actual=$(sha256sum "$stage/candidate") || fail 'checksum computation failed' ;;
+    macos-arm64) actual=$(shasum -a 256 "$stage/candidate") || fail 'checksum computation failed' ;;
+esac
+actual=${actual%% *}
+[ "$actual" = "$expected_digest" ] || fail 'checksum mismatch'
+
+# Never execute or activate the candidate in I1. I2 must prove direct ownership,
+# serialization, same-filesystem staging and uncertain-activation handling; I3
+# must authenticate architecture/signer/trust and candidate version first.
+fail "activation is not implemented; installation refused for $bin_dir/work"
