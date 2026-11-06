@@ -2947,18 +2947,19 @@ fn directory_next<T>(
 mod filesystem {
     use super::*;
     use crate::disposal::RawPath;
-    use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir, ResolveFlags};
+    use rustix::fs::{self, FileType, Mode, OFlags};
+    #[cfg(target_os = "linux")]
+    use rustix::fs::{AtFlags, RawDir, ResolveFlags};
     use std::{
         collections::BTreeSet,
         ffi::CString,
         fs::File,
-        mem::MaybeUninit,
-        os::{
-            fd::{AsRawFd, OwnedFd},
-            unix::ffi::OsStrExt,
-        },
+        os::fd::{AsRawFd, OwnedFd},
         path::Path,
     };
+
+    #[cfg(target_os = "linux")]
+    use std::{mem::MaybeUninit, os::unix::ffi::OsStrExt};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(super) struct Identity {
@@ -2977,6 +2978,7 @@ mod filesystem {
     impl Identity {
         // st_nlink has architecture-dependent width; retain the portable u64 conversion.
         #[allow(clippy::useless_conversion)]
+        #[cfg(target_os = "linux")]
         fn from_stat(s: fs::Stat) -> Self {
             Self {
                 device: s.st_dev,
@@ -2992,8 +2994,18 @@ mod filesystem {
                 ctime_ns: s.st_ctime_nsec,
             }
         }
+        #[cfg(target_os = "linux")]
         fn kind(&self) -> FileType {
             FileType::from_raw_mode(self.mode)
+        }
+        #[cfg(not(target_os = "linux"))]
+        fn kind(&self) -> FileType {
+            // Identity cannot be acquired until the native backend is implemented.
+            // Keep the shared mode representation without truncating a stored mode.
+            self.mode
+                .try_into()
+                .map(FileType::from_raw_mode)
+                .unwrap_or(FileType::Unknown)
         }
         fn approval_semantic_v1(&self, out: &mut Vec<u8>) {
             for n in [
@@ -3046,10 +3058,22 @@ mod filesystem {
             out
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    fn stat(fd: &OwnedFd, b: &mut Budget) -> Result<Identity, IncompleteReason> {
+        let _ = (fd, b);
+        Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "linux")]
     fn stat(fd: &OwnedFd, b: &mut Budget) -> Result<Identity, IncompleteReason> {
         b.check()?;
         fs::fstat(fd).map(Identity::from_stat).map_err(os_error)
     }
+    #[cfg(not(target_os = "linux"))]
+    fn named(parent: &OwnedFd, name: &[u8], b: &mut Budget) -> Result<Identity, IncompleteReason> {
+        let _ = (parent, name, b);
+        Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "linux")]
     fn named(parent: &OwnedFd, name: &[u8], b: &mut Budget) -> Result<Identity, IncompleteReason> {
         b.check()?;
         fs::statat(parent, cstring(name)?.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
@@ -3095,6 +3119,7 @@ mod filesystem {
     fn cstring(bytes: &[u8]) -> Result<CString, IncompleteReason> {
         CString::new(bytes).map_err(|_| IncompleteReason::InvalidPath)
     }
+    #[cfg(target_os = "linux")]
     fn resolution(below: bool) -> ResolveFlags {
         let flags = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS;
         if below {
@@ -3103,6 +3128,18 @@ mod filesystem {
             flags
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    fn open_path(
+        parent: &OwnedFd,
+        name: &[u8],
+        directory: bool,
+        below: bool,
+        b: &mut Budget,
+    ) -> Result<OwnedFd, IncompleteReason> {
+        let _ = (parent, name, directory, below, b);
+        Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "linux")]
     fn open_path(
         parent: &OwnedFd,
         name: &[u8],
@@ -3133,6 +3170,16 @@ mod filesystem {
         route: Vec<Link>,
     }
     impl Anchor {
+        #[cfg(not(target_os = "linux"))]
+        fn open<H: Boundary>(
+            path: &Path,
+            b: &mut Budget,
+            hooks: &mut H,
+        ) -> Result<Self, IncompleteReason> {
+            let _ = (path, b, hooks);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         fn open<H: Boundary>(
             path: &Path,
             b: &mut Budget,
@@ -3220,6 +3267,12 @@ mod filesystem {
         proc_index: usize,
     }
     impl TrustedProc {
+        #[cfg(not(target_os = "linux"))]
+        fn open<H: Boundary>(b: &mut Budget, hooks: &mut H) -> Result<Self, IncompleteReason> {
+            let _ = (b, hooks);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         fn open<H: Boundary>(b: &mut Budget, hooks: &mut H) -> Result<Self, IncompleteReason> {
             let mut anchor = Anchor::open(Path::new("/proc"), b, hooks)?;
             let proc_index = anchor.route.len() - 1;
@@ -3244,6 +3297,12 @@ mod filesystem {
             result.recheck(b)?;
             Ok(result)
         }
+        #[cfg(not(target_os = "linux"))]
+        fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
+            let _ = (self, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             self.anchor.recheck(b)?;
             b.check()?;
@@ -3467,6 +3526,12 @@ mod filesystem {
         data: BTreeMap<Vec<u8>, Vec<u8>>,
     }
     impl Manifest {
+        #[cfg(not(target_os = "linux"))]
+        pub(super) fn new(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
+            let _ = (path, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         pub(super) fn new(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
             let anchor = Anchor::open(path, b, &mut SystemBoundary)?;
             let proc = TrustedProc::open(b, &mut SystemBoundary)?;
@@ -3490,6 +3555,12 @@ mod filesystem {
                 data: BTreeMap::new(),
             })
         }
+        #[cfg(not(target_os = "linux"))]
+        fn node(&mut self, path: &[u8], b: &mut Budget) -> Result<Option<usize>, IncompleteReason> {
+            let _ = (self, path, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         fn node(&mut self, path: &[u8], b: &mut Budget) -> Result<Option<usize>, IncompleteReason> {
             if path.is_empty() {
                 return Ok(Some(0));
@@ -3627,6 +3698,16 @@ mod filesystem {
             self.held[i].names = Some(names.clone());
             Ok(names)
         }
+        #[cfg(not(target_os = "linux"))]
+        pub(super) fn optional(
+            &mut self,
+            path: &[u8],
+            b: &mut Budget,
+        ) -> Result<Option<Vec<u8>>, IncompleteReason> {
+            let _ = (self, path, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         pub(super) fn optional(
             &mut self,
             path: &[u8],
@@ -3686,6 +3767,12 @@ mod filesystem {
             self.optional(path, b)?
                 .ok_or(IncompleteReason::UnsupportedGit)
         }
+        #[cfg(not(target_os = "linux"))]
+        pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
+            let _ = (self, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             check_nodes(&self.held, b)?;
             self.anchor.recheck(b)?;
@@ -3964,6 +4051,12 @@ mod filesystem {
         absent: Option<Vec<u8>>,
     }
     impl Endpoint {
+        #[cfg(not(target_os = "linux"))]
+        pub(super) fn open(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
+            let _ = (path, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         pub(super) fn open(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
             let raw = path.as_os_str().as_bytes();
             let relative = raw
@@ -4034,6 +4127,12 @@ mod filesystem {
         pub(super) fn missing(&self) -> bool {
             self.absent.is_some()
         }
+        #[cfg(not(target_os = "linux"))]
+        pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
+            let _ = (self, b);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             self.anchor.recheck(b)?;
             if let Some((fd, name, identity)) = &self.final_entry {
@@ -4077,6 +4176,12 @@ mod filesystem {
             Sha256::digest(out).to_vec()
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn boot_id(b: &mut Budget) -> Result<Vec<u8>, IncompleteReason> {
+        let _ = (b,);
+        Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "linux")]
     pub(super) fn boot_id(b: &mut Budget) -> Result<Vec<u8>, IncompleteReason> {
         let anchor = Anchor::open(Path::new("/proc/sys/kernel/random"), b, &mut SystemBoundary)?;
         if fs::fstatfs(&anchor.last().fd).map_err(os_error)?.f_type != fs::PROC_SUPER_MAGIC {
@@ -4193,6 +4298,12 @@ mod filesystem {
             }
             Ok(())
         }
+        #[cfg(not(target_os = "linux"))]
+        fn visit(&mut self, parent: usize, depth: usize) -> Result<(), IncompleteReason> {
+            let _ = (self, parent, depth);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         fn visit(&mut self, parent: usize, depth: usize) -> Result<(), IncompleteReason> {
             self.b.check()?;
             if depth > MAX_DEPTH {
@@ -4262,6 +4373,12 @@ mod filesystem {
             self.held[parent].names = Some(names);
             self.check_held(parent)
         }
+        #[cfg(not(target_os = "linux"))]
+        fn hash_file(&mut self, index: usize) -> Result<[u8; 32], IncompleteReason> {
+            let _ = (self, index);
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "linux")]
         fn hash_file(&mut self, index: usize) -> Result<[u8; 32], IncompleteReason> {
             let held = &self.held[index];
             regular(&held.identity)?;
@@ -4309,6 +4426,16 @@ mod filesystem {
             Ok(hasher.finalize().into())
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    fn enumerate(
+        held: &Held,
+        b: &mut Budget,
+        first: bool,
+    ) -> Result<Vec<Vec<u8>>, IncompleteReason> {
+        let _ = (held, b, first);
+        Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "linux")]
     fn enumerate(
         held: &Held,
         b: &mut Budget,

@@ -164,6 +164,11 @@ impl Clock {
             }
             return Ok(stamp);
         }
+        #[cfg(not(target_os = "linux"))]
+        fn ns() -> Held<u64> {
+            Err("native_boot_clock_incomplete")
+        }
+        #[cfg(target_os = "linux")]
         fn ns() -> Held<u64> {
             let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
             let seconds = u64::try_from(t.tv_sec).map_err(|_| "clock_anomaly")?;

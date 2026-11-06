@@ -3,11 +3,13 @@
 //! same-UID containment. Two advertisements cannot detect an away-and-back move.
 use super::*;
 use crate::config::{Config, ConfigDocument, RemoteTarget};
-use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags};
-use std::{
-    ffi::CString, mem::MaybeUninit, os::fd::OwnedFd, os::unix::ffi::OsStrExt, process::Command,
-};
+use rustix::fs::{self as rfs, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, FileType, Mode, ResolveFlags};
+use std::{ffi::CString, os::fd::OwnedFd, os::unix::ffi::OsStrExt, process::Command};
 
+#[cfg(target_os = "linux")]
+use std::mem::MaybeUninit;
 type Held<T> = Result<T, &'static str>;
 const PROCESS_OUTPUT: usize = 1024 * 1024;
 
@@ -1199,9 +1201,16 @@ impl Scratch {
         &self.path
     }
 }
+#[cfg(target_os = "linux")]
 fn stat_id(stat: &rfs::Stat) -> (u64, u64) {
     (stat.st_dev, stat.st_ino)
 }
+#[cfg(not(target_os = "linux"))]
+fn beneath(parent: &OwnedFd, name: &std::ffi::CStr, flags: OFlags) -> Held<OwnedFd> {
+    let _ = (parent, name, flags);
+    Err("native_scratch_backend_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn beneath(parent: &OwnedFd, name: &std::ffi::CStr, flags: OFlags) -> Held<OwnedFd> {
     rfs::openat2(
         parent,
@@ -1216,6 +1225,12 @@ fn beneath(parent: &OwnedFd, name: &std::ffi::CStr, flags: OFlags) -> Held<Owned
     .map_err(|_| "scratch_unknown")
 }
 impl Scratch {
+    #[cfg(not(target_os = "linux"))]
+    fn create(config: &Config, context: &Context, id: Uuid, b: &mut Budget) -> Held<Self> {
+        let _ = (config, context, id, b);
+        Err("native_scratch_backend_incomplete")
+    }
+    #[cfg(target_os = "linux")]
     fn create(config: &Config, context: &Context, id: Uuid, b: &mut Budget) -> Held<Self> {
         input(b.check())?;
         let name = format!("work-verify-{id}");
@@ -1274,6 +1289,12 @@ impl Scratch {
         result.check()?;
         Ok(result)
     }
+    #[cfg(not(target_os = "linux"))]
+    fn check(&self) -> Held<()> {
+        let _ = (self,);
+        Err("native_scratch_backend_incomplete")
+    }
+    #[cfg(target_os = "linux")]
     fn check(&self) -> Held<()> {
         let parent = rfs::fstat(&self.parent).map_err(|_| "scratch_unknown")?;
         let named_parent = rfs::statat(rfs::CWD, c"/tmp", AtFlags::SYMLINK_NOFOLLOW)
@@ -1306,6 +1327,12 @@ impl Scratch {
         }
         Ok(())
     }
+    #[cfg(not(target_os = "linux"))]
+    fn cleanup(&self, b: &mut Budget) -> Held<()> {
+        let _ = (self, b);
+        Err("native_scratch_backend_incomplete")
+    }
+    #[cfg(target_os = "linux")]
     fn cleanup(&self, b: &mut Budget) -> Held<()> {
         if b.remote_reap_unknown {
             return Err("cleanup_unknown");
@@ -1428,6 +1455,12 @@ fn cleanup_time(b: &Budget) -> Held<()> {
         Ok(())
     }
 }
+#[cfg(not(target_os = "linux"))]
+fn cleanup_binding(actual: &rfs::Stat, node: &CleanupNode) -> Held<()> {
+    let _ = (actual, node);
+    Err("native_scratch_backend_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn cleanup_binding(actual: &rfs::Stat, node: &CleanupNode) -> Held<()> {
     if stat_id(actual) != stat_id(&node.stat)
         || actual.st_uid != node.stat.st_uid

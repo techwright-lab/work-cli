@@ -2,7 +2,11 @@
 //! Tests were authored before this logic; no local RED/GREEN claim.
 use super::*;
 use crate::config::{Config, ConfigDocument};
-use rustix::fs::{self as rfs, Mode, OFlags, ResolveFlags};
+#[cfg(any(target_os = "linux", test))]
+use rustix::fs as rfs;
+use rustix::fs::OFlags;
+#[cfg(target_os = "linux")]
+use rustix::fs::{Mode, ResolveFlags};
 use serde::Serialize;
 use std::{
     fs::File,
@@ -1326,6 +1330,7 @@ fn short_context_matches(
 
 fn receipt_reason(error: ReceiptError) -> &'static str {
     match error {
+        ReceiptError::NativeIncomplete => "native_backend_incomplete",
         ReceiptError::Conflict => "receipt_conflict",
         ReceiptError::CapacityFull => "capacity_full",
         ReceiptError::UnsafeReceiptStore => "unsafe_receipt_store",
@@ -1346,6 +1351,7 @@ fn hash32(digest: &sha2::digest::Output<Sha256>) -> [u8; 32] {
 }
 
 const LOCK_DIR: &str = "recovery-preparation-locks-v1";
+#[cfg(target_os = "linux")]
 const LOCK_RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS)
@@ -1379,6 +1385,12 @@ fn lock_file_meta(file: &File) -> Held<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn open_lock_authority(store: &Store) -> Held<File> {
+    let _ = (store,);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn open_lock_authority(store: &Store) -> Held<File> {
     let identity = store.authority_identity();
     let directory = rfs::openat2(
@@ -1401,6 +1413,12 @@ fn open_lock_authority(store: &Store) -> Held<File> {
     Ok(directory)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
+    let _ = (parent, name, flags);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
     let additional = if flags.contains(OFlags::PATH) {
         OFlags::empty()
@@ -1418,6 +1436,12 @@ fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
     .map_err(|_| "lock_unknown")
 }
 
+#[cfg(not(target_os = "linux"))]
+fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    let _ = (store, key);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     let authority = open_lock_authority(store)?;
     let authority_id = lock_identity(&authority)?;
@@ -1462,6 +1486,12 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    let _ = (store, key);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     let authority = open_lock_authority(store)?;
     let authority_id = lock_identity(&authority)?;

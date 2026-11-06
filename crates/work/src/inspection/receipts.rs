@@ -2,13 +2,15 @@
 //! no local execution or RED/GREEN claim.
 use super::{frame, hex, Captured, Coverage, InspectionError, Observation, Store};
 use crate::disposal::ValidatedPolicies;
-use rustix::fs::{self, AtFlags, FileType, Mode, OFlags, RawDir, RenameFlags, ResolveFlags};
+use rustix::fs::{self, FileType, Mode, OFlags, RenameFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, RawDir, ResolveFlags};
 use sha2::{Digest, Sha256};
+use std::{fs::File, io::Write, os::unix::ffi::OsStrExt};
+#[cfg(target_os = "linux")]
 use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     mem::MaybeUninit,
-    os::unix::ffi::OsStrExt,
 };
 use uuid::Uuid;
 
@@ -16,6 +18,7 @@ const DIRECTORY: &str = "inspection-receipts-v1";
 const MAX_RECEIPT: u64 = 2 * 1024 * 1024;
 const MAX_TOTAL: u64 = 16 * 1024 * 1024;
 const MAX_NAMES: usize = 4096;
+#[cfg(target_os = "linux")]
 const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS)
@@ -23,6 +26,8 @@ const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ReceiptError {
+    #[error("native receipt backend incomplete")]
+    NativeIncomplete,
     #[error("inspection context changed or unavailable")]
     Conflict,
     #[error("inspection receipt capacity full")]
@@ -47,6 +52,7 @@ pub enum ReceiptError {
 impl ReceiptError {
     pub(super) fn label(&self) -> &'static str {
         match self {
+            Self::NativeIncomplete => "native_backend_incomplete",
             Self::Conflict => "conflict",
             Self::CapacityFull => "capacity_full",
             Self::UnsafeReceiptStore => "unsafe_receipt_store",
@@ -462,6 +468,7 @@ fn rename_noreplace(dir: &File, from: &str, to: &str) -> Result<()> {
 fn stat(file: &File) -> Result<fs::Stat> {
     fs::fstat(file).map_err(|_| ReceiptError::UnsafeReceiptStore)
 }
+#[cfg(target_os = "linux")]
 fn identity(stat: &fs::Stat) -> (u64, u64) {
     (stat.st_dev, stat.st_ino)
 }
@@ -486,6 +493,12 @@ fn validate_file(stat: &fs::Stat) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(not(target_os = "linux"))]
+fn open_relative(parent: &File, name: &str, flags: OFlags) -> Result<File> {
+    let _ = (parent, name, flags);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 fn open_relative(parent: &File, name: &str, flags: OFlags) -> Result<File> {
     // openat2 rejects NONBLOCK with O_PATH. Metadata-only handles still use
     // the same no-follow/no-mount resolution; data opens remain nonblocking.
@@ -540,6 +553,7 @@ fn read_charged(file: &File, limit: u64, budget: &mut super::Budget) -> Result<V
     }
     Ok(bytes)
 }
+#[cfg(target_os = "linux")]
 fn next_receipt_name(
     entries: &mut RawDir<'_, &File>,
     budget: Option<&mut super::Budget>,
@@ -558,6 +572,12 @@ fn next_receipt_name(
         },
     }
 }
+#[cfg(not(target_os = "linux"))]
+fn open_authority(store: &Store) -> Result<File> {
+    let _ = (store,);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 fn open_authority(store: &Store) -> Result<File> {
     let authority = store.authority_identity();
     let directory = fs::openat2(
@@ -617,6 +637,12 @@ impl Location {
         }
         Ok(location)
     }
+    #[cfg(not(target_os = "linux"))]
+    fn check(&self, store: &Store) -> Result<()> {
+        let _ = (self, store);
+        Err(ReceiptError::NativeIncomplete)
+    }
+    #[cfg(target_os = "linux")]
     fn check(&self, store: &Store) -> Result<()> {
         let parent = open_authority(store)?;
         if identity(&stat(&parent)?) != identity(&stat(&self.parent)?) {
@@ -651,6 +677,12 @@ impl Reservation {
         )
     }
 }
+#[cfg(not(target_os = "linux"))]
+fn check_named(dir: &File, name: &str, file: &File, length: u64, filled: bool) -> Result<()> {
+    let _ = (dir, name, file, length, filled);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 fn check_named(dir: &File, name: &str, file: &File, length: u64, filled: bool) -> Result<()> {
     let held = stat(file)?;
     validate_file(&held)?;
@@ -708,6 +740,12 @@ pub(super) fn authority_bytes_for_recovery(store: &Store) -> Vec<u8> {
     authority_bytes(store)
 }
 
+#[cfg(not(target_os = "linux"))]
+pub(super) fn read_raw(store: &Store, id: Uuid, budget: &super::Budget) -> Result<Vec<u8>> {
+    let _ = (store, id, budget);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 pub(super) fn read_raw(store: &Store, id: Uuid, budget: &mut super::Budget) -> Result<Vec<u8>> {
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     budget.check().map_err(|_| ReceiptError::Conflict)?;
@@ -863,6 +901,12 @@ pub(super) struct RecoveryResultBinding {
     pub dev: u64,
     pub ino: u64,
 }
+#[cfg(not(target_os = "linux"))]
+pub(super) fn reservation_binding(reservation: &Reservation) -> Result<RecoveryResultBinding> {
+    let _ = (reservation,);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 pub(super) fn reservation_binding(reservation: &Reservation) -> Result<RecoveryResultBinding> {
     let held = stat(&reservation.file)?;
     validate_file(&held)?;
@@ -896,6 +940,19 @@ fn write_reserved(
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn publish_reserved(
+    store: &mut Store,
+    guard: &crate::checkout_guard::CheckoutGuard,
+    id: Uuid,
+    length: u64,
+    context: &super::Context,
+    budget: &super::Budget,
+) -> Result<PersistedReceipt> {
+    let _ = (store, guard, id, length, context, budget);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 fn publish_reserved(
     store: &mut Store,
     guard: &crate::checkout_guard::CheckoutGuard,
@@ -997,6 +1054,16 @@ fn publish_reserved(
     Ok(PersistedReceipt { id, digest })
 }
 
+#[cfg(not(target_os = "linux"))]
+fn restart_recovery_result(
+    store: &mut Store,
+    publication: &super::recovery_refs::RecoveryResultPublication<'_>,
+    budget: &super::Budget,
+) -> Result<()> {
+    let _ = (store, publication, budget);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 fn restart_recovery_result(
     store: &mut Store,
     publication: &super::recovery_refs::RecoveryResultPublication<'_>,
@@ -1085,6 +1152,17 @@ pub(super) fn reserve_recovery(
     reserve_with_budget(store, id, length, Some(budget))
 }
 
+#[cfg(not(target_os = "linux"))]
+fn reserve_with_budget(
+    store: &Store,
+    id: Uuid,
+    length: u64,
+    budget: Option<&super::Budget>,
+) -> Result<Reservation> {
+    let _ = (store, id, length, budget);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 fn reserve_with_budget(
     store: &Store,
     id: Uuid,
@@ -1257,6 +1335,12 @@ fn encode_envelope(
 }
 /// Targeted passive read through an existing mutable-open Store (the inspector's
 /// current-authority handle). No lease, SQL, creation, sync, repair or freshness.
+#[cfg(not(target_os = "linux"))]
+pub fn read_receipt(store: &Store, id: Uuid) -> Result<ReceiptData> {
+    let _ = (store, id);
+    Err(ReceiptError::NativeIncomplete)
+}
+#[cfg(target_os = "linux")]
 pub fn read_receipt(store: &Store, id: Uuid) -> Result<ReceiptData> {
     store.may_acquire_lease().map_err(|_| ReceiptError::Busy)?;
     uuid(id.to_string().as_bytes())?;
@@ -1506,6 +1590,8 @@ fn body_metadata(
             return Err(ReceiptError::Corrupt);
         }
         let mode = u32::from_be_bytes(c.field(8)?.try_into().map_err(|_| ReceiptError::Corrupt)?);
+        #[cfg(not(target_os = "linux"))]
+        let mode = mode.try_into().map_err(|_| ReceiptError::Corrupt)?;
         if !matches!(
             FileType::from_raw_mode(mode),
             FileType::RegularFile | FileType::Directory
