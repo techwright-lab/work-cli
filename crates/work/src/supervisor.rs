@@ -1048,6 +1048,15 @@ pub(crate) fn command_off_document(
     command_parsed(&config, command, attribution)
 }
 /// CLI signal handlers only request cancellation; no handler sends OS signals.
+#[cfg(not(target_os = "linux"))]
+pub fn command(config: &Config, request: Run) -> io::Result<i32> {
+    let _ = (config, request);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux supervision unsupported on this platform",
+    ))
+}
+#[cfg(target_os = "linux")]
 pub fn command(config: &Config, request: Run) -> io::Result<i32> {
     let (command, attribution) = parse_command(request)?;
     command_parsed(config, command, attribution)

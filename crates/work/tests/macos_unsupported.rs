@@ -373,3 +373,36 @@ fn linux_scope_public_probes_refuse_before_any_helper_execution() {
         assert_eq!(snapshot(&root), before);
     }
 }
+
+#[test]
+fn supervisor_command_refuses_before_parsing_private_request_or_history() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let context = root.join("secret-context");
+    fs::write(&context, b"private invalid context: must not be parsed").unwrap();
+    let config = work_cli::config::Config {
+        store_dir: Some(root.join("authority")),
+        trusted_registry: Some(root.join("registry")),
+        ..Default::default()
+    };
+    let request = work_cli::supervisor::Run {
+        checkout: uuid::Uuid::nil(),
+        run_id: uuid::Uuid::nil(),
+        actor: Some("secret-actor".into()),
+        attribution: None,
+        execution_chain: context,
+        argv: vec!["/bin/sh".into(), "-c".into(), "touch child-launched".into()],
+    };
+    let before = snapshot(&root);
+    let error = work_cli::supervisor::command(&config, request).unwrap_err();
+    assert_eq!(snapshot(&root), before);
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    let diagnostic = error.to_string();
+    assert!(
+        diagnostic.contains("supervision unsupported"),
+        "{diagnostic}"
+    );
+    for private in ["secret-", "touch", "child-launched"] {
+        assert!(!diagnostic.contains(private), "{diagnostic}");
+    }
+}
