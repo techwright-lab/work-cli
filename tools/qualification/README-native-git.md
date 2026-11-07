@@ -126,8 +126,19 @@ PID/PGID, limits, exit status, bounded stderr tail and quiescence result. Failur
 requires an absent owned group, reaped direct child and drained pipes to report
 quiet. Unavailable evidence, a spawn interruption before identity is returned,
 or an incomplete stop/drain is explicitly **UNKNOWN**, never ready or successful.
-The fixture manifest preserves UNKNOWN as well. CLI-only signal handlers are
-restored afterward; imports and ordinary library calls install no handlers.
+The fixture manifest preserves UNKNOWN as well. Once established, the original
+`UnknownOutcome` (and its native-error cause) remains primary through pipe/log
+cleanup, footer/flush/close, command-record writes and outer evidence finalization.
+Secondary evidence errors are retained on the exception and in available in-memory
+records (at most eight diagnostics, each at most 256 characters); remaining evidence
+steps are attempted independently. Known-quiescent failures do not become UNKNOWN
+merely because evidence I/O fails. An unwritable record/manifest is **not** claimed
+persisted or intact: a failed write can leave old, partial or missing evidence.
+UNKNOWN and secondary diagnostics remain available in memory/the escaping
+exception; retain all existing evidence for investigation. The retention
+message is emitted only after a successful manifest write, not as durability proof.
+CLI-only signal handlers are restored afterward; imports and ordinary library
+calls install no handlers.
 SIGKILL or host/process loss cannot guarantee child cleanup or a final record:
 `starting`/`running` records with UNKNOWN outcome must be retained and investigated,
 not treated as reusable fixtures or cleanup authority.

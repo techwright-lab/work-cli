@@ -58,7 +58,56 @@ class Refusal(Exception):
 
 
 class UnknownOutcome(Refusal):
-    pass
+    def __init__(self, message):
+        super().__init__(message)
+        self.secondary_errors = []
+
+    def __str__(self):
+        message = super().__str__()
+        if self.secondary_errors:
+            message += "; secondary evidence errors: " + " | ".join(self.secondary_errors)
+        return message
+
+
+class UnknownFinalization:
+    """Only an established UNKNOWN outranks secondary evidence/close failures."""
+    def __init__(self, record):
+        self.record = record
+        self.unknown = None
+
+    def remember(self, unknown):
+        self.unknown = unknown
+        self.record["secondary_errors"] = unknown.secondary_errors
+        return unknown
+
+    def secondary(self, operation, error):
+        # Shared by command and outer manifest; bound both count and message size.
+        if len(self.unknown.secondary_errors) < 8:
+            self.unknown.secondary_errors.append(
+                (operation + ": " + type(error).__name__ + ": " + str(error))[:256])
+
+    def attempt(self, operation, action):
+        try:
+            action()
+            return True
+        except BaseException as error:
+            if self.unknown is None:
+                raise
+            self.secondary(operation, error)
+            return False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, error, traceback):
+        if self.unknown is not None and error is not self.unknown:
+            # Multiple context exits can mask one another before reaching us.
+            for _ in range(8):
+                if error is None or error is self.unknown:
+                    break
+                self.secondary("context exit", error)
+                error = error.__context__
+            raise self.unknown
 
 
 class CommandInterrupted(Refusal):
@@ -389,7 +438,8 @@ def run_command(command, env, cwd, log, *, timeout=3600, capture_stdout=False):
     spawn_attempted = False
     stdout = bytearray()
     stderr_tail = bytearray()
-    with log.open("ab") as output, selectors.DefaultSelector() as streams:
+    with UnknownFinalization(state) as finalization, \
+            log.open("ab") as output, selectors.DefaultSelector() as streams:
         def write_log(data):
             if output.tell() + len(data) > MAX_LOG_BYTES - LOG_STATUS_RESERVE:
                 raise Refusal("aggregate log byte limit exceeded")
@@ -468,24 +518,31 @@ def run_command(command, env, cwd, log, *, timeout=3600, capture_stdout=False):
                          quiescence="owned-group-absent-and-pipes-drained" if quiet else "UNKNOWN",
                          error=str(error) or type(error).__name__)
             if not quiet:
-                raise UnknownOutcome("UNKNOWN owned-command outcome; retain fixture and accounting: " + str(error)) from error
+                unknown = finalization.remember(UnknownOutcome(
+                    "UNKNOWN owned-command outcome; retain fixture and accounting: " + str(error)))
+                raise unknown from error
             raise
         finally:
             state["captured_stdout_bytes"] = len(stdout)
             state["stderr_tail"] = bytes(stderr_tail).decode("utf-8", errors="replace")
             for key in list(streams.get_map().values()):
-                streams.unregister(key.fileobj)
-                key.fileobj.close()
+                finalization.attempt("pipe unregister", lambda: streams.unregister(key.fileobj))
+                finalization.attempt("pipe close", key.fileobj.close)
             if process is not None:
                 for pipe in (process.stdout, process.stderr):
                     if not pipe.closed:
-                        pipe.close()
+                        finalization.attempt("pipe close", pipe.close)
             footer = (f"\nexit={state['exit_code']} status={state['status']} "
                       f"quiescence={state['quiescence']}\n").encode()[:LOG_STATUS_RESERVE]
-            if output.tell() + len(footer) <= MAX_LOG_BYTES:
-                output.write(footer)
-                output.flush()
-            state_path.write_text(json.dumps(state, indent=2) + "\n")
+
+            def write_footer():
+                if output.tell() + len(footer) <= MAX_LOG_BYTES:
+                    output.write(footer)
+                    output.flush()
+
+            finalization.attempt("log footer/flush", write_footer)
+            finalization.attempt("command record write", lambda: state_path.write_text(
+                json.dumps(state, indent=2) + "\n"))
 
 
 def download(version, archive, env, destination):
@@ -503,19 +560,26 @@ def retained_evidence(destination, metadata):
     metadata.update(status="running", outcome="UNKNOWN", mode="DEVELOPMENT/NON-GATE", support_claim=False)
     manifest = destination / "manifest.json"
     manifest.write_text(json.dumps(metadata, indent=2) + "\n")
-    try:
-        yield metadata
-        metadata.update(status="passed", outcome="owned commands completed")
-    except BaseException as error:
-        metadata.update(status="unknown" if isinstance(error, UnknownOutcome) else "failed",
-                        outcome="UNKNOWN" if isinstance(error, UnknownOutcome) else "failed; inspect command records",
-                        error=str(error) or type(error).__name__)
-        raise
-    finally:
-        metadata["retained_bytes"] = footprint(destination)
-        metadata["free_after_bytes"] = shutil.disk_usage(destination).free
-        manifest.write_text(json.dumps(metadata, indent=2) + "\n")
-        print("Retained evidence: " + str(manifest), file=sys.stderr)
+    with UnknownFinalization(metadata) as finalization:
+        try:
+            yield metadata
+            metadata.update(status="passed", outcome="owned commands completed")
+        except BaseException as error:
+            if isinstance(error, UnknownOutcome):
+                finalization.remember(error)
+            metadata.update(status="unknown" if isinstance(error, UnknownOutcome) else "failed",
+                            outcome="UNKNOWN" if isinstance(error, UnknownOutcome) else "failed; inspect command records",
+                            error=str(error) or type(error).__name__)
+            raise
+        finally:
+            finalization.attempt("retained footprint", lambda: metadata.update(
+                retained_bytes=footprint(destination)))
+            finalization.attempt("physical free space", lambda: metadata.update(
+                free_after_bytes=shutil.disk_usage(destination).free))
+            if finalization.attempt("manifest write", lambda: manifest.write_text(
+                    json.dumps(metadata, indent=2) + "\n")):
+                finalization.attempt("retention diagnostic", lambda: print(
+                    "Retained evidence: " + str(manifest), file=sys.stderr))
 
 
 def observe(command, env, destination, *, capture_stdout=True):

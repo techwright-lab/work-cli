@@ -768,6 +768,219 @@ class NativeGitFixtureTests(unittest.TestCase):
         self.assertFalse((self.destination / "prefix").exists())
         self.assertFalse(any("generate-lockfile" in c or "install" in c for c in self.commands))
 
+    def command_finalization_fault(self, fault, quiet):
+        destination = self.base / (fault + str(quiet))
+        destination.mkdir(mode=0o700)
+        log = destination / "command.log"
+        metadata = {}
+        primary = self.builder.Refusal("mock native timeout")
+        secondary = OSError("injected " + fault)
+        process = mock.Mock(pid=12345, stdout=mock.Mock(closed=False),
+                            stderr=mock.Mock(closed=False))
+        process.poll.return_value = 7
+        streams = mock.MagicMock()
+        streams.__enter__.return_value = streams
+        streams.get_map.return_value = {}
+        real_open, real_write = Path.open, Path.write_text
+        output = None
+        footer_written = False
+
+        def open_log(path, *args, **kwargs):
+            nonlocal output
+            stream = real_open(path, *args, **kwargs)
+            if path != log or args != ("ab",):
+                return stream
+            output = mock.MagicMock(wraps=stream)
+            output.__enter__.return_value = output
+
+            def write(data):
+                nonlocal footer_written
+                if data.startswith(b"\nexit="):
+                    footer_written = True
+                    if fault == "footer":
+                        raise secondary
+                return stream.write(data)
+
+            def flush():
+                if fault == "flush" and footer_written:
+                    raise secondary
+                stream.flush()
+
+            def close(*args):
+                stream.close()
+                if fault in ("log-close", "context-closes"):
+                    raise secondary
+                return False
+
+            output.write.side_effect = write
+            output.flush.side_effect = flush
+            output.__exit__.side_effect = close
+            return output
+
+        def write_record(path, data, *args, **kwargs):
+            if path.name.endswith(".command.json"):
+                status = json.loads(data)["status"]
+                if status == "running":
+                    raise primary  # No process is launched; only the stop result is mocked.
+                if fault == "command-record" and status in ("failed", "unknown"):
+                    raise secondary
+            return real_write(path, data, *args, **kwargs)
+
+        if fault == "pipe-close":
+            process.stdout.close.side_effect = secondary
+        if fault == "selector-close":
+            streams.__exit__.side_effect = secondary
+        if fault == "context-closes":
+            streams.__exit__.side_effect = OSError("injected selector-close")
+        with mock.patch.object(Path, "open", open_log), \
+                mock.patch.object(Path, "write_text", write_record), \
+                mock.patch.object(self.builder.subprocess, "Popen", return_value=process), \
+                mock.patch.object(self.builder.selectors, "DefaultSelector", return_value=streams), \
+                mock.patch.object(self.builder, "stop_owned_group", return_value=quiet), \
+                self.assertRaises(BaseException) as raised:
+            with self.builder.retained_evidence(destination, metadata):
+                self.builder.run_command(["mock-owned-command"], {}, destination, log)
+        record = json.loads((destination / "manifest.json").read_text())
+        return raised.exception, primary, secondary, metadata, record, destination
+
+    def test_command_unknown_survives_finalization_and_context_exit_faults(self):
+        for fault in ("command-record", "footer", "flush", "pipe-close", "selector-close", "log-close", "context-closes"):
+            with self.subTest(fault=fault):
+                error, primary, secondary, metadata, record, destination = self.command_finalization_fault(fault, False)
+                self.assertIsInstance(error, self.builder.UnknownOutcome)
+                self.assertIs(error.__cause__, primary)
+                self.assertEqual(record["status"], "unknown")
+                self.assertEqual(record["outcome"], "UNKNOWN")
+                self.assertTrue(any(str(secondary) in item for item in error.secondary_errors))
+                self.assertEqual(metadata["secondary_errors"], error.secondary_errors)
+                if fault == "context-closes":
+                    self.assertTrue(any("injected selector-close" in item for item in error.secondary_errors))
+                if fault == "command-record":
+                    # This injected write fails before opening the conservative record.
+                    command = json.loads((destination / "command.log.command.json").read_text())
+                    self.assertEqual(command["status"], "starting")
+                    self.assertEqual(command["quiescence"], "UNKNOWN")
+                else:
+                    command = json.loads((destination / "command.log.command.json").read_text())
+                    self.assertEqual(command["status"], "unknown")
+
+    def test_command_quiescent_finalization_faults_remain_known_failed(self):
+        for fault in ("command-record", "footer", "flush", "pipe-close", "selector-close", "log-close", "context-closes"):
+            with self.subTest(fault=fault):
+                error, primary, secondary, metadata, record, destination = self.command_finalization_fault(fault, True)
+                self.assertIs(error, secondary)
+                self.assertEqual(record["status"], "failed")
+                self.assertNotEqual(record["outcome"], "UNKNOWN")
+
+    def retained_finalization_fault(self, fault, unknown):
+        destination = self.base / (fault + str(unknown))
+        destination.mkdir(mode=0o700)
+        metadata = {}
+        cause = self.builder.Refusal("mock native timeout")
+        primary = self.builder.UnknownOutcome("UNKNOWN mock stop") if unknown else cause
+        if unknown:
+            primary.__cause__ = cause
+        secondary = OSError("injected " + fault)
+        real_write = Path.write_text
+        writes = 0
+
+        def write_manifest(path, data, *args, **kwargs):
+            nonlocal writes
+            if path == destination / "manifest.json":
+                writes += 1
+                if fault in ("manifest", "manifest-partial") and writes == 2:
+                    if fault == "manifest-partial":
+                        real_write(path, '{"status":')
+                    raise secondary
+            return real_write(path, data, *args, **kwargs)
+
+        with mock.patch.object(Path, "write_text", write_manifest), \
+                mock.patch.object(self.builder, "footprint", side_effect=secondary if fault == "footprint" else None,
+                                  return_value=4096), \
+                mock.patch.object(self.builder.shutil, "disk_usage", side_effect=secondary if fault == "free" else None,
+                                  return_value=SimpleNamespace(free=123456)), \
+                mock.patch.object(self.builder, "print", create=True,
+                                  side_effect=secondary if fault == "diagnostic" else None) as diagnostic, \
+                self.assertRaises(BaseException) as raised:
+            with self.builder.retained_evidence(destination, metadata):
+                raise primary
+        contents = (destination / "manifest.json").read_text()
+        if fault == "manifest-partial":
+            self.assertEqual(contents, '{"status":')
+            record = None
+        else:
+            record = json.loads(contents)
+        if fault in ("manifest", "manifest-partial"):
+            diagnostic.assert_not_called()
+        return raised.exception, primary, secondary, metadata, record
+
+    def test_retained_unknown_survives_accounting_manifest_and_diagnostic_faults(self):
+        for fault in ("footprint", "free", "manifest", "diagnostic"):
+            with self.subTest(fault=fault):
+                error, primary, secondary, metadata, record = self.retained_finalization_fault(fault, True)
+                self.assertIs(error, primary)
+                self.assertEqual(str(error.__cause__), "mock native timeout")
+                self.assertEqual(metadata["status"], "unknown")
+                self.assertEqual(metadata["outcome"], "UNKNOWN")
+                self.assertTrue(any(str(secondary) in item for item in error.secondary_errors))
+                self.assertEqual(metadata["secondary_errors"], error.secondary_errors)
+                self.assertEqual(record["outcome"], "UNKNOWN")
+                self.assertEqual(record["status"], "running" if fault == "manifest" else "unknown")
+
+    def test_unknown_survives_partial_manifest_write_without_claiming_persistence(self):
+        error, primary, secondary, metadata, record = self.retained_finalization_fault("manifest-partial", True)
+        self.assertIs(error, primary)
+        self.assertIsNone(record, "partial JSON is not a persisted manifest")
+        self.assertEqual(metadata["status"], "unknown")
+        self.assertEqual(metadata["outcome"], "UNKNOWN")
+        self.assertTrue(any(str(secondary) in item for item in error.secondary_errors))
+
+    def test_retained_quiescent_finalization_faults_do_not_become_unknown(self):
+        for fault in ("footprint", "free", "manifest", "diagnostic"):
+            with self.subTest(fault=fault):
+                error, primary, secondary, metadata, record = self.retained_finalization_fault(fault, False)
+                self.assertIs(error, secondary)
+                self.assertEqual(metadata["status"], "failed")
+                self.assertNotEqual(metadata["outcome"], "UNKNOWN")
+
+    def test_unknown_secondary_diagnostics_are_bounded_across_nested_finalization(self):
+        primary = self.builder.UnknownOutcome("UNKNOWN mock stop")
+        cause = self.builder.Refusal("mock native timeout")
+        primary.__cause__ = cause
+        metadata = []
+
+        def nested(depth):
+            if depth == 0:
+                raise primary
+            destination = self.base / str(depth)
+            destination.mkdir(mode=0o700)
+            record = {}
+            metadata.append(record)
+            with self.builder.retained_evidence(destination, record):
+                nested(depth - 1)
+
+        with mock.patch.object(self.builder, "footprint", side_effect=OSError("injected " + "x" * 1000)), \
+                mock.patch.object(self.builder.shutil, "disk_usage", return_value=SimpleNamespace(free=123456)), \
+                mock.patch.object(self.builder, "print", create=True), \
+                self.assertRaises(self.builder.UnknownOutcome) as raised:
+            nested(12)
+        self.assertIs(raised.exception, primary)
+        self.assertIs(primary.__cause__, cause)
+        self.assertEqual(len(primary.secondary_errors), 8)
+        self.assertTrue(all(len(item) <= 256 for item in primary.secondary_errors))
+        self.assertIn("secondary evidence errors", str(primary))
+        self.assertTrue(all(record["secondary_errors"] is primary.secondary_errors for record in metadata))
+        self.assertTrue(all(record["status"] == "unknown" for record in metadata))
+
+    def test_initial_manifest_write_failure_is_not_an_unknown_native_outcome(self):
+        self.destination.mkdir(mode=0o700)
+        metadata = {}
+        with mock.patch.object(Path, "write_text", side_effect=OSError("manifest unwritable")), \
+                self.assertRaisesRegex(OSError, "manifest unwritable"):
+            with self.builder.retained_evidence(self.destination, metadata):
+                self.fail("must refuse before native work")
+        self.assertFalse((self.destination / "manifest.json").exists())
+
     def test_smoke_requires_qualified_h2_selection_and_unchanged_identities(self):
         self.mock_build()
         options = SimpleNamespace(fixture=self.destination, destination=self.root / "smoke")
