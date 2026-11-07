@@ -42,6 +42,7 @@ STOP_DRAIN_BYTES = 1024**2
 TREE_STOP_SECONDS = 3.0
 TERM_GRACE_SECONDS = 0.5
 STORAGE_CHECK_SECONDS = 1.0
+FOOTPRINT_ATTEMPTS = 3
 POLL_SECONDS = 0.05
 LOG_STATUS_RESERVE = 512
 GIT_CARGO = (b'[package]\nname = "gitcore"\nversion = "0.1.0"\nedition = "2018"\n'
@@ -225,17 +226,49 @@ def extract_archive(path, destination, version):
 
 
 def footprint(path):
-    # Count allocated bytes (not apparent sparse size), without following links.
-    total = 0
-    seen = set()
-    for root, dirs, files in os.walk(path, followlinks=False):
-        for name in [".", *dirs, *files]:
-            info = (Path(root) / name).lstat()
-            identity = (info.st_dev, info.st_ino)
-            if identity not in seen:
-                seen.add(identity)
-                total += info.st_blocks * 512
-    return total
+    # Best-effort live census, not a snapshot. Compiler renames can invalidate a
+    # descendant listing: discard that entire attempt, never a partial subtotal.
+    path = Path(path)
+    root_identity = None
+
+    def validate_root():
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise Refusal("footprint root unavailable: " + str(path)) from error
+        if (not stat.S_ISDIR(info.st_mode) or
+                (root_identity is not None and (info.st_dev, info.st_ino) != root_identity)):
+            raise Refusal("footprint root changed or not a non-symlink directory: " + str(path))
+        return info
+
+    def walk_error(error):
+        # os.walk otherwise silently drops unreadable or vanished subtrees.
+        raise Refusal("footprint walk failed: " + str(error)) from error
+
+    info = validate_root()
+    root_identity = (info.st_dev, info.st_ino)
+    for _ in range(FOOTPRINT_ATTEMPTS):
+        info = validate_root()
+        total = info.st_blocks * 512
+        seen = {root_identity}
+        vanished = None
+        for root, dirs, files in os.walk(path, followlinks=False, onerror=walk_error):
+            for name in [*dirs, *files]:
+                try:
+                    info = (Path(root) / name).lstat()
+                except FileNotFoundError as error:
+                    vanished = error
+                    break
+                identity = (info.st_dev, info.st_ino)
+                if identity not in seen:
+                    seen.add(identity)
+                    total += info.st_blocks * 512
+            if vanished is not None:
+                break
+        validate_root()
+        if vanished is None:
+            return total
+    raise Refusal(f"footprint unstable after {FOOTPRINT_ATTEMPTS} complete census attempts") from vanished
 
 
 def storage_preflight(base):

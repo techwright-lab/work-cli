@@ -1,4 +1,5 @@
 """Portable mocked-source tests, not native Git/platform qualification."""
+import errno
 import hashlib
 import importlib.util
 import io
@@ -821,6 +822,194 @@ class NativeGitFixtureTests(unittest.TestCase):
                        (self.base, original, self.base / "nested", self.base / "outside"))
         self.assertEqual(self.builder.footprint(self.base), expected)
         self.assertGreaterEqual(self.builder.footprint(self.base), before)
+
+    def test_footprint_recounts_from_zero_after_transient_descendant_disappearance(self):
+        retained = self.base / "retained"
+        vanished = self.base / "receive-pack.o.tmp"
+        retained.write_bytes(b"old" * 4096)
+        vanished.write_bytes(b"temporary")
+        real_lstat = Path.lstat
+        real_walk = os.walk
+        disappeared = False
+
+        def lstat(path, *args, **kwargs):
+            nonlocal disappeared
+            if path == vanished and not disappeared:
+                disappeared = True
+                vanished.unlink()
+                retained.write_bytes(b"new" * 16384)
+                (self.base / "still-retained.o.tmp").write_bytes(b"count me" * 8192)
+                raise FileNotFoundError(errno.ENOENT, "compiler renamed temporary", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        def walk(path, **kwargs):
+            if not disappeared:
+                return iter([(str(self.base), [], [retained.name, vanished.name])])
+            return real_walk(path, **kwargs)
+
+        with mock.patch.object(Path, "lstat", lstat), \
+                mock.patch.object(self.builder.os, "walk", side_effect=walk) as census:
+            actual = self.builder.footprint(self.base)
+        expected = sum(path.lstat().st_blocks * 512 for path in
+                       (self.base, retained, self.base / "still-retained.o.tmp"))
+        self.assertEqual(actual, expected)
+        self.assertEqual(census.call_count, 2)
+
+    def test_footprint_persistent_descendant_disappearance_exhausts_three_full_attempts(self):
+        vanished = self.base / "churn.tmp"
+        real_lstat = Path.lstat
+        misses = []
+
+        def lstat(path, *args, **kwargs):
+            if path == vanished:
+                misses.append(path)
+                raise FileNotFoundError(errno.ENOENT, "descendant churn", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", lstat), \
+                mock.patch.object(self.builder.os, "walk", return_value=None) as walk:
+            walk.side_effect = lambda *a, **kw: iter([(str(self.base), [], [vanished.name])])
+            with self.assertRaisesRegex(self.builder.Refusal, "unstable.*3"):
+                self.builder.footprint(self.base)
+        self.assertEqual(len(misses), 3)
+        self.assertEqual(walk.call_count, 3)
+
+    def test_footprint_walk_errors_fail_closed_without_retry_or_partial_result(self):
+        nested = self.base / "nested"
+        nested.mkdir()
+        (self.base / "counted-first").write_bytes(b"retained" * 4096)
+        real_scandir = os.scandir
+        for code in (errno.ENOENT, errno.EACCES, errno.EIO):
+            calls = []
+
+            def scandir(path):
+                if Path(path) == nested:
+                    calls.append(path)
+                    raise OSError(code, "walk failed", str(path))
+                return real_scandir(path)
+
+            with self.subTest(errno=code), \
+                    mock.patch.object(self.builder.os, "scandir", side_effect=scandir):
+                with self.assertRaisesRegex(self.builder.Refusal, "walk"):
+                    self.builder.footprint(self.base)
+            self.assertEqual(len(calls), 1)
+
+    def test_footprint_invalid_roots_fail_closed_before_walking(self):
+        regular = self.root / "regular"
+        regular.write_bytes(b"not a directory")
+        alias = self.root / "alias"
+        alias.symlink_to(self.base, target_is_directory=True)
+        for path in (self.root / "missing", regular, alias):
+            with self.subTest(path=path), mock.patch.object(self.builder.os, "walk") as walk:
+                with self.assertRaisesRegex(self.builder.Refusal, "root"):
+                    self.builder.footprint(path)
+                walk.assert_not_called()
+
+    def test_footprint_root_permission_error_is_not_retried(self):
+        with mock.patch.object(Path, "lstat", side_effect=PermissionError(errno.EACCES, "denied")) as lstat:
+            with self.assertRaisesRegex(self.builder.Refusal, "root"):
+                self.builder.footprint(self.base)
+        self.assertEqual(lstat.call_count, 1)
+
+    def test_footprint_root_change_or_loss_during_census_fails_closed(self):
+        for change in ("replace", "symlink", "remove"):
+            path = self.root / change
+            path.mkdir()
+
+            def walk(root, **kwargs):
+                path.rename(self.root / (change + "-retained"))
+                if change == "replace":
+                    path.mkdir()
+                elif change == "symlink":
+                    path.symlink_to(self.base, target_is_directory=True)
+                yield str(path), [], []
+
+            with self.subTest(change=change), mock.patch.object(self.builder.os, "walk", walk):
+                with self.assertRaisesRegex(self.builder.Refusal, "root"):
+                    self.builder.footprint(path)
+
+    def test_footprint_root_replacement_during_descendant_loss_prevents_retry(self):
+        vanished = self.base / "gone.tmp"
+        real_lstat = Path.lstat
+
+        def lstat(path, *args, **kwargs):
+            if path == vanished:
+                self.base.rename(self.source / "retained-original")
+                self.base.mkdir()
+                raise FileNotFoundError(errno.ENOENT, "gone", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", lstat), \
+                mock.patch.object(self.builder.os, "walk", side_effect=lambda *a, **kw:
+                                  iter([(str(self.base), [], [vanished.name])])) as walk:
+            with self.assertRaisesRegex(self.builder.Refusal, "root"):
+                self.builder.footprint(self.base)
+        self.assertEqual(walk.call_count, 1)
+
+    def test_footprint_descendant_non_enoent_errors_are_not_retried(self):
+        retained = self.base / "keep.tmp"
+        retained.write_bytes(b"preserve")
+        real_lstat = Path.lstat
+        for code in (errno.EACCES, errno.EIO):
+            calls = []
+
+            def lstat(path, *args, **kwargs):
+                if path == retained:
+                    calls.append(path)
+                    raise OSError(code, "cannot inspect", str(path))
+                return real_lstat(path, *args, **kwargs)
+
+            with self.subTest(errno=code), mock.patch.object(Path, "lstat", lstat):
+                with self.assertRaises(OSError) as raised:
+                    self.builder.footprint(self.base)
+            self.assertEqual(raised.exception.errno, code)
+            self.assertEqual(len(calls), 1)
+        self.assertEqual(retained.read_bytes(), b"preserve")
+
+    def test_footprint_unchanged_tree_counts_full_allocated_retention_including_temporaries(self):
+        retained = self.base / "retained.o.tmp"
+        retained.write_bytes(b"x" * 8192)
+        sparse = self.base / "sparse"
+        with sparse.open("wb") as stream:
+            stream.truncate(8 * 1024**2)
+        nested = self.base / "nested"
+        nested.mkdir()
+        os.link(retained, nested / "alias")
+        broken = self.base / "broken-link"
+        broken.symlink_to(self.root / "missing-target")
+        expected = sum(path.lstat().st_blocks * 512 for path in
+                       (self.base, retained, sparse, nested, broken))
+        self.assertLess(sparse.lstat().st_blocks * 512, sparse.stat().st_size)
+        with mock.patch.object(self.builder.os, "walk", wraps=os.walk) as walk:
+            self.assertEqual(self.builder.footprint(self.base), expected)
+        self.assertEqual(walk.call_count, 1)
+
+    def test_footprint_retry_exhaustion_stops_owned_group_as_known_failure(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        command, marker = self.owned_tree_command()
+        vanished = self.base / "churn.tmp"
+        vanished.write_bytes(b"retain")
+        real_lstat = Path.lstat
+        misses = []
+
+        def lstat(path, *args, **kwargs):
+            if path == vanished and marker.exists():
+                misses.append(path)
+                raise FileNotFoundError(errno.ENOENT, "descendant churn", str(path))
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "lstat", lstat), \
+                mock.patch.object(self.builder, "STORAGE_CHECK_SECONDS", 0.05):
+            with self.assertRaisesRegex(self.builder.Refusal, "unstable.*3"):
+                self.builder.run_command(command, env, self.destination, log, timeout=2)
+        self.assertEqual(len(misses), 3)
+        self.assert_owned_group_gone(marker)
+        state = self.command_state(log)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["quiescence"], "owned-group-absent-and-pipes-drained")
+        self.assertIn("SIGTERM", state["stop_signals"])
+        self.assertEqual(vanished.read_bytes(), b"retain")
 
     def test_storage_preflight_uses_allocated_1_7_gib_without_reducing_build_estimate(self):
         limit = 17 * 1024**3 // 10

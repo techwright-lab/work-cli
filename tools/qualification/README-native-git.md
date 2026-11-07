@@ -144,12 +144,26 @@ stderr into returned stdout. This is observed pipe order, not atomic ordering
 between independent child streams.
 
 Physical free space and aggregate fixture footprint are checked before and at
-one-second intervals during commands. These are live observations, not an atomic
-quota/reservation against concurrent allocation. Deadlines and byte controls
-bound userspace work under responsive OS calls; they are **best effort against
-blocked kernel/filesystem I/O**, not universal hard wall-time bounds or malicious
-same-UID containment. Unknown outcomes preserve all files and accounting; there
-is no automatic replay, artifact cleanup or pruning.
+one-second intervals during commands. The footprint census makes at most three
+full-tree attempts (the initial attempt and two fresh retries), without sleeps.
+Only an ENOENT from a listed descendant's `lstat` permits a retry: the entire
+partial total and hard-link inventory are discarded. A retained compiler `.tmp`
+file is still counted; no names or uncounted entries are excluded. Each attempt
+validates that the root remains the same non-symlink directory by device/inode
+before scanning and again before returning or retrying. Missing, replaced,
+non-directory or symlink roots, walk errors (including ENOENT) and non-ENOENT
+inspection errors fail closed. Persistent descendant churn exhausts the bound
+and fails the command through the existing owned-group stop/reap/drain path;
+only established quiescence makes it a known failure rather than UNKNOWN.
+
+These are **bounded best-effort live observations**, not an atomic snapshot,
+exact instantaneous footprint or quota/reservation against concurrent allocation.
+Root checks do not prove an unchanged tree between observations. Deadlines and
+byte controls bound userspace work under responsive OS calls; they are **best
+effort against blocked kernel/filesystem I/O**, not universal hard wall-time
+bounds or malicious same-UID containment. A census can delay command polling
+while filesystem calls are in progress. Unknown outcomes preserve all files and
+accounting; there is no automatic replay, artifact cleanup or pruning.
 
 Example after the parent grants the slot (use new destination names per run):
 
@@ -223,10 +237,20 @@ Full workspace, formatting, strict all-target Clippy, helper, packaging, install
 artifact, macOS15/26 and release gates remain separate; this fixture slice alone
 makes no release-readiness claim.
 
-The current suite has 51 portable/controlled-child regressions, including
-preservation of dependency-probe UNKNOWN outcomes through the outer manifest
-and the 1.7GiB allocation with the unchanged build estimate. Source-linked
-correction evidence is under `target/h3-evidence/correction-unknown-20261107/`:
+The current suite has 61 portable/controlled-child regressions, including fresh
+recensus after compiler-temporary disappearance, bounded retry exhaustion with
+owned-group quiescence, fail-closed walk/root/error cases, and full retained
+allocated-size controls (temporaries, sparse files, hard links and symlinks).
+Source-linked RED/GREEN evidence is under
+`target/h3-evidence/footprint-census-20261107/`: both pinned-container logs,
+native Python 3.9 logs, and JSON records of commands, numeric exits and
+before/after SHA256 fingerprints of all three H3 source files. No real compiler,
+Cargo, built Git or native H2 build/smoke runs are part of these tests.
+
+The preceding 51-test correction included preservation of dependency-probe
+UNKNOWN outcomes through the outer manifest and the 1.7GiB allocation with the
+unchanged build estimate. Its historical source-linked evidence remains under
+`target/h3-evidence/correction-unknown-20261107/`:
 `red-VERSION.log`, `red-limit-VERSION.log`, `green-VERSION.log` and
 `green-python3.9.log`, with JSON records of exact commands, numeric exits, test
 counts and before/after SHA256 fingerprints of all three H3 source files.
@@ -234,6 +258,17 @@ The older 49-test `final-owned-runner-*` logs predate the last runner edits and
 are not exact-current-source proof. These are runner tests, not new Git build
 qualification. Fresh source SPEC/QUALITY reviews and an explicit native
 execution grant are still required.
+
+The subsequent real Git 2.55.0 attempt at `a25f798` failed after 42.49 seconds
+when `receive-pack-b94debf0.o.tmp` disappeared during the old census. Its make
+group was TERM-stopped/reaped (exit -15), absent with drained pipes: a **known
+failure**, not UNKNOWN. The complete retained packet is under
+`target/h3-evidence/corrected-native-20261107/` and
+`target/native-git-fixtures/h2-build-2.55.0-corrected-20261107/`.
+Git 2.56.0 and both smokes were NOT_RUN. Those packets and all historical
+prefixes/archives remain retained; this census correction does not qualify a
+new native build. A fresh parent grant and native verification, then SPEC and
+QUALITY review, remain required before integration or prefix consumption.
 
 ## Historical c058cd5 development observation (2026-11-06)
 
