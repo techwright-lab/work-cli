@@ -73,6 +73,7 @@ pub(crate) struct ConfigDocument {
 /// Setup-owned first-time document fields. Not an execution Config.
 #[allow(dead_code)]
 pub(crate) struct InstallDocument {
+    pub git_path: Option<PathBuf>,
     pub actor: String,
     pub repositories: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
@@ -83,6 +84,19 @@ pub(crate) struct InstallDocument {
 impl ConfigDocument {
     pub(crate) fn git_path(&self) -> Result<Option<PathBuf>, Error> {
         git_path(&self.value)
+    }
+    pub(crate) fn set_git_path(&mut self, path: &std::path::Path) -> Result<(), Error> {
+        let mut value = toml::Table::new();
+        value.insert(
+            "git_path".into(),
+            toml::Value::String(path.to_str().ok_or_else(invalid_path)?.into()),
+        );
+        let path = git_path(&toml::Value::Table(value))?.expect("present selector");
+        self.value.as_table_mut().ok_or_else(invalid_path)?.insert(
+            "git_path".into(),
+            toml::Value::String(path.to_str().ok_or_else(invalid_path)?.into()),
+        );
+        Ok(())
     }
     pub(crate) fn default_actor(&self) -> Result<Option<String>, Error> {
         self.value
@@ -214,9 +228,13 @@ impl ConfigDocument {
             path_value(&install.trusted_registry, false)?,
         );
         table.insert("allocation".into(), allocation_value(&install.allocation)?);
-        Ok(Self {
+        let mut document = Self {
             value: toml::Value::Table(table),
-        })
+        };
+        if let Some(path) = install.git_path {
+            document.set_git_path(&path)?;
+        }
+        Ok(document)
     }
     pub(crate) fn retirement_prepare_intents(&self) -> Result<bool, Error> {
         let invalid = || Error::Config("invalid retirement policy".into());
@@ -787,21 +805,17 @@ mod approval_policy_tests {
             assert!(Config::from_text(&text).is_ok());
         }
         for line in VALID.lines().skip(1) {
-            assert!(
-                ConfigDocument::from_text(&VALID.replace(line, ""))
-                    .unwrap()
-                    .approval()
-                    .is_err()
-            );
+            assert!(ConfigDocument::from_text(&VALID.replace(line, ""))
+                .unwrap()
+                .approval()
+                .is_err());
         }
         for key in ["version='v1'", "operator_id='explicit operator'"] {
             let replacement = format!("{}='{}'", key.split('=').next().unwrap(), "x".repeat(257));
-            assert!(
-                ConfigDocument::from_text(&VALID.replace(key, &replacement))
-                    .unwrap()
-                    .approval()
-                    .is_err()
-            );
+            assert!(ConfigDocument::from_text(&VALID.replace(key, &replacement))
+                .unwrap()
+                .approval()
+                .is_err());
         }
     }
 }
@@ -824,12 +838,10 @@ mod remote_policy_tests {
         assert!(d.remote_preservation().is_ok());
         assert!(d.authority().is_ok());
         assert!(d.inspection_policies().is_err());
-        assert!(
-            ConfigDocument::from_text("")
-                .unwrap()
-                .remote_preservation()
-                .is_err()
-        );
+        assert!(ConfigDocument::from_text("")
+            .unwrap()
+            .remote_preservation()
+            .is_err());
         for value in [
             valid.replace("format=1", "format=2"),
             valid.replace("version='v1'", "version=''"),
@@ -844,12 +856,11 @@ mod remote_policy_tests {
             assert!(d.authority().is_ok());
             assert!(d.execution().is_ok());
             assert!(d.inspection_policies().is_ok());
-            assert!(
-                !d.remote_preservation()
-                    .unwrap_err()
-                    .to_string()
-                    .contains("DO_NOT_ECHO")
-            );
+            assert!(!d
+                .remote_preservation()
+                .unwrap_err()
+                .to_string()
+                .contains("DO_NOT_ECHO"));
         }
     }
     #[test]
@@ -915,29 +926,25 @@ mod remote_policy_tests {
             target.replace("/owned/repository/.git", "/another/.git"),
             target.replace("backup.git", "other.git"),
         ] {
-            assert!(
-                ConfigDocument::from_text(&format!(
-                    "{valid}\n[[remote_preservation.targets]]{other}"
-                ))
-                .unwrap()
-                .remote_preservation()
-                .is_err()
-            );
-        }
-        assert!(
-            ConfigDocument::from_text(&valid.replace("version='v1'", "version='v1'\nunknown=1"))
-                .unwrap()
-                .remote_preservation()
-                .is_err()
-        );
-        assert!(
-            ConfigDocument::from_text(
-                &valid.replace("version='v1'", &format!("version='{}'", "a".repeat(129)))
-            )
+            assert!(ConfigDocument::from_text(&format!(
+                "{valid}\n[[remote_preservation.targets]]{other}"
+            ))
             .unwrap()
             .remote_preservation()
-            .is_err()
-        );
+            .is_err());
+        }
+        assert!(ConfigDocument::from_text(
+            &valid.replace("version='v1'", "version='v1'\nunknown=1")
+        )
+        .unwrap()
+        .remote_preservation()
+        .is_err());
+        assert!(ConfigDocument::from_text(
+            &valid.replace("version='v1'", &format!("version='{}'", "a".repeat(129)))
+        )
+        .unwrap()
+        .remote_preservation()
+        .is_err());
         assert!(
             ConfigDocument::from_text(&valid.replace("format=1", "format=1\nformat=1")).is_err()
         );
@@ -980,16 +987,49 @@ mod document_helper_tests {
 
     #[test]
     fn git_path_authority_rejects_malformed_selection() {
-        assert!(
-            super::ConfigDocument::from_text("git_path = 42\n")
-                .unwrap()
-                .authority()
-                .is_err()
-        );
+        assert!(super::ConfigDocument::from_text("git_path = 42\n")
+            .unwrap()
+            .authority()
+            .is_err());
     }
 
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn executable_symlink_spelling_survives_every_document_projection_and_install_render() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("executable");
+        std::fs::write(&executable, b"fixture").unwrap();
+        let alias = temp.path().join("git-link");
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        let mut document =
+            ConfigDocument::from_text("private = 'keep'\n[custom]\nvalue = 7\n").unwrap();
+        document.set_git_path(&alias).unwrap();
+        assert_eq!(document.git_path().unwrap(), Some(alias.clone()));
+        assert_eq!(document.authority().unwrap().git_path, Some(alias.clone()));
+        assert_eq!(document.execution().unwrap().git_path, Some(alias.clone()));
+        let rendered = document.render().unwrap();
+        let value: toml::Value = toml::from_str(&rendered).unwrap();
+        assert_eq!(value["custom"]["value"].as_integer(), Some(7));
+        let install = ConfigDocument::from_install(InstallDocument {
+            git_path: Some(alias.clone()),
+            actor: "alice".into(),
+            repositories: vec![],
+            roots: vec![],
+            store_dir: temp.path().join("store"),
+            trusted_registry: temp.path().join("registry"),
+            allocation: policy(),
+        })
+        .unwrap();
+        assert_eq!(
+            ConfigDocument::from_text(&install.render().unwrap())
+                .unwrap()
+                .git_path()
+                .unwrap(),
+            Some(alias)
+        );
+    }
 
     fn dir(temp: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = temp.path().join(name);
@@ -1097,29 +1137,26 @@ mod document_helper_tests {
     #[test]
     fn document_rejects_wrong_actor_and_repository_types() {
         for text in ["actor = 42\n", "actor = []\n"] {
-            assert!(
-                ConfigDocument::from_text(text)
-                    .unwrap()
-                    .default_actor()
-                    .is_err()
-            );
+            assert!(ConfigDocument::from_text(text)
+                .unwrap()
+                .default_actor()
+                .is_err());
         }
         for text in ["repositories = \"/x\"\n", "repositories = [42]\n"] {
             let mut document = ConfigDocument::from_text(text).unwrap();
             assert!(document.repositories().is_err());
             assert!(document.add_repository(PathBuf::from("/x")).is_err());
         }
-        assert!(
-            ConfigDocument::from_install(InstallDocument {
-                actor: String::new(),
-                repositories: Vec::new(),
-                roots: Vec::new(),
-                store_dir: PathBuf::from("/store"),
-                trusted_registry: PathBuf::from("/registry"),
-                allocation: policy(),
-            })
-            .is_err()
-        );
+        assert!(ConfigDocument::from_install(InstallDocument {
+            git_path: None,
+            actor: String::new(),
+            repositories: Vec::new(),
+            roots: Vec::new(),
+            store_dir: PathBuf::from("/store"),
+            trusted_registry: PathBuf::from("/registry"),
+            allocation: policy(),
+        })
+        .is_err());
     }
 
     #[test]
@@ -1145,6 +1182,7 @@ mod document_helper_tests {
         let store = temp.path().join("store");
         let registry = temp.path().join("registry");
         let document = ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: "alice".into(),
             repositories: vec![repo.clone()],
             roots: vec![root.clone()],
@@ -1197,6 +1235,7 @@ mod document_helper_tests {
         allocation.floor_bytes = 2;
         allocation.warn_bytes = 1;
         let result = ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: "alice".into(),
             repositories: vec![dir(&temp, "repo")],
             roots: vec![temp.path().join("missing-root")],
@@ -1220,6 +1259,7 @@ mod document_helper_tests {
         let mut allocation = policy();
         allocation.capture_sink = Some("devdiary".into());
         let document = ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: "alice".into(),
             repositories: vec![dir(&temp, "repo")],
             roots: vec![temp.path().join("missing-root")],

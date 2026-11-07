@@ -1,11 +1,10 @@
 //! Controlled fake-Git services, not supported-Git matrix qualification.
-#[path = "../tests/support/fifo.rs"]
-mod fifo;
 use super::*;
+use crate::test_fifo as fifo;
 use std::ffi::OsStr;
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{PermissionsExt, symlink},
+    fs::{symlink, PermissionsExt},
 };
 
 struct FakeGit {
@@ -234,7 +233,7 @@ fn fake_git_directory_suffixes_and_ordinary_symlinks_remain_qualified() {
             .binding
             .command(["status"], |_| {})
             .unwrap()
-            .output_aggregate(Duration::from_secs(1), 1024)
+            .fixture_aggregate(Duration::from_secs(1), 1024)
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"dispatch");
@@ -280,7 +279,7 @@ fn fake_git_unsearchable_directory_before_parent_refuses_explicit_path_before_pr
             .binding
             .command(["status"], |_| {})
             .unwrap()
-            .output_aggregate(Duration::from_secs(1), 1024)
+            .fixture_aggregate(Duration::from_secs(1), 1024)
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"dispatch");
@@ -313,7 +312,7 @@ fn fake_git_unsearchable_directory_before_parent_refuses_helper_symlink_target()
             .binding
             .command(["status"], |_| {})
             .unwrap()
-            .output_aggregate(Duration::from_secs(1), 1024)
+            .fixture_aggregate(Duration::from_secs(1), 1024)
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"dispatch");
@@ -479,7 +478,7 @@ fn fake_git_changed_binding_refuses_before_dispatch_and_after_preparation() {
         }
         assert!(selection.binding.revalidate().is_err(), "{change}");
         let failure = prepared
-            .output_aggregate(Duration::from_secs(1), 1024)
+            .fixture_aggregate(Duration::from_secs(1), 1024)
             .unwrap_err();
         assert!(!failure.possibly_executed, "{change}");
         assert_eq!(failure.error.reason, GitBindingReason::Changed);
@@ -499,7 +498,7 @@ fn fake_git_post_dispatch_changes_and_transport_failure_are_possibly_executed() 
         .binding
         .command(["mutate"], |_| {})
         .unwrap()
-        .output_aggregate(Duration::from_secs(1), 1024)
+        .fixture_aggregate(Duration::from_secs(1), 1024)
         .unwrap_err();
     assert!(failure.possibly_executed);
     assert_eq!(failure.error.reason, GitBindingReason::Changed);
@@ -513,7 +512,7 @@ fn fake_git_post_dispatch_changes_and_transport_failure_are_possibly_executed() 
         .binding
         .command(["large"], |_| {})
         .unwrap()
-        .output_aggregate(Duration::from_secs(1), 100)
+        .fixture_aggregate(Duration::from_secs(1), 100)
         .unwrap_err();
     assert!(failure.possibly_executed);
     assert!(matches!(
@@ -611,7 +610,7 @@ fn fake_git_probes_are_sanitized_repository_free_and_dispatch_succeeds() {
             cmd.env("CALLER_RESTRICTION", "preserved");
         })
         .unwrap()
-        .output_aggregate(Duration::from_secs(1), 1024)
+        .fixture_aggregate(Duration::from_secs(1), 1024)
         .unwrap();
     assert!(output.status.success());
     let mut expected = f.helpers.as_os_str().as_bytes().to_vec();
@@ -856,7 +855,7 @@ fn fake_git_owned_fixture_qualifies_through_real_linux_access_service() {
         .binding
         .command(["status"], |_| {})
         .unwrap()
-        .output_aggregate(Duration::from_secs(1), 1024)
+        .fixture_aggregate(Duration::from_secs(1), 1024)
         .unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"dispatch");
@@ -908,4 +907,91 @@ fn guarded_dispatch_preserves_stdin_runner_and_post_execution_uncertainty() {
             Ok::<_, ()>(())
         });
     assert!(result.unwrap_err().possibly_executed);
+}
+
+#[test]
+fn invocation_selection_is_lazy_cli_first_shared_and_never_reselected() {
+    let cli = FakeGit::new();
+    let config = FakeGit::new();
+    let probe = cli.root.path().join("probe");
+    cli.script(
+        "git version 2.55.0",
+        &format!("touch '{}'", probe.display()),
+    );
+    let invocation = GitInvocation::with_access(
+        Some(cli.program.clone()),
+        Some(config.program.clone()),
+        &ACCESS,
+    );
+    assert!(!probe.exists());
+    let binding = invocation.binding().unwrap();
+    assert_eq!(binding.candidate().source, GitSelectionSource::Cli);
+    assert_eq!(binding.canonical_program(), cli.program);
+    let shared = invocation.clone();
+    assert!(std::ptr::eq(binding, shared.binding().unwrap()));
+    fs::write(&cli.program, b"changed").unwrap();
+    assert!(shared
+        .binding()
+        .unwrap()
+        .command(["status"], |_| {})
+        .is_err());
+    let invalid =
+        GitInvocation::with_access(Some("relative".into()), Some(config.program), &ACCESS);
+    assert!(invalid.binding().is_err());
+}
+
+// Existing aggregate-runner controls exercise the generalized production guard;
+// this test adapter preserves their original error classifications and limits.
+trait AggregateFixture {
+    fn fixture_aggregate(
+        self,
+        timeout: Duration,
+        bytes: usize,
+    ) -> Result<std::process::Output, GitDispatchError>;
+}
+impl AggregateFixture for BoundGitCommand<'_, '_> {
+    fn fixture_aggregate(
+        self,
+        timeout: Duration,
+        bytes: usize,
+    ) -> Result<std::process::Output, GitDispatchError> {
+        let program = self.binding.canonical_program.clone();
+        self.dispatch(|command| crate::bounded_process::output_aggregate(command, timeout, bytes))?
+            .map_err(|reason| GitDispatchError {
+                possibly_executed: true,
+                error: error(&program, GitBindingReason::ProcessIncomplete(reason)),
+            })
+    }
+}
+
+#[test]
+fn invocation_failed_selection_is_cached_and_config_cannot_switch() {
+    let f = FakeGit::new();
+    fs::remove_file(&f.program).unwrap();
+    let invocation = GitInvocation::with_access(Some(f.program.clone()), None, &ACCESS);
+    assert!(invocation.binding().is_err());
+    f.script("git version 2.55.0", "");
+    assert!(invocation.binding().is_err());
+    assert!(invocation.configure(Some(f.program)).is_err());
+}
+
+#[test]
+fn invocation_concurrent_initialization_runs_one_qualification() {
+    let f = FakeGit::new();
+    let marker = f.root.path().join("probes");
+    f.script(
+        "git version 2.55.0",
+        &format!("printf x >> '{}'", marker.display()),
+    );
+    let invocation = GitInvocation::with_access(Some(f.program.clone()), None, &ACCESS);
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let shared = invocation.clone();
+            std::thread::spawn(move || shared.binding().unwrap().canonical_program().to_path_buf())
+        })
+        .collect();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), f.program);
+    }
+    assert_eq!(fs::read(marker).unwrap(), b"xx");
 }

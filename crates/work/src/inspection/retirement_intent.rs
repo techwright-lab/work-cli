@@ -67,16 +67,35 @@ pub fn prepare_retirement(
     assertion: Option<Uuid>,
     task_complete: bool,
 ) -> RetirementIntentReport {
-    prepare_inner(
+    prepare_retirement_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        config_path,
+        checkout,
+        operation,
+        assertion,
+        task_complete,
+    )
+}
+pub(crate) fn prepare_retirement_with_git(
+    invocation: &crate::git::GitInvocation,
+    config_path: &Path,
+    checkout: Uuid,
+    operation: Uuid,
+    assertion: Option<Uuid>,
+    task_complete: bool,
+) -> RetirementIntentReport {
+    prepare_inner_with_git(
+        invocation,
         config_path,
         checkout,
         operation,
         assertion,
         task_complete,
         #[cfg(test)]
-        None,
-        #[cfg(test)]
-        retirement::PrepareFault::None,
+        PrepareHooks {
+            driver: None,
+            fault: retirement::PrepareFault::None,
+        },
     )
     .unwrap_or_else(|reason| failed_operation(checkout, operation, reason))
 }
@@ -87,7 +106,23 @@ pub fn abort_retirement(
     operation: Uuid,
     revision: u64,
 ) -> RetirementIntentReport {
-    abort_inner(
+    abort_retirement_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        config_path,
+        checkout,
+        operation,
+        revision,
+    )
+}
+pub(crate) fn abort_retirement_with_git(
+    invocation: &crate::git::GitInvocation,
+    config_path: &Path,
+    checkout: Uuid,
+    operation: Uuid,
+    revision: u64,
+) -> RetirementIntentReport {
+    abort_inner_with_git(
+        invocation,
         config_path,
         checkout,
         operation,
@@ -117,14 +152,16 @@ fn failed_operation(
 }
 
 /// Faithful private offline path; no remote pipeline or SQL-only clearing.
-pub(super) fn abort_inner(
+pub(super) fn abort_inner_with_git(
+    invocation: &crate::git::GitInvocation,
     config_path: &Path,
     checkout: Uuid,
     operation: Uuid,
     revision: u64,
     #[cfg(test)] fault: retirement::AbortFault,
 ) -> Result<RetirementIntentReport, &'static str> {
-    match retirement::abort_offline(
+    match retirement::abort_offline_with_git(
+        invocation,
         config_path,
         checkout,
         operation,
@@ -167,15 +204,22 @@ pub fn retirement_status(config_path: &Path, checkout: Uuid) -> RetirementIntent
 
 /// Faithful private entry, NOT a report-to-proof adapter. The cfg(test) inputs
 /// select the existing owned Driver fixture and negative commit faults only.
-pub(super) fn prepare_inner(
+#[cfg(test)]
+pub(super) struct PrepareHooks<'a> {
+    driver: Option<&'a crate::scope_driver::Driver>,
+    fault: retirement::PrepareFault,
+}
+pub(super) fn prepare_inner_with_git(
+    invocation: &crate::git::GitInvocation,
     config_path: &Path,
     checkout: Uuid,
     operation: Uuid,
     assertion: Option<Uuid>,
     task_complete: bool,
-    #[cfg(test)] driver: Option<&crate::scope_driver::Driver>,
-    #[cfg(test)] fault: retirement::PrepareFault,
+    #[cfg(test)] hooks: PrepareHooks<'_>,
 ) -> Result<RetirementIntentReport, &'static str> {
+    #[cfg(test)]
+    let PrepareHooks { driver, fault } = hooks;
     // Bounded no-follow flag read only: no Store, lock or collection Budget.
     // The collector's original Budget is later retained through commit unchanged.
     let document =
@@ -243,7 +287,8 @@ pub(super) fn prepare_inner(
     let mut owner = {
         #[cfg(test)]
         if let Some(driver) = driver {
-            retirement::collect_fresh_prepare_inner(
+            retirement::collect_fresh_prepare_inner_with_git(
+                invocation,
                 config_path,
                 checkout,
                 assertion,
@@ -252,11 +297,25 @@ pub(super) fn prepare_inner(
                 Some(driver),
             )?
         } else {
-            retirement::collect_fresh_prepare(config_path, checkout, assertion, store, guard)?
+            retirement::collect_fresh_prepare_with_git(
+                invocation,
+                config_path,
+                checkout,
+                assertion,
+                store,
+                guard,
+            )?
         }
         #[cfg(not(test))]
         {
-            retirement::collect_fresh_prepare(config_path, checkout, assertion, store, guard)?
+            retirement::collect_fresh_prepare_with_git(
+                invocation,
+                config_path,
+                checkout,
+                assertion,
+                store,
+                guard,
+            )?
         }
     };
     owner.recheck_prepare_configuration(config_path)?;
@@ -447,6 +506,44 @@ pub(super) fn committed_report(
     report.fence_active = true;
     report.history_count = count;
     report
+}
+
+#[cfg(test)]
+pub(super) fn prepare_inner(
+    config_path: &Path,
+    checkout: Uuid,
+    operation: Uuid,
+    assertion: Option<Uuid>,
+    task_complete: bool,
+    driver: Option<&crate::scope_driver::Driver>,
+    fault: retirement::PrepareFault,
+) -> Result<RetirementIntentReport, &'static str> {
+    prepare_inner_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        config_path,
+        checkout,
+        operation,
+        assertion,
+        task_complete,
+        PrepareHooks { driver, fault },
+    )
+}
+#[cfg(test)]
+pub(super) fn abort_inner(
+    config_path: &Path,
+    checkout: Uuid,
+    operation: Uuid,
+    revision: u64,
+    fault: retirement::AbortFault,
+) -> Result<RetirementIntentReport, &'static str> {
+    abort_inner_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        config_path,
+        checkout,
+        operation,
+        revision,
+        fault,
+    )
 }
 
 #[cfg(test)]

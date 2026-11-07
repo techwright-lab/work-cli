@@ -133,6 +133,19 @@ pub fn inspect_and_record(
     checkout: Uuid,
     policies: &ValidatedPolicies,
 ) -> std::result::Result<RecordOutcome, InspectionError> {
+    inspect_and_record_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        store,
+        checkout,
+        policies,
+    )
+}
+pub(crate) fn inspect_and_record_with_git(
+    invocation: &crate::git::GitInvocation,
+    store: &mut Store,
+    checkout: Uuid,
+    policies: &ValidatedPolicies,
+) -> std::result::Result<RecordOutcome, InspectionError> {
     let guard = crate::checkout_guard::CheckoutGuard::shared(store, checkout)
         .map_err(|_| InspectionError)?;
     if let Err(error) = guarded_checkpoint(
@@ -156,7 +169,8 @@ pub fn inspect_and_record(
             receipt: Err(error),
         });
     }
-    let mut captured = super::collect(
+    let mut captured = super::collect_with_git(
+        invocation,
         store,
         checkout,
         policies,

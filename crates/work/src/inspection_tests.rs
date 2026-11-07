@@ -1,6 +1,5 @@
 //! Test source authored before the corresponding A2/A3 logic. CI-only; no RED/GREEN claim.
-#[path = "../tests/support/fifo.rs"]
-mod fifo;
+use crate::test_fifo as fifo;
 
 #[test]
 fn native_command_envelopes_are_exact_and_unknown_argv_stays_conservative() {

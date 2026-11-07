@@ -130,8 +130,20 @@ pub fn prepare_recovery_refused(checkout: Uuid) -> RecoveryReport {
 }
 
 pub fn prepare_recovery(checkout: Uuid, operation: Uuid) -> RecoveryReport {
+    prepare_recovery_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        checkout,
+        operation,
+    )
+}
+pub(crate) fn prepare_recovery_with_git(
+    invocation: &crate::git::GitInvocation,
+    checkout: Uuid,
+    operation: Uuid,
+) -> RecoveryReport {
     match Config::discover_path() {
-        Some(path) => prepare_path(
+        Some(path) => prepare_path_with_git(
+            invocation,
             &path,
             checkout,
             operation,
@@ -525,7 +537,8 @@ struct FreshRecoveryPlan {
     key: CommonKey,
 }
 
-fn prepare_path(
+fn prepare_path_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     operation: Uuid,
@@ -549,7 +562,8 @@ fn prepare_path(
         fault,
     );
     let mut audit = preservation::Audit::new(checkout);
-    let remote = remote_proof::recovery_path(path, checkout, &mut audit, &mut collector);
+    let remote =
+        remote_proof::recovery_path(invocation, path, checkout, &mut audit, &mut collector);
     let preservation = audit.finish(remote);
     let failure = collector.failure;
     let mutating_git = collector.mutating_git;
@@ -1647,6 +1661,17 @@ pub(super) fn prepare_for_assessment(path: &Path, checkout: Uuid) -> RecoveryRep
 
 #[cfg(test)]
 use crate::inspection::fixture;
+
+#[cfg(test)]
+fn prepare_path(path: &Path, checkout: Uuid, operation: Uuid, fault: Fault) -> RecoveryReport {
+    prepare_path_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        operation,
+        fault,
+    )
+}
 
 #[cfg(test)]
 mod tests {

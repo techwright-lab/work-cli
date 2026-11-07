@@ -80,8 +80,14 @@ struct Object {
 /// Fresh actual authority/inspection/remote observation only. No report or
 /// receipt argument, URL override, persistence or configurable collector exists.
 pub fn audit_preservation(checkout: Uuid) -> PreservationReport {
+    audit_preservation_with_git(&crate::git::GitInvocation::unconfigured(None), checkout)
+}
+pub(crate) fn audit_preservation_with_git(
+    invocation: &crate::git::GitInvocation,
+    checkout: Uuid,
+) -> PreservationReport {
     let mut audit = Audit::new(checkout);
-    let remote = remote_proof::audit_configured(checkout, &mut audit);
+    let remote = remote_proof::audit_configured(invocation, checkout, &mut audit);
     audit.finish(remote)
 }
 

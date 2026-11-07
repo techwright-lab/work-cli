@@ -11,6 +11,10 @@ extern crate self as work_cli;
 #[path = "../tests/support/run_fixture.rs"]
 pub(crate) mod test_run_fixture;
 
+#[cfg(test)]
+#[path = "../tests/support/fifo.rs"]
+pub(crate) mod test_fifo;
+
 pub mod admission;
 pub mod adopted;
 pub mod allocate;

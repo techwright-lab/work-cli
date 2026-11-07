@@ -611,6 +611,7 @@ fn readiness_rechecks_marker_after_external_side_effects() {
     for damage in ["marker", "head"] {
         let f = Fixture::new();
         let config = Config {
+            git_path: None,
             store_dir: Some(f.temp.path().join("private")),
             trusted_registry: Some(f.temp.path().join("registry")),
             roots: vec![f.root.clone()],
@@ -760,6 +761,7 @@ fn moved_reuse_branch_boundary_is_persistently_held() {
     let f = Fixture::new();
     git(&f.repo, &["branch", "topic"]);
     let config = Config {
+        git_path: None,
         store_dir: Some(f.temp.path().join("private")),
         trusted_registry: Some(f.temp.path().join("registry")),
         roots: vec![f.root.clone()],

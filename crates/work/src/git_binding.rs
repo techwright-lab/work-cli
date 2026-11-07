@@ -6,7 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::Component;
-use std::process::{Command, Output};
+use std::process::Command;
 use std::time::Duration;
 
 const REQUIRED_HELPERS: [&str; 3] = ["git-upload-pack", "git-receive-pack", "git-upload-archive"];
@@ -20,6 +20,7 @@ pub(crate) enum GitBindingReason {
     NotAbsolute,
     Unavailable,
     UnsafeAccess,
+    #[cfg(any(not(target_os = "linux"), test))]
     AccessUnproven,
     NotExecutable,
     InvalidLayout,
@@ -64,7 +65,7 @@ pub(crate) struct GitSelection<'a> {
     pub(crate) rejections: Vec<GitRejection>,
 }
 
-trait GitAccessProof: std::fmt::Debug {
+trait GitAccessProof: std::fmt::Debug + Send + Sync {
     fn prove(&self, path: &Path, metadata: &fs::Metadata) -> Result<(), GitBindingError>;
 }
 
@@ -381,6 +382,15 @@ impl GitBinding<'_> {
         &self.helper_directory
     }
 
+    pub(crate) fn upload_pack(&self) -> &Path {
+        &self
+            .helpers
+            .iter()
+            .find(|(path, _)| path.file_name() == Some(OsStr::new("git-upload-pack")))
+            .expect("qualified helper layout")
+            .0
+    }
+
     pub(crate) fn revalidate(&self) -> Result<(), GitBindingError> {
         validate_route(
             &self.candidate.path,
@@ -439,30 +449,27 @@ pub(crate) struct GitDispatchError {
     pub(crate) error: GitBindingError,
 }
 
+impl std::fmt::Display for GitDispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Git binding {:?}; possibly_executed={}; no fallback",
+            self.error.reason, self.possibly_executed
+        )
+    }
+}
+impl std::error::Error for GitDispatchError {}
+
 pub(crate) struct BoundGitCommand<'b, 'a> {
     binding: &'b GitBinding<'a>,
     command: Command,
 }
 
 impl BoundGitCommand<'_, '_> {
-    /// Includes pre- AND post-dispatch validation. Nonzero Output status remains
-    /// a caller-specific failure, never evidence that the child did not execute.
-    pub(crate) fn output_aggregate(
-        self,
-        timeout: Duration,
-        bytes: usize,
-    ) -> Result<Output, GitDispatchError> {
-        let program = self.binding.canonical_program.clone();
-        self.dispatch(|command| crate::bounded_process::output_aggregate(command, timeout, bytes))?
-            .map_err(|reason| GitDispatchError {
-                possibly_executed: true,
-                error: error(&program, GitBindingReason::ProcessIncomplete(reason)),
-            })
-    }
-
-    /// A single guarded dispatch through the caller's existing runner. The
-    /// command never escapes this envelope. Runner errors and accounting remain
-    /// caller-owned; binding uncertainty must not cause retry or fallback.
+    /// A single guarded dispatch through the caller's existing synchronous
+    /// runner. The runner must not retain or substitute the command. Runner
+    /// errors/accounting remain caller-owned; binding uncertainty must not cause
+    /// retry or fallback.
     pub(crate) fn dispatch<T, E>(
         mut self,
         runner: impl FnOnce(&mut Command) -> Result<T, E>,
@@ -584,4 +591,217 @@ pub(crate) fn select_git(
     candidates: &[GitCandidate],
 ) -> Result<GitSelection<'static>, GitSelectionFailure> {
     qualify_candidates(candidates, &SystemGitAccess)
+}
+
+/// One lazy invocation-owned qualification shared by explicit call-graph
+/// propagation. Clones retain the same selection, including failed selection;
+/// neither a changed installation nor a failed dispatch can trigger rediscovery.
+#[derive(Clone, Debug)]
+pub(crate) struct GitInvocation(std::sync::Arc<GitInvocationState>);
+
+#[derive(Debug)]
+struct GitInvocationState {
+    cli: Option<PathBuf>,
+    config: std::sync::OnceLock<Option<PathBuf>>,
+    selection: std::sync::OnceLock<Result<GitSelection<'static>, GitSelectionFailure>>,
+    #[cfg(test)]
+    fixture_access: Option<&'static dyn GitAccessProof>,
+}
+
+impl GitInvocation {
+    pub(crate) fn new(cli: Option<PathBuf>, config: Option<PathBuf>) -> Self {
+        let invocation = Self::unconfigured(cli);
+        invocation.0.config.set(config).expect("new invocation");
+        invocation
+    }
+
+    #[cfg(test)]
+    fn with_access(
+        cli: Option<PathBuf>,
+        config: Option<PathBuf>,
+        access: &'static dyn GitAccessProof,
+    ) -> Self {
+        let invocation = Self(std::sync::Arc::new(GitInvocationState {
+            cli,
+            config: std::sync::OnceLock::new(),
+            selection: std::sync::OnceLock::new(),
+            fixture_access: Some(access),
+        }));
+        invocation.0.config.set(config).expect("new invocation");
+        invocation
+    }
+
+    pub(crate) fn unconfigured(cli: Option<PathBuf>) -> Self {
+        Self(std::sync::Arc::new(GitInvocationState {
+            cli,
+            config: std::sync::OnceLock::new(),
+            selection: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            fixture_access: None,
+        }))
+    }
+
+    /// Bind a document's selector before first use. Repeated observations must
+    /// agree; neither config changes nor dispatch errors authorize reselection.
+    pub(crate) fn configure(&self, configured: Option<PathBuf>) -> Result<(), ()> {
+        let current = self.0.config.get_or_init(|| configured.clone());
+        if current == &configured {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    fn selection(&self) -> &Result<GitSelection<'static>, GitSelectionFailure> {
+        self.0.selection.get_or_init(|| {
+            let platform = if cfg!(target_os = "macos") {
+                GitPlatform::MacOs
+            } else {
+                GitPlatform::Linux
+            };
+            let configured = self.0.config.get_or_init(|| None);
+            match git_candidates(platform, self.0.cli.as_deref(), configured.as_deref()) {
+                Ok(candidates) => {
+                    #[cfg(test)]
+                    if let Some(access) = self.0.fixture_access {
+                        return qualify_candidates(&candidates, access);
+                    }
+                    select_git(&candidates)
+                }
+                Err(GitCandidateError::NotAbsolute(candidate)) => Err(GitSelectionFailure {
+                    rejections: vec![GitRejection {
+                        error: error(&candidate.path, GitBindingReason::NotAbsolute),
+                        candidate,
+                    }],
+                    ambiguous: false,
+                }),
+            }
+        })
+    }
+
+    pub(crate) fn binding(&self) -> Result<&GitBinding<'static>, &GitSelectionFailure> {
+        self.selection().as_ref().map(|selected| &selected.binding)
+    }
+
+    pub(crate) fn revalidate_if_selected(&self) -> Result<(), GitBindingError> {
+        match self.0.selection.get() {
+            None => Ok(()),
+            Some(Ok(selection)) => selection.binding.revalidate(),
+            Some(Err(_)) => Err(error(Path::new("/"), GitBindingReason::Unavailable)),
+        }
+    }
+
+    pub(crate) fn require(&self) -> std::io::Result<&GitBinding<'static>> {
+        self.binding()
+            .map_err(|_| std::io::Error::other("selected Git qualification failed; no fallback"))
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct GitDiagnostics {
+    selection_source: &'static str,
+    status: &'static str,
+    attempts: Vec<GitAttempt>,
+    canonical_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_path_bytes: Option<Vec<u8>>,
+    version: Option<String>,
+    helper_directory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    helper_directory_bytes: Option<Vec<u8>>,
+    helpers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    helpers_bytes: Option<Vec<Vec<u8>>>,
+}
+#[derive(Debug, serde::Serialize)]
+struct GitAttempt {
+    source: &'static str,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_bytes: Option<Vec<u8>>,
+    reason: String,
+}
+
+// Display is diagnostic only. Execution and proof always retain the original
+// PathBuf; opaque spellings have exact byte companions, never a lossy roundtrip.
+fn diagnostic_path_bytes(path: &Path) -> Option<Vec<u8>> {
+    path.to_str()
+        .is_none()
+        .then(|| path.as_os_str().as_bytes().to_vec())
+}
+
+fn source_name(source: GitSelectionSource) -> &'static str {
+    match source {
+        GitSelectionSource::Cli => "cli",
+        GitSelectionSource::Config => "config",
+        GitSelectionSource::PlatformDefault => "platform_default",
+    }
+}
+impl GitInvocation {
+    pub(crate) fn diagnostics(&self) -> GitDiagnostics {
+        let (selected, rejections) = match self.selection() {
+            Ok(selection) => (Some(&selection.binding), &selection.rejections),
+            Err(failure) => (None, &failure.rejections),
+        };
+        let mut attempts: Vec<_> = rejections
+            .iter()
+            .map(|rejection| GitAttempt {
+                source: source_name(rejection.candidate.source),
+                path: rejection.candidate.path.to_string_lossy().into_owned(),
+                path_bytes: diagnostic_path_bytes(&rejection.candidate.path),
+                reason: format!("{:?}", rejection.error.reason),
+            })
+            .collect();
+        if let Some(binding) = selected {
+            attempts.push(GitAttempt {
+                source: source_name(binding.candidate().source),
+                path: binding.candidate().path.to_string_lossy().into_owned(),
+                path_bytes: diagnostic_path_bytes(&binding.candidate().path),
+                reason: "qualified".into(),
+            });
+        }
+        GitDiagnostics {
+            selection_source: attempts
+                .first()
+                .map_or("platform_default", |attempt| attempt.source),
+            status: match self.selection() {
+                Ok(_) => "qualified",
+                Err(failure) if failure.ambiguous => "uncertain",
+                Err(_) => "unavailable",
+            },
+            attempts,
+            canonical_path: selected
+                .map(|binding| binding.canonical_program().to_string_lossy().into_owned()),
+            canonical_path_bytes: selected
+                .and_then(|binding| diagnostic_path_bytes(binding.canonical_program())),
+            version: selected.map(|binding| {
+                let v = binding.version();
+                format!("{}.{}.{}", v.major, v.minor, v.patch)
+            }),
+            helper_directory: selected
+                .map(|binding| binding.helper_directory().to_string_lossy().into_owned()),
+            helper_directory_bytes: selected
+                .and_then(|binding| diagnostic_path_bytes(binding.helper_directory())),
+            helpers: selected.map_or_else(Vec::new, |binding| {
+                binding
+                    .helpers
+                    .iter()
+                    .map(|(path, _)| path.to_string_lossy().into_owned())
+                    .collect()
+            }),
+            helpers_bytes: selected.and_then(|binding| {
+                binding
+                    .helpers
+                    .iter()
+                    .any(|(path, _)| path.to_str().is_none())
+                    .then(|| {
+                        binding
+                            .helpers
+                            .iter()
+                            .map(|(path, _)| path.as_os_str().as_bytes().to_vec())
+                            .collect()
+                    })
+            }),
+        }
+    }
 }

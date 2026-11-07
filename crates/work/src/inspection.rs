@@ -20,18 +20,22 @@ mod pack_metadata;
 mod remote_proof;
 pub use remote_proof::{verify_remote, RemoteReport};
 
+pub(crate) use remote_proof::verify_remote_with_git;
 mod preservation;
 pub(crate) mod removal;
 pub use preservation::{audit_preservation, PreservationReport};
 
+pub(crate) use preservation::audit_preservation_with_git;
 mod approval;
 pub(crate) use approval::ApprovalCommand;
 pub use approval::{approve_begin, approve_confirm, ApprovalReport};
 
+pub(crate) use approval::{approve_begin_with_git, approve_confirm_with_git};
 mod recovery_refs;
 pub(crate) use recovery_refs::AllocationCommonLock;
 pub use recovery_refs::{prepare_recovery, prepare_recovery_refused, RecoveryReport};
 
+pub(crate) use recovery_refs::prepare_recovery_with_git;
 mod retirement;
 #[cfg(test)]
 pub(crate) use retirement::Legacy16PreparedInsertion;
@@ -41,6 +45,7 @@ pub use retirement_intent::{
     abort_retirement, prepare_retirement, retirement_status, RetirementIntentReport,
 };
 
+pub(crate) use retirement_intent::{abort_retirement_with_git, prepare_retirement_with_git};
 mod receipts;
 pub use receipts::{
     inspect_and_record, read_receipt, PersistedReceipt, ReceiptData, ReceiptError, RecordOutcome,
@@ -294,20 +299,28 @@ impl InspectionReport {
     }
 }
 pub(crate) fn configured_report(
+    invocation: &crate::git::GitInvocation,
     checkout: Uuid,
     record: bool,
 ) -> Result<InspectionReport, InspectionError> {
     let document = crate::config::ConfigDocument::load().map_err(|_| InspectionError)?;
     let config = document.authority().map_err(|_| InspectionError)?;
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| InspectionError)?;
     let policies = document
         .inspection_policies()
         .map_err(|_| InspectionError)?;
     let mut store = open_configured_store(&config)?;
     let (observation, receipt) = if record {
-        let result = inspect_and_record(&mut store, checkout, &policies)?;
+        let result =
+            receipts::inspect_and_record_with_git(invocation, &mut store, checkout, &policies)?;
         (result.observation, Some(result.receipt))
     } else {
-        (inspect(&mut store, checkout, &policies)?, None)
+        (
+            inspect_with_git(invocation, &mut store, checkout, &policies)?,
+            None,
+        )
     };
     let (recorded, recording, receipt_id) = match receipt {
         None => (false, "not_requested", None),
@@ -416,7 +429,21 @@ pub fn inspect(
     checkout: Uuid,
     policies: &ValidatedPolicies,
 ) -> Result<Observation, InspectionError> {
-    inspect_inner(
+    inspect_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        store,
+        checkout,
+        policies,
+    )
+}
+pub(crate) fn inspect_with_git(
+    invocation: &crate::git::GitInvocation,
+    store: &mut Store,
+    checkout: Uuid,
+    policies: &ValidatedPolicies,
+) -> Result<Observation, InspectionError> {
+    inspect_inner_with_git(
+        invocation,
         store,
         checkout,
         policies,
@@ -424,13 +451,15 @@ pub fn inspect(
         None,
     )
 }
-fn inspect_inner(
+fn inspect_inner_with_git(
+    invocation: &crate::git::GitInvocation,
     store: &mut Store,
     checkout: Uuid,
     policies: &ValidatedPolicies,
     #[cfg(test)] before_repeat: Option<&mut dyn FnMut(&mut Store)>,
 ) -> Result<Observation, InspectionError> {
-    collect(
+    collect_with_git(
+        invocation,
         store,
         checkout,
         policies,
@@ -474,13 +503,14 @@ fn wall_time() -> Result<u64, InspectionError> {
         .try_into()
         .map_err(|_| InspectionError)
 }
-fn collect(
+fn collect_with_git(
+    invocation: &crate::git::GitInvocation,
     store: &mut Store,
     checkout: Uuid,
     policies: &ValidatedPolicies,
     #[cfg(test)] before_repeat: Option<&mut dyn FnMut(&mut Store)>,
 ) -> Result<Captured, InspectionError> {
-    let mut b = Budget::new();
+    let mut b = Budget::with_git(invocation);
     let started = wall_time()?;
     let mut retained_context = None;
     let mut physical = None;
@@ -1596,8 +1626,7 @@ fn run_command(
         stdout,
     })
 }
-fn git_command(cwd: Option<&Path>) -> std::process::Command {
-    let mut command = std::process::Command::new("/usr/bin/git");
+fn git_profile(command: &mut std::process::Command, cwd: Option<&Path>) {
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -1630,6 +1659,11 @@ fn git_command(cwd: Option<&Path>) -> std::process::Command {
         command.args(["-c", value]);
     }
     command.current_dir(cwd.unwrap_or(Path::new("/")));
+}
+#[cfg(test)]
+fn git_command(cwd: Option<&Path>) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/git");
+    git_profile(&mut command, cwd);
     command
 }
 fn git(
@@ -1638,7 +1672,26 @@ fn git(
     input: &[u8],
     b: &mut Budget,
 ) -> Result<ProcessOutput, IncompleteReason> {
-    run_command(git_command(cwd).args(args), input, b, cwd.is_some())
+    b.check()?;
+    let invocation = b.git.clone();
+    let binding = invocation
+        .binding()
+        .map_err(|_| IncompleteReason::UnsupportedGit)?;
+    let prepared = binding
+        .command(std::iter::empty::<&str>(), |command| {
+            git_profile(command, cwd);
+            command.args(args);
+        })
+        .map_err(|_| IncompleteReason::UnsupportedGit)?;
+    match prepared.dispatch(|command| run_command(command, input, b, cwd.is_some())) {
+        Ok(result) => result,
+        Err(error) => {
+            if error.possibly_executed && b.remote_home.is_some() {
+                b.remote_reap_unknown = true;
+            }
+            Err(IncompleteReason::UnsupportedGit)
+        }
+    }
 }
 fn git_success(
     cwd: Option<&Path>,
@@ -2759,6 +2812,7 @@ const DIRECTORY_BUFFER_BYTES: usize = 8192;
 
 // Private operation budget. No caller-supplied path/census/membership bypass.
 struct Budget {
+    git: crate::git::GitInvocation,
     start: Instant,
     remote_home: Option<PathBuf>,
     remote_reap_unknown: bool,
@@ -2773,7 +2827,11 @@ struct Budget {
 }
 impl Budget {
     pub(super) fn new() -> Self {
+        Self::with_git(&crate::git::GitInvocation::unconfigured(None))
+    }
+    fn with_git(invocation: &crate::git::GitInvocation) -> Self {
         Self {
+            git: invocation.clone(),
             start: Instant::now(),
             remote_home: None,
             remote_reap_unknown: false,
@@ -4500,5 +4558,80 @@ mod filesystem {
         }
         equal(&held.identity, &stat(&held.fd, b)?)?;
         Ok(names.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+fn collect(
+    store: &mut Store,
+    checkout: Uuid,
+    policies: &ValidatedPolicies,
+    before_repeat: Option<&mut dyn FnMut(&mut Store)>,
+) -> Result<Captured, InspectionError> {
+    collect_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        store,
+        checkout,
+        policies,
+        before_repeat,
+    )
+}
+#[cfg(test)]
+fn inspect_inner(
+    store: &mut Store,
+    checkout: Uuid,
+    policies: &ValidatedPolicies,
+    before_repeat: Option<&mut dyn FnMut(&mut Store)>,
+) -> Result<Observation, InspectionError> {
+    inspect_inner_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        store,
+        checkout,
+        policies,
+        before_repeat,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod invocation_git_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn selected_git_keeps_stdin_profiles_reservations_and_remote_accounting() {
+        let temp = tempfile::tempdir().unwrap();
+        let helpers = temp.path().join("helpers");
+        std::fs::create_dir(&helpers).unwrap();
+        for name in ["git-upload-pack", "git-receive-pack", "git-upload-archive"] {
+            let path = helpers.join(name);
+            std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let program = temp.path().join("git");
+        std::fs::write(&program, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo 'git version 2.55.0';;\n--exec-path) echo '{}';;\n*) [ \"$GIT_EXEC_PATH\" = '{}' ] && [ \"$GIT_GRAFT_FILE\" = /dev/null ] && [ \"$GIT_TERMINAL_PROMPT\" = 0 ] && [ \"$LC_ALL\" = C ] || exit 3; /bin/cat;;\nesac\n", helpers.display(), helpers.display())).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let invocation = crate::git::GitInvocation::new(Some(program), None);
+        let input = b"literal\0stdin\n";
+        for remote in [false, true] {
+            let mut budget = Budget::with_git(&invocation);
+            if remote {
+                budget.remote_home = Some(temp.path().to_path_buf());
+            }
+            let output = git(None, &["probe"], input, &mut budget).unwrap();
+            assert_eq!(output.code, 0);
+            assert_eq!(output.stdout, input);
+            assert_eq!(budget.counters.child_launches, 1);
+            assert_eq!(budget.counters.reserved_child_slots, 1);
+            assert!(budget.counters.reserved_process_input_bytes > input.len() as u64);
+            assert_eq!(budget.counters.repository_launches, 0);
+            assert_eq!(budget.counters.observed_process_bytes, input.len() as u64);
+            assert!(!budget.remote_reap_unknown);
+            if !remote {
+                assert_eq!(
+                    budget.process_events,
+                    ["spawn", "exit-nowait", "kill-group", "wait"]
+                );
+            }
+        }
     }
 }

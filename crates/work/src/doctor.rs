@@ -10,7 +10,6 @@ use std::{
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 const ENTRY_LIMIT: usize = 10_000;
@@ -18,6 +17,7 @@ const REGISTRATION_LIMIT: usize = 1024;
 const UNSAFE_METADATA: &str = "unsafe Git metadata; registration inventory incomplete";
 #[derive(Serialize)]
 pub struct Report {
+    git: crate::git::GitDiagnostics,
     pub version: u32,
     pub repositories: Vec<PathBuf>,
     pub inventory: Vec<Entry>,
@@ -49,23 +49,35 @@ pub struct Headroom {
     pub available_bytes: Option<u64>,
 }
 
-fn git(path: &Path, args: &[&str]) -> Result<Vec<u8>, &'static str> {
-    let o = crate::bounded_process::output(
-        Command::new("/usr/bin/git")
-            .arg("--no-optional-locks")
-            .arg("-C")
-            .arg(path)
-            .args(args)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0"),
-        std::time::Duration::from_secs(2),
-        1024 * 1024,
-    )?;
-    if o.status.success() {
-        Ok(o.stdout)
+fn git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+    args: &[&str],
+) -> Result<Vec<u8>, &'static str> {
+    let binding = invocation
+        .binding()
+        .map_err(|_| "selected Git unavailable; registration inventory incomplete")?;
+    let command = binding
+        .command(std::iter::empty::<&str>(), |command| {
+            command
+                .arg("--no-optional-locks")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+        })
+        .map_err(|_| "selected Git changed; registration inventory incomplete")?;
+    let output = command
+        .dispatch(|command| {
+            crate::bounded_process::output(command, std::time::Duration::from_secs(2), 1024 * 1024)
+        })
+        .map_err(|_| "selected Git changed; operation may have executed; inventory incomplete")??;
+    if output.status.success() {
+        Ok(output.stdout)
     } else {
         Err("Git command failed; inventory incomplete")
     }
@@ -145,9 +157,10 @@ pub(crate) fn precheck(path: &Path) -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn common(path: &Path) -> Result<PathBuf, &'static str> {
+fn common(invocation: &crate::git::GitInvocation, path: &Path) -> Result<PathBuf, &'static str> {
     precheck(path)?;
     let b = git(
+        invocation,
         path,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
@@ -239,11 +252,19 @@ fn logical_size(path: &Path) -> Option<u64> {
 }
 
 pub fn report(config: &Config) -> Result<Report, Error> {
-    if config.roots.is_empty() || config.repositories.is_empty() {
-        return Err(Error::Config(
-            "doctor requires explicit repositories and managed roots".into(),
-        ));
-    }
+    report_with_git(
+        config,
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+    )
+}
+pub(crate) fn report_with_git(
+    config: &Config,
+    invocation: &crate::git::GitInvocation,
+) -> Result<Report, Error> {
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| Error::Config("Git selector changed".into()))?;
+    let git_diagnostics = invocation.diagnostics();
     let mut roots = config
         .roots
         .iter()
@@ -256,10 +277,16 @@ pub fn report(config: &Config) -> Result<Report, Error> {
         }
     }
     let mut uncertainties = Vec::new();
+    if config.roots.is_empty() || config.repositories.is_empty() {
+        uncertainties.push("repository inventory not configured; inventory unknown");
+    }
+    if invocation.binding().is_err() {
+        uncertainties.push("selected Git unavailable; registration inventory incomplete");
+    }
     let mut repos = BTreeMap::new();
     for repo in &config.repositories {
         validate_path(repo, true)?;
-        match common(repo) {
+        match common(invocation, repo) {
             Ok(c) => {
                 repos.entry(c).or_insert(repo);
             }
@@ -269,7 +296,7 @@ pub fn report(config: &Config) -> Result<Report, Error> {
     let mut entries = BTreeMap::new();
     for (c, repo) in &repos {
         let list = match precheck(repo)
-            .and_then(|()| git(repo, &["worktree", "list", "--porcelain", "-z"]))
+            .and_then(|()| git(invocation, repo, &["worktree", "list", "--porcelain", "-z"]))
         {
             Ok(list) => list,
             Err(reason) => {
@@ -356,8 +383,16 @@ pub fn report(config: &Config) -> Result<Report, Error> {
     };
     uncertainties.sort();
     uncertainties.dedup();
-    Ok(Report { version: 1, repositories: repos.into_keys().collect(), inventory: entries.into_values().collect(),
+    Ok(Report { git: git_diagnostics, version: 1, repositories: repos.into_keys().collect(), inventory: entries.into_values().collect(),
         accounting: Accounting { status, charges: charges.unwrap_or_default(), reason: "accounting records lack checkout filesystem paths; cannot certify managed filesystem identity yet. Unknown means missing, partial, unsafe, unreadable or over-budget authority/store evidence; no initialization or repair attempted" },
         managed_filesystem_count: None, headroom, uncertainties,
         size_basis: "bounded logical regular-file lengths, not allocated or reclaimed Btrfs bytes; null means incomplete/unsafe. Immediate root children only; nested checkouts are not exhaustively discovered. SQLite read-only WAL locks may update existing SHM bookkeeping; not byte immutability" })
+}
+
+#[cfg(test)]
+mod git_diagnostic_tests {
+    #[test]
+    fn prerequisite_diagnostics_need_no_configured_repository_or_authority() {
+        assert!(super::report(&crate::config::Config::default()).is_ok());
+    }
 }

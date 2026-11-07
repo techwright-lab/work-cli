@@ -62,9 +62,28 @@ enum Operation {
 }
 /// Configured fresh collection only. Neither receipts nor reports grant freshness.
 pub fn approve_begin(checkout: Uuid) -> ApprovalReport {
-    configured(checkout, Operation::Begin)
+    approve_begin_with_git(&crate::git::GitInvocation::unconfigured(None), checkout)
+}
+pub(crate) fn approve_begin_with_git(
+    invocation: &crate::git::GitInvocation,
+    checkout: Uuid,
+) -> ApprovalReport {
+    configured(invocation, checkout, Operation::Begin)
 }
 pub fn approve_confirm(
+    checkout: Uuid,
+    observation: Uuid,
+    assert_quiescent: bool,
+) -> ApprovalReport {
+    approve_confirm_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        checkout,
+        observation,
+        assert_quiescent,
+    )
+}
+pub(crate) fn approve_confirm_with_git(
+    invocation: &crate::git::GitInvocation,
     checkout: Uuid,
     observation: Uuid,
     assert_quiescent: bool,
@@ -74,18 +93,29 @@ pub fn approve_confirm(
         report.reason = "assertion_required";
         return report;
     }
-    configured(checkout, Operation::Confirm { observation })
+    configured(invocation, checkout, Operation::Confirm { observation })
 }
-fn configured(checkout: Uuid, op: Operation) -> ApprovalReport {
+fn configured(
+    invocation: &crate::git::GitInvocation,
+    checkout: Uuid,
+    op: Operation,
+) -> ApprovalReport {
     match Config::discover_path() {
-        Some(path) => approve_path(&path, checkout, op, Clock::default()),
+        Some(path) => approve_path_with_git(invocation, &path, checkout, op, Clock::default()),
         None => ApprovalReport::held(checkout),
     }
 }
-fn approve_path(path: &Path, checkout: Uuid, op: Operation, clock: Clock) -> ApprovalReport {
+fn approve_path_with_git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+    checkout: Uuid,
+    op: Operation,
+    clock: Clock,
+) -> ApprovalReport {
     let mut collector = Collector::new(checkout, op, clock);
     let mut audit = preservation::Audit::new(checkout);
-    let remote = remote_proof::approval_path(path, checkout, &mut audit, &mut collector);
+    let remote =
+        remote_proof::approval_path(invocation, path, checkout, &mut audit, &mut collector);
     let mut report = ApprovalReport::held(checkout);
     report.reason = collector.failure.unwrap_or_else(|| {
         if remote.observed() {
@@ -1161,7 +1191,13 @@ pub(super) fn assertion_for_retirement_test(path: &Path, checkout: Uuid) -> Uuid
 pub(super) fn collect_for_receipt_test(path: &Path, checkout: Uuid) -> (Store, SealedApproval) {
     let mut collector = Collector::new(checkout, Operation::Begin, Clock::default());
     let mut audit = preservation::Audit::new(checkout);
-    let remote = remote_proof::approval_path(path, checkout, &mut audit, &mut collector);
+    let remote = remote_proof::approval_path(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        &mut audit,
+        &mut collector,
+    );
     assert!(remote.observed(), "{}", remote.reason());
     assert!(collector.failure.is_none(), "{:?}", collector.failure);
     (
@@ -1171,6 +1207,17 @@ pub(super) fn collect_for_receipt_test(path: &Path, checkout: Uuid) -> (Store, S
 }
 #[cfg(test)]
 use crate::inspection::fixture;
+
+#[cfg(test)]
+fn approve_path(path: &Path, checkout: Uuid, op: Operation, clock: Clock) -> ApprovalReport {
+    approve_path_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        op,
+        clock,
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -1190,8 +1237,13 @@ mod tests {
             },
         );
         let mut audit = preservation::Audit::new(f.allocation.checkout);
-        let remote =
-            remote_proof::approval_path(path, f.allocation.checkout, &mut audit, &mut collector);
+        let remote = remote_proof::approval_path(
+            &crate::git::GitInvocation::unconfigured(None),
+            path,
+            f.allocation.checkout,
+            &mut audit,
+            &mut collector,
+        );
         assert!(remote.observed(), "{}", remote.reason());
         collector
     }

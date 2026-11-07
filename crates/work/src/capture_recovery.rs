@@ -152,7 +152,11 @@ fn checkout_for_run(conn: &Connection, run: &RunId) -> Result<uuid::Uuid> {
     crate::retirement_journal::parse_uuid(&checkout.ok_or(StoreError::Invalid)?)
 }
 
-pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
+pub(crate) fn reconcile_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    run: &RunId,
+) -> Result<&'static str> {
     let registry = config
         .trusted_registry
         .as_deref()
@@ -216,7 +220,11 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
     #[cfg(test)]
     tests::observe("pre_physical", &store);
     let observed = Instant::now();
-    let physical = crate::capture_setup::inspect_physical(&before.allocation, &before.common)?;
+    let physical = crate::capture_setup::inspect_physical_with_git(
+        invocation,
+        &before.allocation,
+        &before.common,
+    )?;
     let sink = crate::sinks::ProcessSink::new(before.spec.sink().process_settings()?);
     #[cfg(test)]
     tests::observe("pre_process", &store);
@@ -230,7 +238,11 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
         tests::observe("post_process", &store);
         let observation = capture_journal::observation(&before.spec, &prepared, false)?;
         let observed = Instant::now();
-        let after = crate::capture_setup::inspect_physical(&before.allocation, &before.common)?;
+        let after = crate::capture_setup::inspect_physical_with_git(
+            invocation,
+            &before.allocation,
+            &before.common,
+        )?;
         if after != physical {
             return Err(StoreError::Conflict);
         }
@@ -270,4 +282,13 @@ pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
     } else {
         "begin_uncertain"
     })
+}
+
+#[cfg(test)]
+pub(crate) fn reconcile(config: &Config, run: &RunId) -> Result<&'static str> {
+    reconcile_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        run,
+    )
 }
