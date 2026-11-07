@@ -50,7 +50,7 @@ modes and metadata are not imported from tar; files/directories are newly owned.
 An optional `--archive /absolute/cache/git-VERSION.tar.xz` must be a verified,
 regular, owned file with no write bits and no symlink route. It is never modified.
 
-The fixture-root retained ceiling is 3GiB, with a conservative 1GiB additional
+The current parent-allocated H3 retained ceiling is 1.7GiB, with a conservative 1GiB additional
 estimate before each build and a projected physical-free floor of 10GiB. The
 manifest records before/after storage observations. Physical accounting counts
 hardlinked Git aliases once, does not follow symlinks, and is not an APFS snapshot
@@ -58,8 +58,10 @@ or compressed-storage guarantee. The parent must separately account the shared
 8GiB wave ceiling, evidence outside this root and concurrent growth. **Obtain the
 parent's heavy slot before any real Cargo/lock generation, native compiler
 probe, make or native batch.**
-Remeasure before each version; stop if it will not fit. No automatic cleanup,
-pruning or capacity increase is authorized.
+Remeasure before each version; stop if it will not fit. The unchanged 1GiB
+estimate may block a second build within this allocation even if actual growth
+would be smaller; plan resources with the parent rather than weakening guards.
+No automatic cleanup, pruning or capacity increase is authorized.
 
 ## Two phases through the reviewed native harness
 
@@ -105,10 +107,49 @@ and SHA256 are recorded and revalidated after make. `CARGO_TARGET_DIR` is explic
 `DESTINATION/source/target`, matching Git's hardcoded library location; make gets
 `CARGO_ARGS=--release --locked --offline`. These generated fixture files are not
 patches to the source archive. The manifest records the pinned Rust tools and
-child environment. Logs retain stdout/stderr in observed stream order, returning
-stdout alone for machine-readable observations and reporting failure exit/status
-plus a bounded stderr diagnostic. This is observed pipe order, not a promise of
-atomic ordering between independent child streams.
+child environment.
+
+### Owned commands and failure bounds
+
+Each command starts a new owned session/process group. Timeout (one hour by
+default), CLI SIGINT/SIGTERM, Python interruption, byte/storage limits and other
+exceptions enter the same bounded stop path: TERM, then KILL after 0.5 seconds,
+direct-child reaping and pipe draining within a fixed three-second stop window.
+A leader that exits while its group remains is a failure, not command success.
+Held pipes after an otherwise absent leader/group also have a finite drain grace.
+Only the newly launched group is signalled; no process-name or unrelated-group
+search/killing occurs. This assumes cooperative descendants inherit the group;
+it is **not containment of processes that escape into another session/group**.
+
+A `LOG.command.json` record is written before launch and updated with the known
+PID/PGID, limits, exit status, bounded stderr tail and quiescence result. Failure
+requires an absent owned group, reaped direct child and drained pipes to report
+quiet. Unavailable evidence, a spawn interruption before identity is returned,
+or an incomplete stop/drain is explicitly **UNKNOWN**, never ready or successful.
+The fixture manifest preserves UNKNOWN as well. CLI-only signal handlers are
+restored afterward; imports and ordinary library calls install no handlers.
+SIGKILL or host/process loss cannot guarantee child cleanup or a final record:
+`starting`/`running` records with UNKNOWN outcome must be retained and investigated,
+not treated as reusable fixtures or cleanup authority.
+
+Normal command transport is capped at 8MiB aggregate stdout+stderr (at most one
+extra detection byte); aggregate retained log size is capped at 16MiB including
+stream tags/status space. Returned stdout is opt-in and capped at 1MiB; make,
+downloads, compile probes and lock generation do not accumulate unused stdout.
+Only the last 2,048 stderr input bytes are retained in memory. Overflow fails the
+command and stops its group, never succeeds through truncation. Teardown has a
+separate capped 1MiB discard/drain budget; exhausting it retains UNKNOWN rather
+than pretending EOF. Logs tag streams in observed read order without mixing
+stderr into returned stdout. This is observed pipe order, not atomic ordering
+between independent child streams.
+
+Physical free space and aggregate fixture footprint are checked before and at
+one-second intervals during commands. These are live observations, not an atomic
+quota/reservation against concurrent allocation. Deadlines and byte controls
+bound userspace work under responsive OS calls; they are **best effort against
+blocked kernel/filesystem I/O**, not universal hard wall-time bounds or malicious
+same-UID containment. Unknown outcomes preserve all files and accounting; there
+is no automatic replay, artifact cleanup or pruning.
 
 Example after the parent grants the slot (use new destination names per run):
 
@@ -182,7 +223,23 @@ Full workspace, formatting, strict all-target Clippy, helper, packaging, install
 artifact, macOS15/26 and release gates remain separate; this fixture slice alone
 makes no release-readiness claim.
 
-## Retained H3 development observation (2026-11-06)
+The current suite has 51 portable/controlled-child regressions, including
+preservation of dependency-probe UNKNOWN outcomes through the outer manifest
+and the 1.7GiB allocation with the unchanged build estimate. Source-linked
+correction evidence is under `target/h3-evidence/correction-unknown-20261107/`:
+`red-VERSION.log`, `red-limit-VERSION.log`, `green-VERSION.log` and
+`green-python3.9.log`, with JSON records of exact commands, numeric exits, test
+counts and before/after SHA256 fingerprints of all three H3 source files.
+The older 49-test `final-owned-runner-*` logs predate the last runner edits and
+are not exact-current-source proof. These are runner tests, not new Git build
+qualification. Fresh source SPEC/QUALITY reviews and an explicit native
+execution grant are still required.
+
+## Historical c058cd5 development observation (2026-11-06)
+
+This packet qualifies the **older c058cd5 runner only**. The subsequent owned-group
+and byte-bound correction requires fresh native verification after review/grant;
+the old passes below are not a new-source pass.
 
 On native macOS 27.0.1 ARM64, both exact fixtures built serially with installed
 Rust 1.98.1, existing CLT clang 21 and explicit SDK27.0. Both H2 build commands and
@@ -203,7 +260,7 @@ Relative to the assigned `native-git-fixtures` checkout:
   `dc708714ef74c6e290a3199c85bab2316dff3062bd85030385689a9c70c5a5d3`.
 - Summary and exact invocation scripts: `target/h3-evidence/native-summary.json`
   and `build-lockfix-one.sh` / `smoke-lockfix-one.sh`.
-- Portable final count: 37 tests passed per pinned container. Red/green logs are
+- Historical portable count: 37 tests passed per pinned container. Red/green logs are
   under `target/h3-evidence/`, including `red-versionless-lock.log` and
   `green-versionless-lock-git-VERSION.log`.
 

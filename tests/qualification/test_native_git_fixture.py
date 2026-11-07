@@ -2,13 +2,17 @@
 import hashlib
 import importlib.util
 import io
+import inspect
 import json
 import os
 from pathlib import Path
+import signal
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -227,6 +231,230 @@ class NativeGitFixtureTests(unittest.TestCase):
         self.assertIn("exit=7", log.read_text())
         self.assertEqual(json.loads((self.destination / "manifest.json").read_text())["status"], "failed")
 
+    def require_bounded_runner(self):
+        self.assertIn("timeout", inspect.signature(self.builder.run_command).parameters,
+                      "runner lacks bounded owned-group execution")
+
+    def owned_tree_command(self, leader_exits=False):
+        marker = self.root / ("owned-pids-" + str(time.monotonic_ns()) + ".json")
+        child = 'import time; time.sleep(60)'
+        code = ('import json, os, signal, subprocess, sys, time; '
+                f'child=subprocess.Popen([sys.executable,"-c",{child!r}]); ')
+        if not leader_exits:
+            code += ('signal.signal(signal.SIGTERM,lambda *a: '
+                     '(child.terminate(),child.wait(timeout=1),sys.exit(0))); ')
+        code += (f'open({str(marker)!r},"w").write(json.dumps([os.getpid(),child.pid,os.getpgrp()])); '
+                 'print("owned tree ready",flush=True); ')
+        code += 'sys.exit(0)' if leader_exits else 'time.sleep(60)'
+        return [sys.executable, "-c", code], marker
+
+    def runner_fixture(self):
+        self.destination.mkdir(mode=0o700)
+        return self.builder.isolated_environment(self.destination), self.destination / "command.log"
+
+    def command_state(self, log):
+        return json.loads(log.with_name(log.name + ".command.json").read_text())
+
+    def assert_owned_group_gone(self, marker):
+        leader, child, group = json.loads(marker.read_text())
+        self.assertEqual(leader, group)
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(group, 0)
+        for pid in (leader, child):
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_timeout_stops_owned_descendants_and_records_quiescence(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        command, marker = self.owned_tree_command()
+        started = time.monotonic()
+        with self.assertRaisesRegex(self.builder.Refusal, "timed out"):
+            self.builder.run_command(command, env, self.destination, log, timeout=0.5)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assert_owned_group_gone(marker)
+        state = self.command_state(log)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["quiescence"], "owned-group-absent-and-pipes-drained")
+
+    def test_leader_exit_with_descendant_held_pipes_is_not_success(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        command, marker = self.owned_tree_command(leader_exits=True)
+        started = time.monotonic()
+        with self.assertRaisesRegex(self.builder.Refusal, "leader exited"):
+            self.builder.run_command(command, env, self.destination, log, timeout=30)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assert_owned_group_gone(marker)
+        self.assertEqual(self.command_state(log)["status"], "failed")
+
+    def test_interrupt_and_arbitrary_exception_stop_owned_tree(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        for exception in (KeyboardInterrupt, RuntimeError):
+            command, marker = self.owned_tree_command()
+            original_read = os.read
+            injected = False
+
+            def read(fd, size):
+                nonlocal injected
+                if not injected and marker.exists():
+                    injected = True
+                    raise exception("injected reader interruption")
+                return original_read(fd, size)
+
+            with self.subTest(exception=exception), \
+                    mock.patch.object(self.builder.os, "read", side_effect=read), \
+                    self.assertRaises(exception):
+                self.builder.run_command(command, env, self.destination, log, timeout=2)
+            self.assert_owned_group_gone(marker)
+            self.assertEqual(self.command_state(log)["status"], "failed")
+
+    def test_spawn_interruption_without_returned_identity_is_unknown(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        with mock.patch.object(self.builder.subprocess, "Popen", side_effect=KeyboardInterrupt("spawn interrupted")):
+            with self.assertRaisesRegex(self.builder.UnknownOutcome, "UNKNOWN"):
+                self.builder.run_command([sys.executable, "-c", "pass"], env,
+                                         self.destination, log, timeout=1)
+        state = self.command_state(log)
+        self.assertEqual(state["status"], "unknown")
+        self.assertIsNone(state["pgid"])
+
+    def test_term_ignoring_command_is_killed_within_fixed_stop_deadline(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        command = [sys.executable, "-c", 'import signal,time; '
+                   'signal.signal(signal.SIGTERM,signal.SIG_IGN); print("ready",flush=True); time.sleep(60)']
+        started = time.monotonic()
+        with self.assertRaisesRegex(self.builder.Refusal, "timed out"):
+            self.builder.run_command(command, env, self.destination, log, timeout=0.3)
+        self.assertLess(time.monotonic() - started, 5)
+        state = self.command_state(log)
+        self.assertIn("SIGKILL", state["stop_signals"])
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(state["pgid"], 0)
+
+    def test_unproven_group_quiescence_is_explicit_unknown_not_ready(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        with mock.patch.object(self.builder, "TREE_STOP_SECONDS", 0.2), \
+                mock.patch.object(self.builder, "owned_group_alive", return_value=True):
+            with self.assertRaisesRegex(self.builder.UnknownOutcome, "UNKNOWN"):
+                with self.builder.retained_evidence(self.destination, {}):
+                    self.builder.run_command([sys.executable, "-c", "pass"], env,
+                                             self.destination, log, timeout=0.2)
+        self.assertEqual(self.command_state(log)["status"], "unknown")
+        self.assertEqual(json.loads((self.destination / "manifest.json").read_text())["status"], "unknown")
+
+    def test_cli_sigterm_stops_owned_group_and_restores_handlers(self):
+        self.assertTrue(hasattr(self.builder, "cli_signal_handlers"), "missing CLI-only signal scope")
+        previous = signal.getsignal(signal.SIGTERM)
+        with self.builder.cli_signal_handlers():
+            self.assertNotEqual(signal.getsignal(signal.SIGTERM), previous)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+        env, log = self.runner_fixture()
+        command, marker = self.owned_tree_command()
+        driver = ('import importlib.util,pathlib,sys; '
+                  f's=importlib.util.spec_from_file_location("builder",{str(SCRIPT)!r}); '
+                  'b=importlib.util.module_from_spec(s);s.loader.exec_module(b)\n'
+                  'try:\n'
+                  ' with b.cli_signal_handlers():\n'
+                  f'  with b.retained_evidence(pathlib.Path({str(self.destination)!r}),{{}}):\n'
+                  f'   b.run_command({command!r},{env!r},pathlib.Path({str(self.destination)!r}),'
+                  f'pathlib.Path({str(log)!r}),timeout=10)\n'
+                  'except b.CommandInterrupted as e: sys.exit(128+e.signum)\n')
+        process = subprocess.Popen([sys.executable, "-c", driver], stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists())
+            process.send_signal(signal.SIGTERM)
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 128 + signal.SIGTERM, stderr.decode())
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+        self.assert_owned_group_gone(marker)
+        self.assertEqual(json.loads((self.destination / "manifest.json").read_text())["status"], "failed")
+
+    def test_both_transport_streams_are_byte_bounded_and_overflow_is_failure(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        for fd in (1, 2):
+            with self.subTest(fd=fd), mock.patch.object(self.builder, "MAX_COMMAND_BYTES", 4096):
+                command = [sys.executable, "-c", f'import os; os.write({fd},b"x"*100000)']
+                with self.assertRaisesRegex(self.builder.Refusal, "byte limit"):
+                    self.builder.run_command(command, env, self.destination, log, timeout=2)
+                state = self.command_state(log)
+                self.assertEqual(state["status"], "failed")
+                self.assertLessEqual(len(state["stderr_tail"].encode()), self.builder.STDERR_TAIL_BYTES)
+                self.assertEqual(state["captured_stdout_bytes"], 0)
+                self.assertLessEqual(log.stat().st_size, self.builder.MAX_LOG_BYTES)
+
+    def test_successful_no_payload_command_retains_only_bounded_stderr_tail(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        result = self.builder.run_command([sys.executable, "-c",
+                                          'import os; os.write(2,b"x"*100000+b"TAIL"); print("discard")'],
+                                         env, self.destination, log, timeout=2)
+        state = self.command_state(log)
+        self.assertEqual(result, b"")
+        self.assertEqual(state["captured_stdout_bytes"], 0)
+        self.assertEqual(len(state["stderr_tail"].encode()), self.builder.STDERR_TAIL_BYTES)
+        self.assertTrue(state["stderr_tail"].endswith("TAIL"))
+        self.assertIn("[stderr]", log.read_text())
+        self.assertIn("[stdout]", log.read_text())
+
+    def test_stopping_a_group_does_not_signal_another_owned_session(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        control = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   start_new_session=True)
+        try:
+            with self.assertRaisesRegex(self.builder.Refusal, "timed out"):
+                self.builder.run_command([sys.executable, "-c", "import time; time.sleep(60)"],
+                                         env, self.destination, log, timeout=0.1)
+            self.assertIsNone(control.poll(), "unrelated owned control session was signalled")
+        finally:
+            control.terminate()
+            control.wait(timeout=2)
+
+    def test_stdout_capture_and_aggregate_log_have_independent_caps(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        with mock.patch.object(self.builder, "MAX_CAPTURE_BYTES", 1024):
+            with self.assertRaisesRegex(self.builder.Refusal, "capture byte limit"):
+                self.builder.run_command([sys.executable, "-c", 'print("x"*10000)'], env,
+                                         self.destination, log, timeout=2, capture_stdout=True)
+        with mock.patch.object(self.builder, "MAX_LOG_BYTES", log.stat().st_size + 4096):
+            with self.assertRaisesRegex(self.builder.Refusal, "log byte limit"):
+                self.builder.run_command([sys.executable, "-c", 'print("x"*10000)'], env,
+                                         self.destination, log, timeout=2)
+            self.assertLessEqual(log.stat().st_size, self.builder.MAX_LOG_BYTES)
+
+    def test_long_command_storage_hold_stops_the_owned_group(self):
+        self.require_bounded_runner()
+        env, log = self.runner_fixture()
+        command, marker = self.owned_tree_command()
+        calls = 0
+
+        def storage_check(log):
+            nonlocal calls
+            calls += 1
+            if marker.exists():
+                raise self.builder.Refusal("storage floor reached")
+
+        with mock.patch.object(self.builder, "STORAGE_CHECK_SECONDS", 0.02), \
+                mock.patch.object(self.builder, "command_storage_check", side_effect=storage_check):
+            with self.assertRaisesRegex(self.builder.Refusal, "storage floor"):
+                self.builder.run_command(command, env, self.destination, log, timeout=2)
+        self.assertGreaterEqual(calls, 2)
+        self.assert_owned_group_gone(marker)
+
     def test_source_target_must_be_explicitly_ignored(self):
         (self.source / ".gitignore").unlink()
         with self.assertRaisesRegex(self.builder.Refusal, "ignored"):
@@ -253,7 +481,8 @@ class NativeGitFixtureTests(unittest.TestCase):
             self.builder.cached_archive(fifo, "2.55.0")
 
     def mock_build(self, fail_dependencies=False, cargo_manifest=GIT_CARGO,
-                   cargo_lock=GITCORE_LOCK, cargo_version="1.98.1", mutate_tool_after_make=False):
+                   cargo_lock=GITCORE_LOCK, cargo_version="1.98.1", mutate_tool_after_make=False,
+                   dependency_error=None):
         (self.source / ".gitignore").write_text("/target\n")
         sdk = self.root / "sdk"
         sdk.mkdir()
@@ -278,12 +507,13 @@ class NativeGitFixtureTests(unittest.TestCase):
         commands = []
         self.commands = commands
 
-        def observe(command, env, destination):
+        def observe(command, env, destination, *, capture_stdout=True):
             command = [str(arg) for arg in command]
             commands.append(command)
             name = Path(command[0]).name
             if name == "cargo":
                 if "generate-lockfile" in command:
+                    self.assertFalse(capture_stdout)
                     self.assertEqual(env["CARGO_NET_OFFLINE"], "true")
                     self.assertEqual(Path(command[command.index("--manifest-path") + 1]), self.destination / "Cargo.toml")
                     self.assertEqual(destination, self.destination)
@@ -304,9 +534,13 @@ class NativeGitFixtureTests(unittest.TestCase):
                 return "27.0.1"
             if name == "sysctl":
                 return "0"
-            if name == "clang" and "-o" in command and fail_dependencies:
-                raise self.builder.Refusal("failed probe")
+            if name == "clang" and "-o" in command:
+                if dependency_error is not None:
+                    raise dependency_error
+                if fail_dependencies:
+                    raise self.builder.Refusal("failed probe")
             if name == "make" and "install" in command:
+                self.assertFalse(capture_stdout)
                 self.make_environment = dict(env)
                 prefix = self.destination / "prefix"
                 for relative in ["bin/git", *["libexec/git-core/" + n for n in self.builder.HELPERS]]:
@@ -502,7 +736,8 @@ class NativeGitFixtureTests(unittest.TestCase):
         env = self.builder.isolated_environment(self.destination)
         output = self.builder.run_command([sys.executable, "-c", 'import sys; '
                                           'print("observed"); print("diagnostic", file=sys.stderr)'],
-                                         env, self.destination, self.destination / "command.log")
+                                         env, self.destination, self.destination / "command.log",
+                                         capture_stdout=True)
         self.assertEqual(output, b"observed\n")
         self.assertIn("diagnostic", (self.destination / "command.log").read_text())
 
@@ -514,6 +749,23 @@ class NativeGitFixtureTests(unittest.TestCase):
         record = json.loads((self.destination / "manifest.json").read_text())
         self.assertEqual(record["status"], "failed")
         self.assertIn("missing dependency", record["error"])
+
+    def test_dependency_probe_unknown_preserves_exception_chain_and_outer_manifest(self):
+        cause = self.builder.Refusal("command timed out")
+        unknown = self.builder.UnknownOutcome("UNKNOWN probe quiescence")
+        unknown.__cause__ = cause
+        with self.assertRaises(self.builder.Refusal) as raised:
+            self.mock_build(dependency_error=unknown)
+        record = json.loads((self.destination / "manifest.json").read_text())
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(record["outcome"], "UNKNOWN")
+        self.assertEqual(record["error"], str(unknown))
+        self.assertIs(raised.exception, unknown)
+        self.assertIs(raised.exception.__cause__, cause)
+        self.assertTrue((self.destination / "dependencies.c").is_file())
+        self.assertFalse((self.destination / "source").exists())
+        self.assertFalse((self.destination / "prefix").exists())
+        self.assertFalse(any("generate-lockfile" in c or "install" in c for c in self.commands))
 
     def test_smoke_requires_qualified_h2_selection_and_unchanged_identities(self):
         self.mock_build()
@@ -569,6 +821,14 @@ class NativeGitFixtureTests(unittest.TestCase):
                        (self.base, original, self.base / "nested", self.base / "outside"))
         self.assertEqual(self.builder.footprint(self.base), expected)
         self.assertGreaterEqual(self.builder.footprint(self.base), before)
+
+    def test_storage_preflight_uses_allocated_1_7_gib_without_reducing_build_estimate(self):
+        limit = 17 * 1024**3 // 10
+        self.assertEqual(self.builder.RETAINED_LIMIT, limit)
+        self.assertEqual(self.builder.BUILD_ESTIMATE, 1024**3)
+        with mock.patch.object(self.builder, "footprint", return_value=limit - 1024**3 + 1):
+            with self.assertRaisesRegex(self.builder.Refusal, "1.7GiB"):
+                self.builder.storage_preflight(self.base)
 
     def test_storage_preflight_stops_without_pruning(self):
         usage = mock.Mock(free=10 * 1024**3)
