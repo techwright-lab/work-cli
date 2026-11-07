@@ -248,15 +248,23 @@ Full workspace, formatting, strict all-target Clippy, helper, packaging, install
 artifact, macOS15/26 and release gates remain separate; this fixture slice alone
 makes no release-readiness claim.
 
-The current suite has 61 portable/controlled-child regressions, including fresh
-recensus after compiler-temporary disappearance, bounded retry exhaustion with
-owned-group quiescence, fail-closed walk/root/error cases, and full retained
-allocated-size controls (temporaries, sparse files, hard links and symlinks).
-Source-linked RED/GREEN evidence is under
+The historical `b5de613` census suite had 61 portable/controlled-child
+regressions, including fresh recensus after compiler-temporary disappearance,
+bounded retry exhaustion with owned-group quiescence, fail-closed walk/root/error
+cases, and full retained allocated-size controls (temporaries, sparse files,
+hard links and symlinks). Its source-linked RED/GREEN evidence is under
 `target/h3-evidence/footprint-census-20261107/`: both pinned-container logs,
 native Python 3.9 logs, and JSON records of commands, numeric exits and
-before/after SHA256 fingerprints of all three H3 source files. No real compiler,
-Cargo, built Git or native H2 build/smoke runs are part of these tests.
+before/after SHA256 fingerprints of all three H3 source files.
+
+The current `6234d0e` finalization suite has 68 regressions. Its source-linked
+RED/GREEN evidence is under `target/h3-evidence/finalization-unknown-20261107/`;
+the `final-green-*` records report 68 tests / OK / exit 0 in both pinned
+containers and native Python 3.9, with before/after source fingerprints.
+No real compiler, Cargo, built Git or native H2 build/smoke runs are part of
+these tests. The actual builds and helper smokes for both Git pins under
+`target/h3-evidence/census-native-20261107/` passed at historical `b5de613`,
+not `6234d0e`; they are not current-source native qualification.
 
 The preceding 51-test correction included preservation of dependency-probe
 UNKNOWN outcomes through the outer manifest and the 1.7GiB allocation with the
