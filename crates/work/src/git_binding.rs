@@ -232,12 +232,12 @@ fn observe_route(
         let Some(next) = pending.pop_front() else {
             match required {
                 RequiredObject::Directory if !meta.is_dir() => {
-                    return Err(error(&current, GitBindingReason::InvalidLayout))
+                    return Err(error(&current, GitBindingReason::InvalidLayout));
                 }
                 RequiredObject::Executable
                     if !meta.is_file() || meta.mode() & 0o111 == 0 || meta.mode() & 0o6000 != 0 =>
                 {
-                    return Err(error(&current, GitBindingReason::NotExecutable))
+                    return Err(error(&current, GitBindingReason::NotExecutable));
                 }
                 _ => {}
             }
@@ -448,30 +448,39 @@ impl BoundGitCommand<'_, '_> {
     /// Includes pre- AND post-dispatch validation. Nonzero Output status remains
     /// a caller-specific failure, never evidence that the child did not execute.
     pub(crate) fn output_aggregate(
-        mut self,
+        self,
         timeout: Duration,
         bytes: usize,
     ) -> Result<Output, GitDispatchError> {
+        let program = self.binding.canonical_program.clone();
+        self.dispatch(|command| crate::bounded_process::output_aggregate(command, timeout, bytes))?
+            .map_err(|reason| GitDispatchError {
+                possibly_executed: true,
+                error: error(&program, GitBindingReason::ProcessIncomplete(reason)),
+            })
+    }
+
+    /// A single guarded dispatch through the caller's existing runner. The
+    /// command never escapes this envelope. Runner errors and accounting remain
+    /// caller-owned; binding uncertainty must not cause retry or fallback.
+    pub(crate) fn dispatch<T, E>(
+        mut self,
+        runner: impl FnOnce(&mut Command) -> Result<T, E>,
+    ) -> Result<Result<T, E>, GitDispatchError> {
         self.binding
             .revalidate()
             .map_err(|error| GitDispatchError {
                 possibly_executed: false,
                 error,
             })?;
-        let result = crate::bounded_process::output_aggregate(&mut self.command, timeout, bytes);
+        let result = runner(&mut self.command);
         self.binding
             .revalidate()
             .map_err(|error| GitDispatchError {
                 possibly_executed: true,
                 error,
             })?;
-        result.map_err(|reason| GitDispatchError {
-            possibly_executed: true,
-            error: error(
-                &self.binding.canonical_program,
-                GitBindingReason::ProcessIncomplete(reason),
-            ),
-        })
+        Ok(result)
     }
 }
 
@@ -543,7 +552,7 @@ fn qualify_candidates<'a>(
                 return Ok(GitSelection {
                     binding,
                     rejections,
-                })
+                });
             }
             Err(error) => {
                 let ambiguous = matches!(

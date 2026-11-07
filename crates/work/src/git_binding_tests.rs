@@ -5,7 +5,7 @@ use super::*;
 use std::ffi::OsStr;
 use std::os::unix::{
     ffi::OsStrExt,
-    fs::{symlink, PermissionsExt},
+    fs::{PermissionsExt, symlink},
 };
 
 struct FakeGit {
@@ -832,7 +832,8 @@ fn fake_git_strict_version_and_overlong_exec_path_are_not_trimmed_into_validity(
     ] {
         let f = FakeGit::new();
         fs::write(&f.program, format!("#!/bin/sh\n{script}\n")).unwrap();
-        let failure = qualify_candidates(&[f.candidate(GitSelectionSource::Cli)], &ACCESS).unwrap_err();
+        let failure =
+            qualify_candidates(&[f.candidate(GitSelectionSource::Cli)], &ACCESS).unwrap_err();
         assert!(!failure.ambiguous);
     }
 }
@@ -876,4 +877,35 @@ fn fake_git_darwin_access_is_explicitly_unproven_before_execution() {
         GitBindingReason::AccessUnproven
     );
     assert!(!marker.exists());
+}
+
+#[test]
+fn guarded_dispatch_preserves_stdin_runner_and_post_execution_uncertainty() {
+    let f = FakeGit::new();
+    fs::write(&f.program, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo 'git version 2.55.0';;\n--exec-path) echo '{}';;\n*) /bin/cat;;\nesac\n", f.helpers.display())).unwrap();
+    let selected = bind(&f);
+    let output = selected
+        .binding
+        .command(["input"], |_| {})
+        .unwrap()
+        .dispatch(|command| {
+            crate::bounded_process::output_with_input_aggregate(
+                command,
+                Duration::from_secs(2),
+                128,
+                b"literal\0input\n",
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.stdout, b"literal\0input\n");
+    let result = selected
+        .binding
+        .command(["input"], |_| {})
+        .unwrap()
+        .dispatch(|_| {
+            fs::write(f.helpers.join("git-upload-pack"), b"changed").unwrap();
+            Ok::<_, ()>(())
+        });
+    assert!(result.unwrap_err().possibly_executed);
 }

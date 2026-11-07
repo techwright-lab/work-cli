@@ -8,6 +8,8 @@ pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// user, or organization paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
+    /// Optional absolute executable spelling; qualification follows symlinks safely.
+    pub git_path: Option<PathBuf>,
     /// Directory for the local lifecycle store, when the host has configured one.
     pub store_dir: Option<PathBuf>,
     pub trusted_registry: Option<PathBuf>,
@@ -79,6 +81,9 @@ pub(crate) struct InstallDocument {
     pub allocation: AllocationPolicy,
 }
 impl ConfigDocument {
+    pub(crate) fn git_path(&self) -> Result<Option<PathBuf>, Error> {
+        git_path(&self.value)
+    }
     pub(crate) fn default_actor(&self) -> Result<Option<String>, Error> {
         self.value
             .get("actor")
@@ -230,6 +235,7 @@ impl ConfigDocument {
     }
     pub(crate) fn authority(&self) -> Result<Config, Error> {
         Ok(Config {
+            git_path: self.git_path()?,
             store_dir: single_path(&self.value, "store_dir")?,
             trusted_registry: single_path(&self.value, "trusted_registry")?,
             roots: many_paths(&self.value, "roots")?,
@@ -425,6 +431,7 @@ impl Config {
     }
     fn from_value(value: &toml::Value) -> Result<Self, Error> {
         Ok(Self {
+            git_path: git_path(value)?,
             store_dir: single_path(value, "store_dir")?,
             trusted_registry: single_path(value, "trusted_registry")?,
             roots: many_paths(value, "roots")?,
@@ -462,6 +469,24 @@ impl Config {
         })
     }
 }
+// Unlike authority directories, an executable spelling may traverse installation
+// symlinks. This validates only the selector; Git qualification proves its route.
+fn git_path(value: &toml::Value) -> Result<Option<PathBuf>, Error> {
+    value
+        .get("git_path")
+        .map(|value| {
+            let invalid = || Error::Config("git_path must be an absolute executable path".into());
+            let text = value.as_str().ok_or_else(invalid)?;
+            if text.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r'))
+                || !std::path::Path::new(text).is_absolute()
+            {
+                return Err(invalid());
+            }
+            Ok(PathBuf::from(text))
+        })
+        .transpose()
+}
+
 fn parse_toml(text: &str) -> Result<toml::Value, Error> {
     if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(Error::Config("configuration exceeds size limit".into()));
@@ -762,17 +787,21 @@ mod approval_policy_tests {
             assert!(Config::from_text(&text).is_ok());
         }
         for line in VALID.lines().skip(1) {
-            assert!(ConfigDocument::from_text(&VALID.replace(line, ""))
-                .unwrap()
-                .approval()
-                .is_err());
+            assert!(
+                ConfigDocument::from_text(&VALID.replace(line, ""))
+                    .unwrap()
+                    .approval()
+                    .is_err()
+            );
         }
         for key in ["version='v1'", "operator_id='explicit operator'"] {
             let replacement = format!("{}='{}'", key.split('=').next().unwrap(), "x".repeat(257));
-            assert!(ConfigDocument::from_text(&VALID.replace(key, &replacement))
-                .unwrap()
-                .approval()
-                .is_err());
+            assert!(
+                ConfigDocument::from_text(&VALID.replace(key, &replacement))
+                    .unwrap()
+                    .approval()
+                    .is_err()
+            );
         }
     }
 }
@@ -781,7 +810,9 @@ mod approval_policy_tests {
 mod remote_policy_tests {
     use super::*;
     fn text(url: &str, branch: &str) -> String {
-        format!("[remote_preservation]\nformat=1\nversion='v1'\n[[remote_preservation.targets]]\ncommon_dir='/owned/repository/.git'\nremote='backup'\nurl={url:?}\nbranch={branch:?}\n")
+        format!(
+            "[remote_preservation]\nformat=1\nversion='v1'\n[[remote_preservation.targets]]\ncommon_dir='/owned/repository/.git'\nremote='backup'\nurl={url:?}\nbranch={branch:?}\n"
+        )
     }
     #[test]
     fn strict_lazy_remote_policy_isolation() {
@@ -793,10 +824,12 @@ mod remote_policy_tests {
         assert!(d.remote_preservation().is_ok());
         assert!(d.authority().is_ok());
         assert!(d.inspection_policies().is_err());
-        assert!(ConfigDocument::from_text("")
-            .unwrap()
-            .remote_preservation()
-            .is_err());
+        assert!(
+            ConfigDocument::from_text("")
+                .unwrap()
+                .remote_preservation()
+                .is_err()
+        );
         for value in [
             valid.replace("format=1", "format=2"),
             valid.replace("version='v1'", "version=''"),
@@ -811,11 +844,12 @@ mod remote_policy_tests {
             assert!(d.authority().is_ok());
             assert!(d.execution().is_ok());
             assert!(d.inspection_policies().is_ok());
-            assert!(!d
-                .remote_preservation()
-                .unwrap_err()
-                .to_string()
-                .contains("DO_NOT_ECHO"));
+            assert!(
+                !d.remote_preservation()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("DO_NOT_ECHO")
+            );
         }
     }
     #[test]
@@ -881,25 +915,29 @@ mod remote_policy_tests {
             target.replace("/owned/repository/.git", "/another/.git"),
             target.replace("backup.git", "other.git"),
         ] {
-            assert!(ConfigDocument::from_text(&format!(
-                "{valid}\n[[remote_preservation.targets]]{other}"
-            ))
+            assert!(
+                ConfigDocument::from_text(&format!(
+                    "{valid}\n[[remote_preservation.targets]]{other}"
+                ))
+                .unwrap()
+                .remote_preservation()
+                .is_err()
+            );
+        }
+        assert!(
+            ConfigDocument::from_text(&valid.replace("version='v1'", "version='v1'\nunknown=1"))
+                .unwrap()
+                .remote_preservation()
+                .is_err()
+        );
+        assert!(
+            ConfigDocument::from_text(
+                &valid.replace("version='v1'", &format!("version='{}'", "a".repeat(129)))
+            )
             .unwrap()
             .remote_preservation()
-            .is_err());
-        }
-        assert!(ConfigDocument::from_text(
-            &valid.replace("version='v1'", "version='v1'\nunknown=1")
-        )
-        .unwrap()
-        .remote_preservation()
-        .is_err());
-        assert!(ConfigDocument::from_text(
-            &valid.replace("version='v1'", &format!("version='{}'", "a".repeat(129)))
-        )
-        .unwrap()
-        .remote_preservation()
-        .is_err());
+            .is_err()
+        );
         assert!(
             ConfigDocument::from_text(&valid.replace("format=1", "format=1\nformat=1")).is_err()
         );
@@ -935,6 +973,21 @@ mod inspection_policy_tests {
 
 #[cfg(test)]
 mod document_helper_tests {
+    #[test]
+    fn git_path_rejects_relative_explicit_selection() {
+        assert!(super::Config::from_text("git_path = 'relative/git'\n").is_err());
+    }
+
+    #[test]
+    fn git_path_authority_rejects_malformed_selection() {
+        assert!(
+            super::ConfigDocument::from_text("git_path = 42\n")
+                .unwrap()
+                .authority()
+                .is_err()
+        );
+    }
+
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -1044,25 +1097,29 @@ mod document_helper_tests {
     #[test]
     fn document_rejects_wrong_actor_and_repository_types() {
         for text in ["actor = 42\n", "actor = []\n"] {
-            assert!(ConfigDocument::from_text(text)
-                .unwrap()
-                .default_actor()
-                .is_err());
+            assert!(
+                ConfigDocument::from_text(text)
+                    .unwrap()
+                    .default_actor()
+                    .is_err()
+            );
         }
         for text in ["repositories = \"/x\"\n", "repositories = [42]\n"] {
             let mut document = ConfigDocument::from_text(text).unwrap();
             assert!(document.repositories().is_err());
             assert!(document.add_repository(PathBuf::from("/x")).is_err());
         }
-        assert!(ConfigDocument::from_install(InstallDocument {
-            actor: String::new(),
-            repositories: Vec::new(),
-            roots: Vec::new(),
-            store_dir: PathBuf::from("/store"),
-            trusted_registry: PathBuf::from("/registry"),
-            allocation: policy(),
-        })
-        .is_err());
+        assert!(
+            ConfigDocument::from_install(InstallDocument {
+                actor: String::new(),
+                repositories: Vec::new(),
+                roots: Vec::new(),
+                store_dir: PathBuf::from("/store"),
+                trusted_registry: PathBuf::from("/registry"),
+                allocation: policy(),
+            })
+            .is_err()
+        );
     }
 
     #[test]
