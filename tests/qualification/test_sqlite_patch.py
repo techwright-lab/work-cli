@@ -118,7 +118,7 @@ class SqlitePatchTests(unittest.TestCase):
 
     def test_darwin_build_has_sha256_source_gate(self):
         build = (VENDOR / "build.rs").read_text()
-        self.assertIn("verify_work_darwin_source();", build)
+        self.assertIn("let work_darwin_verified = verify_work_darwin_source();", build)
         self.assertIn("sha2::Sha256", build)
         self.assertIn('env::var("CARGO_CFG_TARGET_OS")', build)
         self.assertIn("Work requires exact patched bundled SQLite", build)
@@ -157,7 +157,7 @@ class SqlitePatchTests(unittest.TestCase):
         self.assertFalse(report["work_vfs_faults_tested"])
         self.assertEqual(report["cargo_dependency"], "libsqlite3-sys 0.36.0 (path copy)")
         cases = {case["name"]: case for case in report["cases"]}
-        self.assertEqual(len(cases), 23)
+        self.assertEqual(len(cases), 29)
         for name in ("cargo-bundled-sql", "permitted-unset", "permitted-zero",
                      "reject-env-one", "reject-env-empty", "reject-env-other",
                      "reject-no-bundled", "reject-sqlcipher", "reject-bundled-sqlcipher",
@@ -171,6 +171,11 @@ class SqlitePatchTests(unittest.TestCase):
                 self.assertEqual(case["status"], "passed")
                 self.assertFalse(case["alternate_tools_executed"])
                 self.assertEqual(case["execution"], "compiled real build.rs, not a Cargo fault transaction")
+        for name in ("reject-bundled-windows-only", "reject-bundled-bindings-only",
+                     "failed-c-compile-no-marker", "failed-c-compile-stale-marker",
+                     "failed-verification-stale-marker"):
+            self.assertFalse(cases[name]["marker_generated"], name)
+        self.assertEqual(cases["library-missing-generated-output"]["status"], "passed")
         self.assertTrue((destination / "dependency/Cargo.toml").read_text().startswith("[workspace]\n"))
         self.assertTrue(report["root_inputs_unchanged"])
         self.assertEqual(before, {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in unchanged_paths})

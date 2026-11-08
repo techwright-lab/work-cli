@@ -119,3 +119,74 @@ fault propagation, acknowledgement ordering, store integration and checked
 checkpoints remain **S3**, even if this matrix and SQL smoke pass. No native
 support, release readiness, complete workspace test/Clippy/package/artifact gates,
 macOS 15/26 qualification, or root dependency switch is claimed here.
+
+## S3a-P marker controls and evidence limits
+
+The portable suite now preserves all **23** controls above and adds six (29
+total): bundled-windows-only/bundled-bindings-only rejection, failed C compile
+with fresh output, failed C compile with historical marker output, failed input
+verification with historical output, and actual library compilation without a
+generated marker. On Linux the last control succeeds without requiring or
+creating a Darwin marker. All bounded failures assert no new marker generation;
+stale fixtures explicitly retain historical bytes. The existing OUT_DIR barriers
+are still **not marker-positive evidence**.
+
+To bound retained storage, script cases copy only the five mandatory inputs they
+can reach, not the unused SQLCipher tree. Prohibited routes receive no source
+inputs: they must fail at the route guard before opening any source. Each fault
+mutates only its own copied file. The complete pristine vendor remains separately
+hash-verified. No shared mutable fault source or target is used.
+
+On native Darwin, `library_controls` additionally compiles the real library for
+the actual rustc host target (no synthetic target cfg): seven prohibited feature
+sets must fail even with historical marker output. `marker_io_failure` proves a
+real successful C/archive build followed by fatal marker-write failure.
+`links_override_control` uses a fresh standalone Cargo target and an explicit
+negative-only links override: build-script execution is suppressed, and the
+missing generated include refuses compilation. These are callable qualification
+controls; native orchestration must supply an explicit installed **Python 3.11+**
+(as `tomllib` requires), not assume H2's system `python3` is suitable. Do not
+install tools or change global PATH to satisfy that prerequisite.
+
+Stage3 retained evidence lives in `target/s3ap-stage3/`:
+
+- `portable-red-{255,256}`: the new fourth-glue-target test genuinely failed
+  before implementation; `portable-green-{255,256}`: 17 Python tests and 29
+  real-script/library controls passed per pinned Git fixture.
+- `native-positive-20261108T224741Z`: H2 exit 1, driver setup predicate error
+  **before Cargo**, retained unchanged. This is not a marker compilation result.
+- `native-recovery-20261108T224913Z`: actual locked/offline application metadata
+  and `cargo check -p work-cli --test sqlite_selection` both **0** on fresh H2
+  source/target/private registry. Five source checks precede successful Darwin C
+  compile/archive; the generated marker bytes/hash and real rusqlite API check
+  are recorded. H2 aggregate remains **1** because subsequent guard import used
+  system Python without `tomllib`. Do not relabel that aggregate GREEN.
+- `native-guard-only-20261108T225208Z`: separately authorized fresh H2 run,
+  explicit existing arm64 Python 3.11.11 with `-I -B`, exit **0**. It verifies the
+  positive run's full immutable input inventory, copies registry-only bytes to
+  new private state, reads its compiler artifacts without modifying them, and
+  executes **37 compile-only guard controls** (22 original non-SQL controls plus
+  15 marker controls). No application/runtime SQLite/SQL execution occurs here.
+
+Admission/command/resource JSON, source and complete registry before/after hashes,
+actual exits, marker bytes, archive hashes, control counts and logs are retained.
+The initial 1.50-GiB Stage3 retention ceiling was explicitly raised by the
+supervisor to 2.00 then 2.50 GiB for the separately admitted recoveries, within
+unchanged whole-lane 6-GiB/wave 18-GiB ceilings and physical 10-GiB floor. Failures
+were preserved, never cleaned or automatically retried. These macOS27/SDK27
+observations remain **DEVELOPMENT/NON-GATE**. Independent SPEC then quality review,
+parent production enforcement/link evidence/upstream negative, full integrated
+qualification and packaging/release gates remain separate obligations.
+
+Final self-review initially caught a rustfmt-only wrapping difference in the new
+library `compile_error!`. That failed formatting run is retained. The explicitly
+approved correction changes only whitespace outside the unchanged literal;
+`final-format-equivalence-and-reconstruction.json` proves identical macro tokens,
+otherwise identical whole-library bytes, unchanged first three glue sections,
+and exact fourth-section upstream reconstruction. Only library/glue hashes and
+their documented values changed. Both portable fixtures subsequently rerun small
+format/provenance/Python checks, without repeating the heavy control matrix.
+**Native evidence is on the pre-format bytes**, not the final exact source:
+library `8799808cbe6cd56fd61516fcc5cd4ebaaec020d73b6720dede74653d1309e96d`,
+glue `a3bb26a4fa46c7320e1aeb8beee026799236ba54f4f9b6838a95f2785194cfd5`.
+The final exact-source native/integration gate remains pending with the parent.

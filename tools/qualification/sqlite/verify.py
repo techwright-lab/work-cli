@@ -121,7 +121,7 @@ def verify_tree(tree):
         raise ValueError("glue patch digest mismatch")
     sections = re.split(r"(?=^--- a/)", glue, flags=re.MULTILINE)[1:]
     targets = [section.splitlines()[0].removeprefix("--- a/") for section in sections]
-    if targets != ["Cargo.toml", "Cargo.toml.orig", "build.rs"]:
+    if targets != ["Cargo.toml", "Cargo.toml.orig", "build.rs", "src/lib.rs"]:
         raise ValueError("unexpected glue patch targets")
     for name, section in zip(targets, sections):
         original = apply_patch((tree / name).read_text(), section, reverse=True, target=name)

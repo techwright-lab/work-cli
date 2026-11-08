@@ -23,9 +23,9 @@ subsequent integration. There is no version bump or system SQLite substitution.
 - `provenance.json` records all 26 named original members, all vendored file
   hashes, and both patch hashes. All original files are retained, including
   upstream license, bindings and unused SQLCipher sources. Only `sqlite3.c`,
-  `build.rs`, `Cargo.toml` and `Cargo.toml.orig` differ from the crate.
+  `build.rs`, `src/lib.rs`, `Cargo.toml` and `Cargo.toml.orig` differ from the crate.
 - `darwin-required-ack.patch` is the exact C delta; `vendor-glue.patch` is the
-  separate build/manifest delta. The offline verifier checks every vendored input
+  separate build/manifest/library delta. The offline verifier checks every vendored input
   and reverses both exact, line-numbered patches to the original member hashes.
   There is no fuzz, offset acceptance, download, or automatic upgrade.
 - The vendored `build.rs` hashes C/header/bundled-binding inputs with the already
@@ -81,7 +81,7 @@ The only modified C function definitions are `full_fsync`, `unixSync`,
 and `sqlite3WalClose`, plus the new private `unixSyncDirectory`. The other
 `walIndexClose` callers (`sqlite3WalOpen` error cleanup and `walIndexReadHdr`
 error cleanup) still discard its result; those calls do **not** request deletion
-and already return an error. No new exported SQLite or Rust application API,
+and already return an error. No new exported SQLite C or runtime Rust application API,
 application unsafe code, environment fault switch or runtime download is added.
 
 ## UNSOLVED S3 integration obligations (not waived by this patch)
@@ -150,3 +150,53 @@ tools/qualification/container.sh -- python3 tools/qualification/sqlite/whole_lin
 This slice does not claim full workspace/release readiness. Full locked workspace,
 Clippy, packaging, artifact smoke and native fault/reboot gates must be recorded
 at the integrated candidate, separately from these source-control-flow checks.
+
+## S3a-P: generated Darwin selection marker (issue #50)
+
+For **target macOS**, `verify_work_darwin_source` returns true only after all five
+mandatory input hashes pass, before *any* build route. Only the bundled route
+receives that result. After `cfg.compile(lib_name)` returns successfully, it
+writes `OUT_DIR/work_darwin_verified.rs` with exactly:
+
+```rust
+pub const WORK_DARWIN_REQUIRED_ACK_V1: () = ();
+```
+
+A failed verification, C compile/archive or marker write fails the build. The
+library includes the generated file only on macOS, requiring `bundled` and
+rejecting SQLCipher, bundled SQLCipher, Gecko and loadable-extension features.
+`bundled-windows` alone and `bundled_bindings` do not satisfy that requirement.
+There is no test/docs exemption or feature/manual-cfg-defined marker. Linux
+*targets* neither generate nor require it, regardless of build host. System,
+pkg-config and Cargo links-override paths cannot generate it.
+
+The actual rusqlite ffi re-export exposes this unit constant to the parent's
+compile-only selection test. The parent owns root Cargo selection/lock and the
+later production anonymous constant; this vendor slice adds neither application
+code nor a dependency upgrade. The constant proves selection of this reviewed
+build contract, **not final linkage, connection configuration, acknowledgement
+propagation or durability**.
+
+Retained OUT_DIR files and normal cache hits are historical observations, not
+fresh verification. Failed scripts stop Cargo even if historical marker bytes
+remain; fresh skipped-script/links-override fixtures cannot supply the include.
+This is **not defense against fabricated outputs, Cargo configuration, hostile
+compilers or foreign caches**. Qualification requires fresh owned targets,
+isolated HOME/CARGO_HOME, fully hashed approved registry-only seeds, and no
+inherited config, credentials, wrappers or flags (except the explicit negative
+links-override fixture).
+
+The fourth glue target is now `src/lib.rs`. Before updating the three affected
+provenance digests, all four exact glue sections were inspected and reversed to
+independently archive-hashed upstream bytes, then forward-applied back to the
+vendor. Upstream member hashes, archive pin, all five mandatory input hashes and
+the C patch are unchanged. Reviewed SHA256 transitions:
+
+| Input | Before | After |
+| --- | --- | --- |
+| `build.rs` | `9d7c0e719fce6f4f6701320c278b3ef7f8e30af5638cf2238f9ce5f02c909319` | `dfb641e4b3af3f4024854886d5e8a80598a9d0f634089655b1989e07ac2e12a1` |
+| `src/lib.rs` | `f61d8e306e11357479e20999f7b7adc5f3dbaea40cd17361853574001cf79360` | `5b2fe629451027d9b60a3c6cae448aa27d74713e411a242b20ad100ce5e06447` |
+| `vendor-glue.patch` | `de4bb5d15b9c884b91081c2ad7aebaf6d0d553c34e3817d6b64f1c36d53311f5` | `033936b1891493846b34b85e65acaf23fdfc3b18f2e64970fe8bd9f8f635bf0b` |
+
+Do not bless new digests by regeneration: future changes require exact source
+reconstruction and independent source/boundary review again.

@@ -22,6 +22,8 @@ MANDATORY = ("sqlite3.c", "sqlite3.h", "sqlite3ext.h",
              "bindgen_bundled_version.rs", "bindgen_bundled_version_ext.rs")
 ALTERNATE_ERROR = ("Work requires exact patched bundled SQLite; "
                    "system/alternate SQLite is not permitted")
+MARKER_FILE = "work_darwin_verified.rs"
+MARKER_BYTES = b"pub const WORK_DARWIN_REQUIRED_ACK_V1: () = ();\n"
 SMOKE = r'''
 use libsqlite3_sys as sql;
 use std::ffi::{CStr, CString};
@@ -108,6 +110,9 @@ class Fixture:
         self.env = {"PATH": str(Path(rustc).parent) + ":/usr/bin:/bin:/usr/sbin:/sbin",
                     "LC_ALL": "C", "LANG": "C", "CARGO_NET_OFFLINE": "true",
                     "CARGO_BUILD_JOBS": "4", "RUSTC": self.rustc,
+                    "CARGO_INCREMENTAL": "0", "CARGO_PROFILE_DEV_DEBUG": "0",
+                    "CARGO_PROFILE_TEST_DEBUG": "0", "CARGO_PROFILE_DEV_STRIP": "none",
+                    "CARGO_PROFILE_TEST_STRIP": "none",
                     "RUST_BACKTRACE": "0", "RUSTUP_AUTO_INSTALL": "0"}
         # Only the explicit SDK chosen by the reviewed native wrapper crosses in.
         if "SDKROOT" in os.environ:
@@ -210,9 +215,13 @@ class Fixture:
                 "missing real Cargo build artifacts/execution")
         require("static=sqlite3" in script_execution["linked_libs"], "not bundled static linkage")
         build_output = Path(script_execution["out_dir"]).parent / "output"
+        marker = Path(script_execution["out_dir"]) / MARKER_FILE
         if "apple-darwin" in self.host:
             require(all("cargo:rerun-if-changed=sqlite3/" + p in build_output.read_text()
                         for p in MANDATORY), "Cargo did not execute Darwin source checks")
+            require(marker.read_bytes() == MARKER_BYTES, "wrong generated Darwin marker")
+        else:
+            require(not marker.exists(), "Linux target generated Darwin marker")
         self.bundled_script = Path(script)
         self.report["cargo_build_script"] = {"path": script, "sha256": sha(script),
                                              "source_sha256": sha(self.vendor / "build.rs"),
@@ -231,7 +240,7 @@ class Fixture:
         output = self.destination / ("guard-" + name)
         args = [self.rustc, "--edition=2021", "--crate-name", "work_sqlite_guard",
                 str(self.vendor / "build.rs"), "-o", str(output),
-                "-L", "dependency=" + str(self.destination / "target/debug/deps")]
+                "-L", "dependency=" + str(Path(next(iter(self.externs.values()))).parent)]
         for feature in ["min_sqlite_version_3_34_1", *features]:
             args += ["--cfg", 'feature="' + feature + '"']
         for dependency, artifact in sorted(self.externs.items()):
@@ -246,11 +255,19 @@ class Fixture:
         return output
 
     def guard_case(self, name, script, *, fault=None, package_env=None,
-                   target_os="macos", target="aarch64-apple-darwin", host=None, permitted=False):
+                   target_os="macos", target="aarch64-apple-darwin", host=None, permitted=False,
+                   compile_failure=False, stale_marker=False):
         case = self.destination / "cases" / name
         case.mkdir(parents=True)
         tree = case / "vendor"
-        copy_tree(self.vendor, tree)
+        # Bounded cases copy only inputs they can reach. The full pristine
+        # package remains separately pinned. Prohibited routes must fail before
+        # opening any source, including their alternate SQLCipher tree.
+        tree.mkdir()
+        (tree / "sqlite3").mkdir()
+        if fault or permitted or compile_failure or target_os == "linux":
+            for filename in MANDATORY:
+                shutil.copyfile(self.vendor / "sqlite3" / filename, tree / "sqlite3" / filename)
         mutation = None
         if fault:
             kind, filename = fault
@@ -271,6 +288,9 @@ class Fixture:
             path.chmod(0o700)
         out = case / "out"
         out.mkdir()
+        if stale_marker:
+            # Historical-output model only, not an adversarial-output defense.
+            (out / MARKER_FILE).write_bytes(MARKER_BYTES)
         env = dict(self.env, CARGO_CFG_TARGET_OS=target_os, TARGET=target,
                    HOST=host or self.host, CARGO_MANIFEST_DIR=str(tree),
                    CC=str(tools / "cc"), AR=str(tools / "ar"), PKG_CONFIG=str(tools / "pkg-config"),
@@ -292,11 +312,14 @@ class Fixture:
             require(expected_error in stderr, name + " did not reach post-guard OUT_DIR barrier")
             require(stdout.splitlines() == ["cargo:rerun-if-changed=sqlite3/" + p for p in MANDATORY],
                     name + " did not verify every mandatory input")
-        elif target_os == "linux":
+        elif compile_failure or target_os == "linux":
             require(executed, name + " did not reach bounded compiler trap after bypassing macOS guard")
             require("Work SQLite source drift:" not in stderr and ALTERNATE_ERROR not in stderr,
                     name + " incorrectly enforced Darwin guard")
             require((out / "bindgen.rs").is_file(), name + " did not take ordinary bundled path")
+            if compile_failure:
+                require(all("cargo:rerun-if-changed=sqlite3/" + p in stdout for p in MANDATORY),
+                        name + " did not verify all mandatory inputs before C compilation")
         elif fault:
             kind, filename = fault
             if kind == "missing":
@@ -311,10 +334,15 @@ class Fixture:
             expected_error = ALTERNATE_ERROR
         if expected_error:
             require(expected_error in stderr, name + " wrong guard/barrier error")
-            require(not executed and not list(out.iterdir()), name + " unsafe downstream effects")
+            require(not executed and {p.name for p in out.iterdir()} ==
+                    ({MARKER_FILE} if stale_marker else set()), name + " unsafe downstream effects")
             require("cargo:rerun-if-env-changed=LIBSQLITE3_SYS_USE_PKG_CONFIG" not in stdout,
                     name + " reached alternate-route selection")
+        marker = out / MARKER_FILE
+        require(marker.read_bytes() == MARKER_BYTES if stale_marker else not marker.exists(),
+                name + " unexpectedly generated/changed a marker on failure")
         self.report["cases"].append({"name": name, "status": "passed", "mutation": mutation,
+                                     "marker_generated": False, "historical_marker_retained": stale_marker,
                                      "execution": "compiled real build.rs, not a Cargo fault transaction",
                                      "executable": str(script), "executable_sha256": sha(script),
                                      "target_os": target_os, "target": target, "host": env["HOST"],
@@ -342,11 +370,111 @@ class Fixture:
                         target="x86_64-unknown-linux-gnu", host="aarch64-apple-darwin",
                         fault=("altered", "sqlite3.c"))
 
+    def marker_controls(self):
+        for name, features in (("bundled-windows-only", ["bundled-windows"]),
+                               ("bundled-bindings-only", ["bundled_bindings"])):
+            self.guard_case("reject-" + name, self.compile_variant(name, features))
+        self.guard_case("failed-c-compile-no-marker", self.bundled_script, compile_failure=True)
+        self.guard_case("failed-c-compile-stale-marker", self.bundled_script,
+                        compile_failure=True, stale_marker=True)
+        self.guard_case("failed-verification-stale-marker", self.bundled_script,
+                        fault=("altered", "sqlite3.c"), stale_marker=True)
+        self.library_controls()
+
+    def library_controls(self):
+        # Compile the actual library for rustc's REAL target, without a build
+        # script. No forged target cfg, feature-defined marker, or docs exemption.
+        native_darwin = "apple-darwin" in self.host
+        variants = [("library-missing-generated-output", ["bundled"], False)]
+        if native_darwin:
+            variants += [("library-reject-" + name, features, True) for name, features in (
+                ("no-bundled", []), ("bundled-windows", ["bundled-windows"]),
+                ("bundled-bindings", ["bundled_bindings"]),
+                ("sqlcipher", ["bundled", "sqlcipher"]),
+                ("bundled-sqlcipher", ["bundled", "bundled-sqlcipher"]),
+                ("in-gecko", ["bundled", "in_gecko"]),
+                ("loadable-extension", ["bundled", "loadable_extension"]))]
+        for name, features, historical in variants:
+            case = self.destination / "cases" / name
+            case.mkdir(parents=True)
+            out = case / "out"
+            out.mkdir()
+            shutil.copyfile(self.vendor / "sqlite3/bindgen_bundled_version.rs", out / "bindgen.rs")
+            if historical:
+                (out / MARKER_FILE).write_bytes(MARKER_BYTES)
+            args = [self.rustc, "--edition=2021", "--crate-name", "work_sqlite_library_guard",
+                    "--crate-type=rlib", "--emit=metadata", str(self.vendor / "src/lib.rs"),
+                    "-o", str(case / "library.rmeta")]
+            for feature in features:
+                args += ["--cfg", 'feature="' + feature + '"']
+            result = self.command(name, args, self.vendor, dict(self.env, OUT_DIR=str(out)),
+                                  expected="failure" if native_darwin else 0)
+            if native_darwin:
+                error = ALTERNATE_ERROR if historical else MARKER_FILE
+                require(error in result.stderr.decode(), name + " wrong library refusal")
+            require((out / MARKER_FILE).exists() == historical, name + " library generated marker")
+            self.report["cases"].append({"name": name, "status": "passed", "features": features,
+                                         "real_rustc_host_target": self.host,
+                                         "historical_marker_retained": historical,
+                                         "execution": "real library rustc without build script"})
+
+    def marker_io_failure(self):
+        require("apple-darwin" in self.host, "marker I/O requires a real Darwin C build")
+        name = "marker-write-failure-after-c-compile"
+        case = self.destination / "cases" / name
+        case.mkdir(parents=True)
+        out = case / "out"
+        out.mkdir()
+        (out / MARKER_FILE).mkdir()  # An owned directory makes write() fail.
+        env = dict(self.env, CARGO_CFG_TARGET_OS="macos", TARGET=self.host, HOST=self.host,
+                   OUT_DIR=str(out), OPT_LEVEL="0", DEBUG="false", CARGO_CFG_TARGET_ENV="",
+                   CARGO_CFG_TARGET_FEATURE="", CARGO_MANIFEST_DIR=str(self.vendor))
+        result = self.command(name, [str(self.bundled_script)], self.vendor, env, expected="failure")
+        require(b"Could not write Work Darwin verification marker" in result.stderr,
+                "marker I/O failure was not fatal")
+        archive = out / "libsqlite3.a"
+        require(archive.is_file() and (out / MARKER_FILE).is_dir(),
+                "marker I/O failure did not follow successful C compilation")
+        self.report["cases"].append({"name": name, "status": "passed",
+                                     "archive_sha256": sha(archive), "marker_generated": False,
+                                     "execution": "real bundled C compile, failed marker write"})
+
+    def links_override_control(self):
+        require("apple-darwin" in self.host, "marker override refusal requires real Darwin target")
+        name = "fresh-links-override-skips-build-script"
+        case = self.destination / "cases" / name
+        (case / "src").mkdir(parents=True)
+        (case / ".cargo").mkdir()
+        (case / "src/main.rs").write_text(
+            "fn main() { let _: () = libsqlite3_sys::WORK_DARWIN_REQUIRED_ACK_V1; }\n")
+        (case / "Cargo.toml").write_text(
+            '[workspace]\n[package]\nname = "work-marker-override-negative"\n'
+            'version = "0.0.0"\nedition = "2021"\n[dependencies]\n'
+            'libsqlite3-sys = { path = ' + json.dumps(str(self.vendor)) +
+            ', version = "=0.36.0", features = ["bundled"] }\n')
+        # The sole intentional links override: negative fixture only. OUT_DIR
+        # is fresh; no fabricated generated marker or bindings are supplied.
+        (case / ".cargo/config.toml").write_text(
+            '[target.' + self.host + '.sqlite3]\nrustc-link-lib = []\n')
+        shutil.copyfile(ROOT / "Cargo.lock", case / "Cargo.lock")
+        env = dict(self.env, CARGO_TARGET_DIR=str(case / "target"))
+        self.command(name + "-metadata", [self.cargo, "metadata", "--offline", "--format-version=1"],
+                     case, env)
+        validate_lock(case / "Cargo.lock", ROOT / "Cargo.lock")
+        result = self.command(name, [self.cargo, "check", "--offline", "--locked", "-vv"],
+                              case, env, expected="failure")
+        require(b"work_darwin_verified.rs" in result.stderr, "override did not fail at marker include")
+        require(b"build-script-build" not in result.stderr, "override unexpectedly ran build script")
+        require(not list((case / "target").rglob(MARKER_FILE)), "override generated a marker")
+        self.report["cases"].append({"name": name, "status": "passed", "marker_generated": False,
+                                     "execution": "fresh Cargo target with explicit negative links override"})
+
     def run(self):
         try:
             self.prepare()
             self.cargo_smoke()
             self.matrix()
+            self.marker_controls()
             verify.verify_tree(self.vendor)
             self.report["status"] = "passed"
         except Exception as error:

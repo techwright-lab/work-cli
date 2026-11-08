@@ -1,5 +1,25 @@
 #![expect(non_snake_case, non_camel_case_types)]
 #![cfg_attr(not(test), no_std)]
+
+#[cfg(all(
+    target_os = "macos",
+    any(
+        not(feature = "bundled"),
+        feature = "sqlcipher",
+        feature = "bundled-sqlcipher",
+        feature = "in_gecko",
+        feature = "loadable_extension"
+    )
+))]
+compile_error!(
+    "Work requires exact patched bundled SQLite; system/alternate SQLite is not permitted"
+);
+
+// Generated only after target source verification and successful bundled C compilation.
+// Retained OUT_DIR output is historical, not proof of a fresh build-script run.
+#[cfg(target_os = "macos")]
+include!(concat!(env!("OUT_DIR"), "/work_darwin_verified.rs"));
+
 // force linking to openssl
 #[cfg(feature = "bundled-sqlcipher-vendored-openssl")]
 extern crate openssl_sys;

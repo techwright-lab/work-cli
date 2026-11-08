@@ -41,9 +41,9 @@ fn copy_bindings<T: AsRef<Path>>(dir: &str, bindgen_name: &str, out_path: T) {
 
 // This vendored crate is Work's exact reviewed Darwin persistence mechanism.
 // Check the TARGET (not the build host), before any system-library escape path.
-fn verify_work_darwin_source() {
+fn verify_work_darwin_source() -> bool {
     if !env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos") {
-        return;
+        return false;
     }
     assert!(
         cfg!(feature = "bundled")
@@ -87,10 +87,11 @@ fn verify_work_darwin_source() {
             "Work SQLite source drift: {path}; upgrade requires re-review"
         );
     }
+    true
 }
 
 fn main() {
-    verify_work_darwin_source();
+    let work_darwin_verified = verify_work_darwin_source();
     let out_dir = env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("bindgen.rs");
     if cfg!(feature = "in_gecko") {
@@ -127,7 +128,7 @@ fn main() {
             feature = "bundled-windows",
             feature = "bundled-sqlcipher"
         ))]
-        build_bundled::main(&out_dir, &out_path);
+        build_bundled::main(&out_dir, &out_path, work_darwin_verified);
         #[cfg(not(any(
             feature = "bundled",
             feature = "bundled-windows",
@@ -152,7 +153,7 @@ mod build_bundled {
     use super::{is_compiler, win_target};
 
     #[expect(clippy::assertions_on_constants)] // https://github.com/rust-lang/rust-clippy/issues/16242
-    pub fn main(out_dir: &str, out_path: &Path) {
+    pub fn main(out_dir: &str, out_path: &Path, work_darwin_verified: bool) {
         let lib_name = super::lib_name();
 
         // This is just a sanity check, the top level `main` should ensure this.
@@ -357,6 +358,14 @@ mod build_bundled {
         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
 
         cfg.compile(lib_name);
+
+        if work_darwin_verified {
+            std::fs::write(
+                Path::new(out_dir).join("work_darwin_verified.rs"),
+                "pub const WORK_DARWIN_REQUIRED_ACK_V1: () = ();\n",
+            )
+            .expect("Could not write Work Darwin verification marker");
+        }
 
         println!("cargo:lib_dir={out_dir}");
     }
