@@ -5,6 +5,11 @@
 
 #![forbid(unsafe_code)]
 
+// Require the reviewed bundled-build contract even for library-only builds.
+// This proves dependency selection, not runtime persistence or durability.
+#[cfg(target_os = "macos")]
+const _: () = rusqlite::ffi::WORK_DARWIN_REQUIRED_ACK_V1;
+
 #[cfg(test)]
 extern crate self as work_cli;
 #[cfg(test)]
