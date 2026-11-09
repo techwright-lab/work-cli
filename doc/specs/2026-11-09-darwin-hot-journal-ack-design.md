@@ -1,8 +1,9 @@
 # Darwin hot-journal acknowledgement correction
 
-Status: proposed bounded design. The operator approved pursuing a Darwin C
-correction while preserving journal recovery. Detailed implementation and heavy
-qualification require design review and separate resource admission.
+Status: operator-approved bounded design. The approved scope snapshot is
+`d3c09bc11ef6b73b93f858160b8159555ed2f758`, independently reviewed by `b691f8b1`.
+The operator approved the revised scope and resource limits after that review.
+Implementation still requires a reviewed plan and measured batch admission.
 
 Baseline: `5fdc6b560c6c4bc0e0f000c19d7419ceee533f32`.
 Parent: native Apple Silicon support, issues 30/31. The integrated S3a-P
@@ -262,6 +263,9 @@ One retained native fixture had these approximate component sizes:
 
 These are measured references, not a future peak guarantee.
 
+The following paragraphs retain the **pre-approval scoping record**.
+They do not describe the current approved ceiling.
+
 The combined preliminary estimate is 2.5–3.8 GiB additional, **not admission**.
 Recorded wave retention was 17,501,986,816 bytes under the 18-GiB ceiling.
 Approximately 1.7 GiB of aggregate headroom remained.
@@ -275,6 +279,12 @@ additional margin. It is not approved by this document.
 Keep the 10-GiB physical-free floor and full batch reserves unchanged.
 If the operator retains 18 GiB, pause or propose a smaller programme.
 Do not drop required gates or use cleanup, exclusions or deletion credit.
+
+**Subsequent operator decision:** the revised scope and resource request are approved.
+The current limits are 22 GiB total and 4 GiB additional for this programme, including reserves.
+The 10-GiB physical-free floor and preservation holds remain binding.
+The [implementation plan](../plans/2026-11-09-darwin-hot-journal-ack.md) defines proposed staged allocations.
+No executable batch is admitted by the ceiling decision alone.
 
 ## Acceptance and handoff
 
