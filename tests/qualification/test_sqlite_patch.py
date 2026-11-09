@@ -230,6 +230,19 @@ class SqlitePatchTests(unittest.TestCase):
                                 capture_output=True, text=True, timeout=90)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_extracted_source_linux_retains_generated_artifacts(self):
+        parent = ROOT / "target/sqlite-harness-evidence"
+        before = set(parent.glob("*"))
+        result = subprocess.run(
+            [sys.executable, "-B", str(TOOLS / "run_harness.py"),
+             "--mode", "linux"], capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        created = set(parent.glob("*")) - before
+        self.assertEqual(len(created), 1)
+        retained, = created
+        for name in ("harness.c", "harness-0", "harness-1"):
+            self.assertTrue((retained / name).is_file(), name)
+
     def test_whole_linux_amalgamation_smoke(self):
         self.assertTrue((TOOLS / "whole_linux.py").is_file(),
                         "whole-amalgamation smoke must be distinct from extracted tests")

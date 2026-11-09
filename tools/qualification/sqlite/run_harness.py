@@ -52,18 +52,21 @@ def run(mode):
         start = source.index(key + " ")
         constants.append(source[start:source.index("\n", start)])
     code = code.replace("/* CREATION_CLASSIFIER */", "\n".join(constants) + "\n" + classifier)
-    with tempfile.TemporaryDirectory(prefix="work-sqlite-source-") as temp:
-        c = Path(temp) / "harness.c"
-        exe = Path(temp) / "harness"
-        c.write_text(code)
+    parent = ROOT / "target/sqlite-harness-evidence"
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    retained = Path(tempfile.mkdtemp(prefix="work-sqlite-source-", dir=parent))
+    print(f"{mode}: retained SQLite harness evidence at {retained}", flush=True)
+    c = retained / "harness.c"
+    c.write_text(code)
+    variants = [1] if mode == "darwin" else [0, 1]
+    for fullsync in variants:
+        exe = retained / f"harness-{fullsync}"
         command = ["cc", "-std=c99", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
                    "-Wno-unused-function", str(c), "-o", str(exe)]
         if mode == "darwin":
             command.insert(1, "-D__APPLE__=1")
-        variants = [1] if mode == "darwin" else [0, 1]
-        for fullsync in variants:
-            subprocess.run(command + [f"-DHAVE_FULLFSYNC={fullsync}"], check=True, timeout=60)
-            subprocess.run([str(exe)], check=True, timeout=10)
+        subprocess.run(command + [f"-DHAVE_FULLFSYNC={fullsync}"], check=True, timeout=60)
+        subprocess.run([str(exe)], check=True, timeout=10)
     print(f"{mode}: exact-source extracted control-flow harness passed (not native VFS)")
 
 
