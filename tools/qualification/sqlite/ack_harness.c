@@ -30,13 +30,14 @@ typedef struct unixFile {
   struct unixShm *pShm; struct unixInodeInfo *pInode;
 } unixFile;
 static int full_fail, ordinary_fail, dir_open_fail, dir_sync_fail, unlink_fail;
+static int full_fail_errno;
 static int unlink_fail_at, dir_fail_at;
 static int full_calls, ordinary_calls, dir_calls, close_calls, unlink_calls;
 static int negative_dir;
 static int mock_fcntl(int fd, int op, int arg){
   assert(op==F_FULLFSYNC && arg==0); assert(++full_calls<10);
   if( (fd==7 && dir_sync_fail && (!dir_fail_at || dir_calls==dir_fail_at))
-      || (fd!=7 && full_fail) ){ errno=EIO; return -1; }
+      || (fd!=7 && full_fail) ){ errno=(fd==7 ? EIO : full_fail_errno); return -1; }
   return 0;
 }
 static int mock_fsync(int fd){
@@ -65,6 +66,32 @@ static void storeLastErrno(unixFile *file, int error){ (void)file; (void)error; 
 #define fdatasync mock_fsync
 #define osOpenDirectory mock_open_directory
 #define osUnlink mock_unlink
+typedef long long sqlite3_int64;
+typedef struct Pager {
+  int noSync;
+  sqlite3_file *jfd;
+  sqlite3_int64 journalHdr;
+} Pager;
+static int unixSync(sqlite3_file *, int);
+static int journal_flags, journal_sync_calls, journal_size_calls;
+static int journal_order, journal_ack_order, journal_size_order;
+static int journal_size_rc;
+static sqlite3_int64 journal_size_value;
+static int sqlite3OsSync(sqlite3_file *f, int flags){
+  int rc;
+  journal_flags=flags;
+  journal_sync_calls++;
+  rc=unixSync(f,flags);
+  if( rc==SQLITE_OK ) journal_ack_order=++journal_order;
+  return rc;
+}
+static int sqlite3OsFileSize(sqlite3_file *f, sqlite3_int64 *size){
+  assert(f!=0);
+  journal_size_calls++;
+  journal_size_order=++journal_order;
+  *size=journal_size_value;
+  return journal_size_rc;
+}
 /* EXACT_SOURCE */
 static void reset(void);
 /* SIDECAR_HARNESS */
@@ -72,8 +99,29 @@ static void reset(void){
   full_fail=ordinary_fail=dir_open_fail=dir_sync_fail=unlink_fail=negative_dir=0;
   unlink_fail_at=dir_fail_at=0;
   full_calls=ordinary_calls=dir_calls=close_calls=unlink_calls=0;
+  full_fail_errno=EIO;
+  journal_flags=journal_sync_calls=journal_size_calls=0;
+  journal_order=journal_ack_order=journal_size_order=0;
+  journal_size_rc=SQLITE_OK;
+  journal_size_value=321;
 }
 /* CREATION_CLASSIFIER */
+static void journal_tests(void){
+  unixFile file={3, 0, "owned.db-journal",0,0};
+  Pager pager={0, (sqlite3_file*)&file, 77};
+  reset();
+  assert(pagerSyncHotJournal(&pager)==SQLITE_OK);
+#ifdef __APPLE__
+  assert(journal_flags==SQLITE_SYNC_FULL);
+  assert(full_calls==1); assert(ordinary_calls==0);
+#else
+  assert(journal_flags==SQLITE_SYNC_NORMAL);
+  assert(full_calls==0); assert(ordinary_calls==1);
+#endif
+  assert(journal_sync_calls==1); assert(dir_calls==0);
+  assert(journal_size_calls==1); assert(pager.journalHdr==321);
+  assert(journal_ack_order==1); assert(journal_size_order==2);
+}
 int main(void){
   const int types[]={SQLITE_OPEN_MAIN_DB, SQLITE_OPEN_MAIN_JOURNAL,
                      SQLITE_OPEN_SUPER_JOURNAL, SQLITE_OPEN_WAL};
@@ -150,5 +198,6 @@ int main(void){
     assert(creation_flags(0,types[i])==0);
   }
   sidecar_tests();
+  journal_tests();
   return 0;
 }

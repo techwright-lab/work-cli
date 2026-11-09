@@ -23,7 +23,8 @@ def function(source, signature):
 def run(mode):
     verify_tree(ROOT / "vendor/libsqlite3-sys")
     source = (ROOT / "vendor/libsqlite3-sys/sqlite3/sqlite3.c").read_text()
-    signatures = ["static int full_fsync(", "static int unixSync(", "static int unixDelete("]
+    signatures = ["static int full_fsync(", "static int unixSync(",
+                  "static int pagerSyncHotJournal(", "static int unixDelete("]
     if "static int unixSyncDirectory(" in source:
         signatures.insert(1, "static int unixSyncDirectory(")
     code = (HERE / "ack_harness.c").read_text()
