@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 from pathlib import Path
+import select
 import signal
 import stat
 import subprocess
@@ -244,10 +245,176 @@ class NativeGitFixtureTests(unittest.TestCase):
         if not leader_exits:
             code += ('signal.signal(signal.SIGTERM,lambda *a: '
                      '(child.terminate(),child.wait(timeout=1),sys.exit(0))); ')
-        code += (f'open({str(marker)!r},"w").write(json.dumps([os.getpid(),child.pid,os.getpgrp()])); '
+        staging = marker.with_name(marker.name + ".pending")
+        # The ready name must not become visible until the PID payload is closed.
+        code += (f'\nwith open({str(staging)!r},"x",'
+                 'opener=lambda path,flags:os.open(path,flags,0o600)) as stream:\n'
+                 ' stream.write(json.dumps([os.getpid(),child.pid,os.getpgrp()]))\n'
+                 f'os.replace({str(staging)!r},{str(marker)!r}); '
                  'print("owned tree ready",flush=True); ')
         code += 'sys.exit(0)' if leader_exits else 'time.sleep(60)'
         return [sys.executable, "-c", code], marker
+
+    def test_owned_tree_command_publishes_only_complete_ready_marker(self):
+        command, marker = self.owned_tree_command()
+        opened_read, opened_write = os.pipe()
+        release_read, release_write = os.pipe()
+        # Execute the actual factory code unchanged, pausing only its publication
+        # open (builtins.open or Path.open/io.open), after creation before writing.
+        probe = (
+            'import builtins, io, json, os, pathlib, select, signal\n'
+            f'marker = pathlib.Path({str(marker)!r})\n'
+            'def intercept(original):\n'
+            ' def publication_open(file, mode="r", *args, **kwargs):\n'
+            '  stream = original(file, mode, *args, **kwargs)\n'
+            '  if (isinstance(file, (str, os.PathLike)) and any(flag in mode for flag in "wx")\n'
+            '      and pathlib.Path(file) in (marker, marker.with_name(marker.name + ".pending"))):\n'
+            '   record = [os.getpid(), child.pid, os.getpgrp(), str(file),\n'
+            '             os.fstat(stream.fileno()).st_size, callable(signal.getsignal(signal.SIGTERM))]\n'
+            f'   os.write({opened_write}, json.dumps(record).encode())\n'
+            f'   if not select.select([{release_read}], [], [], 5)[0]:\n'
+            '    raise RuntimeError("publication release deadline")\n'
+            f'   if os.read({release_read}, 1) != b"x":\n'
+            '    raise RuntimeError("publication release missing")\n'
+            '  return stream\n'
+            ' return publication_open\n'
+            'builtins.open = intercept(builtins.open)\n'
+            'io.open = intercept(io.open)\n'
+            f'exec({command[2]!r})\n'
+        )
+        with os.fdopen(opened_read, "rb", buffering=0) as opened, \
+                os.fdopen(opened_write, "wb", buffering=0) as notify, \
+                os.fdopen(release_read, "rb", buffering=0) as released, \
+                os.fdopen(release_write, "wb", buffering=0) as release:
+            process = subprocess.Popen([command[0], "-I", "-B", "-c", probe],
+                                       pass_fds=(notify.fileno(), released.fileno()),
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+            notify.close()
+            released.close()
+            record = None
+            try:
+                self.assertTrue(select.select([opened], [], [], 5)[0], "publication open deadline")
+                record = json.loads(opened.read(4096))
+                self.assertEqual(record[:3:2], [process.pid, process.pid])
+                self.assertEqual(record[4:], [0, True], "pause must follow open and handler installation")
+                visible = marker.exists()
+                raw = marker.read_bytes() if visible else None
+                print("publication probe:", json.dumps({"record": record, "ready_visible": visible,
+                                                       "ready_hex": raw.hex() if raw is not None else None}),
+                      flush=True)
+                self.assertFalse(visible, "ready marker visible before publication write/close")
+            finally:
+                primary_error = sys.exc_info()[1]
+                cleanup_errors = []
+                try:
+                    try:
+                        if process.poll() is None:
+                            release.write(b"x")
+                    finally:
+                        release.close()
+                    if record is not None:
+                        self.assertTrue(select.select([process.stdout], [], [], 5)[0],
+                                        "fixture readiness deadline after release")
+                        self.assertEqual(process.stdout.readline(), b"owned tree ready\n")
+                        self.assertEqual(json.loads(marker.read_text()), record[:3])
+                except Exception as error:
+                    cleanup_errors.append(error)
+                try:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        _, stderr = process.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.communicate(timeout=2)
+                        raise
+                    self.assertEqual(process.returncode, 0, stderr.decode())
+                except Exception as error:
+                    cleanup_errors.append(error)
+                try:
+                    # Even a failed publication handshake must leave no owned group.
+                    deadline = time.monotonic() + 2
+                    while True:
+                        process.poll()
+                        try:
+                            os.killpg(process.pid, 0)
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            break
+                        self.assertLess(time.monotonic(), deadline, "owned group cleanup deadline")
+                        time.sleep(0.01)
+                    process.wait(timeout=2)
+                    if record is not None:
+                        self.assert_owned_group_gone(marker)
+                except Exception as error:
+                    cleanup_errors.append(error)
+                if cleanup_errors:
+                    detail = "publication cleanup secondary errors: " + repr(cleanup_errors)
+                    print(detail, file=sys.stderr, flush=True)
+                    if primary_error is not None:
+                        add_note = getattr(primary_error, "add_note", None)
+                        if callable(add_note):
+                            add_note(detail)
+                    else:
+                        raise AssertionError(detail) from cleanup_errors[0]
+                else:
+                    print("publication probe: owned group absent; leader and child reaped", flush=True)
+
+    def test_publication_cleanup_preserves_primary_and_reports_secondary(self):
+        class SentinelPrimary(Exception):
+            pass
+
+        class SentinelSecondary(Exception):
+            pass
+
+        primary = SentinelPrimary("injected ready assertion")
+        secondary = SentinelSecondary("injected after proven quiescence")
+        original_assert_false = self.assertFalse
+        original_group_gone = self.assert_owned_group_gone
+        primary_traceback = None
+        observed = None
+        calls = []
+        stderr = io.StringIO()
+
+        def fail_ready(value, message=None):
+            nonlocal primary_traceback
+            original_assert_false(value, message)
+            self.assertEqual(message, "ready marker visible before publication write/close")
+            calls.append("ready-primary")
+            try:
+                raise primary
+            except SentinelPrimary:
+                primary_traceback = primary.__traceback__
+                raise
+
+        def fail_after_quiescence(marker):
+            original_group_gone(marker)
+            calls.append("quiescent-secondary")
+            raise secondary
+
+        with mock.patch.object(self, "assertFalse", side_effect=fail_ready), \
+                mock.patch.object(self, "assert_owned_group_gone", side_effect=fail_after_quiescence), \
+                mock.patch.object(sys, "stderr", stderr):
+            try:
+                self.test_owned_tree_command_publishes_only_complete_ready_marker()
+            except Exception as error:
+                observed = error
+
+        print(stderr.getvalue(), file=sys.stderr, end="", flush=True)
+        self.assertIs(observed, primary)
+        self.assertIs(type(observed), SentinelPrimary)
+        self.assertEqual(calls, ["ready-primary", "quiescent-secondary"])
+        self.assertEqual(stderr.getvalue(), "publication cleanup secondary errors: " + repr([secondary]) + "\n")
+        traceback = observed.__traceback__
+        while traceback is not None and traceback is not primary_traceback:
+            traceback = traceback.tb_next
+        self.assertIsNotNone(primary_traceback)
+        self.assertIs(traceback, primary_traceback)
+        print("publication failure probe: primary object/type/traceback preserved; "
+              "secondary reported after owned group absence", flush=True)
 
     def runner_fixture(self):
         self.destination.mkdir(mode=0o700)
