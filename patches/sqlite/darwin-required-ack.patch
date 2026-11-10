@@ -143,7 +143,19 @@
    if( (dirSync & 1)!=0 ){
      int fd;
      rc = osOpenDirectory(zPath, &fd);
-@@ -68365,7 +68428,8 @@
+@@ -62968,7 +63031,11 @@
+ static int pagerSyncHotJournal(Pager *pPager){
+   int rc = SQLITE_OK;
+   if( !pPager->noSync ){
++#if defined(__APPLE__)
++    rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_FULL);
++#else
+     rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_NORMAL);
++#endif
+   }
+   if( rc==SQLITE_OK ){
+     rc = sqlite3OsFileSize(pPager->jfd, &pPager->journalHdr);
+@@ -68365,7 +68432,8 @@
  /*
  ** Close an open wal-index.
  */
@@ -153,7 +165,7 @@
    if( pWal->exclusiveMode==WAL_HEAPMEMORY_MODE || pWal->bShmUnreliable ){
      int i;
      for(i=0; i<pWal->nWiData; i++){
-@@ -68374,8 +68438,13 @@
+@@ -68374,8 +68442,13 @@
      }
    }
    if( pWal->exclusiveMode!=WAL_HEAPMEMORY_MODE ){
@@ -168,7 +180,7 @@
  }
  
  /*
-@@ -69291,13 +69360,26 @@
+@@ -69291,13 +69364,26 @@
        }
      }
  

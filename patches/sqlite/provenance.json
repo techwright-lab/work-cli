@@ -43,7 +43,7 @@
     "Upgrade.md": "d151a67d4bbb1a5a300d084d210d6cd238d833a6d4bd5d958ae7469a9deccb36",
     "bindgen-bindings/bindgen_3.34.1.rs": "4f94d0192ec890b62773368cb026daf219f5182094952c007d28ed6d3812fd68",
     "bindgen-bindings/bindgen_3.34.1_ext.rs": "44ff11f09886f8c41494f65043ac2ddba4e476bb17a81fe93a8c10c7bffdf4a8",
-    "build.rs": "dfb641e4b3af3f4024854886d5e8a80598a9d0f634089655b1989e07ac2e12a1",
+    "build.rs": "a1cd4e17cfa0a8a89df76651b2d510e6604e3fed83d0452c466b779f24fa8989",
     "sqlcipher/LICENSE": "ea4fcb309f14a22065e1ea45362d494d320012249ed865fe9c7c0946db754131",
     "sqlcipher/bindgen_bundled_version.rs": "eb685154c9825ed324e3e7e2eb11efd1a6fd53634e65342856ec459bcbf2f536",
     "sqlcipher/sqlite3.c": "de78ef087cbc26e8fe584de05f1790f3e34897db8731e8154dc674d3f2df28cb",
@@ -51,7 +51,7 @@
     "sqlcipher/sqlite3ext.h": "9a91de0d5e5ccc04ec59041275c67972d6f8894f7543a10033e387b69987beb5",
     "sqlite3/bindgen_bundled_version.rs": "cf53846904130e42d81072cd63302c6d9261f45a9842c3a4093235c072398528",
     "sqlite3/bindgen_bundled_version_ext.rs": "31fed0b8f4b2d4cad09111d32e2e3e91f70e08129f50684667ea086e3b5fade7",
-    "sqlite3/sqlite3.c": "3eff5da4fd92cd6c6c756139534ccf2a5bb17fd611daf93b748f05438841a8fe",
+    "sqlite3/sqlite3.c": "542f88e2bcc33b127fba330b10cc1aab2ddcfdabd5a47fc1ef6eeb55e4328c7a",
     "sqlite3/sqlite3.h": "4340a24cda7bc436d62459c3c5237f67b9ab716ddca872faf8052d0ce0d97119",
     "sqlite3/sqlite3ext.h": "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
     "sqlite3/wasm32-wasi-vfs.c": "b95842044da2b8777876b7d3fef8c9711e8c201fb4a4255dbac98729a456bb5d",
@@ -60,6 +60,6 @@
     "wrapper.h": "b78f576f7eeabf316e183d476b0f16344b6897680b4df47628d3ce38c0aa979a",
     "wrapper_ext.h": "fa7a53fea99318ee29d75e6d5fab4d7ed26e9599803268e6a24396265f2a6f3a"
   },
-  "patch_sha256": "927a1c2f9b67d0cbbd330276072791a507e153d598cbda2889df21d78e7a3ba7",
-  "glue_patch_sha256": "033936b1891493846b34b85e65acaf23fdfc3b18f2e64970fe8bd9f8f635bf0b"
+  "patch_sha256": "b6f42d1756f877705542558ad4642d6fc6c2963a9b267399cdcae65159473f4c",
+  "glue_patch_sha256": "19049326ffc3b4e5e06702cf49bb75d45819d952d384c5168e47c1ed824d3efd"
 }

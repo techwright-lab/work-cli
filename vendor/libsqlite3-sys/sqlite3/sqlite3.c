@@ -63031,7 +63031,11 @@ SQLITE_PRIVATE void sqlite3PagerTruncateImage(Pager *pPager, Pgno nPage){
 static int pagerSyncHotJournal(Pager *pPager){
   int rc = SQLITE_OK;
   if( !pPager->noSync ){
+#if defined(__APPLE__)
+    rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_FULL);
+#else
     rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_NORMAL);
+#endif
   }
   if( rc==SQLITE_OK ){
     rc = sqlite3OsFileSize(pPager->jfd, &pPager->journalHdr);

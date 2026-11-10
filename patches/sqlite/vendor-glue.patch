@@ -45,7 +45,7 @@
 +    for (path, expected) in [
 +        (
 +            "sqlite3/sqlite3.c",
-+            "3eff5da4fd92cd6c6c756139534ccf2a5bb17fd611daf93b748f05438841a8fe",
++            "542f88e2bcc33b127fba330b10cc1aab2ddcfdabd5a47fc1ef6eeb55e4328c7a",
 +        ),
 +        (
 +            "sqlite3/sqlite3.h",
