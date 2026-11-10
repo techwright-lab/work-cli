@@ -121,6 +121,91 @@ static void journal_tests(void){
   assert(journal_sync_calls==1); assert(dir_calls==0);
   assert(journal_size_calls==1); assert(pager.journalHdr==321);
   assert(journal_ack_order==1); assert(journal_size_order==2);
+#ifdef __APPLE__
+  {
+    const int errors[]={EIO, ENOTSUP};
+    unsigned i;
+    for(i=0; i<sizeof(errors)/sizeof(errors[0]); i++){
+      unixFile failed_file={3, 0, "owned.db-journal",0,0};
+      Pager failed_pager={0, (sqlite3_file*)&failed_file, 77};
+      reset(); full_fail=1; full_fail_errno=errors[i];
+      assert(ordinary_fail==0);
+      assert(pagerSyncHotJournal(&failed_pager)==SQLITE_IOERR_FSYNC);
+      assert(journal_flags==SQLITE_SYNC_FULL); assert(journal_sync_calls==1);
+      assert(full_calls==1); assert(ordinary_calls==0);
+      assert(dir_calls==0); assert(close_calls==0);
+      assert(journal_size_calls==0); assert(failed_pager.journalHdr==77);
+      assert(journal_ack_order==0); assert(journal_size_order==0);
+      assert(journal_order==0);
+    }
+  }
+  {
+    unixFile failed_file={3, UNIXFILE_DIRSYNC, "owned.db-journal",0,0};
+    Pager failed_pager={0, (sqlite3_file*)&failed_file, 77};
+    reset(); full_fail=1;
+    assert(ordinary_fail==0);
+    assert(pagerSyncHotJournal(&failed_pager)==SQLITE_IOERR_FSYNC);
+    assert(journal_flags==SQLITE_SYNC_FULL); assert(journal_sync_calls==1);
+    assert(full_calls==1); assert(ordinary_calls==0);
+    assert(dir_calls==0); assert(close_calls==0);
+    assert(failed_file.ctrlFlags & UNIXFILE_DIRSYNC);
+    assert(journal_size_calls==0); assert(failed_pager.journalHdr==77);
+    assert(journal_ack_order==0); assert(journal_size_order==0);
+    assert(journal_order==0);
+  }
+#else
+  {
+    unixFile failed_file={3, 0, "owned.db-journal",0,0};
+    Pager failed_pager={0, (sqlite3_file*)&failed_file, 77};
+    reset(); ordinary_fail=1;
+    assert(pagerSyncHotJournal(&failed_pager)==SQLITE_IOERR_FSYNC);
+    assert(journal_flags==SQLITE_SYNC_NORMAL); assert(journal_sync_calls==1);
+    assert(full_calls==0); assert(ordinary_calls==1);
+    assert(dir_calls==0); assert(close_calls==0);
+    assert(journal_size_calls==0); assert(failed_pager.journalHdr==77);
+    assert(journal_ack_order==0); assert(journal_size_order==0);
+    assert(journal_order==0);
+  }
+#endif
+  {
+    unixFile size_file={3, 0, "owned.db-journal",0,0};
+    Pager size_pager={0, (sqlite3_file*)&size_file, 77};
+    reset(); journal_size_rc=SQLITE_IOERR_FSTAT;
+    assert(pagerSyncHotJournal(&size_pager)==SQLITE_IOERR_FSTAT);
+#ifdef __APPLE__
+    assert(journal_flags==SQLITE_SYNC_FULL);
+    assert(full_calls==1); assert(ordinary_calls==0);
+#else
+    assert(journal_flags==SQLITE_SYNC_NORMAL);
+    assert(full_calls==0); assert(ordinary_calls==1);
+#endif
+    assert(journal_sync_calls==1); assert(dir_calls==0);
+    assert(journal_size_calls==1); assert(size_pager.journalHdr==321);
+    assert(journal_ack_order==1); assert(journal_size_order==2);
+    assert(journal_order==2);
+  }
+  {
+    unixFile bypass_file={3, 0, "owned.db-journal",0,0};
+    Pager bypass_pager={1, (sqlite3_file*)&bypass_file, 77};
+    reset();
+    assert(pagerSyncHotJournal(&bypass_pager)==SQLITE_OK);
+    assert(journal_sync_calls==0); assert(journal_flags==0);
+    assert(full_calls==0); assert(ordinary_calls==0); assert(dir_calls==0);
+    assert(journal_size_calls==1); assert(bypass_pager.journalHdr==321);
+    assert(journal_ack_order==0); assert(journal_size_order==1);
+    assert(journal_order==1);
+  }
+  {
+    unixFile bypass_file={3, 0, "owned.db-journal",0,0};
+    Pager bypass_pager={1, (sqlite3_file*)&bypass_file, 77};
+    reset(); journal_size_rc=SQLITE_IOERR_FSTAT;
+    assert(pagerSyncHotJournal(&bypass_pager)==SQLITE_IOERR_FSTAT);
+    assert(journal_sync_calls==0); assert(journal_flags==0);
+    assert(full_calls==0); assert(ordinary_calls==0); assert(dir_calls==0);
+    assert(journal_size_calls==1); assert(bypass_pager.journalHdr==321);
+    assert(journal_ack_order==0); assert(journal_size_order==1);
+    assert(journal_order==1);
+  }
 }
 int main(void){
   const int types[]={SQLITE_OPEN_MAIN_DB, SQLITE_OPEN_MAIN_JOURNAL,
