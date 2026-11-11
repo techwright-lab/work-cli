@@ -157,6 +157,19 @@ const _: () = {
                 | libc::ATTR_CMN_FILEID
     );
     assert!(
+        crate::access::GIT_ACCESS_COMMON
+            == libc::ATTR_CMN_DEVID
+                | libc::ATTR_CMN_FSID
+                | libc::ATTR_CMN_OBJTYPE
+                | libc::ATTR_CMN_CHGTIME
+                | libc::ATTR_CMN_OWNERID
+                | libc::ATTR_CMN_GRPID
+                | libc::ATTR_CMN_ACCESSMASK
+                | libc::ATTR_CMN_USERACCESS
+                | libc::ATTR_CMN_EXTENDED_SECURITY
+                | libc::ATTR_CMN_FILEID
+    );
+    assert!(
         crate::topology::TOPOLOGY_COMMON
             == libc::ATTR_CMN_RETURNED_ATTRS | libc::ATTR_CMN_FILEID | libc::ATTR_CMN_FULLPATH
     );
@@ -171,8 +184,18 @@ const _: () = {
 fn observe_list(
     fd: BorrowedFd<'_>,
     name: Option<&CStr>,
+    requested: libc::attrlist,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    observe_list_with_options(fd, name, requested, buffer, libc::FSOPT_ATTR_CMN_EXTENDED)
+}
+
+fn observe_list_with_options(
+    fd: BorrowedFd<'_>,
+    name: Option<&CStr>,
     mut requested: libc::attrlist,
     buffer: &mut [u8],
+    options: u32,
 ) -> io::Result<()> {
     // SAFETY: fd is borrowed live, optional name is a live CStr validated as one
     // component by the safe caller. requested is initialized. Caller buffer is
@@ -186,14 +209,14 @@ fn observe_list(
                 (&mut requested as *mut libc::attrlist).cast(),
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
-                (libc::FSOPT_NOFOLLOW | libc::FSOPT_ATTR_CMN_EXTENDED).into(),
+                (libc::FSOPT_NOFOLLOW | options).into(),
             ),
             None => libc::fgetattrlist(
                 fd.as_raw_fd(),
                 (&mut requested as *mut libc::attrlist).cast(),
                 buffer.as_mut_ptr().cast(),
                 buffer.len(),
-                libc::FSOPT_ATTR_CMN_EXTENDED,
+                options,
             ),
         }
     };
@@ -218,6 +241,45 @@ fn list(commonattr: u32, dirattr: u32, forkattr: u32) -> libc::attrlist {
         fileattr: 0,
         forkattr,
     }
+}
+// Legacy schema: omitting RETURNED_ATTRS/PACK_INVAL preserves the kernel's
+// requested-attribute support gate. REPORT_FULLSIZE makes truncation visible.
+// SDK getattrlist(2): RETURN_REALDEV changes both DEVID and FSID. Keep the
+// selection explicit; consumers correlate Stat to metadata and Physical to the
+// actual held mount, checking all other object/ACL evidence across both calls.
+fn git_access_options(domain: crate::GitAccessDomain) -> u32 {
+    libc::FSOPT_REPORT_FULLSIZE
+        | match domain {
+            crate::GitAccessDomain::Stat => 0,
+            crate::GitAccessDomain::Physical => libc::FSOPT_RETURN_REALDEV,
+        }
+}
+pub(crate) fn git_access_fd(
+    fd: BorrowedFd<'_>,
+    domain: crate::GitAccessDomain,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    observe_list_with_options(
+        fd,
+        None,
+        list(crate::access::GIT_ACCESS_COMMON, 0, 0),
+        buffer,
+        git_access_options(domain),
+    )
+}
+pub(crate) fn git_access_at(
+    fd: BorrowedFd<'_>,
+    name: &CStr,
+    domain: crate::GitAccessDomain,
+    buffer: &mut [u8],
+) -> io::Result<()> {
+    observe_list_with_options(
+        fd,
+        Some(name),
+        list(crate::access::GIT_ACCESS_COMMON, 0, 0),
+        buffer,
+        git_access_options(domain),
+    )
 }
 pub(crate) fn access_fd(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<()> {
     observe_list(fd, None, list(crate::access::ACCESS_COMMON, 0, 0), buffer)

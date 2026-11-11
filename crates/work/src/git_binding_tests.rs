@@ -48,8 +48,8 @@ impl FakeGit {
 
 // Qualification runs in a fake-owner container. This controlled proof service
 // is used only for fixture-created paths/ancestors and models mode protection,
-// not production ownership/ACL proof. Real Linux access proof has separate tests;
-// Darwin must be Unproven.
+// not production ownership/ACL proof. Real system access policies have separate
+// native/Linux controls; an injected Unproven service must always refuse.
 #[derive(Debug)]
 struct FixtureAccess;
 impl GitAccessProof for FixtureAccess {
@@ -64,6 +64,22 @@ impl GitAccessProof for FixtureAccess {
     }
 }
 const ACCESS: FixtureAccess = FixtureAccess;
+
+// Linux fixtures exercise opaque bytes unchanged. APFS rejects malformed UTF-8
+// with EILSEQ, so native fixtures exercise non-ASCII valid UTF-8 instead. Neither
+// branch skips the route/byte-preservation assertions or changes product policy.
+fn fixture_name<'a>(linux: &'a [u8], native: &'a str) -> &'a OsStr {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = native;
+        OsStr::from_bytes(linux)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = linux;
+        OsStr::new(native)
+    }
+}
 
 fn bind(f: &FakeGit) -> GitSelection<'static> {
     qualify_candidates(&[f.candidate(GitSelectionSource::Cli)], &ACCESS).unwrap()
@@ -206,7 +222,7 @@ fn fake_git_directory_suffixes_and_ordinary_symlinks_remain_qualified() {
         symlink(path_with_suffix(&actual_helpers, suffix), &helper_alias).unwrap();
         f.helpers = path_with_suffix(&helper_alias, suffix);
         f.script("git version 2.55.0", "");
-        let directory = f.root.path().join(OsStr::from_bytes(b"bin-\xff"));
+        let directory = f.root.path().join(fixture_name(b"bin-\xff", "bin-☃"));
         fs::create_dir(&directory).unwrap();
         symlink("../git", directory.join("git")).unwrap();
         let directory_alias = f.root.path().join("bin-alias");
@@ -250,7 +266,10 @@ fn fake_git_unsearchable_directory_before_parent_refuses_explicit_path_before_pr
             "git version 2.55.0",
             &format!("touch '{}'", marker.display()),
         );
-        let directory = f.root.path().join(OsStr::from_bytes(b"no-search-\xff"));
+        let directory = f
+            .root
+            .path()
+            .join(fixture_name(b"no-search-\xff", "no-search-☃"));
         fs::create_dir(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o600)).unwrap();
         let spelling = directory.join(traversal);
@@ -547,12 +566,15 @@ fn fake_git_ambiguous_or_changed_probes_abort_default_selection() {
 }
 
 #[test]
-fn fake_git_exec_path_preserves_non_utf8_bytes_and_hardlinked_helpers() {
+fn fake_git_exec_path_preserves_platform_path_bytes_and_hardlinked_helpers() {
     let mut f = FakeGit::new();
-    let program = f.root.path().join(OsStr::from_bytes(b"git-\xff"));
+    let program = f.root.path().join(fixture_name(b"git-\xff", "git-☃"));
     fs::rename(&f.program, &program).unwrap();
     f.program = program;
-    let helpers = f.root.path().join(OsStr::from_bytes(b"helpers-\xff"));
+    let helpers = f
+        .root
+        .path()
+        .join(fixture_name(b"helpers-\xff", "helpers-☃"));
     fs::rename(&f.helpers, &helpers).unwrap();
     f.helpers = helpers;
     let mut script =
@@ -863,19 +885,32 @@ fn fake_git_owned_fixture_qualifies_through_real_linux_access_service() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn fake_git_darwin_access_is_explicitly_unproven_before_execution() {
+fn fake_git_darwin_directory_contents_are_not_acl_witness_changes() {
     let f = FakeGit::new();
-    let marker = f.root.path().join("executed");
-    f.script(
-        "git version 2.55.0",
-        &format!("touch '{}'", marker.display()),
-    );
-    let failure = select_git(&[f.candidate(GitSelectionSource::Cli)]).unwrap_err();
+    let chmod = |rights: &str| {
+        let output = Command::new("/bin/chmod")
+            .env_clear()
+            .args(["+a", rights])
+            .arg(&f.helpers)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    chmod("everyone allow readattr,readsecurity");
+    let selected = select_git(&[f.candidate(GitSelectionSource::Cli)]).unwrap();
+    fs::write(f.helpers.join("unrelated"), b"directory content, not ACL").unwrap();
+    selected.binding.revalidate().unwrap();
+    chmod("everyone allow readextattr");
     assert_eq!(
-        failure.rejections[0].error.reason,
-        GitBindingReason::AccessUnproven
+        selected.binding.revalidate().unwrap_err().reason,
+        GitBindingReason::Changed
     );
-    assert!(!marker.exists());
+    // Both ACLs are harmless; the old binding must still detect the change.
+    assert!(select_git(&[f.candidate(GitSelectionSource::Cli)]).is_ok());
 }
 
 #[test]

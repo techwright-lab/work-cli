@@ -1254,7 +1254,28 @@ class NativeGitFixtureTests(unittest.TestCase):
         self.assertEqual(len(misses), 3)
         self.assertEqual(walk.call_count, 3)
 
-    def test_footprint_walk_errors_fail_closed_without_retry_or_partial_result(self):
+    def test_footprint_recounts_after_transient_scandir_disappearance(self):
+        nested = self.base / "rmeta-temporary"
+        nested.mkdir()
+        retained = nested / "retained"
+        retained.write_bytes(b"payload" * 4096)
+        real_scandir = os.scandir
+        calls = []
+
+        def scandir(path):
+            if Path(path) == nested:
+                calls.append(path)
+                if len(calls) == 1:
+                    raise FileNotFoundError(errno.ENOENT, "compiler renamed directory", str(path))
+            return real_scandir(path)
+
+        with mock.patch.object(self.builder.os, "scandir", side_effect=scandir):
+            actual = self.builder.footprint(self.base)
+        expected = sum(p.lstat().st_blocks * 512 for p in (self.base, nested, retained))
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(calls), 2)
+
+    def test_footprint_walk_errors_fail_closed_with_bounded_enoent_recount(self):
         nested = self.base / "nested"
         nested.mkdir()
         (self.base / "counted-first").write_bytes(b"retained" * 4096)
@@ -1270,9 +1291,9 @@ class NativeGitFixtureTests(unittest.TestCase):
 
             with self.subTest(errno=code), \
                     mock.patch.object(self.builder.os, "scandir", side_effect=scandir):
-                with self.assertRaisesRegex(self.builder.Refusal, "walk"):
+                with self.assertRaisesRegex(self.builder.Refusal, "unstable.*3" if code == errno.ENOENT else "walk"):
                     self.builder.footprint(self.base)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 3 if code == errno.ENOENT else 1)
 
     def test_footprint_invalid_roots_fail_closed_before_walking(self):
         regular = self.root / "regular"

@@ -65,8 +65,24 @@ pub(crate) struct GitSelection<'a> {
     pub(crate) rejections: Vec<GitRejection>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GitAccessWitness {
+    Portable,
+    #[cfg(target_os = "macos")]
+    Darwin(DarwinGitAccessWitness),
+}
+
 trait GitAccessProof: std::fmt::Debug + Send + Sync {
     fn prove(&self, path: &Path, metadata: &fs::Metadata) -> Result<(), GitBindingError>;
+
+    fn witness(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) -> Result<GitAccessWitness, GitBindingError> {
+        self.prove(path, metadata)?;
+        Ok(GitAccessWitness::Portable)
+    }
 }
 
 #[derive(Debug)]
@@ -74,9 +90,11 @@ struct SystemGitAccess;
 
 impl GitAccessProof for SystemGitAccess {
     fn prove(&self, path: &Path, metadata: &fs::Metadata) -> Result<(), GitBindingError> {
-        // Darwin ACL/effective-access observations are not implemented yet. Mode
-        // bits there are NOT an access proof; neither accept nor ban all ACLs.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            darwin_git_access(path, metadata).map(|_| ())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = metadata;
             Err(error(path, GitBindingReason::AccessUnproven))
@@ -93,7 +111,19 @@ impl GitAccessProof for SystemGitAccess {
             )
         }
     }
+
+    #[cfg(target_os = "macos")]
+    fn witness(
+        &self,
+        path: &Path,
+        metadata: &fs::Metadata,
+    ) -> Result<GitAccessWitness, GitBindingError> {
+        darwin_git_access(path, metadata).map(GitAccessWitness::Darwin)
+    }
 }
+
+#[cfg(target_os = "macos")]
+include!("git_access_darwin.rs");
 
 #[cfg(target_os = "linux")]
 fn linux_access_policy(
@@ -128,6 +158,7 @@ struct RouteEntry {
     // File/symlink changes, including in-place executable upgrades, are not.
     data: Option<(u64, i64, i64, i64, i64)>,
     target: Option<PathBuf>,
+    access: GitAccessWitness,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,7 +218,7 @@ fn observe_route(
         }
         let meta = fs::symlink_metadata(&current)
             .map_err(|_| error(&current, GitBindingReason::Unavailable))?;
-        access.prove(&current, &meta)?;
+        let witness = access.witness(&current, &meta)?;
         let target = if meta.file_type().is_symlink() {
             Some(
                 fs::read_link(&current)
@@ -211,6 +242,7 @@ fn observe_route(
                 meta.ctime_nsec(),
             )),
             target: target.clone(),
+            access: witness,
         });
         if let Some(target) = target {
             links += 1;

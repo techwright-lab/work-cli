@@ -10,8 +10,9 @@ pub use topology::{decode_topology, DirectoryTopology, MountedVolume, TOPOLOGY_B
 
 mod access;
 pub use access::{
-    decode_access, decode_filesec, AccessError, AccessObservation, Ace, Acl, GrantExposure,
-    Principal, ACCESS_BUFFER_SIZE,
+    decode_access, decode_filesec, decode_git_access, AccessError, AccessObservation, Ace, Acl,
+    GitAccessDomain, GitAccessObservation, GitAcl, GrantExposure, Principal, ACCESS_BUFFER_SIZE,
+    GIT_ACCESS_BUFFER_SIZE,
 };
 
 mod attributes;
@@ -41,7 +42,7 @@ pub use boot::boot_session_uuid;
 pub use boot::{parse_boot_session_uuid, BootSessionError, BootSessionUuid};
 
 #[cfg(target_os = "macos")]
-pub use access::{access_at, access_fd, principal};
+pub use access::{access_at, access_fd, git_access_at, git_access_fd, principal};
 
 #[cfg(target_os = "macos")]
 pub use topology::{

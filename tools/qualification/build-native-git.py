@@ -291,7 +291,13 @@ def footprint(path):
         return info
 
     def walk_error(error):
-        # os.walk otherwise silently drops unreadable or vanished subtrees.
+        nonlocal vanished
+        # A compiler can retire a directory between lstat and scandir too.
+        # Discard this entire census, just as for a vanished file; never return
+        # a partial count. Root loss and non-ENOENT errors still fail closed.
+        if isinstance(error, FileNotFoundError):
+            vanished = error
+            return
         raise Refusal("footprint walk failed: " + str(error)) from error
 
     info = validate_root()

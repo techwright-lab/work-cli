@@ -1410,6 +1410,7 @@ dependencies = [
  "toml",
  "uuid",
  "work-contract",
+ "work-darwin",
 ]
 
 [[package]]

@@ -182,6 +182,144 @@ pub fn decode_access(bytes: &[u8]) -> Result<AccessObservation<'_>, AccessError>
     })
 }
 
+/// ACL evidence from a successful legacy-schema observation. SupportedNone is
+/// a bounded zero-length reference, not a missing returned bit or NOACL sentinel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitAcl<'a> {
+    SupportedNone,
+    Present(Acl<'a>),
+}
+
+/// The native query's device/FSID domain. REALDEV changes both fields; it must
+/// not be compared directly to normal stat's logical device on volume groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitAccessDomain {
+    Stat,
+    Physical,
+}
+
+/// Correlating metadata and ACL from one legacy-schema observation. This is not
+/// an atomic permissions snapshot; callers must bracket it with route/metadata
+/// checks. Device and filesystem IDs are separate identity domains. Object type
+/// is the SDK fsobj_type_t value, to be checked by the consuming access policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitAccessObservation<'a> {
+    /// Domain selected by the query; Stat matches normal stat, Physical does not.
+    pub device: i32,
+    /// Stat FSID may be logical on volume groups. Only the Physical observation
+    /// is correlated to an independently held mounted_volume_fd. Neither field
+    /// implies equivalence of device and FSID identity domains.
+    pub fsid: [i32; 2],
+    pub object_type: u32,
+    pub change_time: (i64, i64),
+    pub owner: u32,
+    pub group: u32,
+    pub mode: u32,
+    pub effective_access: u32,
+    pub file_id: u64,
+    pub acl: GitAcl<'a>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const GIT_ACCESS_COMMON: u32 = 0x0263_880e;
+pub const GIT_ACCESS_BUFFER_SIZE: usize = 68 + 44 + 128 * 24;
+
+/// Decode the 64-bit legacy Git access schema (common mask 0x0263880e).
+/// The caller must obtain it without RETURNED_ATTRS or PACK_INVAL_ATTRS: only a
+/// successful supported-attribute query gives a null reference its meaning.
+/// SDK getattrlist(2) aligns all fields to four bytes, including the timespec
+/// at offset 20 and FILEID at offset 60. No native structure casts are used.
+pub fn decode_git_access(bytes: &[u8]) -> Result<GitAccessObservation<'_>, AccessError> {
+    let length = usize::try_from(word(bytes, 0)?).map_err(|_| AccessError::Malformed)?;
+    if length < 68 || length % 4 != 0 {
+        return Err(AccessError::Malformed);
+    }
+    if length > GIT_ACCESS_BUFFER_SIZE {
+        return Err(AccessError::EntryBudget);
+    }
+    let bytes = bytes.get(..length).ok_or(AccessError::Malformed)?;
+    let effective_access = word(bytes, 48)?;
+    let change_time = (
+        i64::from_ne_bytes(
+            bytes[20..28]
+                .try_into()
+                .map_err(|_| AccessError::Malformed)?,
+        ),
+        i64::from_ne_bytes(
+            bytes[28..36]
+                .try_into()
+                .map_err(|_| AccessError::Malformed)?,
+        ),
+    );
+    if effective_access & !7 != 0 || !(0..1_000_000_000).contains(&change_time.1) {
+        return Err(AccessError::Inconsistent);
+    }
+    let security = crate::topology::reference(bytes, 52, 68)?;
+    let acl = if security.is_empty() {
+        GitAcl::SupportedNone
+    } else {
+        let acl = decode_filesec(security)?;
+        if acl.absent {
+            return Err(AccessError::Inconsistent);
+        }
+        GitAcl::Present(acl)
+    };
+    Ok(GitAccessObservation {
+        device: word(bytes, 4)? as i32,
+        fsid: [word(bytes, 8)? as i32, word(bytes, 12)? as i32],
+        object_type: word(bytes, 16)?,
+        change_time,
+        owner: word(bytes, 36)?,
+        group: word(bytes, 40)?,
+        mode: word(bytes, 44)?,
+        effective_access,
+        file_id: crate::topology::file_id(bytes, 60)?,
+        acl,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_git_access(buffer: &mut [u8]) -> std::io::Result<&mut [u8]> {
+    let buffer = buffer.get_mut(..GIT_ACCESS_BUFFER_SIZE).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "Git access buffer budget")
+    })?;
+    buffer.fill(0);
+    Ok(buffer)
+}
+
+/// One legacy no-follow component observation using an initialized fixed caller
+/// buffer. No payload open, refetch, retry or mode-only fallback. Native errors
+/// retain errno; invalid or unavailable evidence refuses. The default device
+/// and FSID domains require independent metadata/mounted-volume correlation.
+#[cfg(target_os = "macos")]
+pub fn git_access_at<'a>(
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    domain: GitAccessDomain,
+    buffer: &'a mut [u8],
+) -> std::io::Result<GitAccessObservation<'a>> {
+    crate::Component::new(name.to_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let buffer = prepare_git_access(buffer)?;
+    crate::ffi::git_access_at(parent, name, domain, buffer)?;
+    decode_git_access(buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Observe an already-held directory, including a route root, without a fake
+/// "."/".." component or regular-file open. The caller supplies a directory FD.
+/// One bounded legacy syscall with the same correlation requirements as
+/// git_access_at; no retry, refetch or fallback on unsupported evidence.
+#[cfg(target_os = "macos")]
+pub fn git_access_fd<'a>(
+    directory: std::os::fd::BorrowedFd<'_>,
+    domain: GitAccessDomain,
+    buffer: &'a mut [u8],
+) -> std::io::Result<GitAccessObservation<'a>> {
+    let buffer = prepare_git_access(buffer)?;
+    crate::ffi::git_access_fd(directory, domain, buffer)?;
+    decode_git_access(buffer).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Borrows an already-held object FD. One bounded read-only syscall; no retry,
 /// allocation, mode-only fallback, readable payload open or permission repair.
 /// Reobserve routes/identities around use; this call does not protect ancestors.
