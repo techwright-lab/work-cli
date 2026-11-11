@@ -65,11 +65,23 @@ fn regular_metadata_rejects_foreign_uid_even_with_otherwise_safe_shape() {
     let path = temp.path().join("file");
     fs::write(&path, b"metadata").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
-    let mut s = stamp(&open(&path, OFlags::PATH).unwrap()).unwrap();
+    // This is a controlled regular fixture for the portable metadata policy,
+    // not the production metadata-only acquisition path.
+    let mut s = stamp(&File::open(&path).unwrap()).unwrap();
     assert!(regular(&s, true).is_ok());
     s.uid = s.uid.wrapping_add(1);
     assert!(regular(&s, true).is_err());
     assert!(regular(&s, false).is_err());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn native_key_metadata_refuses_without_a_metadata_only_backend() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("key");
+    fs::write(&path, b"owned fixture").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(key_metadata(&path).is_err());
 }
 
 use crate::{

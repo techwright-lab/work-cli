@@ -624,11 +624,10 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "libsqlite3-sys"
 version = "0.36.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b4103cffefa72eb8428cb6b47d6627161e51c2739fc5e3b734584157bc642a"
 dependencies = [
  "cc",
  "pkg-config",
+ "sha2",
  "vcpkg",
 ]
 
@@ -1411,6 +1410,7 @@ dependencies = [
  "toml",
  "uuid",
  "work-contract",
+ "work-darwin",
 ]
 
 [[package]]
@@ -1423,6 +1423,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "work-darwin"
+version = "0.3.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

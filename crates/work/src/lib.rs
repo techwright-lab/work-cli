@@ -5,11 +5,20 @@
 
 #![forbid(unsafe_code)]
 
+// Require the reviewed bundled-build contract even for library-only builds.
+// This proves dependency selection, not runtime persistence or durability.
+#[cfg(target_os = "macos")]
+const _: () = rusqlite::ffi::WORK_DARWIN_REQUIRED_ACK_V1;
+
 #[cfg(test)]
 extern crate self as work_cli;
 #[cfg(test)]
 #[path = "../tests/support/run_fixture.rs"]
 pub(crate) mod test_run_fixture;
+
+#[cfg(test)]
+#[path = "../tests/support/fifo.rs"]
+pub(crate) mod test_fifo;
 
 pub mod admission;
 pub mod adopted;
@@ -38,6 +47,7 @@ pub mod error;
 pub mod events;
 pub mod finish;
 mod gap_continuation;
+mod git;
 pub mod identity;
 pub mod inspection;
 mod interactive;

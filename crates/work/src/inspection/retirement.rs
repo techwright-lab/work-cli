@@ -790,7 +790,8 @@ fn assess_path(
         }
     }
     // Same pipeline; public assessment drops the private retained outcome.
-    collect_retained(
+    collect_retained_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
         path,
         Collector::new(checkout, assertion),
         #[cfg(test)]
@@ -799,7 +800,8 @@ fn assess_path(
     .0
 }
 
-fn collect_retained(
+fn collect_retained_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     mut collector: Collector,
     #[cfg(test)] driver: Option<&Driver>,
@@ -807,7 +809,8 @@ fn collect_retained(
     let checkout = collector.checkout;
     let assertion = collector.assertion;
     let mut audit = preservation::Audit::new(checkout);
-    let remote = remote_proof::retirement_path(path, checkout, &mut audit, &mut collector);
+    let remote =
+        remote_proof::retirement_path(invocation, path, checkout, &mut audit, &mut collector);
     // Audit owns the actual collected Context's participation even when sealing
     // failed. Retain it before finish consumes Audit and decide may drop every
     // Assessment owner; report data must never reconstruct this capability.
@@ -1260,14 +1263,16 @@ pub(super) struct FreshRetirementAssessment {
     binding: crate::retirement_journal::ImmutableBinding,
 }
 
-pub(super) fn collect_fresh_prepare(
+pub(super) fn collect_fresh_prepare_with_git(
+    invocation: &crate::git::GitInvocation,
     config_path: &Path,
     checkout: Uuid,
     assertion: Option<Uuid>,
     store: Store,
     guard: crate::checkout_guard::CheckoutGuard,
 ) -> Held<FreshRetirementAssessment> {
-    collect_fresh_prepare_inner(
+    collect_fresh_prepare_inner_with_git(
+        invocation,
         config_path,
         checkout,
         assertion,
@@ -1278,7 +1283,8 @@ pub(super) fn collect_fresh_prepare(
     )
 }
 
-pub(super) fn collect_fresh_prepare_inner(
+pub(super) fn collect_fresh_prepare_inner_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     assertion: Option<Uuid>,
@@ -1291,7 +1297,8 @@ pub(super) fn collect_fresh_prepare_inner(
         parse_checkout(&id.to_string()).map_err(|_| "assertion_ineligible")?;
     }
     let collector = Collector::with_exclusive(checkout, assertion, store, guard)?;
-    collect_fresh_from_collector(
+    collect_fresh_from_collector_with_git(
+        invocation,
         path,
         collector,
         #[cfg(test)]
@@ -1299,12 +1306,14 @@ pub(super) fn collect_fresh_prepare_inner(
     )
 }
 
-fn collect_fresh_from_collector(
+fn collect_fresh_from_collector_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     collector: Collector,
     #[cfg(test)] driver: Option<&Driver>,
 ) -> Held<FreshRetirementAssessment> {
-    let (report, retained) = collect_retained(
+    let (report, retained) = collect_retained_with_git(
+        invocation,
         path,
         collector,
         #[cfg(test)]
@@ -1915,7 +1924,8 @@ fn abort_target(
     Ok((row, history.len() as u64, fence_active))
 }
 
-pub(super) fn abort_offline(
+pub(super) fn abort_offline_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     operation: Uuid,
@@ -1923,7 +1933,7 @@ pub(super) fn abort_offline(
     #[cfg(test)] fault: AbortFault,
 ) -> Held<AbortCommit> {
     use crate::retirement_journal::parse_uuid;
-    let mut budget = Budget::new();
+    let mut budget = Budget::with_git(invocation);
     // Deliberately do not inspect prepare_intents: routing is independent of it.
     // Its bytes still participate in both unchanged configuration commitments.
     let (document, first_config) = remote_proof::load_document(path, &mut budget)?;
@@ -2889,6 +2899,87 @@ pub(super) fn set_age_first_observation() {
 
 #[cfg(test)]
 use crate::inspection::fixture;
+
+#[cfg(test)]
+fn collect_retained(
+    path: &Path,
+    collector: Collector,
+    driver: Option<&Driver>,
+) -> (RetirementAssessmentReport, Option<RetainedDecision>) {
+    collect_retained_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        collector,
+        driver,
+    )
+}
+#[cfg(test)]
+fn collect_fresh_from_collector(
+    path: &Path,
+    collector: Collector,
+    driver: Option<&Driver>,
+) -> Held<FreshRetirementAssessment> {
+    collect_fresh_from_collector_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        collector,
+        driver,
+    )
+}
+#[cfg(test)]
+pub(super) fn collect_fresh_prepare_inner(
+    path: &Path,
+    checkout: Uuid,
+    assertion: Option<Uuid>,
+    store: Store,
+    guard: crate::checkout_guard::CheckoutGuard,
+    driver: Option<&Driver>,
+) -> Held<FreshRetirementAssessment> {
+    collect_fresh_prepare_inner_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        assertion,
+        store,
+        guard,
+        driver,
+    )
+}
+#[cfg(test)]
+pub(super) fn abort_offline(
+    path: &Path,
+    checkout: Uuid,
+    operation: Uuid,
+    revision: u64,
+    fault: AbortFault,
+) -> Held<AbortCommit> {
+    abort_offline_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        operation,
+        revision,
+        fault,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn collect_fresh_prepare(
+    path: &Path,
+    checkout: Uuid,
+    assertion: Option<Uuid>,
+    store: Store,
+    guard: crate::checkout_guard::CheckoutGuard,
+) -> Held<FreshRetirementAssessment> {
+    collect_fresh_prepare_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        assertion,
+        store,
+        guard,
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -5646,14 +5737,19 @@ mod tests {
                     .unwrap_err(),
                     "assertion_invalidated"
                 );
-                // Real wall/boottime samples AFTER rejection prove this is an
+                // Real time samples AFTER rejection prove this is an
                 // otherwise-unexpired published claim, not the expiry fault test.
                 let claim: serde_json::Value = serde_json::from_slice(&original_claim).unwrap();
-                let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
-                let now_ns = u64::try_from(now.tv_sec).unwrap() * 1_000_000_000
-                    + u64::try_from(now.tv_nsec).unwrap();
                 assert!(wall_time().unwrap() < claim["claim_expiry"]["wall_ms"].as_u64().unwrap());
-                assert!(now_ns < claim["claim_expiry"]["boottime_ns"].as_u64().unwrap());
+                // The stored claim currently uses Linux CLOCK_BOOTTIME. Do not
+                // fabricate a native clock or omit the remaining history checks.
+                #[cfg(target_os = "linux")]
+                {
+                    let now = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+                    let now_ns = u64::try_from(now.tv_sec).unwrap() * 1_000_000_000
+                        + u64::try_from(now.tv_nsec).unwrap();
+                    assert!(now_ns < claim["claim_expiry"]["boottime_ns"].as_u64().unwrap());
+                }
                 assert_eq!(
                     original_claim,
                     receipts::read_receipt(&f.store, original_assertion)

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/work-contract", "crates/work"]
+members = ["crates/work-contract", "crates/work", "crates/work-darwin"]
 
 [workspace.package]
 version = "0.3.0"
@@ -21,3 +21,6 @@ work-contract = { path = "crates/work-contract" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys", version = "=0.36.0" }

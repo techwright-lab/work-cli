@@ -1,12 +1,15 @@
 //! Checkout-bound operation exclusion. Non-Clone RAII; never unlinks the lock.
 use crate::store::{Result, Store, StoreError};
-use rustix::fs::{self as rfs, Mode, OFlags, ResolveFlags};
+use rustix::fs::{self as rfs, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{Mode, ResolveFlags};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 const LOCK_DIR: &str = "checkout-operations-v1";
+#[cfg(target_os = "linux")]
 const LOCK_RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS)
@@ -185,6 +188,21 @@ fn acquire(store: &Store, checkout: Uuid, exclusive: bool) -> Result<CheckoutGua
 }
 // Private shared mechanism receives the actual owner validated by one of the
 // two purpose-specific entry points above, never a validation-bypass flag.
+#[cfg(not(target_os = "linux"))]
+fn acquire_validated(
+    identity: &crate::store::AuthorityIdentity,
+    checkout: Uuid,
+    exclusive: bool,
+    schema: crate::store::InitializationRetention,
+) -> Result<CheckoutGuard> {
+    let _ = (identity, checkout, exclusive, schema);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native checkout guard incomplete",
+    )
+    .into())
+}
+#[cfg(target_os = "linux")]
 fn acquire_validated(
     identity: &crate::store::AuthorityIdentity,
     checkout: Uuid,
@@ -278,6 +296,16 @@ fn lock_file_meta(file: &File) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
+    let _ = (identity,);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native checkout guard incomplete",
+    )
+    .into())
+}
+#[cfg(target_os = "linux")]
 fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
     let directory = rfs::openat2(
         rfs::CWD,
@@ -299,6 +327,16 @@ fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
     Ok(directory)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
+    let _ = (parent, name, flags);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "native checkout guard incomplete",
+    )
+    .into())
+}
+#[cfg(target_os = "linux")]
 fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
     let additional = if flags.contains(OFlags::PATH) {
         OFlags::empty()

@@ -37,6 +37,17 @@ pub fn begin(
     config: &crate::config::Config,
     request: &AdoptedRequest,
 ) -> std::io::Result<BeginRun> {
+    begin_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        request,
+    )
+}
+pub(crate) fn begin_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &crate::config::Config,
+    request: &AdoptedRequest,
+) -> std::io::Result<BeginRun> {
     use crate::allocate::{db, err};
     request
         .validate()
@@ -58,7 +69,8 @@ pub fn begin(
         return db(store.begin_adopted_under_lease(request, &lock));
     }
     drop(lock);
-    let physical = crate::allocate::observe_checkout(&mut store, checkout, &guard)?;
+    let physical =
+        crate::allocate::observe_checkout_with_git(invocation, &mut store, checkout, &guard)?;
     let lock = crate::allocate::lifecycle_lock(&store)?;
     crate::allocate::verified_checkout_under_lease(&mut store, physical, &lock)?;
     let result = db(store.begin_adopted_under_lease(request, &lock));
@@ -98,10 +110,25 @@ fn input<T: serde::de::DeserializeOwned>() -> Result<T> {
     serde_json::from_slice(&bytes).map_err(|_| StoreError::Invalid)
 }
 pub fn command(config: &crate::config::Config, command: Command) -> Result<String> {
+    command_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        command,
+    )
+}
+pub(crate) fn command_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &crate::config::Config,
+    command: Command,
+) -> Result<String> {
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| StoreError::Invalid)?;
     match command {
         Command::Begin => {
             let request: AdoptedRequest = input()?;
-            let result = begin(config, &request).map_err(|_| StoreError::Invalid)?;
+            let result =
+                begin_with_git(invocation, config, &request).map_err(|_| StoreError::Invalid)?;
             Ok(if result == BeginRun::Created {
                 "created"
             } else {

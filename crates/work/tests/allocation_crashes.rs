@@ -1,3 +1,5 @@
+#[path = "support/fifo.rs"]
+mod fifo;
 mod support;
 use support::*;
 use uuid::Uuid;
@@ -489,14 +491,7 @@ fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
             "wrong-id" => record["checkout"] = Uuid::now_v7().to_string().into(),
             "marker-fifo" => {
                 std::fs::remove_file(&marker).unwrap();
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &marker,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&marker, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR);
             }
             "marker-oversized" => std::fs::write(&marker, vec![b' '; 16385]).unwrap(),
             "marker-symlink" => {
@@ -616,6 +611,7 @@ fn readiness_rechecks_marker_after_external_side_effects() {
     for damage in ["marker", "head"] {
         let f = Fixture::new();
         let config = Config {
+            git_path: None,
             store_dir: Some(f.temp.path().join("private")),
             trusted_registry: Some(f.temp.path().join("registry")),
             roots: vec![f.root.clone()],
@@ -671,14 +667,7 @@ fn fifo_backlink_is_not_opened_as_blocking_metadata() {
     let identity = work_cli::identity::CheckoutIdentity::inspect(&f.root.join("task")).unwrap();
     let backlink = identity.private_git_dir.join("gitdir");
     std::fs::remove_file(&backlink).unwrap();
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &backlink,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )
-    .unwrap();
+    fifo::create_fifo(&backlink, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_work"))
         .args([
             "start",
@@ -751,14 +740,7 @@ fn blocked_git_on_reserved_retry_is_bounded_and_persistently_held() {
     assert_eq!(status.signal(), Some(6));
     let config = f.repo.join(".git/config");
     std::fs::rename(&config, config.with_extension("original")).unwrap();
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &config,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )
-    .unwrap();
+    fifo::create_fifo(&config, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR);
     let before = std::time::Instant::now();
     let out = f.start(&operation.to_string(), "task", "topic", &[]);
     assert!(!out.status.success());
@@ -779,6 +761,7 @@ fn moved_reuse_branch_boundary_is_persistently_held() {
     let f = Fixture::new();
     git(&f.repo, &["branch", "topic"]);
     let config = Config {
+        git_path: None,
         store_dir: Some(f.temp.path().join("private")),
         trusted_registry: Some(f.temp.path().join("registry")),
         roots: vec![f.root.clone()],

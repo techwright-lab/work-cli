@@ -1,4 +1,6 @@
 //! Native fixtures are SOURCE ONLY until isolated CI. No synthetic completeness authority.
+#[path = "support/fifo.rs"]
+mod fifo;
 #[path = "support/inspection_fixture.rs"]
 mod fixture;
 use std::{
@@ -291,14 +293,7 @@ fn auxiliary_pack_metadata_refuses_unsafe_or_unknown_inputs() {
             }
             "rev-fifo" => {
                 fs::remove_file(&reverse).unwrap();
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &reverse,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&reverse, rustix::fs::Mode::RUSR);
             }
             "info-link" => {
                 fs::remove_file(&info).unwrap();
@@ -562,14 +557,7 @@ fn native_git_input_preflight_and_manifest() {
                 symlink(&sentinel, dir.join("0".repeat(38))).unwrap();
             }
             "ref-fifo" => {
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    f.common().join("refs/heads/fifo"),
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&f.common().join("refs/heads/fifo"), rustix::fs::Mode::RUSR);
             }
             "config-link" => {
                 fs::remove_file(f.common().join("config")).unwrap();
@@ -621,14 +609,7 @@ fn private_refs_reject_links_special_files_and_nonempty_directories_before_git()
             }
             "fifo" => {
                 fs::remove_dir(&refs).unwrap();
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &refs,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&refs, rustix::fs::Mode::RUSR);
             }
             "regular-file" => {
                 fs::remove_dir(&refs).unwrap();

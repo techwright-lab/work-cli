@@ -1,0 +1,18 @@
+[package]
+name = "work-darwin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+description = "Internal bounded Darwin observation adapter for work-cli"
+
+# Deliberate, operator-approved FFI boundary: do not inherit the application's
+# workspace forbid. Individual reviewed FFI modules must opt into unsafe code.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "=0.2.191"

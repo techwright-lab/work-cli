@@ -2,7 +2,11 @@
 //! Tests were authored before this logic; no local RED/GREEN claim.
 use super::*;
 use crate::config::{Config, ConfigDocument};
-use rustix::fs::{self as rfs, Mode, OFlags, ResolveFlags};
+#[cfg(any(target_os = "linux", test))]
+use rustix::fs as rfs;
+use rustix::fs::OFlags;
+#[cfg(target_os = "linux")]
+use rustix::fs::{Mode, ResolveFlags};
 use serde::Serialize;
 use std::{
     fs::File,
@@ -126,8 +130,20 @@ pub fn prepare_recovery_refused(checkout: Uuid) -> RecoveryReport {
 }
 
 pub fn prepare_recovery(checkout: Uuid, operation: Uuid) -> RecoveryReport {
+    prepare_recovery_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        checkout,
+        operation,
+    )
+}
+pub(crate) fn prepare_recovery_with_git(
+    invocation: &crate::git::GitInvocation,
+    checkout: Uuid,
+    operation: Uuid,
+) -> RecoveryReport {
     match Config::discover_path() {
-        Some(path) => prepare_path(
+        Some(path) => prepare_path_with_git(
+            invocation,
             &path,
             checkout,
             operation,
@@ -521,7 +537,8 @@ struct FreshRecoveryPlan {
     key: CommonKey,
 }
 
-fn prepare_path(
+fn prepare_path_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     operation: Uuid,
@@ -545,7 +562,8 @@ fn prepare_path(
         fault,
     );
     let mut audit = preservation::Audit::new(checkout);
-    let remote = remote_proof::recovery_path(path, checkout, &mut audit, &mut collector);
+    let remote =
+        remote_proof::recovery_path(invocation, path, checkout, &mut audit, &mut collector);
     let preservation = audit.finish(remote);
     let failure = collector.failure;
     let mutating_git = collector.mutating_git;
@@ -1326,6 +1344,7 @@ fn short_context_matches(
 
 fn receipt_reason(error: ReceiptError) -> &'static str {
     match error {
+        ReceiptError::NativeIncomplete => "native_backend_incomplete",
         ReceiptError::Conflict => "receipt_conflict",
         ReceiptError::CapacityFull => "capacity_full",
         ReceiptError::UnsafeReceiptStore => "unsafe_receipt_store",
@@ -1346,6 +1365,7 @@ fn hash32(digest: &sha2::digest::Output<Sha256>) -> [u8; 32] {
 }
 
 const LOCK_DIR: &str = "recovery-preparation-locks-v1";
+#[cfg(target_os = "linux")]
 const LOCK_RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS)
@@ -1379,6 +1399,12 @@ fn lock_file_meta(file: &File) -> Held<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+fn open_lock_authority(store: &Store) -> Held<File> {
+    let _ = (store,);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn open_lock_authority(store: &Store) -> Held<File> {
     let identity = store.authority_identity();
     let directory = rfs::openat2(
@@ -1401,6 +1427,12 @@ fn open_lock_authority(store: &Store) -> Held<File> {
     Ok(directory)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
+    let _ = (parent, name, flags);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
     let additional = if flags.contains(OFlags::PATH) {
         OFlags::empty()
@@ -1418,6 +1450,12 @@ fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
     .map_err(|_| "lock_unknown")
 }
 
+#[cfg(not(target_os = "linux"))]
+fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    let _ = (store, key);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     let authority = open_lock_authority(store)?;
     let authority_id = lock_identity(&authority)?;
@@ -1462,6 +1500,12 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    let _ = (store, key);
+    Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     let authority = open_lock_authority(store)?;
     let authority_id = lock_identity(&authority)?;
@@ -1617,6 +1661,17 @@ pub(super) fn prepare_for_assessment(path: &Path, checkout: Uuid) -> RecoveryRep
 
 #[cfg(test)]
 use crate::inspection::fixture;
+
+#[cfg(test)]
+fn prepare_path(path: &Path, checkout: Uuid, operation: Uuid, fault: Fault) -> RecoveryReport {
+    prepare_path_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        operation,
+        fault,
+    )
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,6 @@
 //! Public native setup CLI in disposable owned homes. Never uses live authority.
+#[path = "support/fifo.rs"]
+mod fifo;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -2427,14 +2429,7 @@ fn unsafe_artifact(
             fs::write(path, b"unknown private artifact").unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
         }
-        "fifo" => rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .unwrap(),
+        "fifo" => fifo::create_fifo(path, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR),
         "socket" => return Some(std::os::unix::net::UnixListener::bind(path).unwrap()),
         _ => panic!("unknown artifact fixture: {kind}"),
     }

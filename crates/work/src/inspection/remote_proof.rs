@@ -3,11 +3,13 @@
 //! same-UID containment. Two advertisements cannot detect an away-and-back move.
 use super::*;
 use crate::config::{Config, ConfigDocument, RemoteTarget};
-use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags};
-use std::{
-    ffi::CString, mem::MaybeUninit, os::fd::OwnedFd, os::unix::ffi::OsStrExt, process::Command,
-};
+use rustix::fs::{self as rfs, OFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{AtFlags, FileType, Mode, ResolveFlags};
+use std::{ffi::CString, os::fd::OwnedFd, os::unix::ffi::OsStrExt, process::Command};
 
+#[cfg(target_os = "linux")]
+use std::mem::MaybeUninit;
 type Held<T> = Result<T, &'static str>;
 const PROCESS_OUTPUT: usize = 1024 * 1024;
 
@@ -86,8 +88,15 @@ impl RemoteReport {
 /// Observe the actual existing authority and configured target for this checkout.
 /// No caller-supplied URL, ref, advertisement, receipt or context can enter here.
 pub fn verify_remote(checkout: Uuid) -> RemoteReport {
+    verify_remote_with_git(&crate::git::GitInvocation::unconfigured(None), checkout)
+}
+pub(crate) fn verify_remote_with_git(
+    invocation: &crate::git::GitInvocation,
+    checkout: Uuid,
+) -> RemoteReport {
     match Config::discover_path() {
-        Some(path) => verify_path(
+        Some(path) => verify_path_with_git(
+            invocation,
             &path,
             checkout,
             #[cfg(test)]
@@ -117,6 +126,9 @@ pub(super) fn load_document(
     }
     let text = std::str::from_utf8(&bytes).map_err(|_| "configuration_unknown")?;
     let document = ConfigDocument::from_text(text).map_err(|_| "configuration_unknown")?;
+    b.git
+        .configure(document.git_path().map_err(|_| "configuration_unknown")?)
+        .map_err(|_| "configuration_changed")?;
     Ok((document, manifest))
 }
 fn readonly_context(config: &Config, checkout: Uuid, b: &mut Budget) -> Held<Context> {
@@ -194,14 +206,17 @@ fn notify(observer: &mut Observer<'_>, phase: Phase, scratch: &Scratch) {
     });
 }
 
-fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>) -> RemoteReport {
+fn verify_path_with_git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+    checkout: Uuid,
+    #[cfg(test)] observer: Observer<'_>,
+) -> RemoteReport {
     verify_with_audit(
+        invocation,
         path,
         checkout,
-        None,
-        None,
-        None,
-        None,
+        Collectors::default(),
         #[cfg(test)]
         TestHooks {
             observer,
@@ -210,11 +225,13 @@ fn verify_path(path: &Path, checkout: Uuid, #[cfg(test)] observer: Observer<'_>)
     )
 }
 pub(super) fn audit_configured(
+    invocation: &crate::git::GitInvocation,
     checkout: Uuid,
     audit: &mut super::preservation::Audit,
 ) -> RemoteReport {
     match Config::discover_path() {
-        Some(path) => audit_path(
+        Some(path) => audit_path_with_git(
+            invocation,
             &path,
             checkout,
             audit,
@@ -224,19 +241,21 @@ pub(super) fn audit_configured(
         None => RemoteReport::held(checkout),
     }
 }
-pub(super) fn audit_path(
+pub(super) fn audit_path_with_git(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     audit: &mut super::preservation::Audit,
     #[cfg(test)] before_recheck: Option<&mut dyn FnMut()>,
 ) -> RemoteReport {
     verify_with_audit(
+        invocation,
         path,
         checkout,
-        Some(audit),
-        None,
-        None,
-        None,
+        Collectors {
+            audit: Some(audit),
+            ..Collectors::default()
+        },
         #[cfg(test)]
         TestHooks {
             observer: None,
@@ -245,18 +264,21 @@ pub(super) fn audit_path(
     )
 }
 pub(super) fn approval_path(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     audit: &mut super::preservation::Audit,
     collector: &mut super::approval::Collector,
 ) -> RemoteReport {
     verify_with_audit(
+        invocation,
         path,
         checkout,
-        Some(audit),
-        Some(collector),
-        None,
-        None,
+        Collectors {
+            audit: Some(audit),
+            approval: Some(collector),
+            ..Collectors::default()
+        },
         #[cfg(test)]
         TestHooks {
             observer: None,
@@ -265,18 +287,21 @@ pub(super) fn approval_path(
     )
 }
 pub(super) fn recovery_path(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     audit: &mut super::preservation::Audit,
     collector: &mut super::recovery_refs::Collector,
 ) -> RemoteReport {
     verify_with_audit(
+        invocation,
         path,
         checkout,
-        Some(audit),
-        None,
-        Some(collector),
-        None,
+        Collectors {
+            audit: Some(audit),
+            recovery: Some(collector),
+            ..Collectors::default()
+        },
         #[cfg(test)]
         TestHooks {
             observer: None,
@@ -285,18 +310,21 @@ pub(super) fn recovery_path(
     )
 }
 pub(super) fn retirement_path(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
     audit: &mut super::preservation::Audit,
     collector: &mut super::retirement::Collector,
 ) -> RemoteReport {
     verify_with_audit(
+        invocation,
         path,
         checkout,
-        Some(audit),
-        None,
-        None,
-        Some(collector),
+        Collectors {
+            audit: Some(audit),
+            retirement: Some(collector),
+            ..Collectors::default()
+        },
         #[cfg(test)]
         TestHooks {
             observer: None,
@@ -304,21 +332,32 @@ pub(super) fn retirement_path(
         },
     )
 }
+#[derive(Default)]
+struct Collectors<'a> {
+    audit: Option<&'a mut super::preservation::Audit>,
+    approval: Option<&'a mut super::approval::Collector>,
+    recovery: Option<&'a mut super::recovery_refs::Collector>,
+    retirement: Option<&'a mut super::retirement::Collector>,
+}
 fn verify_with_audit(
+    invocation: &crate::git::GitInvocation,
     path: &Path,
     checkout: Uuid,
-    mut audit: Option<&mut super::preservation::Audit>,
-    mut approval: Option<&mut super::approval::Collector>,
-    mut recovery: Option<&mut super::recovery_refs::Collector>,
-    mut retirement: Option<&mut super::retirement::Collector>,
+    collectors: Collectors<'_>,
     #[cfg(test)] hooks: TestHooks<'_>,
 ) -> RemoteReport {
+    let Collectors {
+        mut audit,
+        mut approval,
+        mut recovery,
+        mut retirement,
+    } = collectors;
     #[cfg(test)]
     let TestHooks {
         mut observer,
         before_recheck,
     } = hooks;
-    let mut b = Budget::new();
+    let mut b = Budget::with_git(invocation);
     let mut audit_nonancestor = false;
     let mut approval_retained = None;
     let mut recovery_retained = None;
@@ -432,7 +471,7 @@ fn verify_with_audit(
         }
         let urls = native(
             &identity.path,
-            &[
+            [
                 "config",
                 "--null",
                 "--get-all",
@@ -458,7 +497,7 @@ fn verify_with_audit(
         };
         native(
             &scratch.path,
-            &[
+            [
                 "init",
                 "--bare",
                 "--template=",
@@ -501,7 +540,7 @@ fn verify_with_audit(
             // a scratch path, fetch selector or externally supplied report.
             let graph = native(
                 &verification,
-                &["rev-list", "--objects", "--no-object-names", &remote],
+                ["rev-list", "--objects", "--no-object-names", &remote],
                 None,
                 &mut b,
             )?;
@@ -538,7 +577,7 @@ fn verify_with_audit(
         validate_scratch_repository(&verification, inputs.format, &mut b)?;
         let ancestry = run(
             &verification,
-            &["merge-base", "--is-ancestor", &local, &remote],
+            ["merge-base", "--is-ancestor", &local, &remote],
             None,
             &mut b,
         )?;
@@ -941,7 +980,8 @@ pub(super) fn run_inspection_command(
         .ok_or(IncompleteReason::ContextUnavailable)?;
     // Parent has already appended the subcommand. Command-line -c must precede
     // it: install equivalent protected configuration through GIT_CONFIG_COUNT.
-    let mut settings = git_command(None);
+    let mut settings = Command::new(command.get_program());
+    git_profile(&mut settings, None);
     configure(&mut settings, home, None);
     let args: Vec<_> = settings.get_args().collect();
     let mut config = Vec::new();
@@ -968,17 +1008,39 @@ pub(super) fn run_inspection_command(
     }
     bounded(command, input_bytes, b, repository)
 }
-fn run(cwd: &Path, args: &[&str], transport: Option<&str>, b: &mut Budget) -> Held<ProcessOutput> {
-    let mut command = git_command(Some(cwd));
-    configure(
-        &mut command,
-        b.remote_home.as_deref().ok_or("scratch_unknown")?,
-        transport,
-    );
-    command.args(args);
-    bounded(&mut command, b"", b, true).map_err(|_| "git_unknown")
+fn run(
+    cwd: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    transport: Option<&str>,
+    b: &mut Budget,
+) -> Held<ProcessOutput> {
+    b.check().map_err(|_| "git_unknown")?;
+    let invocation = b.git.clone();
+    let binding = invocation.binding().map_err(|_| "git_unknown")?;
+    let home = b.remote_home.as_deref().ok_or("scratch_unknown")?;
+    let prepared = binding.command(std::iter::empty::<&str>(), |command| {
+        git_profile(command, Some(cwd));
+        // Scratch ownership remains a caller prerequisite; no ambient HOME.
+        configure(command, home, transport);
+        command.args(args);
+    });
+    let prepared = prepared.map_err(|_| "git_unknown")?;
+    match prepared.dispatch(|command| bounded(command, b"", b, true)) {
+        Ok(result) => result.map_err(|_| "git_unknown"),
+        Err(error) => {
+            if error.possibly_executed {
+                b.remote_reap_unknown = true;
+            }
+            Err("git_unknown")
+        }
+    }
 }
-fn native(cwd: &Path, args: &[&str], transport: Option<&str>, b: &mut Budget) -> Held<Vec<u8>> {
+fn native(
+    cwd: &Path,
+    args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    transport: Option<&str>,
+    b: &mut Budget,
+) -> Held<Vec<u8>> {
     let output = run(cwd, args, transport, b)?;
     if output.code != 0 {
         return Err("git_unknown");
@@ -1006,7 +1068,7 @@ fn advertisement(
 ) -> Held<String> {
     let bytes = native(
         cwd,
-        &[
+        [
             "ls-remote",
             "--quiet",
             "--exit-code",
@@ -1021,6 +1083,21 @@ fn advertisement(
     )?;
     advertised(&bytes, &target.branch, format)
 }
+fn local_upload_pack(path: &Path) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    // Git treats upload-pack as a shell command, even for a local transport.
+    // Quote the validated path as one word, preserving opaque Unix path bytes.
+    let mut option = b"--upload-pack='".to_vec();
+    for byte in path.as_os_str().as_bytes() {
+        if *byte == b'\'' {
+            option.extend_from_slice(b"'\\''");
+        } else {
+            option.push(*byte);
+        }
+    }
+    option.push(b'\'');
+    std::ffi::OsString::from_vec(option)
+}
 fn fetch(
     cwd: &Path,
     url: &str,
@@ -1030,25 +1107,31 @@ fn fetch(
     b: &mut Budget,
 ) -> Held<()> {
     let refspec = format!("{source}:{destination}");
-    native(
-        cwd,
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--no-write-fetch-head",
-            "--no-auto-maintenance",
-            "--no-write-commit-graph",
-            "--refmap=",
-            "--upload-pack=/usr/bin/git-upload-pack",
-            "--",
-            url,
-            &refspec,
-        ],
-        Some(transport),
-        b,
-    )?;
+    let mut args: Vec<std::ffi::OsString> = [
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "--no-recurse-submodules",
+        "--no-write-fetch-head",
+        "--no-auto-maintenance",
+        "--no-write-commit-graph",
+        "--refmap=",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
+    if transport == "LOCAL" {
+        args.push(local_upload_pack(
+            b.git.binding().map_err(|_| "git_unknown")?.upload_pack(),
+        ));
+    }
+    // This controls only a local file-transport helper, not a remote host.
+    args.extend(
+        ["--", url, &refspec]
+            .into_iter()
+            .map(std::ffi::OsString::from),
+    );
+    native(cwd, &args, Some(transport), b)?;
     Ok(())
 }
 fn verified_commit(
@@ -1057,10 +1140,10 @@ fn verified_commit(
     format: ObjectFormat,
     b: &mut Budget,
 ) -> Held<String> {
-    let bytes = native(cwd, &["rev-parse", "--verify", reference], None, b)?;
+    let bytes = native(cwd, ["rev-parse", "--verify", reference], None, b)?;
     let id = input(oid(input(line(&bytes))?, format))?;
     let id = std::str::from_utf8(&id).map_err(|_| "object_unknown")?;
-    if native(cwd, &["cat-file", "-t", id], None, b)? != b"commit\n" {
+    if native(cwd, ["cat-file", "-t", id], None, b)? != b"commit\n" {
         return Err("object_unknown");
     }
     Ok(id.to_string())
@@ -1068,7 +1151,7 @@ fn verified_commit(
 fn validate_objects(cwd: &Path, id: &str, b: &mut Budget) -> Held<()> {
     native(
         cwd,
-        &["fsck", "--full", "--no-reflogs", "--no-dangling", id],
+        ["fsck", "--full", "--no-reflogs", "--no-dangling", id],
         None,
         b,
     )?;
@@ -1199,9 +1282,16 @@ impl Scratch {
         &self.path
     }
 }
+#[cfg(target_os = "linux")]
 fn stat_id(stat: &rfs::Stat) -> (u64, u64) {
     (stat.st_dev, stat.st_ino)
 }
+#[cfg(not(target_os = "linux"))]
+fn beneath(parent: &OwnedFd, name: &std::ffi::CStr, flags: OFlags) -> Held<OwnedFd> {
+    let _ = (parent, name, flags);
+    Err("native_scratch_backend_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn beneath(parent: &OwnedFd, name: &std::ffi::CStr, flags: OFlags) -> Held<OwnedFd> {
     rfs::openat2(
         parent,
@@ -1216,6 +1306,12 @@ fn beneath(parent: &OwnedFd, name: &std::ffi::CStr, flags: OFlags) -> Held<Owned
     .map_err(|_| "scratch_unknown")
 }
 impl Scratch {
+    #[cfg(not(target_os = "linux"))]
+    fn create(config: &Config, context: &Context, id: Uuid, b: &mut Budget) -> Held<Self> {
+        let _ = (config, context, id, b);
+        Err("native_scratch_backend_incomplete")
+    }
+    #[cfg(target_os = "linux")]
     fn create(config: &Config, context: &Context, id: Uuid, b: &mut Budget) -> Held<Self> {
         input(b.check())?;
         let name = format!("work-verify-{id}");
@@ -1274,6 +1370,12 @@ impl Scratch {
         result.check()?;
         Ok(result)
     }
+    #[cfg(not(target_os = "linux"))]
+    fn check(&self) -> Held<()> {
+        let _ = (self,);
+        Err("native_scratch_backend_incomplete")
+    }
+    #[cfg(target_os = "linux")]
     fn check(&self) -> Held<()> {
         let parent = rfs::fstat(&self.parent).map_err(|_| "scratch_unknown")?;
         let named_parent = rfs::statat(rfs::CWD, c"/tmp", AtFlags::SYMLINK_NOFOLLOW)
@@ -1306,6 +1408,12 @@ impl Scratch {
         }
         Ok(())
     }
+    #[cfg(not(target_os = "linux"))]
+    fn cleanup(&self, b: &mut Budget) -> Held<()> {
+        let _ = (self, b);
+        Err("native_scratch_backend_incomplete")
+    }
+    #[cfg(target_os = "linux")]
     fn cleanup(&self, b: &mut Budget) -> Held<()> {
         if b.remote_reap_unknown {
             return Err("cleanup_unknown");
@@ -1428,6 +1536,12 @@ fn cleanup_time(b: &Budget) -> Held<()> {
         Ok(())
     }
 }
+#[cfg(not(target_os = "linux"))]
+fn cleanup_binding(actual: &rfs::Stat, node: &CleanupNode) -> Held<()> {
+    let _ = (actual, node);
+    Err("native_scratch_backend_incomplete")
+}
+#[cfg(target_os = "linux")]
 fn cleanup_binding(actual: &rfs::Stat, node: &CleanupNode) -> Held<()> {
     if stat_id(actual) != stat_id(&node.stat)
         || actual.st_uid != node.stat.st_uid
@@ -1442,6 +1556,31 @@ fn cleanup_binding(actual: &rfs::Stat, node: &CleanupNode) -> Held<()> {
 
 #[cfg(test)]
 use crate::inspection::fixture;
+
+#[cfg(test)]
+fn verify_path(path: &Path, checkout: Uuid, observer: Observer<'_>) -> RemoteReport {
+    verify_path_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        observer,
+    )
+}
+#[cfg(test)]
+pub(super) fn audit_path(
+    path: &Path,
+    checkout: Uuid,
+    audit: &mut super::preservation::Audit,
+    before_recheck: Option<&mut dyn FnMut()>,
+) -> RemoteReport {
+    audit_path_with_git(
+        &crate::git::GitInvocation::unconfigured(None),
+        path,
+        checkout,
+        audit,
+        before_recheck,
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -1682,7 +1821,7 @@ mod tests {
         budget.remote_home = Some(temp.path().to_owned());
         // A finite capacity fault, not forged command output or a timing gate.
         budget.counters.observed_process_bytes = (PROCESS_OUTPUT - 1) as u64;
-        assert!(native(temp.path(), &["--version"], None, &mut budget).is_err());
+        assert!(native(temp.path(), ["--version"], None, &mut budget).is_err());
         assert!(budget.remote_reap_unknown);
     }
     #[test]
@@ -1863,5 +2002,17 @@ mod tests {
                 fs::remove_dir_all(named).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod local_helper_tests {
+    use super::*;
+    #[test]
+    fn local_upload_pack_quotes_the_selected_path_as_one_literal_shell_word() {
+        assert_eq!(
+            local_upload_pack(Path::new("/owned/helper ' spaced")).as_bytes(),
+            b"--upload-pack='/owned/helper '\\'' spaced'"
+        );
     }
 }

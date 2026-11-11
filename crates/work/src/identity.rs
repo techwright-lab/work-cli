@@ -6,7 +6,6 @@ use std::{
     io::Read,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::Command,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -26,35 +25,45 @@ pub struct CheckoutIdentity {
 fn hold(reason: &str) -> io::Error {
     io::Error::other(reason)
 }
-fn git(path: &Path, args: &[&std::ffi::OsStr]) -> io::Result<String> {
-    let output = crate::bounded_process::output(
-        Command::new("/usr/bin/git")
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("LC_ALL", "C")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            // Identity is the stored object graph, never user-supplied parents.
-            // Override legacy grafts as well as modern replacement objects.
-            .env("GIT_GRAFT_FILE", "/dev/null")
-            // Unsupported Git versions fail closed before inspecting objects;
-            // partial clones must not fetch missing objects during authority proof.
-            .args(["--no-replace-objects", "--no-lazy-fetch"])
-            .args([
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "credential.helper=",
-            ])
-            .args(args)
-            .current_dir(path),
-        std::time::Duration::from_secs(2),
-        1024 * 1024,
-    )
-    .map_err(hold)?;
+fn git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+    args: &[&std::ffi::OsStr],
+) -> io::Result<String> {
+    let binding = invocation.require()?;
+    let command = binding
+        .command(std::iter::empty::<&str>(), |command| {
+            command
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("LC_ALL", "C")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                // Identity is the stored object graph, never user-supplied parents.
+                // Override legacy grafts as well as modern replacement objects.
+                .env("GIT_GRAFT_FILE", "/dev/null")
+                // Unsupported Git versions fail closed before inspecting objects;
+                // partial clones must not fetch missing objects during authority proof.
+                .args(["--no-replace-objects", "--no-lazy-fetch"])
+                .args([
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "credential.helper=",
+                ])
+                .args(args)
+                .current_dir(path);
+        })
+        .map_err(|_| hold("Git binding changed before identity dispatch"))?;
+    let output = command
+        .dispatch(|command| {
+            crate::bounded_process::output(command, std::time::Duration::from_secs(2), 1024 * 1024)
+        })
+        .map_err(std::io::Error::other)?
+        .map_err(hold)?;
     if !output.status.success() {
         return Err(hold(
             "Git operation failed; hold for reconciliation (no fallback)",
@@ -83,9 +92,12 @@ pub(crate) fn read_metadata(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
 
 /// Controlled creation: executable checkout filters (including LFS) are unsupported.
 /// Inspect every effective value, including includes and worktree-local configuration.
-pub(crate) fn preflight_creation(path: &Path) -> io::Result<()> {
+pub(crate) fn preflight_creation_with_git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+) -> io::Result<()> {
     // --list succeeds for an empty filter set, unlike --get-regexp's ambiguous exit 1.
-    let config = query(path, &["config", "--null", "--list"])?;
+    let config = query_with_git(invocation, path, &["config", "--null", "--list"])?;
     for entry in config.split('\0') {
         if let Some((key, value)) = entry.split_once('\n') {
             let key = key.to_ascii_lowercase();
@@ -109,29 +121,51 @@ pub(crate) fn preflight_creation(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn query(path: &Path, args: &[&str]) -> io::Result<String> {
+    query_with_git(&crate::git::GitInvocation::new(None, None), path, args)
+}
+pub(crate) fn query_with_git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+    args: &[&str],
+) -> io::Result<String> {
     git(
+        invocation,
         path,
         &args.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>(),
     )
 }
 impl CheckoutIdentity {
     pub fn inspect(path: &Path) -> io::Result<Self> {
+        Self::inspect_with_git(&crate::git::GitInvocation::new(None, None), path)
+    }
+    pub(crate) fn inspect_with_git(
+        invocation: &crate::git::GitInvocation,
+        path: &Path,
+    ) -> io::Result<Self> {
         if fs::symlink_metadata(path)?.file_type().is_symlink() {
             return Err(hold("symlink checkout unsupported"));
         }
         let path = path.canonicalize()?;
         let meta = fs::metadata(&path)?;
-        let top = PathBuf::from(query(&path, &["rev-parse", "--show-toplevel"])?).canonicalize()?;
+        let top = PathBuf::from(query_with_git(
+            invocation,
+            &path,
+            &["rev-parse", "--show-toplevel"],
+        )?)
+        .canonicalize()?;
         if top != path {
             return Err(hold("not a worktree root"));
         }
-        let private_git_dir = PathBuf::from(query(
+        let private_git_dir = PathBuf::from(query_with_git(
+            invocation,
             &path,
             &["rev-parse", "--path-format=absolute", "--git-dir"],
         )?)
         .canonicalize()?;
-        let common_git_dir = PathBuf::from(query(
+        let common_git_dir = PathBuf::from(query_with_git(
+            invocation,
             &path,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         )?)
@@ -143,7 +177,11 @@ impl CheckoutIdentity {
             if Path::new(backlink.trim_end_matches('\n')) != path.join(".git") {
                 return Err(hold("Git backlink mismatch"));
             }
-            let registration = query(&path, &["worktree", "list", "--porcelain", "-z"])?;
+            let registration = query_with_git(
+                invocation,
+                &path,
+                &["worktree", "list", "--porcelain", "-z"],
+            )?;
             let expected = format!(
                 "worktree {}",
                 path.to_str()
@@ -154,7 +192,7 @@ impl CheckoutIdentity {
             }
         }
         Ok(Self {
-            head: query(&path, &["rev-parse", "HEAD"])?,
+            head: query_with_git(invocation, &path, &["rev-parse", "HEAD"])?,
             boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
                 .trim()
                 .to_owned(),
@@ -175,7 +213,18 @@ pub fn move_worktree(
     expected: &CheckoutIdentity,
     destination: &Path,
 ) -> io::Result<CheckoutIdentity> {
-    let current = CheckoutIdentity::inspect(&expected.path)?;
+    move_worktree_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        expected,
+        destination,
+    )
+}
+pub(crate) fn move_worktree_with_git(
+    invocation: &crate::git::GitInvocation,
+    expected: &CheckoutIdentity,
+    destination: &Path,
+) -> io::Result<CheckoutIdentity> {
+    let current = CheckoutIdentity::inspect_with_git(invocation, &expected.path)?;
     if &current != expected {
         return Err(hold("identity changed; reconcile"));
     }
@@ -200,10 +249,11 @@ pub fn move_worktree(
         .ok_or_else(|| hold("invalid destination"))?;
     let destination = parent.join(name);
     // Revalidate immediately before the only mutation. No force, no blind rename.
-    if CheckoutIdentity::inspect(&expected.path)? != current {
+    if CheckoutIdentity::inspect_with_git(invocation, &expected.path)? != current {
         return Err(hold("identity changed before move"));
     }
     git(
+        invocation,
         &current.path,
         &[
             "worktree".as_ref(),
@@ -213,7 +263,7 @@ pub fn move_worktree(
             destination.as_os_str(),
         ],
     )?;
-    let moved = CheckoutIdentity::inspect(&destination)?;
+    let moved = CheckoutIdentity::inspect_with_git(invocation, &destination)?;
     if moved.directory != current.directory
         || moved.private_git_dir != current.private_git_dir
         || moved.common_git_dir != current.common_git_dir
