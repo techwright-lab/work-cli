@@ -3005,17 +3005,17 @@ fn directory_next<T>(
 mod filesystem {
     use super::*;
     use crate::disposal::RawPath;
+    #[cfg(target_os = "macos")]
+    use rustix::fs::AtFlags;
     use rustix::fs::{self, FileType, Mode, OFlags};
     #[cfg(target_os = "linux")]
     use rustix::fs::{AtFlags, RawDir, ResolveFlags};
-    use std::{
-        collections::BTreeSet,
-        ffi::CString,
-        fs::File,
-        os::fd::{AsRawFd, OwnedFd},
-        path::Path,
-    };
+    #[cfg(not(target_os = "macos"))]
+    use std::os::fd::AsRawFd;
+    use std::{collections::BTreeSet, ffi::CString, fs::File, os::fd::OwnedFd, path::Path};
 
+    #[cfg(target_os = "macos")]
+    use std::os::{fd::AsFd, unix::ffi::OsStrExt};
     #[cfg(target_os = "linux")]
     use std::{mem::MaybeUninit, os::unix::ffi::OsStrExt};
 
@@ -3032,6 +3032,10 @@ mod filesystem {
         mtime_ns: u64,
         ctime: i64,
         ctime_ns: u64,
+        // Compared by equal() and binding_equal(), never encoded: how Darwin
+        // evidence enters persisted fingerprints and records is undecided.
+        #[cfg(target_os = "macos")]
+        native: darwin::Evidence,
     }
     impl Identity {
         // st_nlink has architecture-dependent width; retain the portable u64 conversion.
@@ -3058,8 +3062,8 @@ mod filesystem {
         }
         #[cfg(not(target_os = "linux"))]
         fn kind(&self) -> FileType {
-            // Identity cannot be acquired until the native backend is implemented.
-            // Keep the shared mode representation without truncating a stored mode.
+            // The native mode type is narrower than the shared representation.
+            // A mode that does not fit is unknown, never truncated.
             self.mode
                 .try_into()
                 .map(FileType::from_raw_mode)
@@ -3116,20 +3120,28 @@ mod filesystem {
             out
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn stat(fd: &OwnedFd, b: &mut Budget) -> Result<Identity, IncompleteReason> {
         let _ = (fd, b);
         Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "macos")]
+    fn stat(fd: &OwnedFd, b: &mut Budget) -> Result<Identity, IncompleteReason> {
+        darwin::held(fd.as_fd(), b)
     }
     #[cfg(target_os = "linux")]
     fn stat(fd: &OwnedFd, b: &mut Budget) -> Result<Identity, IncompleteReason> {
         b.check()?;
         fs::fstat(fd).map(Identity::from_stat).map_err(os_error)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn named(parent: &OwnedFd, name: &[u8], b: &mut Budget) -> Result<Identity, IncompleteReason> {
         let _ = (parent, name, b);
         Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "macos")]
+    fn named(parent: &OwnedFd, name: &[u8], b: &mut Budget) -> Result<Identity, IncompleteReason> {
+        darwin::named(parent.as_fd(), name, b)?.ok_or(IncompleteReason::Changed)
     }
     #[cfg(target_os = "linux")]
     fn named(parent: &OwnedFd, name: &[u8], b: &mut Budget) -> Result<Identity, IncompleteReason> {
@@ -3150,6 +3162,12 @@ mod filesystem {
     // route. Preserve directory type, access/owner and actual object identity.
     // Never use this comparison for held census contents (including root).
     fn binding_equal(a: &Identity, b: &Identity) -> Result<(), IncompleteReason> {
+        // A directory's route, real volume, effective access and ACL bind it
+        // as its mode does. None of them moves with child churn.
+        #[cfg(target_os = "macos")]
+        if a.native != b.native {
+            return Err(IncompleteReason::Changed);
+        }
         if a.device == b.device
             && a.inode == b.inode
             && a.kind() == FileType::Directory
@@ -3186,7 +3204,7 @@ mod filesystem {
             flags
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn open_path(
         parent: &OwnedFd,
         name: &[u8],
@@ -3196,6 +3214,22 @@ mod filesystem {
     ) -> Result<OwnedFd, IncompleteReason> {
         let _ = (parent, name, directory, below, b);
         Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "macos")]
+    fn open_path(
+        parent: &OwnedFd,
+        name: &[u8],
+        directory: bool,
+        below: bool,
+        b: &mut Budget,
+    ) -> Result<OwnedFd, IncompleteReason> {
+        b.check()?;
+        // Darwin has no O_PATH. Holding a regular file needs the undecided
+        // readable-acquisition contract (issue 59), so only directories open.
+        if !directory {
+            return Err(IncompleteReason::UnsupportedResolution);
+        }
+        darwin::open_directory(parent.as_fd(), name, below)
     }
     #[cfg(target_os = "linux")]
     fn open_path(
@@ -3228,7 +3262,7 @@ mod filesystem {
         route: Vec<Link>,
     }
     impl Anchor {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         fn open<H: Boundary>(
             path: &Path,
             b: &mut Budget,
@@ -3236,6 +3270,44 @@ mod filesystem {
         ) -> Result<Self, IncompleteReason> {
             let _ = (path, b, hooks);
             Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "macos")]
+        fn open<H: Boundary>(
+            path: &Path,
+            b: &mut Budget,
+            hooks: &mut H,
+        ) -> Result<Self, IncompleteReason> {
+            let raw = path.as_os_str().as_bytes();
+            if raw.first() != Some(&b'/') || raw.len() > MAX_PATH_BYTES {
+                return Err(IncompleteReason::InvalidPath);
+            }
+            let parts: Vec<&[u8]> = if raw == b"/" {
+                vec![]
+            } else {
+                raw[1..].split(|c| *c == b'/').collect()
+            };
+            if parts.len() > MAX_DEPTH
+                || parts
+                    .iter()
+                    .any(|p| p.is_empty() || *p == b"." || *p == b".." || p.contains(&0))
+            {
+                return Err(IncompleteReason::InvalidPath);
+            }
+            b.check()?;
+            let fd = fs::openat(fs::CWD, c"/", darwin::directory_flags(), Mode::empty())
+                .map_err(os_error)?;
+            let identity = stat(&fd, b)?;
+            let mut anchor = Self {
+                route: vec![Link {
+                    fd,
+                    name: vec![],
+                    identity,
+                }],
+            };
+            for part in parts {
+                anchor.descend(part, false, b, hooks)?;
+            }
+            Ok(anchor)
         }
         #[cfg(target_os = "linux")]
         fn open<H: Boundary>(
@@ -3320,10 +3392,38 @@ mod filesystem {
             Ok(())
         }
     }
+    #[cfg(not(target_os = "macos"))]
     struct TrustedProc {
         anchor: Anchor,
         proc_index: usize,
     }
+    // Darwin has no accepted readable-acquisition provider: hard-link capture
+    // versus a retained handle is undecided (issue 59). This holder owns no
+    // route and issues nothing, so every payload reopen refuses before an open.
+    #[cfg(target_os = "macos")]
+    struct TrustedProc;
+    #[cfg(target_os = "macos")]
+    impl TrustedProc {
+        fn open<H: Boundary>(b: &mut Budget, _hooks: &mut H) -> Result<Self, IncompleteReason> {
+            b.check()?;
+            Ok(Self)
+        }
+        fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
+            b.check()
+        }
+        fn reopen_syncable<H: Boundary>(
+            &self,
+            _retained: &OwnedFd,
+            _expected: &Identity,
+            _path: &[u8],
+            _directory: bool,
+            _b: &mut Budget,
+            _hooks: &mut H,
+        ) -> Result<OwnedFd, IncompleteReason> {
+            Err(IncompleteReason::UnsupportedResolution)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
     impl TrustedProc {
         #[cfg(not(target_os = "linux"))]
         fn open<H: Boundary>(b: &mut Budget, hooks: &mut H) -> Result<Self, IncompleteReason> {
@@ -3584,12 +3684,12 @@ mod filesystem {
         data: BTreeMap<Vec<u8>, Vec<u8>>,
     }
     impl Manifest {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         pub(super) fn new(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
             let _ = (path, b);
             Err(IncompleteReason::UnsupportedResolution)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(super) fn new(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
             let anchor = Anchor::open(path, b, &mut SystemBoundary)?;
             let proc = TrustedProc::open(b, &mut SystemBoundary)?;
@@ -3613,10 +3713,74 @@ mod filesystem {
                 data: BTreeMap::new(),
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         fn node(&mut self, path: &[u8], b: &mut Budget) -> Result<Option<usize>, IncompleteReason> {
             let _ = (self, path, b);
             Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "macos")]
+        fn node(&mut self, path: &[u8], b: &mut Budget) -> Result<Option<usize>, IncompleteReason> {
+            if path.is_empty() {
+                return Ok(Some(0));
+            }
+            RawPath::from_bytes(path).map_err(|_| IncompleteReason::InvalidPath)?;
+            if let Some(i) = self.paths.get(path) {
+                return Ok(Some(*i));
+            }
+            if self.absent.contains_key(path) {
+                return Ok(None);
+            }
+            let mut parent = 0;
+            let mut prefix = Vec::new();
+            let parts: Vec<_> = path.split(|c| *c == b'/').collect();
+            for (part_index, name) in parts.iter().enumerate() {
+                if !prefix.is_empty() {
+                    prefix.push(b'/');
+                }
+                prefix.extend_from_slice(name);
+                if let Some(i) = self.paths.get(&prefix) {
+                    parent = *i;
+                    continue;
+                }
+                if self.absent.contains_key(&prefix) {
+                    return Ok(None);
+                }
+                b.entry()?;
+                // A no-follow metadata lookup distinguishes absence, without a
+                // speculative readable open of a link, FIFO, socket or device.
+                let Some(before) = darwin::named(self.held[parent].fd.as_fd(), name, b)? else {
+                    self.absent.insert(prefix, (parent, name.to_vec()));
+                    return Ok(None);
+                };
+                let mut evidence = Vec::new();
+                before.encode(&mut evidence);
+                b.observe(25, &prefix);
+                b.observe(26, &evidence);
+                let directory = before.kind() == FileType::Directory;
+                if !directory {
+                    regular(&before)?;
+                }
+                if part_index + 1 < parts.len() && !directory {
+                    return Err(IncompleteReason::UnsupportedGit);
+                }
+                let fd = open_path(&self.held[parent].fd, name, directory, true, b)?;
+                equal(&before, &stat(&fd, b)?)?;
+                if before.device != self.held[0].identity.device {
+                    return Err(IncompleteReason::MountCrossing);
+                }
+                let i = self.held.len();
+                self.held.push(Held {
+                    fd,
+                    parent: Some(parent),
+                    name: name.to_vec(),
+                    path: prefix.clone(),
+                    identity: before,
+                    names: None,
+                });
+                self.paths.insert(prefix.clone(), i);
+                parent = i;
+            }
+            Ok(Some(parent))
         }
         #[cfg(target_os = "linux")]
         fn node(&mut self, path: &[u8], b: &mut Budget) -> Result<Option<usize>, IncompleteReason> {
@@ -3825,12 +3989,12 @@ mod filesystem {
             self.optional(path, b)?
                 .ok_or(IncompleteReason::UnsupportedGit)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             let _ = (self, b);
             Err(IncompleteReason::UnsupportedResolution)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             check_nodes(&self.held, b)?;
             self.anchor.recheck(b)?;
@@ -3894,6 +4058,11 @@ mod filesystem {
         pub(super) fn root_dev_ino(&self) -> (u64, u64) {
             (self.held[0].identity.device, self.held[0].identity.inode)
         }
+        #[cfg(target_os = "macos")]
+        pub(super) fn persistent_fs(&self) -> Result<(), IncompleteReason> {
+            darwin::persistent_fs(&self.held[0])
+        }
+        #[cfg(not(target_os = "macos"))]
         pub(super) fn persistent_fs(&self) -> Result<(), IncompleteReason> {
             let fs = fs::fstatfs(&self.held[0].fd).map_err(os_error)?;
             let magic = fs.f_type as u64;
@@ -4109,10 +4278,45 @@ mod filesystem {
         absent: Option<Vec<u8>>,
     }
     impl Endpoint {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         pub(super) fn open(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
             let _ = (path, b);
             Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "macos")]
+        pub(super) fn open(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
+            let raw = path.as_os_str().as_bytes();
+            let relative = raw
+                .strip_prefix(b"/")
+                .ok_or(IncompleteReason::InvalidPath)?;
+            RawPath::from_bytes(relative).map_err(|_| IncompleteReason::InvalidPath)?;
+            let mut anchor = Anchor::open(Path::new("/"), b, &mut SystemBoundary)?;
+            let parts: Vec<_> = relative.split(|c| *c == b'/').collect();
+            for (i, name) in parts.iter().enumerate() {
+                b.entry()?;
+                let Some(identity) = darwin::named(anchor.last().fd.as_fd(), name, b)? else {
+                    return Ok(Self {
+                        anchor,
+                        final_entry: None,
+                        absent: Some(name.to_vec()),
+                    });
+                };
+                if i + 1 == parts.len() {
+                    regular(&identity)?;
+                    let fd = open_path(&anchor.last().fd, name, false, false, b)?;
+                    equal(&identity, &stat(&fd, b)?)?;
+                    return Ok(Self {
+                        anchor,
+                        final_entry: Some((fd, name.to_vec(), identity)),
+                        absent: None,
+                    });
+                }
+                if identity.kind() != FileType::Directory {
+                    return Err(IncompleteReason::UnsupportedGit);
+                }
+                anchor.descend(name, false, b, &mut SystemBoundary)?;
+            }
+            Err(IncompleteReason::InvalidPath)
         }
         #[cfg(target_os = "linux")]
         pub(super) fn open(path: &Path, b: &mut Budget) -> Result<Self, IncompleteReason> {
@@ -4185,12 +4389,12 @@ mod filesystem {
         pub(super) fn missing(&self) -> bool {
             self.absent.is_some()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             let _ = (self, b);
             Err(IncompleteReason::UnsupportedResolution)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         pub(super) fn recheck(&self, b: &mut Budget) -> Result<(), IncompleteReason> {
             self.anchor.recheck(b)?;
             if let Some((fd, name, identity)) = &self.final_entry {
@@ -4356,10 +4560,81 @@ mod filesystem {
             }
             Ok(())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         fn visit(&mut self, parent: usize, depth: usize) -> Result<(), IncompleteReason> {
             let _ = (self, parent, depth);
             Err(IncompleteReason::UnsupportedResolution)
+        }
+        #[cfg(target_os = "macos")]
+        fn visit(&mut self, parent: usize, depth: usize) -> Result<(), IncompleteReason> {
+            self.b.check()?;
+            if depth > MAX_DEPTH {
+                return self.b.fail(IncompleteReason::DepthBudget);
+            }
+            let names = enumerate(&self.held[parent], self.b, true)?;
+            for name in &names {
+                let mut path = self.held[parent].path.clone();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(name);
+                let raw = RawPath::from_bytes(&path).map_err(|_| IncompleteReason::InvalidPath)?;
+                if (name == b".git" && depth > 0) || name == b".gitmodules" {
+                    #[cfg(test)]
+                    self.hooks.rejected(&path, IncompleteReason::NestedGit);
+                    return Err(IncompleteReason::NestedGit);
+                }
+                self.hooks.event(Event::BeforeChildOpen, &path, None)?;
+                // Without O_PATH the child is classified by name first: nothing
+                // but a directory is ever opened here.
+                let real = named(&self.held[parent].fd, name, self.b)?;
+                let identity = self.hooks.child_identity(real);
+                let mut evidence = Vec::new();
+                identity.encode(&mut evidence);
+                self.b.observe(25, &path);
+                self.b.observe(26, &evidence);
+                let directory = identity.kind() == FileType::Directory;
+                if !directory {
+                    let result = regular(&identity);
+                    #[cfg(test)]
+                    let result = result.inspect_err(|reason| self.hooks.rejected(&path, *reason));
+                    result?;
+                }
+                if identity.device != self.held[0].identity.device {
+                    return Err(IncompleteReason::MountCrossing);
+                }
+                if name == b".git" && directory {
+                    #[cfg(test)]
+                    self.hooks
+                        .rejected(&path, IncompleteReason::GitMetadataUnproven);
+                    return Err(IncompleteReason::GitMetadataUnproven);
+                }
+                let fd = open_path(&self.held[parent].fd, name, directory, true, self.b)?;
+                equal(&identity, &stat(&fd, self.b)?)?;
+                let index = self.held.len();
+                self.held.push(Held {
+                    fd,
+                    parent: Some(parent),
+                    name: name.clone(),
+                    path: path.clone(),
+                    identity: identity.clone(),
+                    names: None,
+                });
+                let content_sha256 = if directory {
+                    self.visit(index, depth + 1)?;
+                    None
+                } else {
+                    Some(self.hash_file(index)?)
+                };
+                self.check_held(index)?;
+                self.entries.push(Entry {
+                    path: raw,
+                    identity,
+                    content_sha256,
+                });
+            }
+            self.held[parent].names = Some(names);
+            self.check_held(parent)
         }
         #[cfg(target_os = "linux")]
         fn visit(&mut self, parent: usize, depth: usize) -> Result<(), IncompleteReason> {
@@ -4484,7 +4759,7 @@ mod filesystem {
             Ok(hasher.finalize().into())
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn enumerate(
         held: &Held,
         b: &mut Budget,
@@ -4492,6 +4767,351 @@ mod filesystem {
     ) -> Result<Vec<Vec<u8>>, IncompleteReason> {
         let _ = (held, b, first);
         Err(IncompleteReason::UnsupportedResolution)
+    }
+    #[cfg(target_os = "macos")]
+    fn enumerate(
+        held: &Held,
+        b: &mut Budget,
+        first: bool,
+    ) -> Result<Vec<Vec<u8>>, IncompleteReason> {
+        b.check()?;
+        // A NEW open of '.' gives an independent enumeration offset; the held
+        // descriptor is never duplicated or read.
+        let mut cursor =
+            work_darwin::DirectoryCursor::open_held(held.fd.as_fd()).map_err(darwin::refusal)?;
+        darwin::same_directory(&held.identity, &cursor)?;
+        let mut buffer = [0u8; DIRECTORY_BUFFER_BYTES];
+        let mut names = BTreeSet::new();
+        loop {
+            // Every native batch pays the whole buffer BEFORE the call,
+            // including the end-of-directory and failed attempts.
+            let count = directory_next(b, true, || cursor.read_batch(&mut buffer))?
+                .map_err(darwin::refusal)?;
+            if count == 0 {
+                break;
+            }
+            // Exactly the returned record count is decoded, never a stale
+            // tail. A malformed or over-budget batch is not end-of-directory.
+            let mut entries = [None; darwin::BATCH_ENTRIES];
+            work_darwin::decode_census(&buffer, count, &mut entries)
+                .map_err(|_| IncompleteReason::Io)?;
+            for entry in entries[..count].iter().flatten() {
+                let name = entry.name.as_bytes();
+                let length = held.path.len() + usize::from(!held.path.is_empty()) + name.len();
+                if length > MAX_PATH_BYTES {
+                    return Err(IncompleteReason::InvalidPath);
+                }
+                if names.len() >= MAX_ENTRIES as usize {
+                    return b.fail(IncompleteReason::EntryBudget);
+                }
+                if first {
+                    b.entry()?;
+                    b.output((length as u64) * 2 + 256)?;
+                }
+                // Evidence of returned names, NOT the number of kernel bytes read.
+                b.counters.copied_name_bytes = b
+                    .counters
+                    .copied_name_bytes
+                    .checked_add(name.len() as u64)
+                    .ok_or(IncompleteReason::ReadBudget)?;
+                if !names.insert(name.to_vec()) {
+                    return Err(IncompleteReason::Changed);
+                }
+            }
+        }
+        equal(&held.identity, &stat(&held.fd, b)?)?;
+        Ok(names.into_iter().collect())
+    }
+
+    /// Darwin observation beneath the shared manifest and census logic. This is
+    /// validated containment under observed topology, not atomic NO_XDEV: a
+    /// lookup can touch a foreign volume before the hop is refused.
+    #[cfg(target_os = "macos")]
+    pub(super) mod darwin {
+        use super::*;
+        use std::{ffi::CStr, os::fd::BorrowedFd};
+        use work_darwin::{
+            Component, DirectoryTopology, GitAccessDomain, GitAccessObservation, GitAcl,
+            GIT_ACCESS_BUFFER_SIZE, TOPOLOGY_BUFFER_SIZE,
+        };
+
+        // The smallest census record is larger than this divisor, so one
+        // native batch can never return more records than these slots.
+        pub(super) const BATCH_ENTRIES: usize = DIRECTORY_BUFFER_BYTES / 40;
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub(super) struct Evidence {
+            access: Access,
+            object: Object,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Access {
+            effective: u32,
+            // None is a successful observation of no ACL, never a missing answer.
+            acl: Option<(u32, Vec<work_darwin::Ace>)>,
+        }
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum Object {
+            Directory {
+                real_fsid: [i32; 2],
+                mount_status: u32,
+                path: Vec<u8>,
+                no_firmlink_path: Vec<u8>,
+            },
+            // None is a zero or unavailable data generation. A payload read
+            // must refuse it; modification times are no substitute.
+            Other {
+                generation: Option<u32>,
+            },
+        }
+
+        pub(super) fn refusal(error: std::io::Error) -> IncompleteReason {
+            rustix::io::Errno::from_io_error(&error)
+                .map_or(IncompleteReason::UnsupportedResolution, os_error)
+        }
+        fn component(name: &[u8]) -> Result<CString, IncompleteReason> {
+            Component::new(name).map_err(|_| IncompleteReason::InvalidPath)?;
+            cstring(name)
+        }
+        pub(super) fn directory_flags() -> OFlags {
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+        }
+        // The domain std's MetadataExt::dev() reports, which CheckoutIdentity
+        // is compared against. Whether Darwin device or fsid values may enter
+        // persisted records is undecided (issue 54).
+        fn device(raw: i32) -> u64 {
+            raw as u64
+        }
+        fn identity(s: fs::Stat, native: Evidence) -> Identity {
+            Identity {
+                device: device(s.st_dev),
+                inode: s.st_ino,
+                mode: u32::from(s.st_mode),
+                links: u64::from(s.st_nlink),
+                uid: s.st_uid,
+                gid: s.st_gid,
+                size: s.st_size,
+                mtime: s.st_mtime,
+                mtime_ns: s.st_mtime_nsec as u64,
+                ctime: s.st_ctime,
+                ctime_ns: s.st_ctime_nsec as u64,
+                native,
+            }
+        }
+        // The access observation is a second syscall: it must describe the
+        // object that was just statted.
+        fn access(
+            s: &fs::Stat,
+            observed: GitAccessObservation<'_>,
+        ) -> Result<Access, IncompleteReason> {
+            let directory = FileType::from_raw_mode(s.st_mode) == FileType::Directory;
+            if observed.file_id != s.st_ino
+                || observed.device != s.st_dev
+                || observed.owner != s.st_uid
+                || observed.group != s.st_gid
+                || observed.mode & 0o7777 != u32::from(s.st_mode) & 0o7777
+                || (observed.object_type == 2) != directory
+            {
+                return Err(IncompleteReason::Changed);
+            }
+            let acl = match observed.acl {
+                GitAcl::SupportedNone => None,
+                GitAcl::Present(acl) => Some((acl.flags, acl.entries().collect())),
+            };
+            Ok(Access {
+                effective: observed.effective_access,
+                acl,
+            })
+        }
+        fn directory(
+            s: &fs::Stat,
+            observed: DirectoryTopology<'_>,
+        ) -> Result<Object, IncompleteReason> {
+            if observed.file_id != s.st_ino {
+                return Err(IncompleteReason::Changed);
+            }
+            Ok(Object::Directory {
+                real_fsid: observed.real_fsid,
+                mount_status: observed.mount_status,
+                path: observed.path.to_vec(),
+                no_firmlink_path: observed.no_firmlink_path.to_vec(),
+            })
+        }
+        fn generation(
+            parent: BorrowedFd<'_>,
+            name: &CStr,
+            inode: u64,
+        ) -> Result<Option<u32>, IncompleteReason> {
+            use work_darwin::{AttributeError, DecodeError};
+            let mut buffer = [0; work_darwin::ATTRIBUTE_BUFFER_SIZE];
+            match work_darwin::attributes_at(parent, name, &mut buffer) {
+                Ok(observed) if observed.file_id == inode => Ok(Some(observed.generation)),
+                Ok(_) => Err(IncompleteReason::Changed),
+                Err(AttributeError::Decode(DecodeError::UnavailableIdentity)) => Ok(None),
+                Err(AttributeError::Os(error)) => Err(refusal(error)),
+                Err(_) => Err(IncompleteReason::UnsupportedResolution),
+            }
+        }
+
+        /// A held directory, with its real mounted volume cross-checked.
+        pub(super) fn held(
+            fd: BorrowedFd<'_>,
+            b: &mut Budget,
+        ) -> Result<Identity, IncompleteReason> {
+            b.check()?;
+            let s = fs::fstat(fd).map_err(os_error)?;
+            let mut buffer = [0; GIT_ACCESS_BUFFER_SIZE];
+            let observed = work_darwin::git_access_fd(fd, GitAccessDomain::Stat, &mut buffer)
+                .map_err(refusal)?;
+            let access = access(&s, observed)?;
+            let mut buffer = [0; TOPOLOGY_BUFFER_SIZE];
+            let observed = work_darwin::directory_topology_fd(fd, &mut buffer).map_err(refusal)?;
+            let object = directory(&s, observed)?;
+            Ok(identity(s, Evidence { access, object }))
+        }
+        /// One no-follow component beneath a held parent, never opened. None is
+        /// proven absence.
+        pub(super) fn named(
+            parent: BorrowedFd<'_>,
+            name: &[u8],
+            b: &mut Budget,
+        ) -> Result<Option<Identity>, IncompleteReason> {
+            b.check()?;
+            let name = component(name)?;
+            let s = match fs::statat(parent, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(s) => s,
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(e) => return Err(os_error(e)),
+            };
+            let mut buffer = [0; GIT_ACCESS_BUFFER_SIZE];
+            let observed =
+                work_darwin::git_access_at(parent, &name, GitAccessDomain::Stat, &mut buffer)
+                    .map_err(refusal)?;
+            let access = access(&s, observed)?;
+            let object = match FileType::from_raw_mode(s.st_mode) {
+                FileType::Directory => {
+                    let mut buffer = [0; TOPOLOGY_BUFFER_SIZE];
+                    let observed = work_darwin::directory_topology_at(parent, &name, &mut buffer)
+                        .map_err(refusal)?;
+                    directory(&s, observed)?
+                }
+                FileType::RegularFile => Object::Other {
+                    generation: generation(parent, &name, s.st_ino)?,
+                },
+                _ => Object::Other { generation: None },
+            };
+            Ok(Some(identity(s, Evidence { access, object })))
+        }
+
+        /// One edge of the held-parent walk, judged on both ends' topology.
+        pub(in crate::inspection) fn hop(
+            parent: DirectoryTopology<'_>,
+            name: Component<'_>,
+            child: DirectoryTopology<'_>,
+            below: bool,
+        ) -> Result<(), IncompleteReason> {
+            if below {
+                if parent.real_fsid != child.real_fsid || child.mount_status != 0 {
+                    return Err(IncompleteReason::MountCrossing);
+                }
+                return parent
+                    .validate_child(name, child)
+                    .map_err(|_| IncompleteReason::Changed);
+            }
+            // Above the inspected root the route may enter another volume or
+            // firmlink, as it may on Linux. The ordinary path must still grow
+            // by exactly this component.
+            let separator: &[u8] = if parent.path == b"/" { b"" } else { b"/" };
+            if child.path == [parent.path, separator, name.as_bytes()].concat() {
+                Ok(())
+            } else {
+                Err(IncompleteReason::Changed)
+            }
+        }
+        pub(super) fn open_directory(
+            parent: BorrowedFd<'_>,
+            name: &[u8],
+            below: bool,
+        ) -> Result<OwnedFd, IncompleteReason> {
+            let mut parent_buffer = [0; TOPOLOGY_BUFFER_SIZE];
+            let mut child_buffer = [0; TOPOLOGY_BUFFER_SIZE];
+            if name == b"." {
+                // A second descriptor for the held directory itself.
+                let child =
+                    fs::openat(parent, c".", directory_flags(), Mode::empty()).map_err(os_error)?;
+                let held = work_darwin::directory_topology_fd(parent, &mut parent_buffer)
+                    .map_err(refusal)?;
+                let fresh = work_darwin::directory_topology_fd(child.as_fd(), &mut child_buffer)
+                    .map_err(refusal)?;
+                if held.real_fsid != fresh.real_fsid {
+                    return Err(IncompleteReason::MountCrossing);
+                }
+                if held != fresh {
+                    return Err(IncompleteReason::Changed);
+                }
+                return Ok(child);
+            }
+            let name = component(name)?;
+            let child = work_darwin::open_directory_at(parent, &name).map_err(refusal)?;
+            let above =
+                work_darwin::directory_topology_fd(parent, &mut parent_buffer).map_err(refusal)?;
+            let opened = work_darwin::directory_topology_fd(child.as_fd(), &mut child_buffer)
+                .map_err(refusal)?;
+            let mut anchored_buffer = [0; TOPOLOGY_BUFFER_SIZE];
+            let anchored = work_darwin::directory_topology_at(parent, &name, &mut anchored_buffer)
+                .map_err(refusal)?;
+            // The name must still lead to the directory that was opened.
+            if anchored != opened {
+                return Err(IncompleteReason::Changed);
+            }
+            let name =
+                Component::new(name.to_bytes()).map_err(|_| IncompleteReason::InvalidPath)?;
+            hop(above, name, opened, below)?;
+            Ok(child)
+        }
+        /// A fresh cursor must read the directory the manifest holds.
+        pub(super) fn same_directory(
+            held: &Identity,
+            cursor: &work_darwin::DirectoryCursor,
+        ) -> Result<(), IncompleteReason> {
+            let mut buffer = [0; TOPOLOGY_BUFFER_SIZE];
+            let observed = cursor.topology(&mut buffer).map_err(refusal)?;
+            let fresh = Object::Directory {
+                real_fsid: observed.real_fsid,
+                mount_status: observed.mount_status,
+                path: observed.path.to_vec(),
+                no_firmlink_path: observed.no_firmlink_path.to_vec(),
+            };
+            if observed.file_id == held.inode && fresh == held.native.object {
+                Ok(())
+            } else {
+                Err(IncompleteReason::Changed)
+            }
+        }
+
+        /// Recovery storage is accepted only as a local APFS mount.
+        pub(in crate::inspection) fn persistent_volume(
+            filesystem: &[u8],
+            flags: u32,
+        ) -> Result<(), IncompleteReason> {
+            const MNT_LOCAL: u32 = 0x0000_1000;
+            if filesystem == b"apfs" && flags & MNT_LOCAL != 0 {
+                Ok(())
+            } else {
+                Err(IncompleteReason::UnsupportedGit)
+            }
+        }
+        pub(super) fn persistent_fs(root: &Held) -> Result<(), IncompleteReason> {
+            let volume = work_darwin::mounted_volume_fd(root.fd.as_fd()).map_err(refusal)?;
+            // The volume answering now must be the one the root was bound to.
+            let Object::Directory { real_fsid, .. } = &root.identity.native.object else {
+                return Err(IncompleteReason::Changed);
+            };
+            if volume.fsid != *real_fsid {
+                return Err(IncompleteReason::Changed);
+            }
+            persistent_volume(volume.filesystem(), volume.flags)
+        }
     }
     #[cfg(target_os = "linux")]
     fn enumerate(
