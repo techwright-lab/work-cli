@@ -1384,6 +1384,8 @@ fn lock_directory_meta(file: &File) -> Held<()> {
     {
         return Err("lock_unknown");
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private(file, &meta).map_err(|_| "lock_unknown")?;
     Ok(())
 }
 
@@ -1396,13 +1398,21 @@ fn lock_file_meta(file: &File) -> Held<()> {
     {
         return Err("lock_unknown");
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private(file, &meta).map_err(|_| "lock_unknown")?;
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_lock_authority(store: &Store) -> Held<File> {
     let _ = (store,);
     Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "macos")]
+fn open_lock_authority(store: &Store) -> Held<File> {
+    let identity = store.authority_identity();
+    crate::authority_darwin::open_authority(&identity.directory, identity.directory_id)
+        .map_err(|_| "lock_unknown")
 }
 #[cfg(target_os = "linux")]
 fn open_lock_authority(store: &Store) -> Held<File> {
@@ -1427,10 +1437,19 @@ fn open_lock_authority(store: &Store) -> Held<File> {
     Ok(directory)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
     let _ = (parent, name, flags);
     Err("native_recovery_lock_incomplete")
+}
+// Shared callers reopen read-only; anything else is not a Darwin reopen.
+#[cfg(target_os = "macos")]
+fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
+    if !flags.difference(OFlags::DIRECTORY).is_empty() {
+        return Err("lock_unknown");
+    }
+    crate::authority_darwin::open_child(parent, name, flags.contains(OFlags::DIRECTORY))
+        .map_err(|_| "lock_unknown")
 }
 #[cfg(target_os = "linux")]
 fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
@@ -1450,10 +1469,49 @@ fn open_lock_child(parent: &File, name: &str, flags: OFlags) -> Held<File> {
     .map_err(|_| "lock_unknown")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     let _ = (store, key);
     Err("native_recovery_lock_incomplete")
+}
+#[cfg(target_os = "macos")]
+fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    darwin_operation_lock(store.authority_identity(), key, true)
+}
+#[cfg(target_os = "macos")]
+fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
+    darwin_operation_lock(store.authority_identity(), key, false)
+}
+#[cfg(target_os = "macos")]
+fn darwin_operation_lock(
+    identity: &crate::store::AuthorityIdentity,
+    key: &CommonKey,
+    create: bool,
+) -> Held<OperationLock> {
+    use crate::authority_darwin::{acquire_lock, LockRefusal, LockRequest};
+    let name = format!("{:016x}-{:016x}.lock", key.dev, key.ino);
+    let held = acquire_lock(&LockRequest {
+        authority: &identity.directory,
+        authority_id: identity.directory_id,
+        directory: LOCK_DIR,
+        name: &name,
+        create,
+        exclusive: true,
+    })
+    .map_err(|refusal| match refusal {
+        LockRefusal::Busy => "preparation_busy",
+        LockRefusal::Absent => "preparation_required",
+        LockRefusal::Unproven => "lock_unknown",
+    })?;
+    Ok(OperationLock {
+        authority: held.authority,
+        directory: held.directory,
+        file: held.file,
+        authority_id: held.authority_id,
+        directory_id: held.directory_id,
+        file_id: held.file_id,
+        name,
+    })
 }
 #[cfg(target_os = "linux")]
 fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
@@ -1500,7 +1558,7 @@ fn acquire_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> {
     let _ = (store, key);
     Err("native_recovery_lock_incomplete")
@@ -1554,6 +1612,41 @@ fn acquire_existing_lock(store: &Store, key: &CommonKey) -> Held<OperationLock> 
         }),
         Err(e) if e == rustix::io::Errno::WOULDBLOCK => Err("preparation_busy"),
         Err(_) => Err("lock_unknown"),
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_lock_tests {
+    use super::*;
+
+    #[test]
+    fn preparation_lock_is_exclusive_per_common_directory_and_never_created_on_resume() {
+        let (_temp, _registry, identity) = crate::authority_darwin::registered_authority_fixture();
+        let key = |ino| CommonKey {
+            path: Vec::new(),
+            dev: 7,
+            ino,
+        };
+        assert_eq!(
+            darwin_operation_lock(&identity, &key(1), false).err(),
+            Some("preparation_required")
+        );
+        assert!(!identity.directory.join(LOCK_DIR).exists());
+        let held = darwin_operation_lock(&identity, &key(1), true).unwrap();
+        assert_eq!(held.name, "0000000000000007-0000000000000001.lock");
+        for create in [true, false] {
+            assert_eq!(
+                darwin_operation_lock(&identity, &key(1), create).err(),
+                Some("preparation_busy")
+            );
+        }
+        darwin_operation_lock(&identity, &key(2), true).unwrap();
+        assert_eq!(
+            darwin_operation_lock(&identity, &key(3), false).err(),
+            Some("preparation_required")
+        );
+        drop(held);
+        darwin_operation_lock(&identity, &key(1), false).unwrap();
     }
 }
 
