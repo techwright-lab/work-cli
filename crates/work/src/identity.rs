@@ -73,6 +73,46 @@ fn git(
         .map(|s| s.trim_end_matches('\n').to_owned())
         .map_err(|_| hold("non-UTF8 Git identity unsupported"))
 }
+#[cfg(not(target_os = "macos"))]
+fn boot_identity() -> io::Result<String> {
+    Ok(fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+        .trim()
+        .to_owned())
+}
+/// Two equal observations of the kernel boot session, or a hold. There is no
+/// substitute identity when the observation is missing, malformed or nil.
+#[cfg(target_os = "macos")]
+fn boot_identity() -> io::Result<String> {
+    let observe =
+        || work_darwin::boot_session_uuid().map_err(|_| hold("boot session identity unavailable"));
+    let first = observe()?;
+    if observe()? != first {
+        return Err(hold("boot session identity changed during observation"));
+    }
+    Ok(darwin_boot_id(&first))
+}
+#[cfg(target_os = "macos")]
+const DARWIN_BOOT_PROVIDER: &str = "darwin-bootsession-v1:";
+// PROVISIONAL, pending the record-compatibility decision (issue 54): the Darwin
+// boot provider and its version travel as a prefix inside the existing boot_id
+// string, so no record format changes. This is the only place that encodes it.
+#[cfg(target_os = "macos")]
+fn darwin_boot_id(session: &work_darwin::BootSessionUuid) -> String {
+    let uuid = session.as_bytes().iter().copied().map(char::from);
+    DARWIN_BOOT_PROVIDER.chars().chain(uuid).collect()
+}
+/// Whether a recorded boot identity came from this platform's provider. One
+/// from another provider is incomparable: neither this boot nor an earlier one.
+#[cfg(target_os = "macos")]
+pub(crate) fn recorded_by_native_boot_provider(recorded: &str) -> bool {
+    recorded
+        .strip_prefix(DARWIN_BOOT_PROVIDER)
+        .is_some_and(|uuid| {
+            let frame = [uuid.as_bytes(), &[0]].concat();
+            work_darwin::parse_boot_session_uuid(&frame)
+                .is_ok_and(|session| session.as_bytes() == uuid.as_bytes())
+        })
+}
 /// Open first, then validate the descriptor: no symlink/FIFO/device or unbounded reads.
 pub(crate) fn read_metadata(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     let file = fs::OpenOptions::new()
@@ -193,9 +233,7 @@ impl CheckoutIdentity {
         }
         Ok(Self {
             head: query_with_git(invocation, &path, &["rev-parse", "HEAD"])?,
-            boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-                .trim()
-                .to_owned(),
+            boot_id: boot_identity()?,
             path,
             private_git_dir,
             common_git_dir,
@@ -273,6 +311,43 @@ pub(crate) fn move_worktree_with_git(
         return Err(hold("post-move identity mismatch; reconcile both paths"));
     }
     Ok(moved)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_boot_tests {
+    use super::*;
+
+    #[test]
+    fn boot_identity_is_stable_and_names_its_provider() {
+        let boot = boot_identity().unwrap();
+        assert_eq!(boot_identity().unwrap(), boot);
+        let uuid = boot.strip_prefix("darwin-bootsession-v1:").unwrap();
+        assert_eq!(uuid.len(), 36);
+        assert!(uuid
+            .bytes()
+            .all(|b| b == b'-' || b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_ne!(uuid, "00000000-0000-0000-0000-000000000000");
+        assert!(recorded_by_native_boot_provider(&boot));
+    }
+
+    #[test]
+    fn records_from_another_provider_or_malformed_records_never_match() {
+        let linux = "5f0c3b1e-8d2a-4c6f-9b1a-2e7d4f6a8c01";
+        let tagged = format!("darwin-bootsession-v1:{linux}");
+        assert!(recorded_by_native_boot_provider(&tagged));
+        for recorded in [
+            linux.to_owned(),
+            String::new(),
+            "darwin-bootsession-v1:".to_owned(),
+            format!("darwin-bootsession-v2:{linux}"),
+            tagged.to_uppercase(),
+            format!("darwin-bootsession-v1:{}", linux.to_uppercase()),
+            "darwin-bootsession-v1:00000000-0000-0000-0000-000000000000".to_owned(),
+            format!("{tagged}\n"),
+        ] {
+            assert!(!recorded_by_native_boot_provider(&recorded), "{recorded}");
+        }
+    }
 }
 
 #[cfg(test)]
