@@ -132,6 +132,24 @@ fn native_fresh_opens_have_independent_offsets_and_small_buffers_do_not_grow() {
     assert_eq!(second.read_batch(&mut b).unwrap(), 1);
     assert_eq!(second.read_batch(&mut b).unwrap(), 0);
 
+    // A held directory, including a route root with no usable parent, gets the
+    // same fresh-offset guarantee and proves which directory the cursor reads.
+    let held = File::open(root.join("dir")).unwrap();
+    let mut held_first = DirectoryCursor::open_held(held.as_fd()).unwrap();
+    let mut held_second = DirectoryCursor::open_held(held.as_fd()).unwrap();
+    for cursor in [&mut held_first, &mut held_second] {
+        for expected in [1, 1, 1, 0] {
+            assert_eq!(cursor.read_batch(&mut a).unwrap(), expected);
+        }
+    }
+    let mut topology = [0; work_darwin::TOPOLOGY_BUFFER_SIZE];
+    assert_eq!(
+        held_first.topology(&mut topology).unwrap().file_id,
+        held.metadata().unwrap().ino()
+    );
+    let file = File::open(root.join("dir/first")).unwrap();
+    assert!(DirectoryCursor::open_held(file.as_fd()).is_err());
+
     fs::create_dir(root.join("long")).unwrap();
     fs::write(root.join("long").join("x".repeat(200)), b"owned").unwrap();
     let mut cursor = DirectoryCursor::open_at(parent.as_fd(), c"long").unwrap();
