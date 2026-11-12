@@ -68,13 +68,22 @@ fn failed_commit_is_uncertain_not_an_ordinary_database_error() {
 
 #[cfg(target_os = "macos")]
 mod darwin {
-    use super::super::{sync_dir, verify_darwin_connection};
+    use super::super::{
+        checkpoint_checked, require_complete_checkpoint, sync_dir, verify_darwin_connection,
+        Checkpoint, CheckpointMode,
+    };
     use super::*;
     use std::os::unix::fs::OpenOptionsExt;
 
     fn insert(conn: &Connection) {
         conn.execute("INSERT INTO entries VALUES(1)", []).unwrap();
     }
+    fn wal_bytes(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join(format!("{NAME}-wal")))
+            .unwrap()
+            .len()
+    }
+
     #[test]
     fn connection_without_the_darwin_settings_is_refused() {
         let (_temp, dir) = private_directory();
@@ -103,5 +112,67 @@ mod darwin {
     fn directory_accepts_the_full_sync_acknowledgement() {
         let (_temp, dir) = private_directory();
         sync_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn unobstructed_checkpoint_reports_every_frame_and_truncates_the_wal() {
+        let (_temp, dir) = private_directory();
+        let conn = bootstrap(&dir);
+        insert(&conn);
+        let passive = checkpoint_checked(&conn, CheckpointMode::Passive).unwrap();
+        assert!(!passive.busy && passive.log > 0 && passive.checkpointed == passive.log);
+        require_complete_checkpoint(passive).unwrap();
+        assert!(wal_bytes(&dir) > 0);
+        let truncated = checkpoint_checked(&conn, CheckpointMode::Truncate).unwrap();
+        assert_eq!(
+            truncated,
+            Checkpoint {
+                busy: false,
+                log: 0,
+                checkpointed: 0
+            }
+        );
+        require_complete_checkpoint(truncated).unwrap();
+        assert_eq!(wal_bytes(&dir), 0);
+    }
+
+    #[test]
+    fn checkpoint_behind_a_held_reader_is_reported_and_refused() {
+        let (_temp, dir) = private_directory();
+        let writer = bootstrap(&dir);
+        insert(&writer);
+        let reader = reopen(&dir);
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM entries;")
+            .unwrap();
+        insert(&writer);
+
+        let passive = checkpoint_checked(&writer, CheckpointMode::Passive).unwrap();
+        assert!(!passive.busy && passive.checkpointed < passive.log);
+        assert!(matches!(
+            require_complete_checkpoint(passive),
+            Err(StoreError::CheckpointIncomplete)
+        ));
+        let truncate = checkpoint_checked(&writer, CheckpointMode::Truncate).unwrap();
+        assert!(truncate.busy);
+        assert!(matches!(
+            require_complete_checkpoint(truncate),
+            Err(StoreError::CheckpointIncomplete)
+        ));
+        assert!(wal_bytes(&dir) > 0);
+
+        reader.execute_batch("ROLLBACK;").unwrap();
+        require_complete_checkpoint(checkpoint_checked(&writer, CheckpointMode::Truncate).unwrap())
+            .unwrap();
+        assert_eq!(wal_bytes(&dir), 0);
+    }
+
+    #[test]
+    fn checkpoint_outside_wal_mode_is_refused() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(matches!(
+            checkpoint_checked(&conn, CheckpointMode::Passive),
+            Err(StoreError::Unsafe)
+        ));
     }
 }

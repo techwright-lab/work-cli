@@ -50,6 +50,9 @@ pub enum StoreError {
     // as `Database` does.
     #[error("store database failure")]
     CommitUncertain(#[source] rusqlite::Error),
+    /// An explicit checkpoint left WAL frames outside the database file.
+    #[error("store checkpoint incomplete")]
+    CheckpointIncomplete,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -414,7 +417,8 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
 }
 
 // Every sync SQLite requests must be F_FULLFSYNC, and no checkpoint may run
-// where its result is discarded, so automatic checkpoints are off.
+// where its result is discarded: automatic checkpoints are off, explicit ones
+// go through `checkpoint_checked`.
 #[cfg(target_os = "macos")]
 const DARWIN_CONNECTION: [(&str, i64); 4] = [
     ("synchronous", 2),
@@ -436,6 +440,61 @@ fn verify_darwin_connection(conn: &Connection) -> Result<()> {
         if actual != required {
             return Err(StoreError::Unsafe);
         }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointMode {
+    Passive,
+    Truncate,
+}
+/// What SQLite reported for one explicit checkpoint, in WAL frames. A PASSIVE
+/// run stopped by a reader reports `busy == false` with `checkpointed < log`.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct Checkpoint {
+    pub(crate) busy: bool,
+    pub(crate) log: u64,
+    pub(crate) checkpointed: u64,
+}
+/// Runs one checkpoint and returns its result unjudged. A sync or I/O failure
+/// is an error; a connection that is not in WAL mode is refused.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn checkpoint_checked(conn: &Connection, mode: CheckpointMode) -> Result<Checkpoint> {
+    let (busy, log, checkpointed): (i64, i64, i64) = conn.query_row(
+        match mode {
+            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+        },
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    match (u64::try_from(log), u64::try_from(checkpointed)) {
+        (Ok(log), Ok(checkpointed)) if matches!(busy, 0 | 1) && checkpointed <= log => {
+            Ok(Checkpoint {
+                busy: busy == 1,
+                log,
+                checkpointed,
+            })
+        }
+        _ => Err(StoreError::Unsafe),
+    }
+}
+// Open decision: which mode each commit point passes, how many frames may stay
+// behind a reader, and whether an incomplete checkpoint fails a command whose
+// effect already committed. Until those are decided every incomplete result
+// is a failure and no call site runs a checkpoint.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn require_complete_checkpoint(checkpoint: Checkpoint) -> Result<()> {
+    if checkpoint.busy || checkpoint.checkpointed != checkpoint.log {
+        return Err(StoreError::CheckpointIncomplete);
     }
     Ok(())
 }
