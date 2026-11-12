@@ -355,6 +355,17 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         }
     }
     check_file(&path)?;
+    // SQLite opens this file without CREATE and so never acknowledges its
+    // name. Acknowledge it here even when an interrupted bootstrap created it.
+    #[cfg(target_os = "macos")]
+    if pending {
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(&path)?
+            .sync_all()?;
+        sync_dir(dir)?;
+    }
     for suffix in ["-wal", "-shm", "-journal"] {
         let side = dir.join(format!("{name}{suffix}"));
         match fs::symlink_metadata(&side) {
@@ -370,7 +381,8 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     // Retain ordinary WAL/SHM bookkeeping at last close so strict readers never
-    // need to create it. FULL commits and normal autocheckpoint remain enabled.
+    // need to create it. FULL commits remain enabled, and so does the normal
+    // autocheckpoint everywhere except macOS.
     conn.set_db_config(
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
         true,
@@ -384,6 +396,8 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         return Err(StoreError::Unsafe);
     }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    #[cfg(target_os = "macos")]
+    configure_darwin_connection(&conn)?;
     let mode: String = conn.query_row(
         if initialize {
             "PRAGMA journal_mode=WAL"
@@ -397,6 +411,33 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         return Err(StoreError::Unsafe);
     }
     Ok(conn)
+}
+
+// Every sync SQLite requests must be F_FULLFSYNC, and no checkpoint may run
+// where its result is discarded, so automatic checkpoints are off.
+#[cfg(target_os = "macos")]
+const DARWIN_CONNECTION: [(&str, i64); 4] = [
+    ("synchronous", 2),
+    ("fullfsync", 1),
+    ("checkpoint_fullfsync", 1),
+    ("wal_autocheckpoint", 0),
+];
+#[cfg(target_os = "macos")]
+fn configure_darwin_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA wal_autocheckpoint=0;",
+    )?;
+    verify_darwin_connection(conn)
+}
+#[cfg(target_os = "macos")]
+fn verify_darwin_connection(conn: &Connection) -> Result<()> {
+    for (pragma, required) in DARWIN_CONNECTION {
+        let actual: i64 = conn.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))?;
+        if actual != required {
+            return Err(StoreError::Unsafe);
+        }
+    }
+    Ok(())
 }
 // One actual open-file description per independent schema participant. Runtime
 // clones share ownership, not a path-based permission or a serialized proof.
@@ -735,6 +776,9 @@ fn validate_uninitialized(registry: &Path, dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+// On Apple targets std's `sync_all` is `fcntl(F_FULLFSYNC)` for any descriptor,
+// directories included, with no `fsync` fallback, so this is already the strong
+// acknowledgement. Re-read std's `File::fsync` when the toolchain pin moves.
 fn sync_dir(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
     Ok(())
