@@ -24,6 +24,8 @@ pub mod admission;
 pub mod adopted;
 pub mod allocate;
 mod attribution_gap;
+#[cfg(target_os = "macos")]
+mod authority_darwin;
 mod bounded_process;
 mod capture_artifacts;
 pub mod capture_bridge;

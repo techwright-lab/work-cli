@@ -172,6 +172,10 @@ impl AuthorityIdentity {
             lock_id,
         }))
     }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn collect_for_native_test(registry: &Path, directory: &Path) -> Result<Arc<Self>> {
+        Self::collect(registry, directory, false)
+    }
     pub(crate) fn revalidate_migration(&self) -> Result<()> {
         existing_directory(&self.registry)?;
         existing_directory(&self.directory)?;
@@ -212,6 +216,7 @@ impl AuthorityIdentity {
 
 // Linux filesystem magic allowlist: ext, Btrfs, XFS, tmpfs and local
 // overlayfs. Unknown/FUSE/network filesystems require separate qualification.
+#[cfg(any(not(target_os = "macos"), test))]
 fn local_filesystem(magic: u64) -> bool {
     matches!(
         magic,
@@ -245,10 +250,15 @@ fn private_dir(path: &Path) -> Result<PathBuf> {
     if !m.is_dir() || m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
         return Err(StoreError::Unsafe);
     }
-    let filesystem = rustix::fs::statfs(path).map_err(std::io::Error::from)?;
-    if !local_filesystem(filesystem.f_type as u64) {
-        return Err(StoreError::Unsafe);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let filesystem = rustix::fs::statfs(path).map_err(std::io::Error::from)?;
+        if !local_filesystem(filesystem.f_type as u64) {
+            return Err(StoreError::Unsafe);
+        }
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::admit_private_directory(path, &m).map_err(|_| StoreError::Unsafe)?;
     Ok(fs::canonicalize(path)?)
 }
 fn check_file(path: &Path) -> Result<()> {
@@ -260,7 +270,57 @@ fn check_file(path: &Path) -> Result<()> {
     {
         return Err(StoreError::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private_file(path, &m).map_err(|_| StoreError::Unsafe)?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_admission_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        (temp, root)
+    }
+
+    #[test]
+    fn initialization_admits_a_new_private_directory_and_reopens_it() {
+        let (_temp, root) = fixture();
+        let registry = root.join(".work-authorities");
+        assert_eq!(private_dir(&registry).unwrap(), registry);
+        let created = fs::symlink_metadata(&registry).unwrap();
+        assert!(created.is_dir());
+        assert_eq!(created.mode() & 0o7777, 0o700);
+        assert_eq!(private_dir(&registry).unwrap(), registry);
+        existing_directory(&registry).unwrap();
+    }
+
+    #[test]
+    fn acl_exposed_directories_and_files_are_not_private_despite_their_mode() {
+        use crate::authority_darwin::grant_acl_fixture as grant;
+        let (_temp, root) = fixture();
+        let authority = private_dir(&root.join("authority")).unwrap();
+        let lock = authority.join("allocation.lock");
+        drop(AuthorityIdentity::open_lock(&authority, true).unwrap());
+        check_file(&lock).unwrap();
+        grant(&lock, "everyone allow read");
+        assert_eq!(fs::symlink_metadata(&lock).unwrap().mode() & 0o7777, 0o600);
+        assert!(matches!(check_file(&lock), Err(StoreError::Unsafe)));
+        assert!(matches!(
+            AuthorityIdentity::open_lock(&authority, false),
+            Err(StoreError::Unsafe)
+        ));
+        grant(&authority, "everyone allow list,search");
+        let exposed = fs::symlink_metadata(&authority).unwrap();
+        assert_eq!(exposed.mode() & 0o7777, 0o700);
+        assert!(matches!(
+            existing_directory(&authority),
+            Err(StoreError::Unsafe)
+        ));
+        assert!(matches!(private_dir(&authority), Err(StoreError::Unsafe)));
+    }
 }
 fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<Connection> {
     let path = dir.join(name);
@@ -1749,6 +1809,8 @@ fn existing_directory(dir: &Path) -> Result<()> {
     if m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
         return Err(StoreError::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private_directory(dir, &m).map_err(|_| StoreError::Unsafe)?;
     Ok(())
 }
 fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> {
