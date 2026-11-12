@@ -66,11 +66,29 @@ fn failed_commit_is_uncertain_not_an_ordinary_database_error() {
     commit(tx).unwrap();
 }
 
+#[test]
+fn failed_commit_on_the_allocation_paths_keeps_the_sqlite_text() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         CREATE TABLE parents(id INTEGER PRIMARY KEY);
+         CREATE TABLE children(parent REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED);",
+    )
+    .unwrap();
+    let tx = conn.transaction().unwrap();
+    tx.execute("INSERT INTO children VALUES(1)", []).unwrap();
+    let error = crate::allocate::commit(tx).unwrap_err();
+    assert_eq!(error.to_string(), "FOREIGN KEY constraint failed");
+    assert!(error
+        .get_ref()
+        .is_some_and(|inner| !inner.is::<StoreError>()));
+}
+
 #[cfg(target_os = "macos")]
 mod darwin {
     use super::super::{
-        checkpoint_checked, require_complete_checkpoint, sync_dir, verify_darwin_connection,
-        Checkpoint, CheckpointMode,
+        checkpoint_checked, require_complete_checkpoint, require_darwin_full_sync, sync_dir,
+        verify_darwin_connection, Checkpoint, CheckpointMode,
     };
     use super::*;
     use std::os::unix::fs::OpenOptionsExt;
@@ -93,6 +111,53 @@ mod darwin {
             verify_darwin_connection(&plain),
             Err(StoreError::Unsafe)
         ));
+    }
+
+    // A journal copied from under its live writer has no lock holder: hot.
+    // Without sync the writer stamps the journal header valid at once.
+    fn hot_journal(dir: &Path) -> PathBuf {
+        let (_source, source) = private_directory();
+        let writer = Connection::open(source.join(NAME)).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA synchronous=OFF;
+                 CREATE TABLE entries(value INTEGER); INSERT INTO entries VALUES(1);
+                 BEGIN; UPDATE entries SET value=2;",
+            )
+            .unwrap();
+        let journal = format!("{NAME}-journal");
+        for name in [NAME, journal.as_str()] {
+            std::fs::copy(source.join(name), dir.join(name)).unwrap();
+            std::fs::set_permissions(
+                dir.join(name),
+                std::os::unix::fs::PermissionsExt::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        dir.join(journal)
+    }
+
+    #[test]
+    fn full_sync_is_in_force_before_a_hot_journal_is_played_back() {
+        let (_temp, dir) = private_directory();
+        let journal = hot_journal(&dir);
+        let conn = Connection::open(dir.join(NAME)).unwrap();
+        require_darwin_full_sync(&conn).unwrap();
+        assert!(journal.exists(), "configuration must not read the database");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        assert!(!journal.exists(), "the first read plays the journal back");
+    }
+
+    #[test]
+    fn interrupted_bootstrap_with_a_hot_journal_resumes_under_the_darwin_settings() {
+        let (_temp, dir) = private_directory();
+        let journal = hot_journal(&dir);
+        let conn = database(&dir, NAME, true, true).unwrap();
+        assert!(!journal.exists());
+        verify_darwin_connection(&conn).unwrap();
     }
 
     #[test]

@@ -70,6 +70,14 @@ pub(crate) fn db<T>(r: crate::store::Result<T>) -> io::Result<T> {
 pub(crate) fn sql<T>(r: rusqlite::Result<T>) -> io::Result<T> {
     r.map_err(|e| err(&e.to_string()))
 }
+// Open decision: the public wording of an uncertain commit. Until it is made a
+// failed COMMIT on these paths prints the SQLite text it always printed.
+pub(crate) fn commit(tx: rusqlite::Transaction<'_>) -> io::Result<()> {
+    crate::store::commit(tx).map_err(|e| match e {
+        crate::store::StoreError::CommitUncertain(source) => err(&source.to_string()),
+        other => io::Error::other(other),
+    })
+}
 pub(crate) fn component(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
@@ -195,7 +203,7 @@ fn save_checked_under_lease(
             expected.check_time()?;
         }
     }
-    db(crate::store::commit(tx))
+    commit(tx)
 }
 #[cfg(test)]
 pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allocation>> {
@@ -271,7 +279,7 @@ pub(crate) fn load_under_lease(
             reason: Some("malformed allocation metadata; operator reconciliation required".into()),
         },
     ))?;
-    db(crate::store::commit(tx))?;
+    commit(tx)?;
     Err(err(
         "malformed allocation metadata; held with charge retained",
     ))
@@ -950,7 +958,7 @@ fn refresh_ready_identity_under_lease(
     if let Some(expected) = predecessor {
         expected.check_time()?;
     }
-    db(crate::store::commit(tx))?;
+    commit(tx)?;
     *a = refreshed;
     Ok(())
 }
@@ -2147,12 +2155,12 @@ pub(crate) fn start_observed_with_git(
                     },
                 ))?;
             }
-            db(crate::store::commit(tx))?;
+            commit(tx)?;
             return Err(err(
                 "ambiguous matching allocations; hold for reconciliation",
             ));
         }
-        db(crate::store::commit(tx))?;
+        commit(tx)?;
         drop(phase);
         {
             let _phase = store.sql_phase();

@@ -11,6 +11,14 @@ type Result<T> = std::result::Result<T, String>;
 fn checked<T, E: std::fmt::Debug>(r: std::result::Result<T, E>) -> Result<T> {
     r.map_err(|e| format!("{e:?}"))
 }
+// Open decision: the public wording of an uncertain commit. Until it is made a
+// failed COMMIT here prints the SQLite error it always printed.
+fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
+    match crate::store::commit(tx) {
+        Err(crate::store::StoreError::CommitUncertain(source)) => checked(Err(source)),
+        other => checked(other),
+    }
+}
 #[derive(Serialize)]
 pub(crate) struct Report {
     pub checkout: Uuid,
@@ -358,7 +366,7 @@ fn publish(
     }
     checked(journal::emit(&tx, a.checkout, operation, phase, record))?;
     checked(b.check())?;
-    checked(crate::store::commit(tx))
+    commit(tx)
 }
 pub(crate) fn command(
     invocation: &crate::git::GitInvocation,
@@ -543,6 +551,20 @@ mod tests {
         } else {
             Ok(())
         }
+    }
+    #[test]
+    fn failed_commit_keeps_the_sqlite_error_text() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parents(id INTEGER PRIMARY KEY);
+             CREATE TABLE children(parent REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED);",
+        )
+        .unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute("INSERT INTO children VALUES(1)", []).unwrap();
+        let message = commit(tx).unwrap_err();
+        assert!(message.starts_with("SqliteFailure("), "{message}");
     }
     #[test]
     fn unsupported_git_explains_minimum_without_mislabeling_other_holds() {

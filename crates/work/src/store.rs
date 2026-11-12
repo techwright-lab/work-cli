@@ -391,6 +391,8 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         true,
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
+    #[cfg(target_os = "macos")]
+    require_darwin_full_sync(&conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
         || (name == "store.sqlite" && matches!(version, 2..=17))
@@ -400,7 +402,7 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
     }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
     #[cfg(target_os = "macos")]
-    configure_darwin_connection(&conn)?;
+    verify_darwin_connection(&conn)?;
     let mode: String = conn.query_row(
         if initialize {
             "PRAGMA journal_mode=WAL"
@@ -420,24 +422,32 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
 // where its result is discarded: automatic checkpoints are off, explicit ones
 // go through `checkpoint_checked`.
 #[cfg(target_os = "macos")]
-const DARWIN_CONNECTION: [(&str, i64); 4] = [
-    ("synchronous", 2),
+const DARWIN_FULL_SYNC: [(&str, i64); 3] = [
     ("fullfsync", 1),
     ("checkpoint_fullfsync", 1),
     ("wal_autocheckpoint", 0),
 ];
+// The first read of the database file plays back a hot journal and syncs with
+// whatever the pager holds then, so this runs before any read. None of these
+// pragmas loads the schema; `synchronous` does, which is why it is set and
+// verified only afterwards. The pager opens at FULL.
 #[cfg(target_os = "macos")]
-fn configure_darwin_connection(conn: &Connection) -> Result<()> {
+fn require_darwin_full_sync(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA wal_autocheckpoint=0;",
     )?;
-    verify_darwin_connection(conn)
+    verify_pragmas(conn, &DARWIN_FULL_SYNC)
 }
 #[cfg(target_os = "macos")]
 fn verify_darwin_connection(conn: &Connection) -> Result<()> {
-    for (pragma, required) in DARWIN_CONNECTION {
+    verify_pragmas(conn, &[("synchronous", 2)])?;
+    verify_pragmas(conn, &DARWIN_FULL_SYNC)
+}
+#[cfg(target_os = "macos")]
+fn verify_pragmas(conn: &Connection, required: &[(&str, i64)]) -> Result<()> {
+    for (pragma, required) in required {
         let actual: i64 = conn.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))?;
-        if actual != required {
+        if actual != *required {
             return Err(StoreError::Unsafe);
         }
     }
