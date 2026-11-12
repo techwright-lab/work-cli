@@ -571,15 +571,17 @@ fn finish_internal(
                     },
                 )?;
             }
-            tx.commit()?;
+            crate::store::commit(tx)?;
             Ok(())
         })();
         match persisted {
             Ok(()) => boundary("outcome_committed"),
             Err(_error)
                 if integrated
-                    && (matches!(&_error, StoreError::Database(_))
-                        || matches!(&_error, StoreError::Io(error)
+                    && (matches!(
+                        &_error,
+                        StoreError::Database(_) | StoreError::CommitUncertain(_)
+                    ) || matches!(&_error, StoreError::Io(error)
                             if error.kind() == std::io::ErrorKind::WouldBlock)) =>
             {
                 // Task completion is committed; retain any per-run FINISH truth
@@ -965,7 +967,7 @@ fn prepare(
         if let Some(proof) = proof {
             proof.fresh()?;
         }
-        tx.commit()?;
+        crate::store::commit(tx)?;
     }
     Ok(receipt)
 }

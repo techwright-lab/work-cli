@@ -195,7 +195,7 @@ fn save_checked_under_lease(
             expected.check_time()?;
         }
     }
-    sql(tx.commit())
+    db(crate::store::commit(tx))
 }
 #[cfg(test)]
 pub(crate) fn load(store: &mut Store, operation: Uuid) -> io::Result<Option<Allocation>> {
@@ -271,7 +271,7 @@ pub(crate) fn load_under_lease(
             reason: Some("malformed allocation metadata; operator reconciliation required".into()),
         },
     ))?;
-    sql(tx.commit())?;
+    db(crate::store::commit(tx))?;
     Err(err(
         "malformed allocation metadata; held with charge retained",
     ))
@@ -950,7 +950,7 @@ fn refresh_ready_identity_under_lease(
     if let Some(expected) = predecessor {
         expected.check_time()?;
     }
-    sql(tx.commit())?;
+    db(crate::store::commit(tx))?;
     *a = refreshed;
     Ok(())
 }
@@ -2147,12 +2147,12 @@ pub(crate) fn start_observed_with_git(
                     },
                 ))?;
             }
-            sql(tx.commit())?;
+            db(crate::store::commit(tx))?;
             return Err(err(
                 "ambiguous matching allocations; hold for reconciliation",
             ));
         }
-        sql(tx.commit())?;
+        db(crate::store::commit(tx))?;
         drop(phase);
         {
             let _phase = store.sql_phase();

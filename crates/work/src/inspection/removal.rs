@@ -358,7 +358,7 @@ fn publish(
     }
     checked(journal::emit(&tx, a.checkout, operation, phase, record))?;
     checked(b.check())?;
-    checked(tx.commit())
+    checked(crate::store::commit(tx))
 }
 pub(crate) fn command(
     invocation: &crate::git::GitInvocation,

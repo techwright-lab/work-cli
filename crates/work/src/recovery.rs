@@ -110,7 +110,7 @@ pub(crate) fn hold_under_lease(
                     },
                 ))?;
             }
-            allocate::sql(tx.commit())?;
+            allocate::db(crate::store::commit(tx))?;
             *a = current;
             return Ok(());
         }

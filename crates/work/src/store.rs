@@ -44,8 +44,20 @@ pub enum StoreError {
     RetirementFenced,
     #[error("checkout operations in flight")]
     OperationsInFlight,
+    /// COMMIT returned an error: the change may still be durable after a crash
+    /// or reopen. Keep charge and history and reconcile; never infer rollback.
+    // Open decision: the public wording. Until it is made this prints exactly
+    // as `Database` does.
+    #[error("store database failure")]
+    CommitUncertain(#[source] rusqlite::Error),
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Ends a transaction so that a failed COMMIT stays distinguishable from an
+/// ordinary statement error.
+pub(crate) fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
+    tx.commit().map_err(StoreError::CommitUncertain)
+}
 
 // Passive history access stays separate. Native mutable opens must refuse before
 // even creating private directories, locks, SQLite sidecars or bootstrap markers.
@@ -1464,7 +1476,7 @@ impl Store {
         tx.prepare("SELECT checkout,group_id FROM writers LIMIT 0")?;
         tx.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
         tx.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
-        tx.commit()?;
+        commit(tx)?;
         drop(phase);
         drop(lease);
         initialization_boundary("store_schema");
@@ -1529,7 +1541,7 @@ impl Store {
             crate::retirement_journal::Attempt::WriterAcquire,
         )?;
         acquire_writer_tx(&tx, checkout, group, true, &lease, &authority)?;
-        tx.commit()?;
+        commit(tx)?;
         Ok(())
     }
     pub fn pending_events(&self, limit: usize) -> Result<Vec<PendingEvent>> {
@@ -1564,7 +1576,7 @@ impl Store {
             "UPDATE outbox SET acknowledged=1 WHERE sequence=?1",
             [sequence],
         )?;
-        tx.commit()?;
+        commit(tx)?;
         Ok(())
     }
 }
@@ -1609,7 +1621,7 @@ fn register_roots(
             (root.to_str(), dir.to_str()),
         )?;
     }
-    tx.commit()?;
+    commit(tx)?;
     drop(phase);
     initialization_boundary("claims");
     Ok(())
@@ -2388,6 +2400,10 @@ pub(crate) mod schema_participation_tests;
 #[cfg(test)]
 #[path = "schema17_migration_tests.rs"]
 mod schema17_migration_tests;
+
+#[cfg(test)]
+#[path = "store_persistence_tests.rs"]
+mod persistence_tests;
 
 #[cfg(test)]
 mod tests {
