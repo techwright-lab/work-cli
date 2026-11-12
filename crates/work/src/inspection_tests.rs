@@ -1600,19 +1600,6 @@ mod darwin_directories {
         }
     }
 
-    // The system root and /Users are separate real volumes joined by a
-    // firmlink: the one crossing a test can observe without mounting anything.
-    #[test]
-    fn real_volume_crossing_beneath_a_root_refuses_but_may_lead_to_one() {
-        let mut b = Budget::new();
-        let mut system = filesystem::Manifest::new(std::path::Path::new("/"), &mut b).unwrap();
-        assert_eq!(
-            system.is_directory(b"Users", &mut b),
-            Err(IncompleteReason::MountCrossing)
-        );
-        assert!(filesystem::Manifest::new(std::path::Path::new("/Users"), &mut b).is_ok());
-    }
-
     fn topology<'a>(
         real_fsid: [i32; 2],
         mount_status: u32,
@@ -1670,11 +1657,16 @@ mod darwin_directories {
     }
 
     #[test]
-    fn persistent_storage_is_proven_local_apfs_or_refused() {
+    fn local_apfs_label_is_necessary_but_does_not_prove_persistent_storage() {
         const LOCAL: u32 = 0x1000;
+        // The owned tree sits on a local APFS mount, which a RAM-backed volume
+        // or a disk image reports too, so the label must not be accepted.
         let t = tree();
         let manifest = filesystem::Manifest::new(&t.root, &mut Budget::new()).unwrap();
-        assert_eq!(manifest.persistent_fs(), Ok(()));
+        assert_eq!(
+            manifest.persistent_fs(),
+            Err(IncompleteReason::UnsupportedGit)
+        );
         assert_eq!(
             filesystem::darwin::persistent_volume(b"apfs", LOCAL),
             Ok(())

@@ -5089,7 +5089,9 @@ mod filesystem {
             }
         }
 
-        /// Recovery storage is accepted only as a local APFS mount.
+        /// A local APFS mount is necessary for recovery storage and proves
+        /// nothing by itself: a RAM-backed volume and a disk image report the
+        /// same label and flag.
         pub(in crate::inspection) fn persistent_volume(
             filesystem: &[u8],
             flags: u32,
@@ -5101,6 +5103,13 @@ mod filesystem {
                 Err(IncompleteReason::UnsupportedGit)
             }
         }
+        /// OPEN DECISION (issue 59; accepted specification section 3, "APFS
+        /// labels ... alone are insufficient evidence"): which evidence shows
+        /// that a local APFS volume survives reboot and detach is the
+        /// operator's choice. Until it is made, no volume is proven persistent.
+        fn persistence_proven() -> Result<(), IncompleteReason> {
+            Err(IncompleteReason::UnsupportedGit)
+        }
         pub(super) fn persistent_fs(root: &Held) -> Result<(), IncompleteReason> {
             let volume = work_darwin::mounted_volume_fd(root.fd.as_fd()).map_err(refusal)?;
             // The volume answering now must be the one the root was bound to.
@@ -5110,7 +5119,8 @@ mod filesystem {
             if volume.fsid != *real_fsid {
                 return Err(IncompleteReason::Changed);
             }
-            persistent_volume(volume.filesystem(), volume.flags)
+            persistent_volume(volume.filesystem(), volume.flags)?;
+            persistence_proven()
         }
     }
     #[cfg(target_os = "linux")]
