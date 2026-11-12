@@ -219,17 +219,12 @@ fn verify_identity_with_git(
     ] {
         crate::config::validate_path(path, true).map_err(|_| fail())?;
     }
-    // A boot identity from another provider is incomparable, not a reboot.
-    #[cfg(target_os = "macos")]
-    if !crate::identity::recorded_by_native_boot_provider(&prior.boot_id) {
-        return Err(fail());
-    }
     let current = CheckoutIdentity::inspect_with_git(git, &a.destination)?;
     if current.path != prior.path
         || current.private_git_dir != prior.private_git_dir
         || current.common_git_dir != prior.common_git_dir
         || current.directory.inode != prior.directory.inode
-        || (current.boot_id == prior.boot_id && current.directory.device != prior.directory.device)
+        || !crate::identity::device_fits_record(&current, prior)
     {
         return Err(fail());
     }

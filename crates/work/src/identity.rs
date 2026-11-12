@@ -104,7 +104,7 @@ fn darwin_boot_id(session: &work_darwin::BootSessionUuid) -> String {
 /// Whether a recorded boot identity came from this platform's provider. One
 /// from another provider is incomparable: neither this boot nor an earlier one.
 #[cfg(target_os = "macos")]
-pub(crate) fn recorded_by_native_boot_provider(recorded: &str) -> bool {
+fn recorded_by_native_boot_provider(recorded: &str) -> bool {
     recorded
         .strip_prefix(DARWIN_BOOT_PROVIDER)
         .is_some_and(|uuid| {
@@ -112,6 +112,16 @@ pub(crate) fn recorded_by_native_boot_provider(recorded: &str) -> bool {
             work_darwin::parse_boot_session_uuid(&frame)
                 .is_ok_and(|session| session.as_bytes() == uuid.as_bytes())
         })
+}
+/// Whether the recorded device number still fits this checkout. A device
+/// number may change only across a reboot, and only a boot identity from this
+/// platform's provider can show one: a foreign record never reads as a reboot.
+pub(crate) fn device_fits_record(current: &CheckoutIdentity, prior: &CheckoutIdentity) -> bool {
+    #[cfg(target_os = "macos")]
+    if !recorded_by_native_boot_provider(&prior.boot_id) {
+        return false;
+    }
+    current.boot_id != prior.boot_id || current.directory.device == prior.directory.device
 }
 /// Open first, then validate the descriptor: no symlink/FIFO/device or unbounded reads.
 pub(crate) fn read_metadata(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
@@ -347,6 +357,31 @@ mod darwin_boot_tests {
         ] {
             assert!(!recorded_by_native_boot_provider(&recorded), "{recorded}");
         }
+    }
+
+    fn checkout(boot_id: &str, device: u64) -> CheckoutIdentity {
+        CheckoutIdentity {
+            path: "/checkout".into(),
+            private_git_dir: "/checkout/.git".into(),
+            common_git_dir: "/checkout/.git".into(),
+            directory: DirectoryIdentity { device, inode: 7 },
+            head: "0".repeat(40),
+            boot_id: boot_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn device_change_is_a_reboot_only_between_native_boot_identities() {
+        let this_boot = "darwin-bootsession-v1:5f0c3b1e-8d2a-4c6f-9b1a-2e7d4f6a8c01";
+        let earlier_boot = "darwin-bootsession-v1:0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let linux_boot = "5f0c3b1e-8d2a-4c6f-9b1a-2e7d4f6a8c01";
+        let current = checkout(this_boot, 2);
+
+        assert!(device_fits_record(&current, &checkout(this_boot, 2)));
+        assert!(device_fits_record(&current, &checkout(earlier_boot, 1)));
+        assert!(!device_fits_record(&current, &checkout(this_boot, 1)));
+        assert!(!device_fits_record(&current, &checkout(linux_boot, 1)));
+        assert!(!device_fits_record(&current, &checkout(linux_boot, 2)));
     }
 }
 
