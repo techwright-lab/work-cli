@@ -129,6 +129,7 @@ impl Drop for TransportGuard {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StoreCategory {
+    NativeIncomplete,
     Unsafe,
     Database,
     Io,
@@ -341,6 +342,7 @@ thread_local! { static ACTIVE: RefCell<Option<Collector>> = const { RefCell::new
 pub(crate) fn store_error(phase: &'static str, error: &crate::store::StoreError) {
     use crate::store::StoreError as E;
     let category = match error {
+        E::NativeIncomplete => StoreCategory::NativeIncomplete,
         E::Unsafe => StoreCategory::Unsafe,
         E::Database(_) => StoreCategory::Database,
         E::Io(_) => StoreCategory::Io,

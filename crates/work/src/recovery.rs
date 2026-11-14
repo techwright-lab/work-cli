@@ -139,8 +139,11 @@ pub(crate) fn reconcile_under_lease(
     *a = current;
     Ok(())
 }
-pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
-    verify_identity(a, false)
+pub(crate) fn verify_with_git(
+    git: &crate::git::GitInvocation,
+    a: &Allocation,
+) -> io::Result<CheckoutIdentity> {
+    verify_identity_with_git(git, a, false)
 }
 
 /// Narrow descriptor reader for the Gap-only verifier. Do not relax the legacy
@@ -169,8 +172,11 @@ pub(crate) fn gap_metadata(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 /// Only the continuation module calls this purpose-specific verifier. Pending
-/// allocations remain exact-HEAD in verify(); no stage or identity is rewritten.
-pub(crate) fn verify_gap(a: &Allocation) -> io::Result<CheckoutIdentity> {
+/// allocations remain exact-HEAD in verify_with_git(git, ); no stage or identity is rewritten.
+pub(crate) fn verify_gap_with_git(
+    git: &crate::git::GitInvocation,
+    a: &Allocation,
+) -> io::Result<CheckoutIdentity> {
     let prior = a
         .identity
         .as_ref()
@@ -196,10 +202,14 @@ pub(crate) fn verify_gap(a: &Allocation) -> io::Result<CheckoutIdentity> {
         return Err(allocate::err("Gap common directory changed"));
     }
     gap_metadata(&prior.private_git_dir.join("work-lease.json"))?;
-    verify_identity(a, true)
+    verify_identity_with_git(git, a, true)
 }
 
-fn verify_identity(a: &Allocation, gap_descendants: bool) -> io::Result<CheckoutIdentity> {
+fn verify_identity_with_git(
+    git: &crate::git::GitInvocation,
+    a: &Allocation,
+    gap_descendants: bool,
+) -> io::Result<CheckoutIdentity> {
     let fail = || allocate::err("insufficient allocation identity");
     let prior = a.identity.as_ref().ok_or_else(fail)?;
     for path in [
@@ -209,7 +219,7 @@ fn verify_identity(a: &Allocation, gap_descendants: bool) -> io::Result<Checkout
     ] {
         crate::config::validate_path(path, true).map_err(|_| fail())?;
     }
-    let current = CheckoutIdentity::inspect(&a.destination)?;
+    let current = CheckoutIdentity::inspect_with_git(git, &a.destination)?;
     if current.path != prior.path
         || current.private_git_dir != prior.private_git_dir
         || current.common_git_dir != prior.common_git_dir
@@ -218,7 +228,8 @@ fn verify_identity(a: &Allocation, gap_descendants: bool) -> io::Result<Checkout
     {
         return Err(fail());
     }
-    let branch = crate::identity::query(&a.destination, &["symbolic-ref", "--quiet", "HEAD"])?;
+    let branch =
+        crate::identity::query_with_git(git, &a.destination, &["symbolic-ref", "--quiet", "HEAD"])?;
     if branch
         != format!(
             "refs/heads/{}",
@@ -231,7 +242,8 @@ fn verify_identity(a: &Allocation, gap_descendants: bool) -> io::Result<Checkout
         if !gap_descendants && a.stage != "ready" {
             return Err(fail());
         }
-        crate::identity::query(
+        crate::identity::query_with_git(
+            git,
             &a.destination,
             &["merge-base", "--is-ancestor", &prior.head, &current.head],
         )?;
@@ -246,4 +258,9 @@ fn verify_identity(a: &Allocation, gap_descendants: bool) -> io::Result<Checkout
         return Err(fail());
     }
     Ok(current)
+}
+
+#[cfg(test)]
+pub(crate) fn verify(a: &Allocation) -> io::Result<CheckoutIdentity> {
+    verify_with_git(&crate::git::GitInvocation::new(None, None), a)
 }

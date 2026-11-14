@@ -27,6 +27,19 @@ pub fn begin(
     request: &RootRunRequest,
     spec: &CaptureSpec,
 ) -> std::io::Result<(Store, BeginCapturedRun)> {
+    begin_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        request,
+        spec,
+    )
+}
+pub(crate) fn begin_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    request: &RootRunRequest,
+    spec: &CaptureSpec,
+) -> std::io::Result<(Store, BeginCapturedRun)> {
     if request.input().attribution.is_some() {
         return Err(crate::allocate::err("capture rejects Off declaration"));
     }
@@ -36,11 +49,12 @@ pub fn begin(
     let guard = crate::allocate::db(crate::checkout_guard::CheckoutGuard::shared_known(
         config, checkout,
     ))?;
-    begin_under_guard(config, request, spec, &guard)
+    begin_under_guard_with_git(invocation, config, request, spec, &guard)
 }
 
 /// Nested capture setup. The caller retains the matching SH guard.
-pub(crate) fn begin_under_guard(
+pub(crate) fn begin_under_guard_with_git(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     request: &RootRunRequest,
     spec: &CaptureSpec,
@@ -88,9 +102,11 @@ pub(crate) fn begin_under_guard(
     }
     if allocation.stage == "ready" {
         drop(lock);
-        let proof = crate::allocate::db(crate::capture_readiness::ContinuationProof::inspect(
-            &store, config, request, spec,
-        ))?;
+        let proof = crate::allocate::db(
+            crate::capture_readiness::ContinuationProof::inspect_with_git(
+                invocation, &store, config, request, spec,
+            ),
+        )?;
         crate::allocate::db(proof.reinspect(&store))?;
         crate::allocate::db(guard.revalidate(&store))?;
         let lock = crate::allocate::lifecycle_lock(&store)?;
@@ -101,7 +117,9 @@ pub(crate) fn begin_under_guard(
         return Ok((store, result));
     }
     drop(lock);
-    let proof = crate::allocate::db(MaterializationProof::inspect(&store, request, spec))?;
+    let proof = crate::allocate::db(MaterializationProof::inspect_with_git(
+        invocation, &store, request, spec,
+    ))?;
     let inspected = crate::allocate::db(proof.reinspect(&store))?;
     crate::allocate::db(guard.require_matching(&store, checkout))?;
     let lock = crate::allocate::lifecycle_lock(&store)?;
@@ -312,6 +330,7 @@ impl PreparationContext {
 // No Clone/Serde, private fields and a single real-inspection constructor. A
 // stored flag, root declaration or preparation response cannot mint this proof.
 pub(crate) struct MaterializationProof {
+    invocation: crate::git::GitInvocation,
     authority: std::sync::Arc<crate::store::AuthorityIdentity>,
     root: RootRunRequest,
     allocation: Allocation,
@@ -346,21 +365,27 @@ pub(crate) struct Physical {
     pub(crate) directories: Vec<(u64, u64)>,
     pub(crate) marker: Vec<u8>,
 }
-fn physical(a: &Allocation, charged_common: &std::path::Path) -> Result<Physical> {
-    let observed = inspect_physical(a, charged_common)?;
+fn physical(
+    invocation: &crate::git::GitInvocation,
+    a: &Allocation,
+    charged_common: &std::path::Path,
+) -> Result<Physical> {
+    let observed = inspect_physical_with_git(invocation, a, charged_common)?;
     if a.identity.as_ref() != Some(&observed.checkout) {
         return Err(StoreError::Conflict);
     }
     Ok(observed)
 }
-pub(crate) fn inspect_physical(
+pub(crate) fn inspect_physical_with_git(
+    invocation: &crate::git::GitInvocation,
     a: &Allocation,
     charged_common: &std::path::Path,
 ) -> Result<Physical> {
     let source = a.request.repository.as_ref().ok_or(StoreError::Invalid)?;
     crate::config::validate_path(source, true).map_err(|_| StoreError::Unsafe)?;
-    let charged_common = crate::allocate::verify_source_authority(a, charged_common)?;
-    let checkout = crate::recovery::verify(a)?;
+    let charged_common =
+        crate::allocate::verify_source_authority_with_git(invocation, a, charged_common)?;
+    let checkout = crate::recovery::verify_with_git(invocation, a)?;
     if checkout.common_git_dir != charged_common
         || checkout.private_git_dir == checkout.common_git_dir
     {
@@ -405,7 +430,12 @@ fn eligible(conn: &Connection, checkout: uuid::Uuid) -> Result<()> {
     }
 }
 impl MaterializationProof {
-    fn inspect(store: &Store, root: &RootRunRequest, spec: &CaptureSpec) -> Result<Self> {
+    fn inspect_with_git(
+        invocation: &crate::git::GitInvocation,
+        store: &Store,
+        root: &RootRunRequest,
+        spec: &CaptureSpec,
+    ) -> Result<Self> {
         if !store.conn.is_autocommit() {
             return Err(StoreError::Invalid);
         }
@@ -422,10 +452,11 @@ impl MaterializationProof {
         let observed = Instant::now();
         #[cfg(test)]
         tests::observe_physical(&store.conn);
-        let physical = physical(&a, &pending.source_common)?;
+        let physical = physical(invocation, &a, &pending.source_common)?;
         let spec_digest =
             Sha256::digest(serde_json::to_vec(spec).map_err(|_| StoreError::Invalid)?).into();
         let proof = Self {
+            invocation: invocation.clone(),
             authority: store.authority_identity().clone(),
             root: root.clone(),
             allocation: a,
@@ -449,7 +480,12 @@ impl MaterializationProof {
         self.fresh()?;
         #[cfg(test)]
         tests::observe_physical(&store.conn);
-        if physical(&self.allocation, &self.pending.source_common)? != self.physical {
+        if physical(
+            &self.invocation,
+            &self.allocation,
+            &self.pending.source_common,
+        )? != self.physical
+        {
             return Err(StoreError::Conflict);
         }
         self.fresh()?;
@@ -515,5 +551,33 @@ impl MaterializationProof {
     }
     pub(crate) fn preparation(&self) -> PendingPreparation {
         self.pending.clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn begin_under_guard(
+    config: &Config,
+    request: &RootRunRequest,
+    spec: &CaptureSpec,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> std::io::Result<(Store, BeginCapturedRun)> {
+    begin_under_guard_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        request,
+        spec,
+        guard,
+    )
+}
+
+#[cfg(test)]
+impl MaterializationProof {
+    fn inspect(store: &Store, root: &RootRunRequest, spec: &CaptureSpec) -> Result<Self> {
+        Self::inspect_with_git(
+            &crate::git::GitInvocation::new(None, None),
+            store,
+            root,
+            spec,
+        )
     }
 }

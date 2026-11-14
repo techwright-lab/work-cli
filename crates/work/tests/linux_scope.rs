@@ -39,7 +39,7 @@ fn default_probe_is_read_only_and_never_qualifies_paperclip() {
     assert!(!json.contains("PATH="));
     assert!(!json.contains("environ"));
     assert!(json.contains("test-run"));
-    let host = inspect_host();
+    let host = inspect_host().unwrap();
     assert!(host.uid.is_some());
     assert!(host.current_cgroup.is_some());
 }

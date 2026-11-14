@@ -66,7 +66,8 @@ pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
 /// Metadata-only Gap physical inspection against an actually admitted baseline.
 /// Callers retain their original operation Instant across both observations and
 /// contention; this local bound never extends that caller's proof lifetime.
-pub(crate) fn inspect_physical(
+pub(crate) fn inspect_physical_with_git(
+    invocation: &crate::git::GitInvocation,
     allocation: &crate::allocate::Allocation,
     charged_common: &std::path::Path,
     baseline: &crate::capture_setup::Physical,
@@ -101,8 +102,9 @@ pub(crate) fn inspect_physical(
         }
         directories.push(actual);
     }
-    let checkout = crate::recovery::verify_gap(allocation)?;
-    let common = crate::allocate::verify_source_authority(allocation, charged_common)?;
+    let checkout = crate::recovery::verify_gap_with_git(invocation, allocation)?;
+    let common =
+        crate::allocate::verify_source_authority_with_git(invocation, allocation, charged_common)?;
     let marker = crate::recovery::gap_metadata(&checkout.private_git_dir.join("work-lease.json"))?;
     if checkout.common_git_dir != common
         || checkout.private_git_dir == checkout.common_git_dir
@@ -122,7 +124,8 @@ pub(crate) fn inspect_physical(
             || !object
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || crate::identity::query(
+            || crate::identity::query_with_git(
+                invocation,
                 &checkout.path,
                 &["rev-parse", &format!("{object}^{{commit}}")],
             )?
@@ -133,7 +136,8 @@ pub(crate) fn inspect_physical(
         }
     }
     for parent in [prior.head.as_str(), anchor] {
-        crate::identity::query(
+        crate::identity::query_with_git(
+            invocation,
             &checkout.path,
             &["merge-base", "--is-ancestor", parent, &checkout.head],
         )?;
@@ -744,6 +748,7 @@ impl<'tx, 'conn> Related<'tx, 'conn> {
 /// Only inspect_continuation constructs this fresh purpose proof. Q decoding
 /// supplies metadata, not this proof or a live writer/launch capability.
 pub(crate) struct ContinuationProof {
+    invocation: crate::git::GitInvocation,
     link: Continuation,
     predecessor: Qualification,
     frontier: [u8; 32],
@@ -756,7 +761,8 @@ impl std::fmt::Debug for ContinuationProof {
         f.write_str("ContinuationProof([redacted])")
     }
 }
-pub(crate) fn inspect_continuation(
+pub(crate) fn inspect_continuation_with_git(
+    invocation: &crate::git::GitInvocation,
     store: &crate::store::Store,
     root: &crate::run_journal::RootRunRequest,
     destination: &crate::attribution_gap::Destination,
@@ -791,7 +797,8 @@ pub(crate) fn inspect_continuation(
         })?
     };
     let observed = Instant::now();
-    let physical = inspect_physical(
+    let physical = inspect_physical_with_git(
+        invocation,
         allocation,
         charged_common,
         &q.physical,
@@ -808,6 +815,7 @@ pub(crate) fn inspect_continuation(
     };
     link.validate()?;
     let proof = ContinuationProof {
+        invocation: invocation.clone(),
         link,
         predecessor: q,
         frontier,
@@ -836,7 +844,8 @@ impl ContinuationProof {
         allocation: &crate::allocate::Allocation,
         charged_common: &Path,
     ) -> Result<()> {
-        if inspect_physical(
+        if inspect_physical_with_git(
+            &self.invocation,
             allocation,
             charged_common,
             &self.predecessor.physical,
@@ -1364,4 +1373,20 @@ impl Continuation {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) fn inspect_physical(
+    allocation: &crate::allocate::Allocation,
+    charged: &Path,
+    baseline: &crate::capture_setup::Physical,
+    anchor: &str,
+) -> Result<crate::capture_setup::Physical> {
+    inspect_physical_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        allocation,
+        charged,
+        baseline,
+        anchor,
+    )
 }

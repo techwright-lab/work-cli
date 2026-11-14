@@ -8,6 +8,8 @@ pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// user, or organization paths.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
+    /// Optional absolute executable spelling; qualification follows symlinks safely.
+    pub git_path: Option<PathBuf>,
     /// Directory for the local lifecycle store, when the host has configured one.
     pub store_dir: Option<PathBuf>,
     pub trusted_registry: Option<PathBuf>,
@@ -71,6 +73,7 @@ pub(crate) struct ConfigDocument {
 /// Setup-owned first-time document fields. Not an execution Config.
 #[allow(dead_code)]
 pub(crate) struct InstallDocument {
+    pub git_path: Option<PathBuf>,
     pub actor: String,
     pub repositories: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
@@ -79,6 +82,22 @@ pub(crate) struct InstallDocument {
     pub allocation: AllocationPolicy,
 }
 impl ConfigDocument {
+    pub(crate) fn git_path(&self) -> Result<Option<PathBuf>, Error> {
+        git_path(&self.value)
+    }
+    pub(crate) fn set_git_path(&mut self, path: &std::path::Path) -> Result<(), Error> {
+        let mut value = toml::Table::new();
+        value.insert(
+            "git_path".into(),
+            toml::Value::String(path.to_str().ok_or_else(invalid_path)?.into()),
+        );
+        let path = git_path(&toml::Value::Table(value))?.expect("present selector");
+        self.value.as_table_mut().ok_or_else(invalid_path)?.insert(
+            "git_path".into(),
+            toml::Value::String(path.to_str().ok_or_else(invalid_path)?.into()),
+        );
+        Ok(())
+    }
     pub(crate) fn default_actor(&self) -> Result<Option<String>, Error> {
         self.value
             .get("actor")
@@ -209,9 +228,13 @@ impl ConfigDocument {
             path_value(&install.trusted_registry, false)?,
         );
         table.insert("allocation".into(), allocation_value(&install.allocation)?);
-        Ok(Self {
+        let mut document = Self {
             value: toml::Value::Table(table),
-        })
+        };
+        if let Some(path) = install.git_path {
+            document.set_git_path(&path)?;
+        }
+        Ok(document)
     }
     pub(crate) fn retirement_prepare_intents(&self) -> Result<bool, Error> {
         let invalid = || Error::Config("invalid retirement policy".into());
@@ -230,6 +253,7 @@ impl ConfigDocument {
     }
     pub(crate) fn authority(&self) -> Result<Config, Error> {
         Ok(Config {
+            git_path: self.git_path()?,
             store_dir: single_path(&self.value, "store_dir")?,
             trusted_registry: single_path(&self.value, "trusted_registry")?,
             roots: many_paths(&self.value, "roots")?,
@@ -425,6 +449,7 @@ impl Config {
     }
     fn from_value(value: &toml::Value) -> Result<Self, Error> {
         Ok(Self {
+            git_path: git_path(value)?,
             store_dir: single_path(value, "store_dir")?,
             trusted_registry: single_path(value, "trusted_registry")?,
             roots: many_paths(value, "roots")?,
@@ -462,6 +487,24 @@ impl Config {
         })
     }
 }
+// Unlike authority directories, an executable spelling may traverse installation
+// symlinks. This validates only the selector; Git qualification proves its route.
+fn git_path(value: &toml::Value) -> Result<Option<PathBuf>, Error> {
+    value
+        .get("git_path")
+        .map(|value| {
+            let invalid = || Error::Config("git_path must be an absolute executable path".into());
+            let text = value.as_str().ok_or_else(invalid)?;
+            if text.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r'))
+                || !std::path::Path::new(text).is_absolute()
+            {
+                return Err(invalid());
+            }
+            Ok(PathBuf::from(text))
+        })
+        .transpose()
+}
+
 fn parse_toml(text: &str) -> Result<toml::Value, Error> {
     if text.len() as u64 > MAX_CONFIG_BYTES {
         return Err(Error::Config("configuration exceeds size limit".into()));
@@ -781,7 +824,9 @@ mod approval_policy_tests {
 mod remote_policy_tests {
     use super::*;
     fn text(url: &str, branch: &str) -> String {
-        format!("[remote_preservation]\nformat=1\nversion='v1'\n[[remote_preservation.targets]]\ncommon_dir='/owned/repository/.git'\nremote='backup'\nurl={url:?}\nbranch={branch:?}\n")
+        format!(
+            "[remote_preservation]\nformat=1\nversion='v1'\n[[remote_preservation.targets]]\ncommon_dir='/owned/repository/.git'\nremote='backup'\nurl={url:?}\nbranch={branch:?}\n"
+        )
     }
     #[test]
     fn strict_lazy_remote_policy_isolation() {
@@ -935,8 +980,56 @@ mod inspection_policy_tests {
 
 #[cfg(test)]
 mod document_helper_tests {
+    #[test]
+    fn git_path_rejects_relative_explicit_selection() {
+        assert!(super::Config::from_text("git_path = 'relative/git'\n").is_err());
+    }
+
+    #[test]
+    fn git_path_authority_rejects_malformed_selection() {
+        assert!(super::ConfigDocument::from_text("git_path = 42\n")
+            .unwrap()
+            .authority()
+            .is_err());
+    }
+
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn executable_symlink_spelling_survives_every_document_projection_and_install_render() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("executable");
+        std::fs::write(&executable, b"fixture").unwrap();
+        let alias = temp.path().join("git-link");
+        std::os::unix::fs::symlink(&executable, &alias).unwrap();
+        let mut document =
+            ConfigDocument::from_text("private = 'keep'\n[custom]\nvalue = 7\n").unwrap();
+        document.set_git_path(&alias).unwrap();
+        assert_eq!(document.git_path().unwrap(), Some(alias.clone()));
+        assert_eq!(document.authority().unwrap().git_path, Some(alias.clone()));
+        assert_eq!(document.execution().unwrap().git_path, Some(alias.clone()));
+        let rendered = document.render().unwrap();
+        let value: toml::Value = toml::from_str(&rendered).unwrap();
+        assert_eq!(value["custom"]["value"].as_integer(), Some(7));
+        let install = ConfigDocument::from_install(InstallDocument {
+            git_path: Some(alias.clone()),
+            actor: "alice".into(),
+            repositories: vec![],
+            roots: vec![],
+            store_dir: temp.path().join("store"),
+            trusted_registry: temp.path().join("registry"),
+            allocation: policy(),
+        })
+        .unwrap();
+        assert_eq!(
+            ConfigDocument::from_text(&install.render().unwrap())
+                .unwrap()
+                .git_path()
+                .unwrap(),
+            Some(alias)
+        );
+    }
 
     fn dir(temp: &tempfile::TempDir, name: &str) -> PathBuf {
         let path = temp.path().join(name);
@@ -1055,6 +1148,7 @@ mod document_helper_tests {
             assert!(document.add_repository(PathBuf::from("/x")).is_err());
         }
         assert!(ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: String::new(),
             repositories: Vec::new(),
             roots: Vec::new(),
@@ -1088,6 +1182,7 @@ mod document_helper_tests {
         let store = temp.path().join("store");
         let registry = temp.path().join("registry");
         let document = ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: "alice".into(),
             repositories: vec![repo.clone()],
             roots: vec![root.clone()],
@@ -1140,6 +1235,7 @@ mod document_helper_tests {
         allocation.floor_bytes = 2;
         allocation.warn_bytes = 1;
         let result = ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: "alice".into(),
             repositories: vec![dir(&temp, "repo")],
             roots: vec![temp.path().join("missing-root")],
@@ -1163,6 +1259,7 @@ mod document_helper_tests {
         let mut allocation = policy();
         allocation.capture_sink = Some("devdiary".into());
         let document = ConfigDocument::from_install(InstallDocument {
+            git_path: None,
             actor: "alice".into(),
             repositories: vec![dir(&temp, "repo")],
             roots: vec![temp.path().join("missing-root")],

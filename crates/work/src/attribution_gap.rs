@@ -613,6 +613,7 @@ fn eligible_history(conn: &Connection, checkout: Uuid, origin: Origin) -> Result
 }
 
 pub(crate) struct GapAdmissionProof {
+    invocation: crate::git::GitInvocation,
     authority: std::sync::Arc<crate::store::AuthorityIdentity>,
     origin: Origin,
     registry: Option<crate::capture_artifacts::Registry>,
@@ -684,6 +685,7 @@ pub(crate) struct CreatedOffLive {
 /// Owned, checked live-close metadata, never a reconstructed capability. The
 /// continuation module can retain it in a one-use seal but cannot assemble it.
 pub(crate) struct GapClosureContext {
+    invocation: crate::git::GitInvocation,
     authority: std::sync::Arc<crate::store::AuthorityIdentity>,
     record: GapRecord,
     context: Context,
@@ -711,7 +713,8 @@ impl GapClosureContext {
             return Err(StoreError::Conflict);
         }
         let allocation = self.record.allocation()?;
-        let physical = crate::gap_continuation::inspect_physical(
+        let physical = crate::gap_continuation::inspect_physical_with_git(
+            &self.invocation,
             &allocation,
             &self.context.repository,
             &self.physical,
@@ -883,6 +886,7 @@ impl CreatedOffLive {
             return Ok(None);
         }
         Ok(Some(GapClosureContext {
+            invocation: self.proof.invocation.clone(),
             authority: self.proof.authority.clone(),
             record: self.record.clone(),
             context: self.proof.context.clone(),
@@ -929,14 +933,19 @@ impl CreatedOffLive {
         let observed = Instant::now();
         let allocation = self.proof.context.allocation(id(&self.record.checkout)?)?;
         let physical = if self.proof.continuation.is_some() {
-            crate::gap_continuation::inspect_physical(
+            crate::gap_continuation::inspect_physical_with_git(
+                &self.proof.invocation,
                 &allocation,
                 &self.proof.context.repository,
                 &self.proof.physical,
                 &self.proof.physical.checkout.head,
             )?
         } else {
-            crate::capture_setup::inspect_physical(&allocation, &self.proof.context.repository)?
+            crate::capture_setup::inspect_physical_with_git(
+                &self.proof.invocation,
+                &allocation,
+                &self.proof.context.repository,
+            )?
         };
         if physical != self.proof.physical {
             return Err(StoreError::Conflict);
@@ -1023,7 +1032,8 @@ pub(crate) fn begin(
     let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)?;
     begin_under_guard(config, root, argv, &guard)
 }
-pub(crate) fn begin_under_guard(
+pub(crate) fn begin_under_guard_with_git(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     root: &RootRunRequest,
     argv: &[OsString],
@@ -1031,7 +1041,7 @@ pub(crate) fn begin_under_guard(
 ) -> Result<(Store, BeginGap)> {
     let (store, lock) = crate::allocate::locked(config)?;
     drop(lock);
-    begin_in_store_under_guard(config, store, root, argv, guard)
+    begin_in_store_under_guard(invocation, config, store, root, argv, guard)
 }
 // Private common core also lets owned contender tests preopen two native Stores
 // before their timed observations. No public bypass, alternate authority, or
@@ -1045,9 +1055,17 @@ fn begin_in_store(
 ) -> Result<(Store, BeginGap)> {
     let checkout = id(&root.identity().checkout.to_string())?;
     let guard = crate::checkout_guard::CheckoutGuard::shared(&store, checkout)?;
-    begin_in_store_under_guard(config, store, root, argv, &guard)
+    begin_in_store_under_guard(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        store,
+        root,
+        argv,
+        &guard,
+    )
 }
 fn begin_in_store_under_guard(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     mut store: Store,
     root: &RootRunRequest,
@@ -1161,7 +1179,8 @@ fn begin_in_store_under_guard(
     #[cfg(test)]
     tests::observe_admission("inspect", &store.conn);
     let continuation = if origin == Origin::RequiredContinuation {
-        Some(crate::gap_continuation::inspect_continuation(
+        Some(crate::gap_continuation::inspect_continuation_with_git(
+            invocation,
             &store,
             root,
             destination.as_ref().ok_or(StoreError::Invalid)?,
@@ -1179,7 +1198,11 @@ fn begin_in_store_under_guard(
             marker: physical.marker.clone(),
         }
     } else {
-        crate::capture_setup::inspect_physical(&allocation, &context.repository)?
+        crate::capture_setup::inspect_physical_with_git(
+            invocation,
+            &allocation,
+            &context.repository,
+        )?
     };
     // inspect_physical delegates to Ready verification, including real Git
     // ancestry and immutable lease/registration identity checks. Ordinary
@@ -1193,6 +1216,7 @@ fn begin_in_store_under_guard(
         return Err(StoreError::Conflict);
     }
     let proof = GapAdmissionProof {
+        invocation: invocation.clone(),
         authority: store.authority_identity().clone(),
         origin,
         registry,
@@ -1248,8 +1272,11 @@ fn begin_in_store_under_guard(
     tests::observe_admission("reinspect", &store.conn);
     if let Some(continuation) = &proof.continuation {
         continuation.reinspect(&allocation, &proof.context.repository)?;
-    } else if crate::capture_setup::inspect_physical(&allocation, &proof.context.repository)?
-        != proof.physical
+    } else if crate::capture_setup::inspect_physical_with_git(
+        invocation,
+        &allocation,
+        &proof.context.repository,
+    )? != proof.physical
     {
         return Err(StoreError::Conflict);
     }
@@ -1331,3 +1358,19 @@ fn begin_in_store_under_guard(
 #[cfg(test)]
 #[path = "attribution_gap_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) fn begin_under_guard(
+    config: &Config,
+    root: &RootRunRequest,
+    argv: &[OsString],
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<(Store, BeginGap)> {
+    begin_under_guard_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        root,
+        argv,
+        guard,
+    )
+}

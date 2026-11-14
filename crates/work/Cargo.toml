@@ -26,6 +26,9 @@ rustix = { version = "1", features = ["process", "fs", "time"] }
 
 tempfile = "3"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+work-darwin = { path = "../work-darwin" }
+
 [dev-dependencies]
 rustix = { version = "1", features = ["time"] }
 

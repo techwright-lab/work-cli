@@ -361,7 +361,15 @@ pub fn supervise_with_io(
     cancel: &CancelToken,
     observer: impl FnMut(Boundary, &RunRecord),
 ) -> io::Result<RunReport> {
-    supervise(config, command, driver, Some(io), cancel, observer)
+    supervise(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        command,
+        driver,
+        Some(io),
+        cancel,
+        observer,
+    )
 }
 fn captured_existing_report(
     config: &Config,
@@ -394,7 +402,10 @@ pub fn supervise_captured_integrated_with_io(
     observer: impl FnMut(Boundary, &RunRecord),
 ) -> io::Result<RunReport> {
     supervise_captured(
-        config,
+        RunConfiguration {
+            invocation: &crate::git::GitInvocation::new(None, config.git_path.clone()),
+            config,
+        },
         command,
         driver,
         Some(io),
@@ -418,7 +429,10 @@ pub fn supervise_captured_with_io(
     observer: impl FnMut(Boundary, &RunRecord),
 ) -> io::Result<RunReport> {
     supervise_captured(
-        config,
+        RunConfiguration {
+            invocation: &crate::git::GitInvocation::new(None, config.git_path.clone()),
+            config,
+        },
         command,
         driver,
         Some(io),
@@ -427,8 +441,12 @@ pub fn supervise_captured_with_io(
         CaptureCompletion::Unfrozen,
     )
 }
+struct RunConfiguration<'a> {
+    invocation: &'a crate::git::GitInvocation,
+    config: &'a Config,
+}
 fn supervise_captured(
-    config: &Config,
+    configuration: RunConfiguration<'_>,
     command: RootCommand,
     driver: &Driver,
     io: Option<LaunchIo>,
@@ -436,6 +454,7 @@ fn supervise_captured(
     observer: impl FnMut(Boundary, &RunRecord),
     completion: CaptureCompletion,
 ) -> io::Result<RunReport> {
+    let RunConfiguration { invocation, config } = configuration;
     if let Some(report) = captured_existing_report(config, &command, true)? {
         return Ok(report);
     }
@@ -482,13 +501,20 @@ fn supervise_captured(
         vec![allocation.request.task.clone()],
         None,
     ))?;
-    let (store, prepared) =
-        crate::capture_preparation::prepare_under_guard(config, &root, &spec, |_, _| {}, &guard)?;
+    let (store, prepared) = crate::capture_preparation::prepare_under_guard_with_git(
+        invocation,
+        config,
+        &root,
+        &spec,
+        |_, _| {},
+        &guard,
+    )?;
     db(guard.revalidate(&store))?;
     let crate::capture_preparation::PreparationResult::Live(live) = prepared else {
         return report(&store, &root.identity().run, true, None);
     };
     execute(
+        invocation,
         config,
         command,
         driver,
@@ -506,7 +532,8 @@ fn supervise_captured(
         guard,
     )
 }
-pub(crate) fn supervise_off(
+pub(crate) fn supervise_off_with_git(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     command: RootCommand,
     driver: &Driver,
@@ -556,7 +583,8 @@ pub(crate) fn supervise_off(
     let mut input = default.input().clone();
     input.attribution = Some(crate::run_journal::AttributionDecision::Off);
     let root = db(RootRunRequest::new(default.identity().clone(), input))?;
-    let (store, began) = db(crate::attribution_gap::begin_under_guard(
+    let (store, began) = db(crate::attribution_gap::begin_under_guard_with_git(
+        invocation,
         config,
         &root,
         &command.argv,
@@ -574,6 +602,7 @@ pub(crate) fn supervise_off(
         }
     };
     execute(
+        invocation,
         config,
         command,
         driver,
@@ -589,6 +618,7 @@ pub(crate) fn supervise_off(
     )
 }
 fn supervise(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     command: RootCommand,
     driver: &Driver,
@@ -627,7 +657,8 @@ fn supervise(
         crate::retirement_journal::Attempt::ExecutionPermit,
     ))?;
     drop(lock);
-    let physical = allocate::observe_checkout(&mut store, command.checkout, &guard)?;
+    let physical =
+        allocate::observe_checkout_with_git(invocation, &mut store, command.checkout, &guard)?;
     let lock = allocate::lifecycle_lock(&store)?;
     let allocation = verified_checkout_under_lease(&mut store, physical, &lock)?;
     let actor = command
@@ -650,6 +681,7 @@ fn supervise(
         return report(&store, &request.identity().run, true, None);
     }
     execute(
+        invocation,
         config,
         command,
         driver,
@@ -686,6 +718,7 @@ enum ExecutionMode {
 }
 #[allow(clippy::too_many_arguments)] // one execution/physical-closure loop for both admission paths
 fn execute(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     command: RootCommand,
     driver: &Driver,
@@ -831,7 +864,8 @@ fn execute(
             drop(initial_lock);
             db(guard.revalidate(&fresh_store))?;
             let physical = if gap_proof.is_none() {
-                Some(allocate::observe_checkout(
+                Some(allocate::observe_checkout_with_git(
+                    invocation,
                     &mut fresh_store,
                     command.checkout,
                     &guard,
@@ -974,7 +1008,8 @@ fn execute(
                             ..
                         } = finalization
                         {
-                            db(crate::capture_readiness::restore_under_guard(
+                            db(crate::capture_readiness::restore_under_guard_with_git(
+                                invocation,
                                 config,
                                 seal,
                                 acknowledgement,
@@ -1028,7 +1063,8 @@ fn parse_command(
     Ok((command, attribution))
 }
 /// Explicit-Off history is resolved before execution policy from the same document.
-pub(crate) fn command_off_document(
+pub(crate) fn command_off_document_with_git(
+    invocation: &crate::git::GitInvocation,
     document: &crate::config::ConfigDocument,
     request: Run,
 ) -> io::Result<i32> {
@@ -1045,14 +1081,51 @@ pub(crate) fn command_off_document(
     let config = document
         .execution()
         .map_err(|_| err("invalid configuration"))?;
-    command_parsed(&config, command, attribution)
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| err("Git selector changed"))?;
+    command_parsed(invocation, &config, command, attribution)
 }
 /// CLI signal handlers only request cancellation; no handler sends OS signals.
+#[cfg(not(target_os = "linux"))]
 pub fn command(config: &Config, request: Run) -> io::Result<i32> {
+    let _ = (config, request);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux supervision unsupported on this platform",
+    ))
+}
+#[cfg(target_os = "linux")]
+pub fn command(config: &Config, request: Run) -> io::Result<i32> {
+    command_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        request,
+    )
+}
+#[cfg(target_os = "linux")]
+pub(crate) fn command_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    request: Run,
+) -> io::Result<i32> {
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| err("Git selector changed"))?;
     let (command, attribution) = parse_command(request)?;
-    command_parsed(config, command, attribution)
+    command_parsed(invocation, config, command, attribution)
+}
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn command_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    request: Run,
+) -> io::Result<i32> {
+    let _ = invocation;
+    command(config, request)
 }
 fn command_parsed(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     command: RootCommand,
     attribution: Option<crate::run_journal::AttributionDecision>,
@@ -1094,14 +1167,22 @@ fn command_parsed(
         }
     }
     let result = if attribution.is_some() {
-        supervise_off(config, command, &driver, None, &cancel, |_, _| {})
+        supervise_off_with_git(
+            invocation,
+            config,
+            command,
+            &driver,
+            None,
+            &cancel,
+            |_, _| {},
+        )
     } else if config
         .allocation
         .as_ref()
         .is_some_and(|a| a.capture_sink.is_some())
     {
         supervise_captured(
-            config,
+            RunConfiguration { invocation, config },
             command,
             &driver,
             None,
@@ -1110,7 +1191,15 @@ fn command_parsed(
             CaptureCompletion::Certify,
         )
     } else {
-        supervise(config, command, &driver, None, &cancel, |_, _| {})
+        supervise(
+            invocation,
+            config,
+            command,
+            &driver,
+            None,
+            &cancel,
+            |_, _| {},
+        )
     };
     for id in handlers {
         signal_hook::low_level::unregister(id);
@@ -1151,4 +1240,24 @@ fn print_report(report: &RunReport) -> i32 {
         }
     }
     report.process_exit_code()
+}
+
+#[cfg(test)]
+pub(crate) fn supervise_off(
+    config: &Config,
+    command: RootCommand,
+    driver: &Driver,
+    io: Option<LaunchIo>,
+    cancel: &CancelToken,
+    observer: impl FnMut(Boundary, &RunRecord),
+) -> io::Result<RunReport> {
+    supervise_off_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        command,
+        driver,
+        io,
+        cancel,
+        observer,
+    )
 }

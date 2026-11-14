@@ -1,7 +1,9 @@
 //! Bounded scope inspector and exact-binding cancellation, not retirement authority.
 //! Library IO injection is for controlled fixtures; production always uses fixed OS paths.
 use crate::{bounded_process, runtime_scope::*};
-use rustix::fs::{openat2, Dir, FileType, Mode, OFlags, ResolveFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+use rustix::fs::{Dir, FileType};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -92,6 +94,12 @@ pub struct Driver {
     remove_attribution_context: bool,
 }
 impl Driver {
+    #[cfg(not(target_os = "linux"))]
+    pub fn new(context: RuntimeContext) -> Result<Self> {
+        let _ = (context,);
+        Err("scope inspection unsupported on this platform")
+    }
+    #[cfg(target_os = "linux")]
     pub fn new(context: RuntimeContext) -> Result<Self> {
         let driver = Self::with_io(
             context,
@@ -111,6 +119,12 @@ impl Driver {
         }
         Ok(driver)
     }
+    #[cfg(not(target_os = "linux"))]
+    pub fn with_io(context: RuntimeContext, io: LibraryIo, limits: Limits) -> Result<Self> {
+        let _ = (context, io, limits);
+        Err("scope inspection unsupported on this platform")
+    }
+    #[cfg(target_os = "linux")]
     pub fn with_io(context: RuntimeContext, io: LibraryIo, limits: Limits) -> Result<Self> {
         context.validate()?;
         if !io.systemctl.is_absolute()
@@ -493,6 +507,12 @@ fn normalized(path: &str) -> bool {
 fn within(path: &str, group: &str) -> bool {
     path == group || path.strip_prefix(group).is_some_and(|p| p.starts_with('/'))
 }
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn canonical_dir(path: &Path) -> Result<File> {
+    let _ = (path,);
+    Err("scope inspection unsupported on this platform")
+}
+#[cfg(target_os = "linux")]
 pub(crate) fn canonical_dir(path: &Path) -> Result<File> {
     if !path.is_absolute() || fs::canonicalize(path).map_err(|_| HOLD)? != path {
         return Err(HOLD);
@@ -509,6 +529,12 @@ pub(crate) fn canonical_dir(path: &Path) -> Result<File> {
     .map(File::from)
     .map_err(|_| HOLD)
 }
+#[cfg(not(target_os = "linux"))]
+fn open(dir: &File, path: &str, directory: bool) -> std::result::Result<File, rustix::io::Errno> {
+    let _ = (dir, path, directory);
+    Err(rustix::io::Errno::NOSYS)
+}
+#[cfg(target_os = "linux")]
 fn open(dir: &File, path: &str, directory: bool) -> std::result::Result<File, rustix::io::Errno> {
     openat2(
         dir,

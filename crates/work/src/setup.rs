@@ -12,7 +12,6 @@ use std::{
     io::{self, BufRead, IsTerminal, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::{Component, Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -21,7 +20,6 @@ const DEFAULT_OWNER_LIMIT: u64 = 4;
 const DEFAULT_FLOOR_BYTES: u64 = 1_073_741_824;
 const DEFAULT_WARN_BYTES: u64 = 5_368_709_120;
 const AFFIRM: &str = "yes";
-const GIT: &str = "/usr/bin/git";
 const LOCK_NAME: &str = ".work-setup.lock";
 const BACKUP_DIR_NAME: &str = ".work-setup-backups";
 const STAGE_PREFIX: &str = ".work-setup-stage-";
@@ -35,6 +33,8 @@ enum SkillsArg {
 
 #[derive(Debug, Args)]
 pub(crate) struct SetupArgs {
+    #[arg(skip)]
+    pub(crate) git_path: Option<PathBuf>,
     /// Accountable actor; required for headless creation
     #[arg(long)]
     actor: Option<String>,
@@ -89,6 +89,7 @@ pub(crate) enum SetupAction {
     Create,
     AddRepositories,
     SkillsOnly,
+    SelectGit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -156,6 +157,8 @@ pub(crate) struct SetupReport {
 
 #[derive(Clone, Debug)]
 pub(crate) struct SetupPlan {
+    git: crate::git::GitInvocation,
+    git_path: Option<PathBuf>,
     pub(crate) action: SetupAction,
     pub(crate) config_path: PathBuf,
     rendered: Option<String>,
@@ -255,7 +258,7 @@ fn run_with_path(
 ) -> SetupReport {
     let prompting = should_prompt(&args);
     if args.check {
-        return check_mode(&path, prompting, stderr);
+        return check_mode(&path, prompting, stderr, args.git_path.clone());
     }
     match classify(&path) {
         Class::Unusable(reason) => fail(
@@ -334,7 +337,12 @@ fn classify(path: &Path) -> Class {
     }
 }
 
-fn check_mode(path: &Path, prompting: bool, stderr: &mut dyn Write) -> SetupReport {
+fn check_mode(
+    path: &Path,
+    prompting: bool,
+    stderr: &mut dyn Write,
+    cli_git: Option<PathBuf>,
+) -> SetupReport {
     let _ = prompting;
     let mut report = blank(SetupAction::Inspect, Some(path), SetupOutcome::Success);
     match classify(path) {
@@ -359,7 +367,17 @@ fn check_mode(path: &Path, prompting: bool, stderr: &mut dyn Write) -> SetupRepo
             let _ = writeln!(stderr, "setup check: {reason}");
         }
         Class::Existing => match read_original(path) {
-            Ok((original, document)) => match inspect_existing(path, &document) {
+            Ok((original, document)) => match inspect_existing(path, &document).and_then(|()| {
+                let configured = document.git_path().map_err(|_| {
+                    fail_val(
+                        SetupAction::Inspect,
+                        Some("git_path"),
+                        None,
+                        "invalid Git selection",
+                    )
+                })?;
+                admit_git_version(&crate::git::GitInvocation::new(cli_git, configured))
+            }) {
                 Ok(()) => {
                     let _ = writeln!(
                         stderr,
@@ -526,8 +544,9 @@ fn collect_create(
         .into());
     }
     writer_ancestors(path, true).map_err(Collect::from)?;
+    let invocation = crate::git::GitInvocation::new(args.git_path.clone(), None);
     let actor = collect_actor(args, prompting, stdin, stderr)?;
-    let repositories = collect_repositories(args, prompting, stdin, stderr)?;
+    let repositories = collect_repositories(args, prompting, stdin, stderr, &invocation)?;
     let root = collect_path_field(
         args.root.as_ref(),
         prompting,
@@ -604,7 +623,8 @@ fn collect_create(
     let root = writer_path(&root, false, "root")?;
     let store_dir = writer_path(&store_dir, false, "store_dir")?;
     let trusted_registry = writer_path(&trusted_registry, false, "trusted_registry")?;
-    let repositories = validate_repositories(&repositories, std::slice::from_ref(&root))?;
+    let repositories =
+        validate_repositories(&invocation, &repositories, std::slice::from_ref(&root))?;
     validate_overlaps(
         path,
         &store_dir,
@@ -621,7 +641,16 @@ fn collect_create(
         warn_bytes,
         capture_sink: None,
     };
+    let git_path = Some(
+        invocation
+            .binding()
+            .map_err(|_| git_failure())?
+            .candidate()
+            .path
+            .clone(),
+    );
     let document = ConfigDocument::from_install(InstallDocument {
+        git_path: git_path.clone(),
         actor: actor.clone(),
         repositories: repositories.clone(),
         roots: vec![root.clone()],
@@ -647,6 +676,8 @@ fn collect_create(
     })?;
     let create_directories = planned_directories(path, &root, &store_dir, &trusted_registry);
     Ok(SetupPlan {
+        git: invocation,
+        git_path,
         action: SetupAction::Create,
         config_path: path.to_path_buf(),
         rendered: Some(rendered),
@@ -674,6 +705,22 @@ fn collect_existing(
     stderr: &mut dyn Write,
 ) -> Result<SetupPlan, Collect> {
     let (original, mut document) = read_original(path).map_err(Collect::from)?;
+    let configured_git = document.git_path().map_err(|_| git_failure())?;
+    let invocation = crate::git::GitInvocation::new(args.git_path.clone(), configured_git.clone());
+    let git_changed = args
+        .git_path
+        .as_ref()
+        .is_some_and(|selected| Some(selected) != configured_git.as_ref());
+    if args.git_path.is_some() {
+        admit_git_version(&invocation)?;
+    }
+    if git_changed {
+        validate_config_writer(path, SetupAction::SelectGit)?;
+        document
+            .set_git_path(args.git_path.as_deref().expect("explicit selection"))
+            .map_err(|_| git_failure())?;
+    }
+    let git_path = args.git_path.clone().or(configured_git);
     let existing_repos = document.repositories().map_err(|err| {
         fail_val(
             SetupAction::Inspect,
@@ -732,6 +779,8 @@ fn collect_existing(
                   actor: Option<String>,
                   repositories: Vec<PathBuf>| {
         SetupPlan {
+            git: invocation.clone(),
+            git_path: git_path.clone(),
             action,
             config_path: path.to_path_buf(),
             rendered,
@@ -773,7 +822,7 @@ fn collect_existing(
         }
     }
     let skills = collect_skills(args, prompting, stdin, stderr)?;
-    if additions.is_empty() && skills == SkillsSelection::None {
+    if additions.is_empty() && skills == SkillsSelection::None && !git_changed {
         if !prompting {
             inspect_existing(path, &document)?;
         }
@@ -795,7 +844,7 @@ fn collect_existing(
         combined
     };
     if let (Some(store), Some(registry)) = (&execution.store_dir, &execution.trusted_registry) {
-        if skills != SkillsSelection::None || !additions.is_empty() {
+        if skills != SkillsSelection::None || !additions.is_empty() || git_changed {
             validate_overlaps(path, store, registry, &prospective_repos, &existing_roots)?;
         }
     }
@@ -815,7 +864,7 @@ fn collect_existing(
                 _ => pending.push(repo),
             }
         }
-        if pending.is_empty() && skills == SkillsSelection::None {
+        if pending.is_empty() && skills == SkillsSelection::None && !git_changed {
             return Ok(finish(
                 SetupAction::AddRepositories,
                 None,
@@ -828,7 +877,7 @@ fn collect_existing(
         if !pending.is_empty() {
             require_registered(&execution, path)?;
             validate_config_writer(path, SetupAction::AddRepositories)?;
-            let validated = validate_repositories(&pending, &roots_for_git)?;
+            let validated = validate_repositories(&invocation, &pending, &roots_for_git)?;
             for repo in validated {
                 match document.add_repository(repo.clone()) {
                     Ok(true) => added.push(repo),
@@ -846,7 +895,7 @@ fn collect_existing(
             }
         }
     }
-    if added.is_empty() && skills == SkillsSelection::None {
+    if added.is_empty() && skills == SkillsSelection::None && !git_changed {
         return Ok(finish(
             SetupAction::AddRepositories,
             None,
@@ -856,7 +905,7 @@ fn collect_existing(
             existing_repos,
         ));
     }
-    if added.is_empty() {
+    if added.is_empty() && !git_changed {
         return Ok(finish(
             SetupAction::SkillsOnly,
             None,
@@ -883,7 +932,11 @@ fn collect_existing(
         )
     })?;
     Ok(finish(
-        SetupAction::AddRepositories,
+        if added.is_empty() {
+            SetupAction::SelectGit
+        } else {
+            SetupAction::AddRepositories
+        },
         Some(rendered),
         original,
         skills,
@@ -974,6 +1027,9 @@ fn apply_plan(
 }
 
 fn mutate(mut plan: SetupPlan) -> SetupReport {
+    if let Err(error) = validate_planned_git(&plan) {
+        return error.into_report(Some(&plan.config_path));
+    }
     let mut created = Vec::new();
     if plan.action == SetupAction::Create {
         if let Err(err) = materialize_directories(&plan.create_directories, &mut created) {
@@ -1199,6 +1255,9 @@ fn preview(plan: &SetupPlan, stderr: &mut dyn Write) -> io::Result<()> {
     writeln!(stderr, "Setup proposal")?;
     writeln!(stderr, "config: {}", plan.config_path.display())?;
     writeln!(stderr, "action: {:?}", plan.action)?;
+    if let Some(path) = &plan.git_path {
+        writeln!(stderr, "git_path: {}", path.display())?;
+    }
     if let Some(actor) = &plan.actor {
         writeln!(stderr, "actor: {actor}")?;
     }
@@ -1304,6 +1363,7 @@ fn collect_repositories(
     prompting: bool,
     stdin: &mut dyn BufRead,
     stderr: &mut dyn Write,
+    invocation: &crate::git::GitInvocation,
 ) -> Result<Vec<PathBuf>, Collect> {
     if !args.repository.is_empty() {
         return Ok(args.repository.clone());
@@ -1319,7 +1379,7 @@ fn collect_repositories(
     }
     let cwd_default = std::env::current_dir()
         .ok()
-        .and_then(|cwd| validate_repositories(std::slice::from_ref(&cwd), &[]).ok())
+        .and_then(|cwd| validate_repositories(invocation, std::slice::from_ref(&cwd), &[]).ok())
         .and_then(|mut repos| repos.pop());
     let shown = cwd_default.as_ref().and_then(|path| path.to_str());
     let first = match prompt(stderr, stdin, "Repository", shown)? {
@@ -1507,7 +1567,11 @@ fn read_line(stdin: &mut dyn BufRead) -> Result<Option<String>, Collect> {
     }
 }
 
-fn validate_repositories(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<PathBuf>, Fail> {
+fn validate_repositories(
+    invocation: &crate::git::GitInvocation,
+    paths: &[PathBuf],
+    roots: &[PathBuf],
+) -> Result<Vec<PathBuf>, Fail> {
     if paths.is_empty() {
         return Err(fail_val(
             SetupAction::Inspect,
@@ -1516,27 +1580,34 @@ fn validate_repositories(paths: &[PathBuf], roots: &[PathBuf]) -> Result<Vec<Pat
             "at least one repository is required",
         ));
     }
-    admit_git_version()?;
+    admit_git_version(invocation)?;
     let mut out = Vec::new();
     for path in paths {
-        out.push(validate_one_repository(path, roots)?);
+        out.push(validate_one_repository_with_git(invocation, path, roots)?);
     }
     Ok(out)
 }
 
-fn admit_git_version() -> Result<(), Fail> {
-    let output = git(None, &["version"])?;
-    crate::inspection::require_supported_git_version(&output).map_err(|_| {
-        fail_val(
-            SetupAction::Inspect,
-            Some("repository"),
-            None,
-            "unsupported Git version",
-        )
-    })
+fn git_failure() -> Fail {
+    fail_val(
+        SetupAction::Inspect,
+        Some("git_path"),
+        None,
+        "selected Git unavailable or changed; no fallback",
+    )
 }
-
+fn admit_git_version(invocation: &crate::git::GitInvocation) -> Result<(), Fail> {
+    invocation.binding().map(|_| ()).map_err(|_| git_failure())
+}
+#[cfg(test)]
 fn validate_one_repository(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, Fail> {
+    validate_one_repository_with_git(&crate::git::GitInvocation::new(None, None), path, roots)
+}
+fn validate_one_repository_with_git(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+    roots: &[PathBuf],
+) -> Result<PathBuf, Fail> {
     let path = validate_path(path, true).map_err(|_| {
         fail_val(
             SetupAction::Inspect,
@@ -1553,7 +1624,11 @@ fn validate_one_repository(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, Fa
             reason,
         )
     })?;
-    let bare = git(Some(&path), &["rev-parse", "--is-bare-repository"])?;
+    let bare = git(
+        invocation,
+        Some(&path),
+        &["rev-parse", "--is-bare-repository"],
+    )?;
     if String::from_utf8_lossy(&bare).trim() != "false" {
         return Err(fail_val(
             SetupAction::Inspect,
@@ -1562,7 +1637,7 @@ fn validate_one_repository(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, Fa
             "bare repositories are not supported",
         ));
     }
-    if managed_checkout_evidence(&path)? {
+    if managed_checkout_evidence(invocation, &path)? {
         return Err(fail_val(
             SetupAction::Inspect,
             Some("repository"),
@@ -1583,8 +1658,12 @@ fn validate_one_repository(path: &Path, roots: &[PathBuf]) -> Result<PathBuf, Fa
     Ok(path)
 }
 
-fn managed_checkout_evidence(path: &Path) -> Result<bool, Fail> {
+fn managed_checkout_evidence(
+    invocation: &crate::git::GitInvocation,
+    path: &Path,
+) -> Result<bool, Fail> {
     let git_dir = git(
+        invocation,
         Some(path),
         &["rev-parse", "--path-format=absolute", "--git-dir"],
     )?;
@@ -1601,20 +1680,32 @@ fn managed_checkout_evidence(path: &Path) -> Result<bool, Fail> {
     }
 }
 
-fn git(cwd: Option<&Path>, args: &[&str]) -> Result<Vec<u8>, Fail> {
-    let mut command = Command::new(GIT);
-    command.arg("--no-optional-locks");
-    if let Some(cwd) = cwd {
-        command.arg("-C").arg(cwd);
-    }
-    command
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0");
-    let output = crate::bounded_process::output(&mut command, Duration::from_secs(2), 1024 * 1024)
+fn git(
+    invocation: &crate::git::GitInvocation,
+    cwd: Option<&Path>,
+    args: &[&str],
+) -> Result<Vec<u8>, Fail> {
+    let binding = invocation.binding().map_err(|_| git_failure())?;
+    let command = binding
+        .command(std::iter::empty::<&str>(), |command| {
+            command.arg("--no-optional-locks");
+            if let Some(cwd) = cwd {
+                command.arg("-C").arg(cwd);
+            }
+            command
+                .args(args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+        })
+        .map_err(|_| git_failure())?;
+    let output = command
+        .dispatch(|command| {
+            crate::bounded_process::output(command, Duration::from_secs(2), 1024 * 1024)
+        })
+        .map_err(|_| git_failure())?
         .map_err(|reason| fail_val(SetupAction::Inspect, Some("repository"), cwd, reason))?;
     if output.status.success() {
         Ok(output.stdout)
@@ -1787,7 +1878,16 @@ impl ProspectiveWrites {
     }
 }
 
+fn validate_planned_git(plan: &SetupPlan) -> Result<(), Fail> {
+    if plan.rendered.is_some() {
+        plan.git
+            .revalidate_if_selected()
+            .map_err(|_| git_failure())?;
+    }
+    Ok(())
+}
 fn validate_prospective_writes(plan: &SetupPlan) -> Result<(), Fail> {
+    validate_planned_git(plan)?;
     let mut writer = ProspectiveWrites {
         directories: plan.create_directories.clone(),
         ..ProspectiveWrites::default()
@@ -2055,6 +2155,7 @@ fn publish(
     backup_path: &mut Option<PathBuf>,
     created: &mut Vec<PathBuf>,
 ) -> Result<(), Fail> {
+    validate_planned_git(plan)?;
     let path = &plan.config_path;
     writer_ancestors(path, plan.original.is_none())?;
     let parent = path.parent().ok_or_else(|| {
@@ -2092,7 +2193,7 @@ fn publish(
                 ));
             }
             write_backup(parent, &original.bytes, backup_path, created)?;
-            stage_and_replace(parent, path, rendered.as_bytes(), true)?;
+            stage_and_replace(parent, path, rendered.as_bytes(), true, plan)?;
         } else if fs::symlink_metadata(path).is_ok() {
             return Err(fail_val(
                 SetupAction::Create,
@@ -2101,8 +2202,15 @@ fn publish(
                 "configuration appeared after planning; refusing clobber",
             ));
         } else {
-            stage_and_replace(parent, path, rendered.as_bytes(), false)?;
+            stage_and_replace(parent, path, rendered.as_bytes(), false, plan)?;
         }
+        validate_planned_git(plan).map_err(|mut failure| {
+            failure.config_written = true;
+            failure
+                .reason
+                .push_str("; configuration published; inspect before retry");
+            failure
+        })?;
         Ok(())
     })();
     if lock.release().is_err() {
@@ -2235,7 +2343,13 @@ fn open_lock(parent: &Path) -> Result<SetupLock, Fail> {
     })
 }
 
-fn stage_and_replace(parent: &Path, dest: &Path, bytes: &[u8], replace: bool) -> Result<(), Fail> {
+fn stage_and_replace(
+    parent: &Path,
+    dest: &Path,
+    bytes: &[u8],
+    replace: bool,
+    plan: &SetupPlan,
+) -> Result<(), Fail> {
     let stage_name = format!("{STAGE_PREFIX}{}", uuid::Uuid::now_v7());
     let stage = parent.join(&stage_name);
     step(WriterStep::StageCreate).map_err(|err| io_reason(dest, err))?;
@@ -2284,6 +2398,10 @@ fn stage_and_replace(parent: &Path, dest: &Path, bytes: &[u8], replace: bool) ->
         .custom_flags(rustix::fs::OFlags::DIRECTORY.bits() as i32)
         .open(parent)
         .map_err(|err| io_reason(parent, err))?;
+    if let Err(error) = validate_planned_git(plan) {
+        let _ = fs::remove_file(&stage);
+        return Err(error);
+    }
     let result = if replace {
         step(WriterStep::RenameReplace)
             .map_err(|err| io_reason(dest, err))
@@ -2716,6 +2834,9 @@ fn take_installer_stub() -> Option<InstallerStubResult> {
 }
 
 #[cfg(test)]
+use crate::test_fifo as fifo;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -2988,6 +3109,8 @@ mod tests {
         fs::write(&config, "keep = true\n").unwrap();
         let original = read_original(&config).unwrap().0;
         let plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::AddRepositories,
             config_path: config.clone(),
             rendered: Some("keep = true\n".into()),
@@ -3024,6 +3147,8 @@ mod tests {
         assert!(!report.authority_modified);
         assert!(report.config_path.is_some());
         let _plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::Create,
             config_path: PathBuf::from("/tmp/config.toml"),
             rendered: None,
@@ -3198,6 +3323,8 @@ mod tests {
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
         let original = read_original(&config).unwrap().0;
         let plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::AddRepositories,
             config_path: config.clone(),
             rendered: Some("keep = false\n".into()),
@@ -3224,6 +3351,8 @@ mod tests {
         let original = read_original(&config).unwrap().0;
         fs::write(&config, "changed = true\n").unwrap();
         let plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             original: Some(original),
             ..plan
         };
@@ -3242,6 +3371,8 @@ mod tests {
         fs::write(&config, "keep = true\n").unwrap();
         let original = read_original(&config).unwrap().0;
         let plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::AddRepositories,
             config_path: config.clone(),
             rendered: Some("keep = true\nadded = 1\n".into()),
@@ -3292,6 +3423,8 @@ mod tests {
             )));
         });
         let mut plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::SkillsOnly,
             config_path: PathBuf::from("/tmp/config.toml"),
             rendered: None,
@@ -3353,6 +3486,8 @@ mod tests {
             )));
         });
         let mut plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::SkillsOnly,
             config_path: PathBuf::from("/tmp/config.toml"),
             rendered: None,
@@ -3389,6 +3524,181 @@ mod tests {
         INSTALLER.with(|slot| slot.borrow_mut().take());
     }
 
+    #[cfg(target_os = "linux")]
+    fn owned_git(temp: &tempfile::TempDir, dispatch: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let executable = temp.path().join("git");
+        let helpers = temp.path().join("helpers");
+        fs::create_dir(&helpers).unwrap();
+        for name in ["git-upload-pack", "git-receive-pack", "git-upload-archive"] {
+            let path = helpers.join(name);
+            fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::write(&executable, format!("#!/bin/sh\ncase \"$1\" in\n--version) echo 'git version 2.55.0';;\n--exec-path) echo '{}';;\n*) {dispatch};;\nesac\n", helpers.display())).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let selected = temp.path().join("git-link");
+        symlink(&executable, &selected).unwrap();
+        (selected, helpers)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn git_selection_preview_cancel_check_and_confirmed_existing_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let (selected, _) = owned_git(&temp, "exit 1");
+        let config = temp.path().join("config.toml");
+        fs::write(
+            &config,
+            "private = 'keep'\n[custom]\nsecret = 'unchanged'\n",
+        )
+        .unwrap();
+        for (flags, outcome) in [
+            (vec!["--dry-run"], SetupOutcome::Preview),
+            (vec!["--interactive"], SetupOutcome::Cancelled),
+            (vec!["--check"], SetupOutcome::Success),
+        ] {
+            let mut args = parse(&flags).unwrap();
+            args.git_path = Some(selected.clone());
+            let before = physical_snapshot(temp.path());
+            let report = run_with_path(
+                args,
+                config.clone(),
+                &mut Cursor::new("\nnone\nno\n"),
+                &mut Vec::new(),
+            );
+            assert_eq!(report.outcome, outcome, "{report:?}");
+            assert!(!report.config_written);
+            assert_eq!(physical_snapshot(temp.path()), before);
+        }
+        let mut args = parse(&["--yes"]).unwrap();
+        args.git_path = Some(selected.clone());
+        let report = run_with_path(args, config.clone(), &mut Cursor::new(""), &mut Vec::new());
+        assert!(report.config_written, "{report:?}");
+        let value: toml::Value = toml::from_str(&fs::read_to_string(config).unwrap()).unwrap();
+        assert_eq!(value["git_path"].as_str(), selected.to_str());
+        assert_eq!(value["private"].as_str(), Some("keep"));
+        assert_eq!(value["custom"]["secret"].as_str(), Some("unchanged"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn git_selection_creation_proposes_without_writes_then_persists_only_when_confirmed() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        fs::create_dir(repo.join(".git")).unwrap();
+        let dispatch = format!("case \"$*\" in *--is-bare-repository*) echo false;; *--git-dir*) echo '{}';; *) exit 1;; esac", repo.join(".git").display());
+        let (selected, _) = owned_git(&temp, &dispatch);
+        let config = temp.path().join("config.toml");
+        let root = temp.path().join("root");
+        let store = temp.path().join("store");
+        let registry = temp.path().join("registry");
+        for (flag, outcome) in [
+            ("--dry-run", SetupOutcome::Preview),
+            ("--yes", SetupOutcome::Success),
+        ] {
+            let mut args = parse(&[
+                flag,
+                "--actor",
+                "alice",
+                "--repository",
+                repo.to_str().unwrap(),
+                "--root",
+                root.to_str().unwrap(),
+                "--store-dir",
+                store.to_str().unwrap(),
+                "--trusted-registry",
+                registry.to_str().unwrap(),
+                "--skills",
+                "none",
+            ])
+            .unwrap();
+            args.git_path = Some(selected.clone());
+            let before = physical_snapshot(temp.path());
+            let report = run_with_path(args, config.clone(), &mut Cursor::new(""), &mut Vec::new());
+            assert_eq!(report.outcome, outcome, "{report:?}");
+            assert_eq!(report.config_written, flag == "--yes");
+            if flag == "--dry-run" {
+                assert_eq!(physical_snapshot(temp.path()), before);
+            }
+        }
+        assert_eq!(
+            ConfigDocument::load_from_path(&config)
+                .unwrap()
+                .git_path()
+                .unwrap(),
+            Some(selected)
+        );
+        assert!(!store.exists());
+        assert!(!registry.exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn changed_git_holds_before_setup_writes_and_before_staged_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let (selected, helpers) = owned_git(&temp, "exit 1");
+        let config = temp.path().join("config.toml");
+        fs::write(&config, "private = 'keep'\n").unwrap();
+        let mut args = parse(&["--yes"]).unwrap();
+        args.git_path = Some(selected);
+        let plan =
+            collect_existing(&args, &config, false, &mut Cursor::new(""), &mut Vec::new()).unwrap();
+        fs::write(helpers.join("git-upload-pack"), b"changed helper").unwrap();
+        let before = physical_snapshot(temp.path());
+        let report = mutate(plan.clone());
+        assert!(!report.config_written);
+        assert_eq!(report.outcome, SetupOutcome::Failed);
+        assert_eq!(physical_snapshot(temp.path()), before);
+        assert!(stage_and_replace(temp.path(), &config, b"replacement", true, &plan).is_err());
+        assert_eq!(fs::read(&config).unwrap(), b"private = 'keep'\n");
+        assert!(!fs::read_dir(temp.path()).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(STAGE_PREFIX.as_bytes())));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn git_selection_reuses_existing_writer_ownership_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let (selected, _) = owned_git(&temp, "exit 1");
+        let config = temp.path().join("config.toml");
+        fs::write(&config, "private = 'keep'\n").unwrap();
+        let meta = fs::metadata(&config).unwrap();
+        let mut args = parse(&["--dry-run"]).unwrap();
+        args.git_path = Some(selected);
+        FOREIGN_FILE.with(|file| file.set(Some((meta.dev(), meta.ino()))));
+        let report = run_with_path(args, config.clone(), &mut Cursor::new(""), &mut Vec::new());
+        FOREIGN_FILE.with(|file| file.set(None));
+        assert_eq!(report.outcome, SetupOutcome::Failed, "{report:?}");
+        assert!(!report.config_written);
+        assert_eq!(fs::read(&config).unwrap(), b"private = 'keep'\n");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn git_selection_reuses_existing_writer_authority_overlap_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let (selected, _) = owned_git(&temp, "exit 1");
+        let config = temp.path().join("config.toml");
+        let endpoint = temp.path().join("endpoint");
+        fs::create_dir(&endpoint).unwrap();
+        let bytes = format!(
+            "store_dir = {endpoint:?}\ntrusted_registry = {endpoint:?}\nprivate = 'keep'\n"
+        );
+        fs::write(&config, &bytes).unwrap();
+        let mut args = parse(&["--dry-run"]).unwrap();
+        args.git_path = Some(selected);
+        let report = run_with_path(args, config.clone(), &mut Cursor::new(""), &mut Vec::new());
+        assert_eq!(report.outcome, SetupOutcome::Failed, "{report:?}");
+        assert!(!report.config_written);
+        assert_eq!(fs::read_to_string(&config).unwrap(), bytes);
+        assert_eq!(fs::read_dir(endpoint).unwrap().count(), 0);
+    }
+
     fn plan_with(
         action: SetupAction,
         config: PathBuf,
@@ -3396,6 +3706,8 @@ mod tests {
         original: Option<OriginalFile>,
     ) -> SetupPlan {
         SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action,
             config_path: config,
             rendered,
@@ -3866,13 +4178,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let missing = temp.path().join("missing.toml");
         let mut stderr = Vec::new();
-        let report = check_mode(&missing, false, &mut stderr);
+        let report = check_mode(&missing, false, &mut stderr, None);
         assert_eq!(report.outcome, SetupOutcome::Failed);
         assert!(report.error.is_some());
         let config = temp.path().join("config.toml");
         fs::write(&config, "actor = [\n").unwrap();
         let mut stderr = Vec::new();
-        let report = check_mode(&config, false, &mut stderr);
+        let report = check_mode(&config, false, &mut stderr, None);
         assert_eq!(report.outcome, SetupOutcome::Failed);
     }
 
@@ -3928,14 +4240,10 @@ mod tests {
         fs::hard_link(&target, dir.join("hardlink")).unwrap();
         symlink(&target, dir.join("symlink")).unwrap();
         fs::create_dir(dir.join("directory")).unwrap();
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            dir.join("fifo"),
-            rustix::fs::FileType::Fifo,
+        fifo::create_fifo(
+            &dir.join("fifo"),
             rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .unwrap();
+        );
         let _socket = UnixListener::bind(dir.join("socket")).unwrap();
         let before = physical_snapshot(temp.path());
         let names = [
@@ -4117,6 +4425,8 @@ mod tests {
     #[test]
     fn next_steps_use_selected_registered_root() {
         let plan = SetupPlan {
+            git: crate::git::GitInvocation::new(None, None),
+            git_path: None,
             action: SetupAction::AddRepositories,
             config_path: PathBuf::from("/tmp/config.toml"),
             rendered: Some("x".into()),
@@ -4136,6 +4446,8 @@ mod tests {
         };
         for action in [SetupAction::AddRepositories, SetupAction::Inspect] {
             let plan = SetupPlan {
+                git: crate::git::GitInvocation::new(None, None),
+                git_path: None,
                 action,
                 ..plan.clone()
             };

@@ -15,3 +15,19 @@ commands and publication gates.
 Keep real repositories and credentials out of qualification containers. Preserve
 payload, authority history and quota on unknown outcomes. Keep release publication
 and confirmed checkout removal behind their explicit operator authorization.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in GitHub Issues for techwright-lab/work-cli.
+Before tracker operations, read `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Before triage, read `docs/agents/triage-labels.md` for the five canonical labels.
+
+### Domain docs
+
+Before domain exploration, read `docs/agents/domain.md` for the single-context
+layout and glossary/ADR consumer rules.

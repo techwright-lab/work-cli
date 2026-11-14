@@ -156,6 +156,20 @@ fn observe(config: &Config, run: &RunId) -> Result<JournalReport> {
     Ok(report)
 }
 pub fn command(config: &Config, command: Command) -> Result<Report> {
+    command_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        command,
+    )
+}
+pub(crate) fn command_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    command: Command,
+) -> Result<Report> {
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| StoreError::Invalid)?;
     let (run, action) = match command {
         Command::Status { run } => {
             return observe(config, &run).map(|r| Report::Journal(Box::new(r)))
@@ -168,7 +182,7 @@ pub fn command(config: &Config, command: Command) -> Result<Report> {
     // No snapshot or SQL phase survives across the delegated process operation.
     observe(config, &run)?;
     let operation = if action == "reconcile-begin" {
-        crate::capture_recovery::reconcile(config, &run)
+        crate::capture_recovery::reconcile_with_git(invocation, config, &run)
     } else if action == "retry" {
         crate::capture_finalization::retry_delivery(config, &run).map(|_| "response_recorded")
     } else {

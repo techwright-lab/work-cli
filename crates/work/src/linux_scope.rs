@@ -2,13 +2,17 @@
 //! Default inspection is read-only. Real scopes require explicit opt-in; this
 //! never certifies Paperclip origin or excludes malicious same-UID writers.
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::{
-    fs, io,
+    fs,
     os::unix::fs::DirBuilderExt,
-    path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use std::{
+    io,
+    path::{Path, PathBuf},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -56,6 +60,7 @@ pub struct QualificationOptions<'a> {
     pub adapter: &'a str,
     pub opt_in_fixture: bool,
 }
+#[cfg(target_os = "linux")]
 fn bounded(command: &mut Command, duration: Duration) -> io::Result<Output> {
     let mut child = command
         .stdin(Stdio::null())
@@ -76,6 +81,7 @@ fn bounded(command: &mut Command, duration: Duration) -> io::Result<Output> {
     }
     child.wait_with_output()
 }
+#[cfg(target_os = "linux")]
 fn systemctl(args: &[&str]) -> io::Result<Output> {
     bounded(
         Command::new("systemctl")
@@ -85,6 +91,7 @@ fn systemctl(args: &[&str]) -> io::Result<Output> {
         Duration::from_secs(2),
     )
 }
+#[cfg(target_os = "linux")]
 fn version(name: &str) -> Option<String> {
     let out = bounded(Command::new(name).arg("--version"), Duration::from_secs(2)).ok()?;
     out.status.success().then(|| {
@@ -97,20 +104,30 @@ fn version(name: &str) -> Option<String> {
             .collect()
     })
 }
+#[cfg(target_os = "linux")]
 fn cgroup(pid: &str) -> Option<String> {
     fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .ok()?
         .lines()
         .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
 }
-pub fn inspect_host() -> HostCapabilities {
+/// Linux host observations only; unsupported platforms never execute probe helpers.
+#[cfg(not(target_os = "linux"))]
+pub fn inspect_host() -> io::Result<HostCapabilities> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux scope inspection unsupported on this platform",
+    ))
+}
+#[cfg(target_os = "linux")]
+pub fn inspect_host() -> io::Result<HostCapabilities> {
     let uid = fs::read_to_string("/proc/self/status").ok().and_then(|s| {
         s.lines().find_map(|l| {
             l.strip_prefix("Uid:")
                 .and_then(|s| s.split_whitespace().next()?.parse().ok())
         })
     });
-    HostCapabilities {
+    Ok(HostCapabilities {
         uid,
         runtime_directory_available: std::env::var_os("XDG_RUNTIME_DIR")
             .is_some_and(|p| Path::new(&p).is_dir()),
@@ -121,7 +138,7 @@ pub fn inspect_host() -> HostCapabilities {
         current_cgroup: cgroup("self"),
         systemd_version: version("systemctl"),
         git_version: version("git"),
-    }
+    })
 }
 /// A point-in-time membership observation, never a claim of killpg containment.
 pub fn assess_membership(bus: bool, scope: Option<&str>, observed: &[String]) -> Disposition {
@@ -138,6 +155,7 @@ pub fn assess_membership(bus: bool, scope: Option<&str>, observed: &[String]) ->
         Disposition::UnknownHold
     }
 }
+#[cfg(target_os = "linux")]
 fn property<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.lines().find_map(|l| l.strip_prefix(key))
 }
@@ -147,6 +165,7 @@ fn group_path(group: &str) -> Option<PathBuf> {
     }
     Some(Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/')))
 }
+#[cfg(target_os = "linux")]
 fn members(group: &str) -> Option<Vec<u32>> {
     fs::read_to_string(group_path(group)?.join("cgroup.procs"))
         .ok()?
@@ -212,6 +231,7 @@ pub fn assess_cleanup(evidence: CleanupEvidence<'_>) -> bool {
                 && (state.cgroup.is_empty() || state.cgroup == scope.cgroup)
         })
 }
+#[cfg(target_os = "linux")]
 fn participant_state(pid: u32) -> ParticipantState {
     // A present PID is never assumed to be a reused identity or safely dead.
     // Only ENOENT proves absence; permission/metadata errors hold.
@@ -227,6 +247,16 @@ fn valid_label(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b))
 }
+/// Linux-only execution qualification; refusal precedes identifiers and host probes.
+#[cfg(not(target_os = "linux"))]
+pub fn qualify(options: QualificationOptions<'_>) -> io::Result<QualificationReport> {
+    let _ = options;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Linux scope qualification unsupported on this platform",
+    ))
+}
+#[cfg(target_os = "linux")]
 pub fn qualify(options: QualificationOptions<'_>) -> io::Result<QualificationReport> {
     if !valid_label(options.run_id) || !valid_label(options.adapter) {
         return Err(io::Error::new(
@@ -235,7 +265,7 @@ pub fn qualify(options: QualificationOptions<'_>) -> io::Result<QualificationRep
         ));
     }
     let mut report = QualificationReport {
-        run_id: options.run_id.into(), adapter: options.adapter.into(), host: inspect_host(),
+        run_id: options.run_id.into(), adapter: options.adapter.into(), host: inspect_host()?,
         disposition: Disposition::UnknownHold, fixture_executed: false, paperclip_qualified: false,
         unit: None, unit_owner_uid: None, unit_properties: None, scope_cgroup: None,
         observed_members: vec![], observations: vec![], cleanup_outcome: "not-started".into(), reasons: vec![],
@@ -273,6 +303,7 @@ pub fn qualify(options: QualificationOptions<'_>) -> io::Result<QualificationRep
     }
     Ok(report)
 }
+#[cfg(target_os = "linux")]
 fn run_fixture(report: &mut QualificationReport, root: &Path, unit: &str) -> io::Result<()> {
     report.unit = Some(unit.into());
     let mut child = Command::new("systemd-run")
@@ -436,6 +467,7 @@ fn run_fixture(report: &mut QualificationReport, root: &Path, unit: &str) -> io:
 }
 // Trusted bounded fixture, not arbitrary agent code. Every descendant has its own
 // lifetime bound independent of the launching parent; cwd/FD survive rename.
+#[cfg(target_os = "linux")]
 const FIXTURE: &str = r#"
 import os, sys, time, json
 root = sys.argv[1]

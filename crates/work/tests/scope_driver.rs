@@ -1,3 +1,5 @@
+#[path = "support/fifo.rs"]
+mod fifo;
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, net::UnixListener},
@@ -291,12 +293,7 @@ fn collector_errors_and_budgets_hold() {
             }
             "fifo" => {
                 fs::remove_file(f.path().join("cgroup.procs")).unwrap();
-                rustix::fs::mkfifoat(
-                    rustix::fs::CWD,
-                    f.path().join("cgroup.procs"),
-                    rustix::fs::Mode::RUSR,
-                )
-                .unwrap();
+                fifo::create_fifo(&f.path().join("cgroup.procs"), rustix::fs::Mode::RUSR);
             }
             "depth" => {
                 f.members("nested", "");

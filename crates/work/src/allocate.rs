@@ -5,7 +5,7 @@ mod finish_tests;
 use crate::{
     admission::{Limits, Reservation},
     config::Config,
-    identity::{query, CheckoutIdentity},
+    identity::CheckoutIdentity,
     store::Store,
 };
 use rusqlite::OptionalExtension;
@@ -500,7 +500,11 @@ impl PhysicalObservation {
         Ok(())
     }
 }
-fn physical_evidence(a: &Allocation, charged: &std::path::Path) -> io::Result<PhysicalEvidence> {
+fn physical_evidence_with_git(
+    git: &crate::git::GitInvocation,
+    a: &Allocation,
+    charged: &std::path::Path,
+) -> io::Result<PhysicalEvidence> {
     let source_path = a
         .request
         .repository
@@ -508,11 +512,11 @@ fn physical_evidence(a: &Allocation, charged: &std::path::Path) -> io::Result<Ph
         .ok_or_else(|| err("missing source repository"))?;
     crate::config::validate_path(source_path, true)
         .map_err(|_| err("unsafe source repository path"))?;
-    let source = CheckoutIdentity::inspect(source_path)?;
+    let source = CheckoutIdentity::inspect_with_git(git, source_path)?;
     if source.common_git_dir != charged {
         return Err(err("source authority changed"));
     }
-    let checkout = crate::recovery::verify(a)?;
+    let checkout = crate::recovery::verify_with_git(git, a)?;
     let marker = RawMarker::capture(&checkout.private_git_dir.join("work-lease.json"))?;
     let decoded: crate::recovery::Marker = serde_json::from_slice(&marker.bytes)?;
     if decoded != crate::recovery::Marker::from(a) {
@@ -563,7 +567,8 @@ mod precheckout_fixture {
     }
 }
 
-fn collect_physical(
+fn collect_physical_with_git(
+    git: &crate::git::GitInvocation,
     store: &Store,
     a: Allocation,
     predecessor: Predecessor,
@@ -576,12 +581,13 @@ fn collect_physical(
         [a.checkout.to_string()],
         |r| r.get(0),
     ))?;
-    let evidence = physical_evidence(&a, std::path::Path::new(&charged)).and_then(|evidence| {
-        if creation_source.is_some_and(|source| *source != evidence.source) {
-            return Err(err("creation source changed before acknowledgment"));
-        }
-        Ok(evidence)
-    });
+    let evidence =
+        physical_evidence_with_git(git, &a, std::path::Path::new(&charged)).and_then(|evidence| {
+            if creation_source.is_some_and(|source| *source != evidence.source) {
+                return Err(err("creation source changed before acknowledgment"));
+            }
+            Ok(evidence)
+        });
     #[cfg(test)]
     physical_fixture::AFTER_FIRST.with(|slot| {
         let callback = slot.borrow_mut().take();
@@ -592,7 +598,7 @@ fn collect_physical(
     // Repeat actual Git and raw-marker evidence, not just path/stat equality.
     // Never reset the first observation's deadline after this recheck.
     let evidence = evidence.and_then(|first| {
-        let fresh = physical_evidence(&a, std::path::Path::new(&charged))?;
+        let fresh = physical_evidence_with_git(git, &a, std::path::Path::new(&charged))?;
         if fresh != first {
             return Err(err("physical evidence changed during observation"));
         }
@@ -609,7 +615,8 @@ fn collect_physical(
         evidence,
     })
 }
-fn observe_allocation(
+fn observe_allocation_with_git(
+    git: &crate::git::GitInvocation,
     store: &mut Store,
     checkout: Uuid,
     guard: &crate::checkout_guard::CheckoutGuard,
@@ -731,21 +738,23 @@ fn observe_allocation(
     }
     let predecessor = Predecessor::read(store, &a, started)?;
     drop(lease);
-    collect_physical(store, a, predecessor, common, guard, None)
+    collect_physical_with_git(git, store, a, predecessor, common, guard, None)
 }
-pub(crate) fn observe_checkout(
+pub(crate) fn observe_checkout_with_git(
+    git: &crate::git::GitInvocation,
     store: &mut Store,
     checkout: Uuid,
     guard: &crate::checkout_guard::CheckoutGuard,
 ) -> io::Result<PhysicalObservation> {
-    observe_allocation(store, checkout, guard, None)
+    observe_allocation_with_git(git, store, checkout, guard, None)
 }
-pub(crate) fn observe_reconciliation(
+pub(crate) fn observe_reconciliation_with_git(
+    git: &crate::git::GitInvocation,
     store: &mut Store,
     a: &Allocation,
     guard: &crate::checkout_guard::CheckoutGuard,
 ) -> io::Result<PhysicalObservation> {
-    observe_allocation(store, a.checkout, guard, Some(a))
+    observe_allocation_with_git(git, store, a.checkout, guard, Some(a))
 }
 fn failed_observation(
     store: &mut Store,
@@ -810,10 +819,11 @@ pub(crate) fn reconcile_observation_under_lease(
 /// observation, and never revives held/quarantined rows.
 #[cfg(test)]
 pub(crate) fn verified_checkout(store: &mut Store, checkout: Uuid) -> io::Result<Allocation> {
+    let git = &crate::git::GitInvocation::new(None, None);
     let guard = db(crate::checkout_guard::CheckoutGuard::shared(
         store, checkout,
     ))?;
-    let observed = observe_checkout(store, checkout, &guard)?;
+    let observed = observe_checkout_with_git(git, store, checkout, &guard)?;
     let lease = lifecycle_lock(store)?;
     verified_checkout_under_lease(store, observed, &lease)
 }
@@ -1905,11 +1915,37 @@ fn normalize(config: &Config, mut r: Start) -> io::Result<Start> {
     Ok(r)
 }
 pub fn start(config: &Config, request: Start) -> io::Result<Allocation> {
-    start_observed(config, request, |_| {})
+    start_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        request,
+    )
+}
+pub(crate) fn start_with_git(
+    git: &crate::git::GitInvocation,
+    config: &Config,
+    request: Start,
+) -> io::Result<Allocation> {
+    git.configure(config.git_path.clone())
+        .map_err(|_| err("Git selector changed"))?;
+    start_observed_with_git(git, config, request, |_| {})
+}
+pub fn start_observed(
+    config: &Config,
+    request: Start,
+    boundary: impl FnMut(&str),
+) -> io::Result<Allocation> {
+    start_observed_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        request,
+        boundary,
+    )
 }
 /// Observer is called only at persisted protocol boundaries. It does not supply policy
 /// or authority. Used by subprocess qualification to abort the allocator itself.
-pub fn start_observed(
+pub(crate) fn start_observed_with_git(
+    git: &crate::git::GitInvocation,
     config: &Config,
     request: Start,
     mut boundary: impl FnMut(&str),
@@ -1933,11 +1969,20 @@ pub fn start_observed(
         .map(|id| Uuid::parse_str(id).map_err(|_| err("invalid checkout key")))
         .transpose()?;
     if let Some(checkout) = prior_checkout {
-        return resume_operation(config, &mut store, &r, checkout, lease, &mut boundary);
+        return resume_operation_with_git(
+            git,
+            config,
+            &mut store,
+            &r,
+            checkout,
+            lease,
+            &mut boundary,
+        );
     }
     drop(lease);
     let repo = r.repository.as_ref().unwrap();
-    query(
+    crate::identity::query_with_git(
+        git,
         repo,
         &[
             "check-ref-format",
@@ -1951,14 +1996,14 @@ pub fn start_observed(
         .iter()
         .map(|path| {
             crate::config::validate_path(path, true).map_err(|_| err("unsafe repository alias"))?;
-            Ok((path.clone(), CheckoutIdentity::inspect(path)?))
+            Ok((path.clone(), CheckoutIdentity::inspect_with_git(git, path)?))
         })
         .collect::<io::Result<Vec<_>>>()?;
     let aliases: Vec<_> = alias_observations
         .iter()
         .map(|(path, identity)| (path.clone(), identity.common_git_dir.clone()))
         .collect();
-    let source = CheckoutIdentity::inspect(repo)?;
+    let source = CheckoutIdentity::inspect_with_git(git, repo)?;
     let common = &source.common_git_dir;
     let reservation = Reservation {
         operation: r.operation,
@@ -1968,17 +2013,17 @@ pub fn start_observed(
         task: r.task.clone(),
     };
     // New-charge-only physical inputs cannot defeat a reusable match.
-    let candidate = candidate_observation(config, &r, &source);
+    let candidate = candidate_observation_with_git(git, config, &r, &source);
     #[cfg(test)]
     if let Ok((candidate, _, _)) = &candidate {
         precheckout_fixture::boundary(&store, candidate);
     }
     for (path, original) in &alias_observations {
-        if CheckoutIdentity::inspect(path)? != *original {
+        if CheckoutIdentity::inspect_with_git(git, path)? != *original {
             return Err(err("repository alias changed during observation"));
         }
     }
-    if CheckoutIdentity::inspect(repo)? != source {
+    if CheckoutIdentity::inspect_with_git(git, repo)? != source {
         return Err(err("source changed during observation"));
     }
     // Retain the actual canonical reservation observation before reacquiring
@@ -1997,7 +2042,8 @@ pub fn start_observed(
         )
         .optional())?;
     if let Some(id) = appeared {
-        return resume_operation(
+        return resume_operation_with_git(
+            git,
             config,
             &mut store,
             &r,
@@ -2145,7 +2191,7 @@ pub fn start_observed(
             return Err(err("configured capture unsupported"));
         }
         drop(lease);
-        let observed = observe_reconciliation(&mut store, &a, &guards[0])?;
+        let observed = observe_reconciliation_with_git(git, &mut store, &a, &guards[0])?;
         let lease = lifecycle_lock(&store)?;
         crate::recovery::reconcile_under_lease(&mut store, &mut a, observed, &lease)?;
         return if matches!(a.stage.as_str(), "ready" | "capture_pending") {
@@ -2181,9 +2227,10 @@ pub fn start_observed(
     drop(lease);
     boundary("charged");
     boundary("reserved");
-    create(config, &mut store, a, &mut boundary, &guard)
+    create_with_git(git, config, &mut store, a, &mut boundary, &guard)
 }
-fn resume_operation(
+fn resume_operation_with_git(
+    git: &crate::git::GitInvocation,
     config: &Config,
     store: &mut Store,
     r: &Start,
@@ -2233,9 +2280,9 @@ fn resume_operation(
     }
     drop(lease);
     if a.stage == "reserved" {
-        return create(config, store, a, boundary, &guard);
+        return create_with_git(git, config, store, a, boundary, &guard);
     }
-    let observed = observe_reconciliation(store, &a, &guard)?;
+    let observed = observe_reconciliation_with_git(git, store, &a, &guard)?;
     let lease = lifecycle_lock(store)?;
     crate::recovery::reconcile_under_lease(store, &mut a, observed, &lease)?;
     if matches!(a.stage.as_str(), "ready" | "capture_pending") {
@@ -2244,7 +2291,8 @@ fn resume_operation(
         Err(err(a.reason.as_deref().unwrap_or("allocation held")))
     }
 }
-fn candidate_observation(
+fn candidate_observation_with_git(
+    git: &crate::git::GitInvocation,
     config: &Config,
     r: &Start,
     source: &CheckoutIdentity,
@@ -2265,7 +2313,8 @@ fn candidate_observation(
         ));
     }
     let branch = r.branch.as_ref().unwrap();
-    let exists = query(
+    let exists = crate::identity::query_with_git(
+        git,
         repo,
         &["show-ref", "--verify", &format!("refs/heads/{branch}")],
     )
@@ -2275,7 +2324,8 @@ fn candidate_observation(
             "existing branch requires explicit --reuse-branch; missing branch cannot be reused",
         ));
     }
-    let base_commit = query(
+    let base_commit = crate::identity::query_with_git(
+        git,
         repo,
         &[
             "rev-parse",
@@ -2307,7 +2357,8 @@ fn candidate_observation(
 }
 /// Physical source inspection against an already-owned charged common directory.
 /// Performs no SQL; capture setup must collect the expected authority beforehand.
-pub(crate) fn verify_source_authority(
+pub(crate) fn verify_source_authority_with_git(
+    git: &crate::git::GitInvocation,
     a: &Allocation,
     charged_common: &std::path::Path,
 ) -> io::Result<PathBuf> {
@@ -2316,7 +2367,7 @@ pub(crate) fn verify_source_authority(
         .repository
         .as_ref()
         .ok_or_else(|| err("missing durable source authority"))
-        .and_then(|path| CheckoutIdentity::inspect(path));
+        .and_then(|path| CheckoutIdentity::inspect_with_git(git, path));
     match result {
         Ok(source) if source.common_git_dir == charged_common => Ok(source.common_git_dir),
         _ => Err(err("source repository authority mismatch")),
@@ -2332,7 +2383,8 @@ fn recheck_creation_root(file: &fs::File, path: &std::path::Path) -> io::Result<
     }
     Ok(())
 }
-fn create(
+fn create_with_git(
+    git: &crate::git::GitInvocation,
     config: &Config,
     store: &mut Store,
     mut a: Allocation,
@@ -2417,13 +2469,14 @@ fn create(
             return Err(err("destination collision"));
         }
         let repo = a.request.repository.as_ref().unwrap();
-        let source = CheckoutIdentity::inspect(repo)?;
+        let source = CheckoutIdentity::inspect_with_git(git, repo)?;
         if source.common_git_dir != std::path::Path::new(&charged) {
             return Err(err("source authority changed"));
         }
-        crate::identity::preflight_creation(repo)?;
+        crate::identity::preflight_creation_with_git(git, repo)?;
         if a.request.reuse_branch
-            && query(
+            && crate::identity::query_with_git(
+                git,
                 repo,
                 &[
                     "rev-parse",
@@ -2470,21 +2523,26 @@ fn create(
             return Err(err("destination collision before Git add"));
         }
         let repo = a.request.repository.as_ref().unwrap();
-        if CheckoutIdentity::inspect(repo)? != source {
+        if CheckoutIdentity::inspect_with_git(git, repo)? != source {
             return Err(err("source changed before Git add"));
         }
         common.revalidate(store)?;
         // The persisted-intent callback and intervening I/O cannot freeze Git
         // configuration. Repeat the executable-filter gate at the actual add.
-        crate::identity::preflight_creation(repo)?;
+        crate::identity::preflight_creation_with_git(git, repo)?;
         let branch = a.request.branch.as_ref().unwrap();
         if a.request.reuse_branch
-            && query(repo, &["rev-parse", &format!("refs/heads/{branch}")])? != a.base_commit
+            && crate::identity::query_with_git(
+                git,
+                repo,
+                &["rev-parse", &format!("refs/heads/{branch}")],
+            )? != a.base_commit
         {
             return Err(err("branch moved before Git add"));
         }
         let result = if a.request.reuse_branch {
-            query(
+            crate::identity::query_with_git(
+                git,
                 repo,
                 &[
                     "-c",
@@ -2499,7 +2557,8 @@ fn create(
                 ],
             )
         } else {
-            query(
+            crate::identity::query_with_git(
+                git,
                 repo,
                 &[
                     "-c",
@@ -2519,10 +2578,10 @@ fn create(
         boundary("created");
         result?;
         recheck_creation_root(&root, a.request.root.as_ref().unwrap())?;
-        if CheckoutIdentity::inspect(repo)? != source {
+        if CheckoutIdentity::inspect_with_git(git, repo)? != source {
             return Err(err("source changed during Git add"));
         }
-        let identity = CheckoutIdentity::inspect(&a.destination)?;
+        let identity = CheckoutIdentity::inspect_with_git(git, &a.destination)?;
         if identity.common_git_dir != source.common_git_dir
             || identity.private_git_dir == identity.common_git_dir
             || identity.head != a.base_commit
@@ -2551,10 +2610,12 @@ fn create(
     let marker_result = (|| {
         recheck_creation_root(&root, a.request.root.as_ref().unwrap())?;
         let identity = a.identity.as_ref().unwrap();
-        if CheckoutIdentity::inspect(a.request.repository.as_ref().unwrap())? != source {
+        if CheckoutIdentity::inspect_with_git(git, a.request.repository.as_ref().unwrap())?
+            != source
+        {
             return Err(err("source changed before marker"));
         }
-        if CheckoutIdentity::inspect(&a.destination)? != *identity {
+        if CheckoutIdentity::inspect_with_git(git, &a.destination)? != *identity {
             return Err(err("identity changed before marker"));
         }
         let marker = identity.private_git_dir.join("work-lease.json");
@@ -2579,7 +2640,8 @@ fn create(
         return Err(error);
     }
     boundary("marker");
-    let mut observed = collect_physical(store, a.clone(), created, common, guard, Some(&source))?;
+    let mut observed =
+        collect_physical_with_git(git, store, a.clone(), created, common, guard, Some(&source))?;
     if let Err(error) = recheck_creation_root(&root, a.request.root.as_ref().unwrap()) {
         observed.evidence = Err(error);
     }
@@ -2591,4 +2653,28 @@ fn create(
     }
     boundary(&a.stage);
     Ok(a)
+}
+
+#[cfg(test)]
+use crate::identity::query;
+#[cfg(test)]
+pub(crate) fn observe_checkout(
+    store: &mut Store,
+    checkout: Uuid,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> io::Result<PhysicalObservation> {
+    observe_checkout_with_git(
+        &crate::git::GitInvocation::new(None, None),
+        store,
+        checkout,
+        guard,
+    )
+}
+#[cfg(test)]
+pub(crate) fn observe_reconciliation(
+    store: &mut Store,
+    a: &Allocation,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> io::Result<PhysicalObservation> {
+    observe_reconciliation_with_git(&crate::git::GitInvocation::new(None, None), store, a, guard)
 }

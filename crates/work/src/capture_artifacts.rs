@@ -1,17 +1,20 @@
 //! Private physical observations. No SQL, callbacks, secret-file reads or runtime authority.
 use crate::capture_bridge::{EndedAt, Prepared, Refused, MAX_WIRE_BYTES};
-use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+use rustix::fs::OFlags;
+#[cfg(target_os = "linux")]
+use rustix::fs::{openat2, Mode, ResolveFlags};
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::io::Read;
 use std::{
     collections::HashSet,
     fmt,
     fs::File,
-    io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
@@ -40,6 +43,12 @@ fn stamp(f: &File) -> Result<Stamp> {
         ctime: (m.ctime(), m.ctime_nsec()),
     })
 }
+#[cfg(not(target_os = "linux"))]
+fn open(path: &Path, flags: OFlags) -> Result<File> {
+    let _ = (path, flags);
+    Err(Refused)
+}
+#[cfg(target_os = "linux")]
 fn open(path: &Path, flags: OFlags) -> Result<File> {
     if !path.is_absolute()
         || path.components().any(|c| {
@@ -80,6 +89,12 @@ fn regular(s: &Stamp, readonly: bool) -> Result<()> {
     Ok(())
 }
 /// Only metadata: O_PATH never reads or hashes a credential's contents.
+#[cfg(not(target_os = "linux"))]
+pub(super) fn key_metadata(path: &Path) -> Result<()> {
+    let _ = (path,);
+    Err(Refused)
+}
+#[cfg(target_os = "linux")]
 pub(super) fn key_metadata(path: &Path) -> Result<()> {
     regular(&stamp(&open(path, OFlags::PATH)?)?, false)
 }
@@ -127,6 +142,12 @@ pub(super) struct Artifact {
     digest: [u8; 32],
 }
 impl Artifact {
+    #[cfg(not(target_os = "linux"))]
+    fn read(path: &Path, readonly: bool) -> Result<(Self, Vec<u8>)> {
+        let _ = (path, readonly);
+        Err(Refused)
+    }
+    #[cfg(target_os = "linux")]
     fn read(path: &Path, readonly: bool) -> Result<(Self, Vec<u8>)> {
         let mut file = open(path, OFlags::RDONLY)?;
         let before = stamp(&file)?;

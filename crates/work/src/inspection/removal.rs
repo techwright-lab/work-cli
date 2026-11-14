@@ -51,16 +51,21 @@ fn history(store: &Store, checkout: Uuid) -> Result<Option<journal::History>> {
 fn incomplete_inspection(reasons: &[IncompleteReason]) -> String {
     let mut message = format!("inspection incomplete: {reasons:?}");
     if reasons.contains(&IncompleteReason::UnsupportedGit) {
-        message.push_str("; requires stable Git >=2.55.0 at /usr/bin/git (canonical MAJOR.MINOR.PATCH version) and a supported repository layout");
+        message.push_str("; requires stable Git >=2.55.0 at selected Git (canonical MAJOR.MINOR.PATCH version) and a supported repository layout");
     }
     message
 }
-fn clean(store: &mut Store, checkout: Uuid) -> Result<(Captured, Vec<String>)> {
+fn clean(
+    invocation: &crate::git::GitInvocation,
+    store: &mut Store,
+    checkout: Uuid,
+) -> Result<(Captured, Vec<String>)> {
     let policies = checked(crate::disposal::validate(crate::disposal::PolicyDocument {
         format: 1,
         policies: vec![],
     }))?;
-    let mut captured = checked(collect(
+    let mut captured = checked(collect_with_git(
+        invocation,
         store,
         checkout,
         &policies,
@@ -355,7 +360,15 @@ fn publish(
     checked(b.check())?;
     checked(tx.commit())
 }
-pub(crate) fn command(config: &Config, checkout: Uuid, confirmed: bool) -> Result<Report> {
+pub(crate) fn command(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    checkout: Uuid,
+    confirmed: bool,
+) -> Result<Report> {
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| "Git selector changed")?;
     let mut store = checked(Store::open_existing_registered_mut(
         config
             .trusted_registry
@@ -377,7 +390,7 @@ pub(crate) fn command(config: &Config, checkout: Uuid, confirmed: bool) -> Resul
         if h.phase == "intent" {
             return Err("previous removal outcome unknown; capacity held; manual investigation required (no replay)".into());
         }
-        let mut b = Budget::new();
+        let mut b = Budget::with_git(invocation);
         absent(a, &h.record, &mut b)?;
         checked(common.revalidate(&store))?;
         checked(guard.revalidate(&store))?;
@@ -407,7 +420,7 @@ pub(crate) fn command(config: &Config, checkout: Uuid, confirmed: bool) -> Resul
         ));
     }
     let (mut first, roots) =
-        clean(&mut store, checkout).map_err(|e| format!("initial collection: {e}"))?;
+        clean(invocation, &mut store, checkout).map_err(|e| format!("initial collection: {e}"))?;
     if !confirmed {
         return Ok(report(checkout, a.destination.clone(), &roots, false));
     }
@@ -423,7 +436,7 @@ pub(crate) fn command(config: &Config, checkout: Uuid, confirmed: bool) -> Resul
     // Our create-only refs changed common administration. Start a fresh retained
     // collection; do not waive the earlier collector's change detection.
     let (mut final_capture, final_roots) =
-        clean(&mut store, checkout).map_err(|e| format!("final collection: {e}"))?;
+        clean(invocation, &mut store, checkout).map_err(|e| format!("final collection: {e}"))?;
     if roots != final_roots {
         return Err("private roots changed during preservation".into());
     }

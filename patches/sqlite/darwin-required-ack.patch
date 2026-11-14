@@ -1,0 +1,209 @@
+--- a/sqlite3/sqlite3.c
++++ b/sqlite3/sqlite3.c
+@@ -42939,6 +42939,10 @@
+ ** the F_FULLFSYNC macro is defined.  F_FULLFSYNC is currently
+ ** only available on Mac OS X.  But that could change.
+ */
++#if defined(__APPLE__) && (defined(SQLITE_NO_SYNC) \
++    || defined(SQLITE_DISABLE_DIRSYNC) || !defined(F_FULLFSYNC))
++# error "Work requires Darwin F_FULLFSYNC and directory sync support"
++#endif
+ #ifdef F_FULLFSYNC
+ # define HAVE_FULLFSYNC 1
+ #else
+@@ -43021,7 +43025,12 @@
+   ** It'd be better to detect fullfsync support once and avoid
+   ** the fcntl call every time sync is called.
+   */
++#if defined(__APPLE__)
++  /* Work requires the requested acknowledgement, not a weaker fallback. */
++  if( !fullSync ) rc = fsync(fd);
++#else
+   if( rc ) rc = fsync(fd);
++#endif
+ 
+ #elif defined(__APPLE__)
+   /* fdatasync() on HFS+ doesn't yet flush the file size if it changed correctly
+@@ -43088,6 +43097,23 @@
+   return unixLogError(SQLITE_CANTOPEN_BKPT, "openDirectory", zDirname);
+ }
+ 
++#if defined(__APPLE__)
++/* Work's required namespace acknowledgement. A sandbox no-op is not an ACK. */
++static int unixSyncDirectory(const char *zPath, unixFile *pFile){
++  int fd = -1;
++  int rc = osOpenDirectory(zPath, &fd);
++  if( rc!=SQLITE_OK ) return rc;
++  if( fd<0 ) return unixLogError(SQLITE_CANTOPEN_BKPT, "openDirectory", zPath);
++  rc = full_fsync(fd, 1, 0);
++  if( rc ){
++    if( pFile ) storeLastErrno(pFile, errno);
++    rc = unixLogError(SQLITE_IOERR_DIR_FSYNC, "full_fsync", zPath);
++  }
++  robust_close(pFile, fd, __LINE__);
++  return rc;
++}
++#endif
++
+ /*
+ ** Make sure all writes to a particular file are committed to disk.
+ **
+@@ -43134,6 +43160,10 @@
+   ** are unable to fsync a directory, so ignore errors on the fsync.
+   */
+   if( pFile->ctrlFlags & UNIXFILE_DIRSYNC ){
++#if defined(__APPLE__)
++    rc = unixSyncDirectory(pFile->zPath, pFile);
++    if( rc!=SQLITE_OK ) return rc;
++#else
+     int dirfd;
+     OSTRACE(("DIRSYNC %s (have_fullfsync=%d fullsync=%d)\n", pFile->zPath,
+             HAVE_FULLFSYNC, isFullsync));
+@@ -43145,6 +43175,7 @@
+       assert( rc==SQLITE_CANTOPEN );
+       rc = SQLITE_OK;
+     }
++#endif
+     pFile->ctrlFlags &= ~UNIXFILE_DIRSYNC;
+   }
+   return rc;
+@@ -44251,6 +44282,14 @@
+ 
+       rc = unixLockSharedMemory(pDbFd, pShmNode);
+       if( rc!=SQLITE_OK && rc!=SQLITE_READONLY_CANTINIT ) goto shm_open_err;
++#if defined(__APPLE__)
++      /* SHM contents are reconstructible; its published namespace still needs
++      ** a checked acknowledgement before this writable connection uses it. */
++      if( rc==SQLITE_OK && !pShmNode->isReadonly ){
++        rc = unixSyncDirectory(zShm, pDbFd);
++        if( rc!=SQLITE_OK ) goto shm_open_err;
++      }
++#endif
+     }
+   }
+ 
+@@ -44708,6 +44747,9 @@
+   unixShmNode *pShmNode;          /* The underlying shared-memory file */
+   unixShm **pp;                   /* For looping over sibling connections */
+   unixFile *pDbFd;                /* The underlying database file */
++#if defined(__APPLE__)
++  int rc = SQLITE_OK;
++#endif
+ 
+   pDbFd = (unixFile*)fd;
+   p = pDbFd->pShm;
+@@ -44736,13 +44778,27 @@
+   pShmNode->nRef--;
+   if( pShmNode->nRef==0 ){
+     if( deleteFlag && pShmNode->hShm>=0 ){
++#if defined(__APPLE__)
++      if( osUnlink(pShmNode->zFilename) ){
++        rc = unixLogError(errno==ENOENT ? SQLITE_IOERR_DELETE_NOENT
++                                       : SQLITE_IOERR_DELETE,
++                          "unlink", pShmNode->zFilename);
++      }else{
++        rc = unixSyncDirectory(pShmNode->zFilename, pDbFd);
++      }
++#else
+       osUnlink(pShmNode->zFilename);
++#endif
+     }
+     unixShmPurge(pDbFd);
+   }
+   unixLeaveMutex();
+ 
++#if defined(__APPLE__)
++  return rc;
++#else
+   return SQLITE_OK;
++#endif
+ }
+ 
+ 
+@@ -45770,6 +45826,9 @@
+         eType==SQLITE_OPEN_SUPER_JOURNAL
+      || eType==SQLITE_OPEN_MAIN_JOURNAL
+      || eType==SQLITE_OPEN_WAL
++#if defined(__APPLE__)
++     || eType==SQLITE_OPEN_MAIN_DB
++#endif
+   ));
+ 
+   /* If argument zPath is a NULL pointer, this function is required to open
+@@ -46050,7 +46109,11 @@
+     }
+     return rc;
+   }
+-#ifndef SQLITE_DISABLE_DIRSYNC
++#if defined(__APPLE__)
++  /* WAL/journal deletion callers may pass dirSync=0; publication is required. */
++  UNUSED_PARAMETER(dirSync);
++  rc = unixSyncDirectory(zPath, 0);
++#elif !defined(SQLITE_DISABLE_DIRSYNC)
+   if( (dirSync & 1)!=0 ){
+     int fd;
+     rc = osOpenDirectory(zPath, &fd);
+@@ -62968,7 +63031,11 @@
+ static int pagerSyncHotJournal(Pager *pPager){
+   int rc = SQLITE_OK;
+   if( !pPager->noSync ){
++#if defined(__APPLE__)
++    rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_FULL);
++#else
+     rc = sqlite3OsSync(pPager->jfd, SQLITE_SYNC_NORMAL);
++#endif
+   }
+   if( rc==SQLITE_OK ){
+     rc = sqlite3OsFileSize(pPager->jfd, &pPager->journalHdr);
+@@ -68365,7 +68432,8 @@
+ /*
+ ** Close an open wal-index.
+ */
+-static void walIndexClose(Wal *pWal, int isDelete){
++static int walIndexClose(Wal *pWal, int isDelete){
++  int rc = SQLITE_OK;
+   if( pWal->exclusiveMode==WAL_HEAPMEMORY_MODE || pWal->bShmUnreliable ){
+     int i;
+     for(i=0; i<pWal->nWiData; i++){
+@@ -68374,8 +68442,13 @@
+     }
+   }
+   if( pWal->exclusiveMode!=WAL_HEAPMEMORY_MODE ){
++#if defined(__APPLE__)
++    rc = sqlite3OsShmUnmap(pWal->pDbFd, isDelete);
++#else
+     sqlite3OsShmUnmap(pWal->pDbFd, isDelete);
+-  }
++#endif
++  }
++  return rc;
+ }
+ 
+ /*
+@@ -69291,13 +69364,26 @@
+       }
+     }
+ 
++#if defined(__APPLE__)
++    {
++      int rc2 = walIndexClose(pWal, isDelete);
++      if( rc==SQLITE_OK ) rc = rc2;
++    }
++#else
+     walIndexClose(pWal, isDelete);
++#endif
+     sqlite3OsClose(pWal->pWalFd);
++#if defined(__APPLE__)
++    if( isDelete && rc==SQLITE_OK ){
++      rc = sqlite3OsDelete(pWal->pVfs, pWal->zWalName, 1);
++    }
++#else
+     if( isDelete ){
+       sqlite3BeginBenignMalloc();
+       sqlite3OsDelete(pWal->pVfs, pWal->zWalName, 0);
+       sqlite3EndBenignMalloc();
+     }
++#endif
+     WALTRACE(("WAL%p: closed\n", pWal));
+     sqlite3_free((void *)pWal->apWiData);
+     sqlite3_free(pWal);

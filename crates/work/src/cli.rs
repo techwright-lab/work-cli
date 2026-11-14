@@ -3,6 +3,42 @@ use work_contract::SchemaVersion;
 
 use crate::config::Config;
 
+#[cfg(test)]
+mod git_option_tests {
+    use super::*;
+
+    #[test]
+    fn root_globals_preserve_private_and_sensitive_command_boundaries() {
+        for args in [
+            vec!["--git", "/private/selector", "__scope-child"],
+            vec!["--git=/private/selector", "run"],
+            vec!["--git", "/private/selector", "--", "recover"],
+        ] {
+            let argv: Vec<std::ffi::OsString> = args.iter().map(Into::into).collect();
+            assert_eq!(command_args(&argv)[0], args[args.len() - 1]);
+        }
+        let args: Vec<std::ffi::OsString> = ["--git", "run", "skill", "install"]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(command_args(&args)[0], "skill");
+    }
+
+    #[test]
+    fn global_git_is_accepted_before_or_after_subcommands_without_qualification() {
+        for argv in [
+            vec!["work", "--git", "/missing/git", "skill", "install"],
+            vec!["work", "skill", "--git=/missing/git", "install"],
+            vec!["work", "skill", "install", "--git", "/missing/git"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(argv).unwrap().git,
+                Some("/missing/git".into())
+            );
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(
     name = "work",
@@ -11,6 +47,9 @@ use crate::config::Config;
     long_about = "Create or reuse a task worktree, run your agent there, then explicitly finish and remove it. Linux-first; help and status are read-only."
 )]
 struct Cli {
+    /// Absolute Git executable; invocation-only except confirmed setup proposals
+    #[arg(long, global = true, value_name = "ABSOLUTE_PATH")]
+    git: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -142,13 +181,36 @@ enum SkillCommand {
     },
 }
 
+// Only root global selectors precede the command. Do not search arbitrary argv:
+// delegated commands and selector values may themselves spell Work commands.
+fn command_args(mut args: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
+    loop {
+        match args.first() {
+            Some(arg) if arg == "--git" => {
+                if args.len() < 2 {
+                    return &[];
+                }
+                args = &args[2..];
+            }
+            Some(arg) if arg.as_encoded_bytes().starts_with(b"--git=") => args = &args[1..],
+            Some(arg) if arg == "--" => return &args[1..],
+            _ => return args,
+        }
+    }
+}
+
 /// Parse arguments and dispatch. Help/version parsing is read-only.
 pub fn run() {
     // Parse the private entry point without Clap diagnostics echoing sensitive argv.
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.first().is_some_and(|a| a == "__scope-child") {
-        if args.len() >= 5 && args[1] == "--context" && args[3] == "--" {
-            let _ = crate::scope_child::run(std::path::Path::new(&args[2]), &args[4..]);
+    #[cfg(target_os = "macos")]
+    refuse_incomplete_native_command(&args);
+    let private_args = command_args(&args);
+    if private_args.first().is_some_and(|a| a == "__scope-child") {
+        #[cfg(not(target_os = "macos"))]
+        if private_args.len() >= 5 && private_args[1] == "--context" && private_args[3] == "--" {
+            let _ =
+                crate::scope_child::run(std::path::Path::new(&private_args[2]), &private_args[4..]);
         }
         eprintln!("scope child held");
         std::process::exit(1);
@@ -156,10 +218,35 @@ pub fn run() {
     dispatch_public(&args);
 }
 
+// Refuse before parsing identifiers or touching config/context/history. Never echo argv.
+// These are development-build boundaries, not implemented Darwin capabilities.
+#[cfg(target_os = "macos")]
+fn refuse_incomplete_native_command(args: &[std::ffi::OsString]) {
+    match command_args(args).first().and_then(|arg| arg.to_str()) {
+        Some("__scope-child" | "run" | "recover") => {
+            eprintln!("execution/supervision unsupported on macOS; no runtime action taken");
+            std::process::exit(1);
+        }
+        Some(
+            "setup" | "start" | "finish" | "remove" | "inspect" | "verify-remote"
+            | "audit-preservation" | "prepare-recovery" | "approve" | "retire" | "capture"
+            | "participant" | "adopt",
+        ) => {
+            eprintln!(
+                "native backend incomplete; managed operation refused before authority access"
+            );
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+}
+
 /// Shared public argv boundary; the private scope-child entry remains in `run`.
 pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
+    #[cfg(target_os = "macos")]
+    refuse_incomplete_native_command(args);
     let argv = std::iter::once(std::ffi::OsString::from("work")).chain(args.iter().cloned());
-    let cli = if args.first().is_some_and(|a| {
+    let cli = if command_args(args).first().is_some_and(|a| {
         a == "capture"
             || a == "inspect"
             || a == "verify-remote"
@@ -193,8 +280,13 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
     } else {
         Cli::parse_from(argv)
     };
+    let git_override = cli.git;
+    let invocation = crate::git::GitInvocation::unconfigured(git_override.clone());
     match cli.command {
-        Command::Setup(args) => crate::setup::command(args),
+        Command::Setup(mut args) => {
+            args.git_path = git_override;
+            crate::setup::command(args)
+        }
         Command::Skill {
             command: SkillCommand::Install { all },
         } => match crate::skill_install::install(all) {
@@ -215,7 +307,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 let config = Config::load().map_err(|e| e.to_string())?;
                 let id =
                     crate::interactive::resolve(&config, &checkout).map_err(|e| e.to_string())?;
-                crate::inspection::removal::command(&config, id, confirm_stopped)
+                crate::inspection::removal::command(&invocation, &config, id, confirm_stopped)
             })();
             match result {
                 Ok(report) => println!(
@@ -231,7 +323,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Command::Capture { command } => {
             let result = Config::load_capture_authority()
                 .map_err(|_| crate::store::StoreError::Unsafe)
-                .and_then(|config| crate::capture_cli::command(&config, command));
+                .and_then(|config| {
+                    crate::capture_cli::command_with_git(&invocation, &config, command)
+                });
             match result {
                 Ok(report) => {
                     println!(
@@ -269,7 +363,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     }
                 }
                 Err(_) => {
-                    eprintln!("participant refused: invalid_metadata_or_existing_authority; inspect explicit root/child context and current schema; no execution permission");
+                    eprintln!(
+                        "participant refused: invalid_metadata_or_existing_authority; inspect explicit root/child context and current schema; no execution permission"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -277,11 +373,13 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Command::Adopt { command } => {
             let result = Config::load()
                 .map_err(|_| crate::store::StoreError::Unsafe)
-                .and_then(|config| crate::adopted::command(&config, command));
+                .and_then(|config| crate::adopted::command_with_git(&invocation, &config, command));
             match result {
                 Ok(report) => println!("{report}"),
                 Err(_) => {
-                    eprintln!("adopted declaration refused/unknown; inspect explicit IDs, existing authority and held lease; no runtime authority granted");
+                    eprintln!(
+                        "adopted declaration refused/unknown; inspect explicit IDs, existing authority and held lease; no runtime authority granted"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -304,7 +402,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 if request.actor.is_none() {
                     request.actor = document.default_actor().map_err(std::io::Error::other)?;
                 }
-                crate::allocate::start(&config, request)
+                crate::allocate::start_with_git(&invocation, &config, request)
             })();
             match result {
                 Ok(a) => println!(
@@ -312,7 +410,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     serde_json::to_string(&a).expect("allocation serialization")
                 ),
                 Err(e) => {
-                    eprintln!("start refused: {e}; inspect WORK_CONFIG and held allocations; retry with the same --operation UUID");
+                    eprintln!(
+                        "start refused: {e}; inspect WORK_CONFIG and held allocations; retry with the same --operation UUID"
+                    );
                     if matches!(
                         e.get_ref()
                             .and_then(|e| e.downcast_ref::<crate::store::StoreError>()),
@@ -339,7 +439,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             }
         }
         Command::Inspect { checkout, record } => {
-            let result = crate::inspection::configured_report(checkout, record);
+            let result = crate::inspection::configured_report(&invocation, checkout, record);
             match result {
                 Ok(report) => {
                     println!(
@@ -351,13 +451,15 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     }
                 }
                 Err(_) => {
-                    eprintln!("inspection unavailable: invalid policy or existing authority; no deletion permission");
+                    eprintln!(
+                        "inspection unavailable: invalid policy or existing authority; no deletion permission"
+                    );
                     std::process::exit(1);
                 }
             }
         }
         Command::VerifyRemote { checkout } => {
-            let report = crate::inspection::verify_remote(checkout);
+            let report = crate::inspection::verify_remote_with_git(&invocation, checkout);
             println!(
                 "{}",
                 serde_json::to_string(&report).expect("remote observation serialization")
@@ -367,7 +469,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             }
         }
         Command::AuditPreservation { checkout } => {
-            let report = crate::inspection::audit_preservation(checkout);
+            let report = crate::inspection::audit_preservation_with_git(&invocation, checkout);
             println!(
                 "{}",
                 serde_json::to_string(&report).expect("preservation audit serialization")
@@ -379,13 +481,18 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
         Command::Approve { command } => {
             let report = match command {
                 crate::inspection::ApprovalCommand::Begin { checkout } => {
-                    crate::inspection::approve_begin(checkout)
+                    crate::inspection::approve_begin_with_git(&invocation, checkout)
                 }
                 crate::inspection::ApprovalCommand::Confirm {
                     checkout,
                     observation,
                     assert_quiescent,
-                } => crate::inspection::approve_confirm(checkout, observation, assert_quiescent),
+                } => crate::inspection::approve_confirm_with_git(
+                    &invocation,
+                    checkout,
+                    observation,
+                    assert_quiescent,
+                ),
             };
             println!(
                 "{}",
@@ -401,7 +508,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
             operation,
         } => {
             let report = match (create, operation) {
-                (true, Some(operation)) => crate::inspection::prepare_recovery(checkout, operation),
+                (true, Some(operation)) => {
+                    crate::inspection::prepare_recovery_with_git(&invocation, checkout, operation)
+                }
                 _ => crate::inspection::prepare_recovery_refused(checkout),
             };
             println!(
@@ -417,7 +526,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 .map_err(|_| crate::store::StoreError::Unsafe)
                 .and_then(|config| {
                     let id = crate::interactive::resolve_finish(&config, &checkout)?;
-                    crate::finish::finish(&config, id)
+                    crate::finish::finish_with_git(&invocation, &config, id)
                 });
             match result {
                 Ok(report) => {
@@ -430,7 +539,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     }
                 }
                 Err(_) => {
-                    eprintln!("finish refused: invalid existing authority, identity or writer context; tree and charge retained");
+                    eprintln!(
+                        "finish refused: invalid existing authority, identity or writer context; tree and charge retained"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -441,21 +552,31 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 crate::config::ConfigDocument::load()
                     .map_err(|_| std::io::Error::other("invalid configuration"))
                     .and_then(|document| {
-                        crate::supervisor::command_off_document(&document, request)
+                        crate::supervisor::command_off_document_with_git(
+                            &invocation,
+                            &document,
+                            request,
+                        )
                     })
             } else {
                 Config::load()
                     .map_err(|_| std::io::Error::other("invalid configuration"))
-                    .and_then(|config| crate::supervisor::command(&config, request))
+                    .and_then(|config| {
+                        crate::supervisor::command_with_git(&invocation, &config, request)
+                    })
             };
             match result {
                 Ok(code) => std::process::exit(code),
                 Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                    eprintln!("interactive TTY/job-control unsupported; use non-terminal protocol stdio; no delegate launched");
+                    eprintln!(
+                        "interactive TTY/job-control unsupported; use non-terminal protocol stdio; no delegate launched"
+                    );
                     std::process::exit(1);
                 }
                 Err(_) => {
-                    eprintln!("run held/refused; inspect lease and run journal; retry only with the same --run-id; historical bindings cannot be restored");
+                    eprintln!(
+                        "run held/refused; inspect lease and run journal; retry only with the same --run-id; historical bindings cannot be restored"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -475,7 +596,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     std::process::exit(1);
                 }
                 Err(_) => {
-                    eprintln!("historical status unknown: existing trusted authority unavailable or invalid");
+                    eprintln!(
+                        "historical status unknown: existing trusted authority unavailable or invalid"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -495,12 +618,14 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     }
                 }
                 Err(_) => {
-                    eprintln!("recovery held: existing trusted authority, schema or runtime unavailable; no launch, task completion or charge release");
+                    eprintln!(
+                        "recovery held: existing trusted authority, schema or runtime unavailable; no launch, task completion or charge release"
+                    );
                     std::process::exit(1);
                 }
             }
         }
-        Command::Retire { command } => retire(command),
+        Command::Retire { command } => retire(&invocation, command),
         Command::Doctor {
             json,
             repositories,
@@ -522,7 +647,7 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 if trusted_registry.is_some() {
                     config.trusted_registry = trusted_registry;
                 }
-                crate::doctor::report(&config)
+                crate::doctor::report_with_git(&config, &invocation)
             })();
             match result {
                 Ok(report) => {
@@ -541,7 +666,9 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                     }
                 }
                 Err(_) => {
-                    eprintln!("doctor requires valid explicit scope and configuration; see work doctor --help");
+                    eprintln!(
+                        "doctor requires valid explicit scope and configuration; see work doctor --help"
+                    );
                     std::process::exit(1);
                 }
             }
@@ -578,7 +705,7 @@ enum RetireCommand {
     },
 }
 
-fn retire(command: RetireCommand) {
+fn retire(invocation: &crate::git::GitInvocation, command: RetireCommand) {
     let path = match crate::config::Config::discover_path() {
         Some(path) => path,
         None => {
@@ -592,7 +719,8 @@ fn retire(command: RetireCommand) {
             assertion,
             task_complete,
             checkout,
-        } => crate::inspection::prepare_retirement(
+        } => crate::inspection::prepare_retirement_with_git(
+            invocation,
             &path,
             checkout,
             operation,
@@ -603,7 +731,9 @@ fn retire(command: RetireCommand) {
             operation,
             revision,
             checkout,
-        } => crate::inspection::abort_retirement(&path, checkout, operation, revision),
+        } => crate::inspection::abort_retirement_with_git(
+            invocation, &path, checkout, operation, revision,
+        ),
         RetireCommand::Status { checkout } => crate::inspection::retirement_status(&path, checkout),
     };
     println!(
@@ -666,7 +796,9 @@ fn print_status(json: bool) {
                 }
             }
             Err(error) => {
-                eprintln!("status unavailable: {error}; existing authority was not initialized or repaired");
+                eprintln!(
+                    "status unavailable: {error}; existing authority was not initialized or repaired"
+                );
                 std::process::exit(1);
             }
         }

@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error("native mutable authority backend incomplete")]
+    NativeIncomplete,
     #[error("unsafe local store or authority configuration")]
     Unsafe,
     #[error("store database failure")]
@@ -44,6 +46,13 @@ pub enum StoreError {
     OperationsInFlight,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+// Passive history access stays separate. Native mutable opens must refuse before
+// even creating private directories, locks, SQLite sidecars or bootstrap markers.
+#[cfg(not(target_os = "linux"))]
+fn require_mutable_authority_backend() -> Result<()> {
+    Err(StoreError::NativeIncomplete)
+}
 
 /// Diagnostic provenance only at retirement open/abort admission. It grants no
 /// role or permission and preserves the original error for StoreError callers.
@@ -544,6 +553,8 @@ impl InitializationRetention {
 }
 impl ExclusiveInitialization {
     fn acquire(registry: &Path, create: bool) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        require_mutable_authority_backend()?;
         if create {
             private_dir(registry)?;
         }
@@ -799,6 +810,8 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        require_mutable_authority_backend()?;
         let (schema, conn, budget, _, authority) =
             existing_authority(registry, dir, managed, true)?;
         let _phase = budget.enter();
@@ -848,6 +861,8 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> std::result::Result<Self, RetirementAdmissionError> {
+        #[cfg(not(target_os = "linux"))]
+        require_mutable_authority_backend()?;
         let reader = Self::open_retirement_readonly(registry, dir, managed)?;
         let role = match reader.role {
             SchemaRole::HistoricalRead(SupportedRetirementVersion::V16) => {
@@ -1041,6 +1056,8 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        require_mutable_authority_backend()?;
         let (schema, conn, budget, _, _authority) =
             existing_authority(registry, dir, managed, false)?;
         {
@@ -1070,6 +1087,8 @@ impl Store {
     /// common trusted registry. Choosing a different registry is explicit host
     /// policy, not a security guarantee; no global filesystem scan is performed.
     pub fn open(dir: &Path, managed: &[PathBuf]) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        require_mutable_authority_backend()?;
         let parent = dir.parent().ok_or(StoreError::Unsafe)?;
         Self::open_registered(&parent.join(".work-authorities"), dir, managed)
     }
@@ -1085,6 +1104,8 @@ impl Store {
     /// Only allowlisted Linux local filesystem types are accepted. Overlay backing
     /// storage durability/locality remains a host qualification obligation.
     pub fn open_registered(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        require_mutable_authority_backend()?;
         let managed = roots(managed)?;
         // Only a specifically validated need for bootstrap, registration or
         // migration reaches EX. Corrupt established metadata is never retried.

@@ -203,11 +203,19 @@ pub fn prepare_observed(
                 std::io::Error::other(e.to_string())
             }
         })?;
-    prepare_under_guard(config, root, spec, observer, &guard)
+    prepare_under_guard_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        root,
+        spec,
+        observer,
+        &guard,
+    )
 }
 
 /// Nested preparation. The caller retains the matching SH guard through BEGIN.
-pub(crate) fn prepare_under_guard(
+pub(crate) fn prepare_under_guard_with_git(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     root: &RootRunRequest,
     spec: &CaptureSpec,
@@ -219,16 +227,17 @@ pub(crate) fn prepare_under_guard(
     }
     let checkout = uuid::Uuid::parse_str(&root.identity().checkout.to_string())
         .map_err(|_| std::io::Error::other("invalid checkout"))?;
-    let (mut store, result) =
-        match crate::capture_setup::begin_under_guard(config, root, spec, guard) {
-            Ok(value) => value,
-            Err(error)
-                if error.to_string() == crate::store::StoreError::RetirementFenced.to_string() =>
-            {
-                return Err(error);
-            }
-            Err(_) => return Err(std::io::Error::other("capture setup refused")),
-        };
+    let (mut store, result) = match crate::capture_setup::begin_under_guard_with_git(
+        invocation, config, root, spec, guard,
+    ) {
+        Ok(value) => value,
+        Err(error)
+            if error.to_string() == crate::store::StoreError::RetirementFenced.to_string() =>
+        {
+            return Err(error);
+        }
+        Err(_) => return Err(std::io::Error::other("capture setup refused")),
+    };
     if guard.require_matching(&store, checkout).is_err() {
         return Err(std::io::Error::other("checkout guard identity changed"));
     }
@@ -342,4 +351,22 @@ pub(crate) fn prepare_under_guard(
             )))
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_under_guard(
+    config: &Config,
+    root: &RootRunRequest,
+    spec: &CaptureSpec,
+    observer: impl FnMut(Boundary, &Store),
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> std::io::Result<(Store, PreparationResult)> {
+    prepare_under_guard_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        root,
+        spec,
+        observer,
+        guard,
+    )
 }

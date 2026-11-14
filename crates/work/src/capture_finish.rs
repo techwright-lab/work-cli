@@ -68,7 +68,11 @@ pub(super) struct Completion {
     observed: Instant,
 }
 impl Completion {
-    pub(super) fn inspect(store: &Store, checkout: Uuid) -> Result<Self> {
+    pub(super) fn inspect(
+        invocation: &crate::git::GitInvocation,
+        store: &Store,
+        checkout: Uuid,
+    ) -> Result<Self> {
         let original = {
             let _phase = store.sql_phase();
             let _snapshot = crate::run_journal::read_transaction(&store.conn)?;
@@ -82,9 +86,12 @@ impl Completion {
             .common_git_dir
             .clone();
         let observed = Instant::now();
-        let physical = crate::capture_setup::inspect_physical(&allocation, &common)?;
+        let physical =
+            crate::capture_setup::inspect_physical_with_git(invocation, &allocation, &common)?;
         allocation.identity = Some(physical.checkout.clone());
-        if crate::capture_setup::inspect_physical(&allocation, &common)? != physical {
+        if crate::capture_setup::inspect_physical_with_git(invocation, &allocation, &common)?
+            != physical
+        {
             return Err(StoreError::Conflict);
         }
         let proof = Self {

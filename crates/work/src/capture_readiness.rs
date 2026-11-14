@@ -262,9 +262,16 @@ pub(crate) fn restore(
 ) -> Result<()> {
     let checkout = seal.checkout()?;
     let guard = crate::checkout_guard::CheckoutGuard::shared_known(config, checkout)?;
-    restore_under_guard(config, seal, ack, &guard)
+    restore_under_guard_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        seal,
+        ack,
+        &guard,
+    )
 }
-pub(crate) fn restore_under_guard(
+pub(crate) fn restore_under_guard_with_git(
+    invocation: &crate::git::GitInvocation,
     config: &crate::config::Config,
     seal: ClosureSeal,
     ack: crate::capture_finalization::FreezeAcknowledgement,
@@ -302,14 +309,21 @@ pub(crate) fn restore_under_guard(
     };
     // No SQL phase, read transaction or allocator flock spans either inspection.
     let observed = std::time::Instant::now();
-    let physical =
-        crate::capture_setup::inspect_physical(&allocation, seal.allocation.source_common())?;
+    let physical = crate::capture_setup::inspect_physical_with_git(
+        invocation,
+        &allocation,
+        seal.allocation.source_common(),
+    )?;
     let registry = registry.canonicalize()?;
     let authority_path = dir.canonicalize()?;
     let mut reinspection = allocation.clone();
     reinspection.identity = Some(physical.checkout.clone());
     if physical
-        != crate::capture_setup::inspect_physical(&reinspection, seal.allocation.source_common())?
+        != crate::capture_setup::inspect_physical_with_git(
+            invocation,
+            &reinspection,
+            seal.allocation.source_common(),
+        )?
     {
         return Err(StoreError::Conflict);
     }
@@ -479,6 +493,7 @@ fn ready(conn: &rusqlite::Connection, checkout: uuid::Uuid) -> Result<()> {
     Ok(())
 }
 pub(crate) struct ContinuationProof {
+    invocation: crate::git::GitInvocation,
     root: crate::run_journal::RootRunRequest,
     spec: [u8; 32],
     pending: crate::capture_setup::PendingPreparation,
@@ -488,7 +503,8 @@ pub(crate) struct ContinuationProof {
     observed: std::time::Instant,
 }
 impl ContinuationProof {
-    pub(crate) fn inspect(
+    pub(crate) fn inspect_with_git(
+        invocation: &crate::git::GitInvocation,
         store: &Store,
         cfg: &crate::config::Config,
         root: &crate::run_journal::RootRunRequest,
@@ -526,9 +542,14 @@ impl ContinuationProof {
         // Preserve current durable ancestry first; the older certificate cannot
         // erase a HEAD advance already observed by normal identity refresh.
         let observed = std::time::Instant::now();
-        let physical = crate::capture_setup::inspect_physical(&anchor, pending.source_common())?;
+        let physical = crate::capture_setup::inspect_physical_with_git(
+            invocation,
+            &anchor,
+            pending.source_common(),
+        )?;
         if cert.physical.checkout.head != physical.checkout.head {
-            crate::identity::query(
+            crate::identity::query_with_git(
+                invocation,
                 &physical.checkout.path,
                 &[
                     "merge-base",
@@ -558,6 +579,7 @@ impl ContinuationProof {
         // history row or a repeated check during unchanged physical reinspection.
         anchor.identity = Some(physical.checkout.clone());
         let proof = Self {
+            invocation: invocation.clone(),
             root: root.clone(),
             spec: hash(spec)?,
             pending,
@@ -574,8 +596,11 @@ impl ContinuationProof {
             return Err(crate::store::StoreError::Invalid);
         }
         self.fresh()?;
-        if crate::capture_setup::inspect_physical(&self.anchor, self.pending.source_common())?
-            != self.physical
+        if crate::capture_setup::inspect_physical_with_git(
+            &self.invocation,
+            &self.anchor,
+            self.pending.source_common(),
+        )? != self.physical
         {
             return Err(crate::store::StoreError::Conflict);
         }
@@ -634,6 +659,39 @@ impl ContinuationProof {
     }
     pub(crate) fn preparation(&self) -> crate::capture_setup::PendingPreparation {
         self.pending.clone()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn restore_under_guard(
+    config: &crate::config::Config,
+    seal: ClosureSeal,
+    ack: crate::capture_finalization::FreezeAcknowledgement,
+    guard: &crate::checkout_guard::CheckoutGuard,
+) -> Result<()> {
+    restore_under_guard_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        seal,
+        ack,
+        guard,
+    )
+}
+#[cfg(test)]
+impl ContinuationProof {
+    pub(crate) fn inspect(
+        store: &Store,
+        cfg: &crate::config::Config,
+        root: &crate::run_journal::RootRunRequest,
+        spec: &crate::capture_journal::CaptureSpec,
+    ) -> Result<Self> {
+        Self::inspect_with_git(
+            &crate::git::GitInvocation::new(None, cfg.git_path.clone()),
+            store,
+            cfg,
+            root,
+            spec,
+        )
     }
 }
 

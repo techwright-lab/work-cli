@@ -5,20 +5,23 @@ use crate::{
     runtime_scope::{Binding, ChildIdentity, LaunchIntent},
     scope_driver::{canonical_dir, live_process},
 };
-use rustix::fs::{openat2, renameat_with, Mode, OFlags, RenameFlags, ResolveFlags};
+#[cfg(target_os = "linux")]
+use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+use rustix::fs::{renameat_with, RenameFlags};
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
     fs::File,
     io::{Read, Write},
-    os::unix::{
-        ffi::{OsStrExt, OsStringExt},
-        fs::MetadataExt,
-        process::CommandExt,
-    },
+    os::unix::{ffi::OsStringExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
+    time::Duration,
+};
+#[cfg(target_os = "linux")]
+use std::{
+    os::unix::{ffi::OsStrExt, process::CommandExt},
+    time::Instant,
 };
 use work_contract::RunId;
 type Result<T> = std::result::Result<T, &'static str>;
@@ -171,6 +174,19 @@ impl Ready {
 
 /// Directory must already be canonical, owned by this uid and exactly 0700.
 /// Existing records are never removed, repaired or overwritten on failure.
+#[cfg(not(target_os = "linux"))]
+pub fn prepare(
+    directory: &Path,
+    intent: &LaunchIntent,
+    parent: &ChildIdentity,
+    cwd: &Path,
+    original: OriginalRuntime,
+    timeout: Duration,
+) -> Result<Prepared> {
+    let _ = (directory, intent, parent, cwd, original, timeout);
+    Err("scope child unsupported on this platform")
+}
+#[cfg(target_os = "linux")]
 pub fn prepare(
     directory: &Path,
     intent: &LaunchIntent,
@@ -277,6 +293,16 @@ impl Prepared {
 pub fn run(context: &Path, argv: &[OsString]) -> Result<()> {
     run_with_collector(context, argv, &OsCollector)
 }
+#[cfg(not(target_os = "linux"))]
+pub fn run_with_collector(
+    context: &Path,
+    argv: &[OsString],
+    collector: &dyn LibraryCollector,
+) -> Result<()> {
+    let _ = (context, argv, collector);
+    Err("scope child unsupported on this platform")
+}
+#[cfg(target_os = "linux")]
 pub fn run_with_collector(
     context: &Path,
     argv: &[OsString],
@@ -401,6 +427,12 @@ fn nonce() -> Result<String> {
         .map_err(|_| HOLD)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
+#[cfg(not(target_os = "linux"))]
+fn create(dir: &File, name: &str) -> Result<File> {
+    let _ = (dir, name);
+    Err("scope child unsupported on this platform")
+}
+#[cfg(target_os = "linux")]
 fn create(dir: &File, name: &str) -> Result<File> {
     openat2(
         dir,
@@ -412,6 +444,12 @@ fn create(dir: &File, name: &str) -> Result<File> {
     .map(File::from)
     .map_err(|_| HOLD)
 }
+#[cfg(not(target_os = "linux"))]
+fn read<T: serde::de::DeserializeOwned>(dir: &File, name: &str) -> Result<Option<T>> {
+    let _ = (dir, name);
+    Err("scope child unsupported on this platform")
+}
+#[cfg(target_os = "linux")]
 fn read<T: serde::de::DeserializeOwned>(dir: &File, name: &str) -> Result<Option<T>> {
     let file = match openat2(
         dir,

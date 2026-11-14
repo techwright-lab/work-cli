@@ -1,3 +1,5 @@
+#[path = "support/fifo.rs"]
+mod fifo;
 #[path = "support/run_fixture.rs"]
 mod run_fixture;
 mod support;
@@ -249,14 +251,7 @@ fn unsafe_registry_and_credential_metadata_refuse_before_receiver_with_exact_hol
             "missing" => fs::remove_file(&registry).unwrap(),
             "fifo" => {
                 fs::remove_file(&registry).unwrap();
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &registry,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&registry, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR);
             }
             "symlink" => {
                 fs::rename(&registry, h.f.temp.path().join("real")).unwrap();
@@ -307,14 +302,7 @@ fn unsafe_registry_and_credential_metadata_refuse_before_receiver_with_exact_hol
                 match case {
                     "key_fifo" => {
                         fs::remove_file(&key).unwrap();
-                        rustix::fs::mknodat(
-                            rustix::fs::CWD,
-                            &key,
-                            rustix::fs::FileType::Fifo,
-                            rustix::fs::Mode::RUSR,
-                            0,
-                        )
-                        .unwrap();
+                        fifo::create_fifo(&key, rustix::fs::Mode::RUSR);
                     }
                     "key_link" => fs::hard_link(&key, h.f.temp.path().join("key2")).unwrap(),
                     "key_mode" => {
@@ -834,14 +822,7 @@ fn unsafe_context_never_becomes_ready() {
             "missing" => fs::remove_file(&h.context).unwrap(),
             "fifo" => {
                 fs::remove_file(&h.context).unwrap();
-                rustix::fs::mknodat(
-                    rustix::fs::CWD,
-                    &h.context,
-                    rustix::fs::FileType::Fifo,
-                    rustix::fs::Mode::RUSR,
-                    0,
-                )
-                .unwrap();
+                fifo::create_fifo(&h.context, rustix::fs::Mode::RUSR);
             }
             "symlink" => {
                 let real = h.f.temp.path().join("real-context");

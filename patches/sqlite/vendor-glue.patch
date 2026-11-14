@@ -1,0 +1,143 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -118,3 +118,7 @@
+ [build-dependencies.vcpkg]
+ version = "0.2.15"
+ optional = true
++
++# Work: already locked in the workspace; no dependency version upgrade.
++[build-dependencies.sha2]
++version = "=0.10.9"
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -59,3 +59,7 @@
+     "extra-traits",
+     "visit-mut",
+ ] }
++
++# Work: already locked in the workspace; no dependency version upgrade.
++[build-dependencies.sha2]
++version = "=0.10.9"
+--- a/build.rs
++++ b/build.rs
+@@ -39,7 +39,59 @@
+     std::fs::copy(from, out_path).expect("Could not copy bindings to output directory");
+ }
+ 
++// This vendored crate is Work's exact reviewed Darwin persistence mechanism.
++// Check the TARGET (not the build host), before any system-library escape path.
++fn verify_work_darwin_source() -> bool {
++    if !env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos") {
++        return false;
++    }
++    assert!(
++        cfg!(feature = "bundled")
++            && !cfg!(any(
++                feature = "sqlcipher",
++                feature = "bundled-sqlcipher",
++                feature = "in_gecko",
++                feature = "loadable_extension"
++            ))
++            && !env::var_os("LIBSQLITE3_SYS_USE_PKG_CONFIG").is_some_and(|v| v != "0"),
++        "Work requires exact patched bundled SQLite; system/alternate SQLite is not permitted"
++    );
++    use sha2::Digest;
++    for (path, expected) in [
++        (
++            "sqlite3/sqlite3.c",
++            "542f88e2bcc33b127fba330b10cc1aab2ddcfdabd5a47fc1ef6eeb55e4328c7a",
++        ),
++        (
++            "sqlite3/sqlite3.h",
++            "4340a24cda7bc436d62459c3c5237f67b9ab716ddca872faf8052d0ce0d97119",
++        ),
++        (
++            "sqlite3/sqlite3ext.h",
++            "ea81fb7bd05882e0e0b92c4d60f677b205f7f1fbf085f218b12f0b5b3f0b9e48",
++        ),
++        (
++            "sqlite3/bindgen_bundled_version.rs",
++            "cf53846904130e42d81072cd63302c6d9261f45a9842c3a4093235c072398528",
++        ),
++        (
++            "sqlite3/bindgen_bundled_version_ext.rs",
++            "31fed0b8f4b2d4cad09111d32e2e3e91f70e08129f50684667ea086e3b5fade7",
++        ),
++    ] {
++        println!("cargo:rerun-if-changed={path}");
++        let bytes = std::fs::read(path).expect("Work SQLite source is missing");
++        assert_eq!(
++            format!("{:x}", sha2::Sha256::digest(bytes)),
++            expected,
++            "Work SQLite source drift: {path}; upgrade requires re-review"
++        );
++    }
++    true
++}
++
+ fn main() {
++    let work_darwin_verified = verify_work_darwin_source();
+     let out_dir = env::var("OUT_DIR").unwrap();
+     let out_path = Path::new(&out_dir).join("bindgen.rs");
+     if cfg!(feature = "in_gecko") {
+@@ -76,7 +128,7 @@
+             feature = "bundled-windows",
+             feature = "bundled-sqlcipher"
+         ))]
+-        build_bundled::main(&out_dir, &out_path);
++        build_bundled::main(&out_dir, &out_path, work_darwin_verified);
+         #[cfg(not(any(
+             feature = "bundled",
+             feature = "bundled-windows",
+@@ -101,7 +153,7 @@
+     use super::{is_compiler, win_target};
+ 
+     #[expect(clippy::assertions_on_constants)] // https://github.com/rust-lang/rust-clippy/issues/16242
+-    pub fn main(out_dir: &str, out_path: &Path) {
++    pub fn main(out_dir: &str, out_path: &Path, work_darwin_verified: bool) {
+         let lib_name = super::lib_name();
+ 
+         // This is just a sanity check, the top level `main` should ensure this.
+@@ -306,6 +358,14 @@
+         println!("cargo:rerun-if-env-changed=LIBSQLITE3_FLAGS");
+ 
+         cfg.compile(lib_name);
++
++        if work_darwin_verified {
++            std::fs::write(
++                Path::new(out_dir).join("work_darwin_verified.rs"),
++                "pub const WORK_DARWIN_REQUIRED_ACK_V1: () = ();\n",
++            )
++            .expect("Could not write Work Darwin verification marker");
++        }
+ 
+         println!("cargo:lib_dir={out_dir}");
+     }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,25 @@
+ #![expect(non_snake_case, non_camel_case_types)]
+ #![cfg_attr(not(test), no_std)]
++
++#[cfg(all(
++    target_os = "macos",
++    any(
++        not(feature = "bundled"),
++        feature = "sqlcipher",
++        feature = "bundled-sqlcipher",
++        feature = "in_gecko",
++        feature = "loadable_extension"
++    )
++))]
++compile_error!(
++    "Work requires exact patched bundled SQLite; system/alternate SQLite is not permitted"
++);
++
++// Generated only after target source verification and successful bundled C compilation.
++// Retained OUT_DIR output is historical, not proof of a fresh build-script run.
++#[cfg(target_os = "macos")]
++include!(concat!(env!("OUT_DIR"), "/work_darwin_verified.rs"));
++
+ // force linking to openssl
+ #[cfg(feature = "bundled-sqlcipher-vendored-openssl")]
+ extern crate openssl_sys;

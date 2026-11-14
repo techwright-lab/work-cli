@@ -375,13 +375,20 @@ pub fn finish_with_sink_observed(
     sink: Option<&dyn LocalSink>,
     boundary: impl FnMut(&str),
 ) -> Result<Report> {
-    finish_internal(config, checkout, Mode::Library(sink), boundary)
+    finish_internal(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        checkout,
+        Mode::Library(sink),
+        boundary,
+    )
 }
 enum Mode<'a> {
     Library(Option<&'a dyn LocalSink>),
     Integrated,
 }
 fn finish_internal(
+    invocation: &crate::git::GitInvocation,
     config: &Config,
     checkout: Uuid,
     mode: Mode<'_>,
@@ -430,7 +437,7 @@ fn finish_internal(
             && crate::capture_journal::unresolved_checkout(&store.conn, checkout)?
     };
     let proof = if captured_new {
-        Some(captured::Completion::inspect(&store, checkout)?)
+        Some(captured::Completion::inspect(invocation, &store, checkout)?)
     } else {
         None
     };
@@ -440,7 +447,7 @@ fn finish_internal(
     };
     let physical = if ordinary_new {
         Some(
-            allocate::observe_checkout(&mut store, checkout, &guard)
+            allocate::observe_checkout_with_git(invocation, &mut store, checkout, &guard)
                 .map_err(|_| StoreError::Invalid)?,
         )
     } else {
@@ -676,7 +683,21 @@ fn finish_internal(
 /// Explicit completion observes original per-run capture facts, independently
 /// of task completion and without delivery retries.
 pub fn finish(config: &Config, checkout: Uuid) -> Result<Report> {
-    finish_internal(config, checkout, Mode::Integrated, |_| {})
+    finish_with_git(
+        &crate::git::GitInvocation::new(None, config.git_path.clone()),
+        config,
+        checkout,
+    )
+}
+pub(crate) fn finish_with_git(
+    invocation: &crate::git::GitInvocation,
+    config: &Config,
+    checkout: Uuid,
+) -> Result<Report> {
+    invocation
+        .configure(config.git_path.clone())
+        .map_err(|_| StoreError::Invalid)?;
+    finish_internal(invocation, config, checkout, Mode::Integrated, |_| {})
 }
 struct CapturedFinish<'a> {
     config: &'a Config,
@@ -1102,7 +1123,12 @@ json.dump(json.load(open({response:?})),sys.stdout)
                 &cfg.roots,
             )
             .unwrap();
-            let proof = captured::Completion::inspect(&store, a.checkout).unwrap();
+            let proof = captured::Completion::inspect(
+                &crate::git::GitInvocation::new(None, None),
+                &store,
+                a.checkout,
+            )
+            .unwrap();
             match change {
                 "writer" => {
                     store
@@ -1224,7 +1250,12 @@ json.dump(json.load(open({response:?})),sys.stdout)
                     "json_set(intent,'$.context.operation','019b86f0-0000-7000-8000-000000000001')",
                 ),
             ] {
-                let proof = captured::Completion::inspect(&store, a.checkout).unwrap();
+                let proof = captured::Completion::inspect(
+                    &crate::git::GitInvocation::new(None, None),
+                    &store,
+                    a.checkout,
+                )
+                .unwrap();
                 let (rowid, original): (i64, rusqlite::types::Value) = store
                     .conn
                     .query_row(
@@ -1427,93 +1458,101 @@ json.dump(json.load(open({response:?})),sys.stdout)
             let mut lease = None;
             let mut before_ack = false;
             let mut outcome_committed = false;
-            let result = finish_internal(&cfg, a.checkout, Mode::Integrated, |boundary| {
-                if boundary == "external_frozen" {
-                    // Verify genuine committed task and typed FINISH truth before
-                    // introducing contention from a separate Store participant.
-                    let receipt = load(&other.conn, a.checkout).unwrap().unwrap();
-                    assert_eq!(receipt.local_freeze, Freeze::Pending);
-                    assert_eq!(receipt.delivery, None);
-                    let frozen = other
-                        .capture_finalization_snapshot(&root.identity().run)
-                        .unwrap()
-                        .expect("committed FINISH intent");
-                    assert_eq!(
-                        frozen.intent.outcome,
-                        crate::run_journal::RootOutcome::Completed
-                    );
-                    assert_eq!(frozen.revision, 2);
-                    assert!(
-                        !frozen
-                            .confirmation
-                            .as_ref()
-                            .expect("known local FINISH")
-                            .delivered
-                    );
-                    let snapshot = durable();
-                    let events = snapshot
-                        .2
-                        .iter()
-                        .map(|(_, body)| serde_json::from_str::<serde_json::Value>(body).unwrap())
-                        .collect::<Vec<_>>();
-                    assert_eq!(
-                        events
+            let result = finish_internal(
+                &crate::git::GitInvocation::new(None, cfg.git_path.clone()),
+                &cfg,
+                a.checkout,
+                Mode::Integrated,
+                |boundary| {
+                    if boundary == "external_frozen" {
+                        // Verify genuine committed task and typed FINISH truth before
+                        // introducing contention from a separate Store participant.
+                        let receipt = load(&other.conn, a.checkout).unwrap().unwrap();
+                        assert_eq!(receipt.local_freeze, Freeze::Pending);
+                        assert_eq!(receipt.delivery, None);
+                        let frozen = other
+                            .capture_finalization_snapshot(&root.identity().run)
+                            .unwrap()
+                            .expect("committed FINISH intent");
+                        assert_eq!(
+                            frozen.intent.outcome,
+                            crate::run_journal::RootOutcome::Completed
+                        );
+                        assert_eq!(frozen.revision, 2);
+                        assert!(
+                            !frozen
+                                .confirmation
+                                .as_ref()
+                                .expect("known local FINISH")
+                                .delivered
+                        );
+                        let snapshot = durable();
+                        let events = snapshot
+                            .2
                             .iter()
-                            .filter(|e| e["type"] == "task_finished"
-                                && e["operation"] == receipt.operation.to_string())
-                            .count(),
-                        1
-                    );
-                    assert_eq!(
-                        events
-                            .iter()
-                            .filter(|e| e["type"] == "capture_finalization_changed"
-                                && e["run"] == root.identity().run.to_string()
-                                && e["change"] == "frozen")
-                            .count(),
-                        1
-                    );
-                    assert!(!events.iter().any(|e| e["type"] == "finish_capture_result"));
-                    before = Some(snapshot);
-                    if case == "unsafe_lock" {
-                        std::fs::set_permissions(
-                            cfg.store_dir.as_ref().unwrap().join("allocation.lock"),
-                            std::fs::Permissions::from_mode(0o644),
-                        )
-                        .unwrap();
-                    } else {
-                        lease = Some(other.authority_lease().unwrap());
-                    }
-                }
-                if boundary == "outcome_committed" {
-                    outcome_committed = true;
-                }
-                if boundary == "before_ack" {
-                    before_ack = true;
-                    lease
-                        .as_ref()
-                        .expect("independent lease held through ack")
-                        .check(&other)
-                        .unwrap();
-                    // Deliberately invalid history must still fail the final fence
-                    // after fallback, never become successful forged authority.
-                    if case == "writer" {
-                        other
-                            .conn
-                            .execute(
-                                "INSERT INTO writers VALUES(?1,?2)",
-                                (a.checkout.to_string(), root.identity().group.to_string()),
+                            .map(|(_, body)| {
+                                serde_json::from_str::<serde_json::Value>(body).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|e| e["type"] == "task_finished"
+                                    && e["operation"] == receipt.operation.to_string())
+                                .count(),
+                            1
+                        );
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|e| e["type"] == "capture_finalization_changed"
+                                    && e["run"] == root.identity().run.to_string()
+                                    && e["change"] == "frozen")
+                                .count(),
+                            1
+                        );
+                        assert!(!events.iter().any(|e| e["type"] == "finish_capture_result"));
+                        before = Some(snapshot);
+                        if case == "unsafe_lock" {
+                            std::fs::set_permissions(
+                                cfg.store_dir.as_ref().unwrap().join("allocation.lock"),
+                                std::fs::Permissions::from_mode(0o644),
                             )
                             .unwrap();
+                        } else {
+                            lease = Some(other.authority_lease().unwrap());
+                        }
                     }
-                    if case == "raw_gap" {
-                        other.conn.execute(
+                    if boundary == "outcome_committed" {
+                        outcome_committed = true;
+                    }
+                    if boundary == "before_ack" {
+                        before_ack = true;
+                        lease
+                            .as_ref()
+                            .expect("independent lease held through ack")
+                            .check(&other)
+                            .unwrap();
+                        // Deliberately invalid history must still fail the final fence
+                        // after fallback, never become successful forged authority.
+                        if case == "writer" {
+                            other
+                                .conn
+                                .execute(
+                                    "INSERT INTO writers VALUES(?1,?2)",
+                                    (a.checkout.to_string(), root.identity().group.to_string()),
+                                )
+                                .unwrap();
+                        }
+                        if case == "raw_gap" {
+                            other.conn.execute(
                             "INSERT INTO attribution_gaps VALUES(?1,?2,?3,?1,'invalid',zeroblob(32))",
                             (root.identity().run.to_string(), root.identity().group.to_string(), a.checkout.to_string()),
                         ).unwrap();
+                        }
                     }
-                }
-            });
+                },
+            );
             if case == "report" {
                 let report =
                     result.expect("committed task report survives post-freeze lease contention");
