@@ -61,7 +61,7 @@ impl Store {
                 to: recipient.into(),
             },
         )?;
-        tx.commit()?;
+        crate::store::commit(tx)?;
         Ok(())
     }
     /// The caller passes the configured operator, never an inferred fallback.
@@ -124,7 +124,7 @@ impl Store {
                 },
             )?;
         }
-        tx.commit()?;
+        crate::store::commit(tx)?;
         Ok(rows.len())
     }
 }

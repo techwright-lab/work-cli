@@ -110,7 +110,7 @@ pub(crate) fn hold_under_lease(
                     },
                 ))?;
             }
-            allocate::sql(tx.commit())?;
+            allocate::commit(tx)?;
             *a = current;
             return Ok(());
         }
@@ -224,7 +224,7 @@ fn verify_identity_with_git(
         || current.private_git_dir != prior.private_git_dir
         || current.common_git_dir != prior.common_git_dir
         || current.directory.inode != prior.directory.inode
-        || (current.boot_id == prior.boot_id && current.directory.device != prior.directory.device)
+        || !crate::identity::device_fits_record(&current, prior)
     {
         return Err(fail());
     }

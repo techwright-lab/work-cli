@@ -397,7 +397,7 @@ impl Store {
             if guard.is_some() && id != checkout {
                 return Err(StoreError::Conflict);
             }
-            tx.commit()?;
+            crate::store::commit(tx)?;
             return Ok(RecordedReservation {
                 checkout: id,
                 guard,
@@ -453,7 +453,7 @@ impl Store {
                 crate::capture_requirement::insert(&tx, checkout, request.operation)?;
             }
         }
-        tx.commit()?;
+        crate::store::commit(tx)?;
         Ok(RecordedReservation { checkout, guard })
     }
 }

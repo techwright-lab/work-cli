@@ -44,8 +44,23 @@ pub enum StoreError {
     RetirementFenced,
     #[error("checkout operations in flight")]
     OperationsInFlight,
+    /// COMMIT returned an error: the change may still be durable after a crash
+    /// or reopen. Keep charge and history and reconcile; never infer rollback.
+    // Open decision: the public wording. Until it is made this prints exactly
+    // as `Database` does.
+    #[error("store database failure")]
+    CommitUncertain(#[source] rusqlite::Error),
+    /// An explicit checkpoint left WAL frames outside the database file.
+    #[error("store checkpoint incomplete")]
+    CheckpointIncomplete,
 }
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Ends a transaction so that a failed COMMIT stays distinguishable from an
+/// ordinary statement error.
+pub(crate) fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
+    tx.commit().map_err(StoreError::CommitUncertain)
+}
 
 // Passive history access stays separate. Native mutable opens must refuse before
 // even creating private directories, locks, SQLite sidecars or bootstrap markers.
@@ -172,6 +187,10 @@ impl AuthorityIdentity {
             lock_id,
         }))
     }
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn collect_for_native_test(registry: &Path, directory: &Path) -> Result<Arc<Self>> {
+        Self::collect(registry, directory, false)
+    }
     pub(crate) fn revalidate_migration(&self) -> Result<()> {
         existing_directory(&self.registry)?;
         existing_directory(&self.directory)?;
@@ -212,6 +231,7 @@ impl AuthorityIdentity {
 
 // Linux filesystem magic allowlist: ext, Btrfs, XFS, tmpfs and local
 // overlayfs. Unknown/FUSE/network filesystems require separate qualification.
+#[cfg(any(not(target_os = "macos"), test))]
 fn local_filesystem(magic: u64) -> bool {
     matches!(
         magic,
@@ -245,10 +265,15 @@ fn private_dir(path: &Path) -> Result<PathBuf> {
     if !m.is_dir() || m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
         return Err(StoreError::Unsafe);
     }
-    let filesystem = rustix::fs::statfs(path).map_err(std::io::Error::from)?;
-    if !local_filesystem(filesystem.f_type as u64) {
-        return Err(StoreError::Unsafe);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let filesystem = rustix::fs::statfs(path).map_err(std::io::Error::from)?;
+        if !local_filesystem(filesystem.f_type as u64) {
+            return Err(StoreError::Unsafe);
+        }
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::admit_private_directory(path, &m).map_err(|_| StoreError::Unsafe)?;
     Ok(fs::canonicalize(path)?)
 }
 fn check_file(path: &Path) -> Result<()> {
@@ -260,7 +285,57 @@ fn check_file(path: &Path) -> Result<()> {
     {
         return Err(StoreError::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private_file(path, &m).map_err(|_| StoreError::Unsafe)?;
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_admission_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        (temp, root)
+    }
+
+    #[test]
+    fn initialization_admits_a_new_private_directory_and_reopens_it() {
+        let (_temp, root) = fixture();
+        let registry = root.join(".work-authorities");
+        assert_eq!(private_dir(&registry).unwrap(), registry);
+        let created = fs::symlink_metadata(&registry).unwrap();
+        assert!(created.is_dir());
+        assert_eq!(created.mode() & 0o7777, 0o700);
+        assert_eq!(private_dir(&registry).unwrap(), registry);
+        existing_directory(&registry).unwrap();
+    }
+
+    #[test]
+    fn acl_exposed_directories_and_files_are_not_private_despite_their_mode() {
+        use crate::authority_darwin::grant_acl_fixture as grant;
+        let (_temp, root) = fixture();
+        let authority = private_dir(&root.join("authority")).unwrap();
+        let lock = authority.join("allocation.lock");
+        drop(AuthorityIdentity::open_lock(&authority, true).unwrap());
+        check_file(&lock).unwrap();
+        grant(&lock, "everyone allow read");
+        assert_eq!(fs::symlink_metadata(&lock).unwrap().mode() & 0o7777, 0o600);
+        assert!(matches!(check_file(&lock), Err(StoreError::Unsafe)));
+        assert!(matches!(
+            AuthorityIdentity::open_lock(&authority, false),
+            Err(StoreError::Unsafe)
+        ));
+        grant(&authority, "everyone allow list,search");
+        let exposed = fs::symlink_metadata(&authority).unwrap();
+        assert_eq!(exposed.mode() & 0o7777, 0o700);
+        assert!(matches!(
+            existing_directory(&authority),
+            Err(StoreError::Unsafe)
+        ));
+        assert!(matches!(private_dir(&authority), Err(StoreError::Unsafe)));
+    }
 }
 fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<Connection> {
     let path = dir.join(name);
@@ -283,6 +358,17 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         }
     }
     check_file(&path)?;
+    // SQLite opens this file without CREATE and so never acknowledges its
+    // name. Acknowledge it here even when an interrupted bootstrap created it.
+    #[cfg(target_os = "macos")]
+    if pending {
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32)
+            .open(&path)?
+            .sync_all()?;
+        sync_dir(dir)?;
+    }
     for suffix in ["-wal", "-shm", "-journal"] {
         let side = dir.join(format!("{name}{suffix}"));
         match fs::symlink_metadata(&side) {
@@ -298,12 +384,15 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     // Retain ordinary WAL/SHM bookkeeping at last close so strict readers never
-    // need to create it. FULL commits and normal autocheckpoint remain enabled.
+    // need to create it. FULL commits remain enabled, and so does the normal
+    // autocheckpoint everywhere except macOS.
     conn.set_db_config(
         rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
         true,
     )?;
     conn.busy_timeout(Duration::from_millis(500))?;
+    #[cfg(target_os = "macos")]
+    require_darwin_full_sync(&conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if !(version == 1
         || (name == "store.sqlite" && matches!(version, 2..=17))
@@ -312,6 +401,8 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         return Err(StoreError::Unsafe);
     }
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    #[cfg(target_os = "macos")]
+    verify_darwin_connection(&conn)?;
     let mode: String = conn.query_row(
         if initialize {
             "PRAGMA journal_mode=WAL"
@@ -325,6 +416,97 @@ fn database(dir: &Path, name: &str, pending: bool, initialize: bool) -> Result<C
         return Err(StoreError::Unsafe);
     }
     Ok(conn)
+}
+
+// Every sync SQLite requests must be F_FULLFSYNC, and no checkpoint may run
+// where its result is discarded: automatic checkpoints are off, explicit ones
+// go through `checkpoint_checked`.
+#[cfg(target_os = "macos")]
+const DARWIN_FULL_SYNC: [(&str, i64); 3] = [
+    ("fullfsync", 1),
+    ("checkpoint_fullfsync", 1),
+    ("wal_autocheckpoint", 0),
+];
+// The first read of the database file plays back a hot journal and syncs with
+// whatever the pager holds then, so this runs before any read. None of these
+// pragmas loads the schema; `synchronous` does, which is why it is set and
+// verified only afterwards. The pager opens at FULL.
+#[cfg(target_os = "macos")]
+fn require_darwin_full_sync(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA wal_autocheckpoint=0;",
+    )?;
+    verify_pragmas(conn, &DARWIN_FULL_SYNC)
+}
+#[cfg(target_os = "macos")]
+fn verify_darwin_connection(conn: &Connection) -> Result<()> {
+    verify_pragmas(conn, &[("synchronous", 2)])?;
+    verify_pragmas(conn, &DARWIN_FULL_SYNC)
+}
+#[cfg(target_os = "macos")]
+fn verify_pragmas(conn: &Connection, required: &[(&str, i64)]) -> Result<()> {
+    for (pragma, required) in required {
+        let actual: i64 = conn.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))?;
+        if actual != *required {
+            return Err(StoreError::Unsafe);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckpointMode {
+    Passive,
+    Truncate,
+}
+/// What SQLite reported for one explicit checkpoint, in WAL frames. A PASSIVE
+/// run stopped by a reader reports `busy == false` with `checkpointed < log`.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) struct Checkpoint {
+    pub(crate) busy: bool,
+    pub(crate) log: u64,
+    pub(crate) checkpointed: u64,
+}
+/// Runs one checkpoint and returns its result unjudged. A sync or I/O failure
+/// is an error; a connection that is not in WAL mode is refused.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn checkpoint_checked(conn: &Connection, mode: CheckpointMode) -> Result<Checkpoint> {
+    let (busy, log, checkpointed): (i64, i64, i64) = conn.query_row(
+        match mode {
+            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+        },
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    match (u64::try_from(log), u64::try_from(checkpointed)) {
+        (Ok(log), Ok(checkpointed)) if matches!(busy, 0 | 1) && checkpointed <= log => {
+            Ok(Checkpoint {
+                busy: busy == 1,
+                log,
+                checkpointed,
+            })
+        }
+        _ => Err(StoreError::Unsafe),
+    }
+}
+// Open decision: which mode each commit point passes, how many frames may stay
+// behind a reader, and whether an incomplete checkpoint fails a command whose
+// effect already committed. Until those are decided every incomplete result
+// is a failure and no call site runs a checkpoint.
+#[cfg(target_os = "macos")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn require_complete_checkpoint(checkpoint: Checkpoint) -> Result<()> {
+    if checkpoint.busy || checkpoint.checkpointed != checkpoint.log {
+        return Err(StoreError::CheckpointIncomplete);
+    }
+    Ok(())
 }
 // One actual open-file description per independent schema participant. Runtime
 // clones share ownership, not a path-based permission or a serialized proof.
@@ -663,6 +845,9 @@ fn validate_uninitialized(registry: &Path, dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+// On Apple targets std's `sync_all` is `fcntl(F_FULLFSYNC)` for any descriptor,
+// directories included, with no `fsync` fallback, so this is already the strong
+// acknowledgement. Re-read std's `File::fsync` when the toolchain pin moves.
 fn sync_dir(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all()?;
     Ok(())
@@ -1404,7 +1589,7 @@ impl Store {
         tx.prepare("SELECT checkout,group_id FROM writers LIMIT 0")?;
         tx.prepare("SELECT owner FROM retired_owners LIMIT 0")?;
         tx.prepare("SELECT sequence,version,payload,acknowledged FROM outbox LIMIT 0")?;
-        tx.commit()?;
+        commit(tx)?;
         drop(phase);
         drop(lease);
         initialization_boundary("store_schema");
@@ -1469,7 +1654,7 @@ impl Store {
             crate::retirement_journal::Attempt::WriterAcquire,
         )?;
         acquire_writer_tx(&tx, checkout, group, true, &lease, &authority)?;
-        tx.commit()?;
+        commit(tx)?;
         Ok(())
     }
     pub fn pending_events(&self, limit: usize) -> Result<Vec<PendingEvent>> {
@@ -1504,7 +1689,7 @@ impl Store {
             "UPDATE outbox SET acknowledged=1 WHERE sequence=?1",
             [sequence],
         )?;
-        tx.commit()?;
+        commit(tx)?;
         Ok(())
     }
 }
@@ -1549,7 +1734,7 @@ fn register_roots(
             (root.to_str(), dir.to_str()),
         )?;
     }
-    tx.commit()?;
+    commit(tx)?;
     drop(phase);
     initialization_boundary("claims");
     Ok(())
@@ -1749,6 +1934,8 @@ fn existing_directory(dir: &Path) -> Result<()> {
     if m.mode() & 0o077 != 0 || m.uid() != rustix::process::geteuid().as_raw() {
         return Err(StoreError::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private_directory(dir, &m).map_err(|_| StoreError::Unsafe)?;
     Ok(())
 }
 fn existing_database(dir: &Path, name: &str) -> Result<(Connection, SqlBudget)> {
@@ -2326,6 +2513,10 @@ pub(crate) mod schema_participation_tests;
 #[cfg(test)]
 #[path = "schema17_migration_tests.rs"]
 mod schema17_migration_tests;
+
+#[cfg(test)]
+#[path = "store_persistence_tests.rs"]
+mod persistence_tests;
 
 #[cfg(test)]
 mod tests {

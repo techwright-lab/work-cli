@@ -117,8 +117,10 @@ impl CheckoutGuard {
         self.revalidate_checkout_metadata(store)
     }
     fn revalidate_checkout_metadata(&self, store: &Store) -> Result<()> {
-        self.schema.matches_authority(store.authority_identity())?;
-        let identity = store.authority_identity();
+        self.revalidate_against(store.authority_identity())
+    }
+    fn revalidate_against(&self, identity: &crate::store::AuthorityIdentity) -> Result<()> {
+        self.schema.matches_authority(identity)?;
         if identity.registry() != self.registry.as_path()
             || identity.directory != self.directory_path
             || identity.database_id() != self.database_id
@@ -135,7 +137,7 @@ impl CheckoutGuard {
         if identity.directory_id != self.authority_id {
             return Err(StoreError::Invalid);
         }
-        let authority = open_authority(store.authority_identity())?;
+        let authority = open_authority(identity)?;
         lock_directory_meta(&self.authority)?;
         lock_directory_meta(&authority)?;
         if lock_identity(&self.authority)? != self.authority_id
@@ -188,7 +190,7 @@ fn acquire(store: &Store, checkout: Uuid, exclusive: bool) -> Result<CheckoutGua
 }
 // Private shared mechanism receives the actual owner validated by one of the
 // two purpose-specific entry points above, never a validation-bypass flag.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn acquire_validated(
     identity: &crate::store::AuthorityIdentity,
     checkout: Uuid,
@@ -201,6 +203,43 @@ fn acquire_validated(
         "native checkout guard incomplete",
     )
     .into())
+}
+#[cfg(target_os = "macos")]
+fn acquire_validated(
+    identity: &crate::store::AuthorityIdentity,
+    checkout: Uuid,
+    exclusive: bool,
+    schema: crate::store::InitializationRetention,
+) -> Result<CheckoutGuard> {
+    use crate::authority_darwin::{acquire_lock, LockRefusal, LockRequest};
+    crate::retirement_journal::parse_uuid(&checkout.to_string())?;
+    let held = acquire_lock(&LockRequest {
+        authority: &identity.directory,
+        authority_id: identity.directory_id,
+        directory: LOCK_DIR,
+        name: &lock_name(checkout),
+        create: true,
+        exclusive,
+    })
+    .map_err(|refusal| match refusal {
+        LockRefusal::Busy => StoreError::OperationsInFlight,
+        LockRefusal::Absent | LockRefusal::Unproven => StoreError::Unsafe,
+    })?;
+    Ok(CheckoutGuard {
+        authority: held.authority,
+        directory: held.directory,
+        file: held.file,
+        authority_id: held.authority_id,
+        directory_id: held.directory_id,
+        file_id: held.file_id,
+        checkout,
+        registry: identity.registry().to_path_buf(),
+        directory_path: identity.directory.clone(),
+        database_id: identity.database_id(),
+        lock_id: identity.lock_id,
+        exclusive,
+        schema,
+    })
 }
 #[cfg(target_os = "linux")]
 fn acquire_validated(
@@ -281,6 +320,8 @@ fn lock_directory_meta(file: &File) -> Result<()> {
     {
         return Err(StoreError::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private(file, &meta).map_err(|_| StoreError::Unsafe)?;
     Ok(())
 }
 
@@ -293,10 +334,12 @@ fn lock_file_meta(file: &File) -> Result<()> {
     {
         return Err(StoreError::Unsafe);
     }
+    #[cfg(target_os = "macos")]
+    crate::authority_darwin::prove_private(file, &meta).map_err(|_| StoreError::Unsafe)?;
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
     let _ = (identity,);
     Err(std::io::Error::new(
@@ -304,6 +347,11 @@ fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
         "native checkout guard incomplete",
     )
     .into())
+}
+#[cfg(target_os = "macos")]
+fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
+    crate::authority_darwin::open_authority(&identity.directory, identity.directory_id)
+        .map_err(|_| StoreError::Unsafe)
 }
 #[cfg(target_os = "linux")]
 fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
@@ -327,7 +375,7 @@ fn open_authority(identity: &crate::store::AuthorityIdentity) -> Result<File> {
     Ok(directory)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
     let _ = (parent, name, flags);
     Err(std::io::Error::new(
@@ -335,6 +383,15 @@ fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
         "native checkout guard incomplete",
     )
     .into())
+}
+// Shared callers reopen read-only; anything else is not a Darwin reopen.
+#[cfg(target_os = "macos")]
+fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
+    if !flags.difference(OFlags::DIRECTORY).is_empty() {
+        return Err(StoreError::Unsafe);
+    }
+    crate::authority_darwin::open_child(parent, name, flags.contains(OFlags::DIRECTORY))
+        .map_err(|_| StoreError::Unsafe)
 }
 #[cfg(target_os = "linux")]
 fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
@@ -352,6 +409,153 @@ fn open_child(parent: &File, name: &str, flags: OFlags) -> Result<File> {
     )
     .map(File::from)
     .map_err(|_| StoreError::Unsafe)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod darwin_tests {
+    use super::*;
+    use crate::store::{AuthorityIdentity, InitializationRetention, SchemaParticipation};
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        registry: PathBuf,
+        identity: Arc<AuthorityIdentity>,
+        checkout: Uuid,
+    }
+    impl Fixture {
+        fn new() -> Self {
+            let (temp, registry, identity) =
+                crate::authority_darwin::registered_authority_fixture();
+            Self {
+                _temp: temp,
+                registry,
+                identity,
+                checkout: Uuid::now_v7(),
+            }
+        }
+        // Each guard gets its own schema participant and its own descriptors.
+        fn acquire(&self, exclusive: bool) -> Result<CheckoutGuard> {
+            let schema = SchemaParticipation::open_existing(&self.registry)?;
+            acquire_validated(
+                &self.identity,
+                self.checkout,
+                exclusive,
+                InitializationRetention::Shared(schema),
+            )
+        }
+        fn revalidate(&self, guard: &CheckoutGuard) -> Result<()> {
+            guard.schema.revalidate()?;
+            guard.revalidate_against(&self.identity)
+        }
+        fn lock_directory(&self) -> PathBuf {
+            self.identity.directory.join(LOCK_DIR)
+        }
+        fn lock_file(&self) -> PathBuf {
+            self.lock_directory().join(lock_name(self.checkout))
+        }
+    }
+
+    fn private_directory(path: &Path) {
+        std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
+
+    fn private_file(path: &Path) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn shared_guards_coexist_and_exclude_an_exclusive_owner() {
+        let fixture = Fixture::new();
+        let first = fixture.acquire(false).unwrap();
+        let second = fixture.acquire(false).unwrap();
+        fixture.revalidate(&first).unwrap();
+        fixture.revalidate(&second).unwrap();
+        assert!(!first.exclusive_held());
+        assert!(matches!(
+            fixture.acquire(true),
+            Err(StoreError::OperationsInFlight)
+        ));
+        drop(first);
+        assert!(matches!(
+            fixture.acquire(true),
+            Err(StoreError::OperationsInFlight)
+        ));
+        drop(second);
+        let exclusive = fixture.acquire(true).unwrap();
+        assert!(exclusive.exclusive_held());
+        fixture.revalidate(&exclusive).unwrap();
+        assert!(matches!(
+            fixture.acquire(false),
+            Err(StoreError::OperationsInFlight)
+        ));
+    }
+
+    #[test]
+    fn drop_unlocks_even_when_an_inherited_descriptor_remains_open() {
+        let fixture = Fixture::new();
+        let guard = fixture.acquire(true).unwrap();
+        let inherited = guard.file.try_clone().unwrap();
+        drop(guard);
+        fixture.acquire(true).unwrap();
+        assert!(inherited.metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn replaced_lock_directory_fails_revalidation() {
+        let fixture = Fixture::new();
+        let guard = fixture.acquire(false).unwrap();
+        std::fs::remove_dir_all(fixture.lock_directory()).unwrap();
+        private_directory(&fixture.lock_directory());
+        private_file(&fixture.lock_file());
+        assert!(matches!(
+            fixture.revalidate(&guard),
+            Err(StoreError::Invalid | StoreError::Unsafe)
+        ));
+    }
+
+    #[test]
+    fn replaced_lock_file_fails_revalidation() {
+        let fixture = Fixture::new();
+        let guard = fixture.acquire(false).unwrap();
+        std::fs::remove_file(fixture.lock_file()).unwrap();
+        private_file(&fixture.lock_file());
+        assert!(matches!(
+            fixture.revalidate(&guard),
+            Err(StoreError::Invalid | StoreError::Unsafe)
+        ));
+    }
+
+    #[test]
+    fn symlinked_lock_directory_and_lock_file_are_refused() {
+        let fixture = Fixture::new();
+        let elsewhere = fixture.identity.directory.join("elsewhere");
+        private_directory(&elsewhere);
+        std::os::unix::fs::symlink(&elsewhere, fixture.lock_directory()).unwrap();
+        assert!(matches!(fixture.acquire(false), Err(StoreError::Unsafe)));
+        std::fs::remove_file(fixture.lock_directory()).unwrap();
+        private_directory(&fixture.lock_directory());
+        private_file(&elsewhere.join("target.lock"));
+        std::os::unix::fs::symlink(elsewhere.join("target.lock"), fixture.lock_file()).unwrap();
+        assert!(matches!(fixture.acquire(false), Err(StoreError::Unsafe)));
+    }
+
+    #[test]
+    fn exposed_lock_directory_is_refused() {
+        let fixture = Fixture::new();
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(fixture.lock_directory())
+            .unwrap();
+        assert!(matches!(fixture.acquire(false), Err(StoreError::Unsafe)));
+    }
 }
 
 #[cfg(test)]

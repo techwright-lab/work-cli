@@ -23,6 +23,21 @@ impl DirectoryCursor {
         crate::ffi::open_directory_at(parent, name).map(Self)
     }
 
+    /// One fresh directory-only, no-follow open of "." beneath an already held
+    /// directory: a new independent offset, never a duplicate of that FD. For a
+    /// held directory whose parent is not retained, such as a route root.
+    /// The lookup can observe a changed mount; compare topology() with the held
+    /// directory's own observation before accepting any batch.
+    pub fn open_held(directory: BorrowedFd<'_>) -> io::Result<Self> {
+        crate::ffi::open_directory_at(directory, c".").map(Self)
+    }
+
+    /// Which directory this cursor reads, with the same fstatfs consistency
+    /// check as directory_topology_fd. The descriptor itself stays private.
+    pub fn topology<'a>(&self, buffer: &'a mut [u8]) -> io::Result<crate::DirectoryTopology<'a>> {
+        crate::directory_topology_fd(self.0.as_fd(), buffer)
+    }
+
     /// Make exactly ONE getattrlistbulk call into the entire caller buffer.
     /// Returns its exact record count; ONLY zero is native EOF. Errno is captured
     /// immediately, including EINTR, with no retry/refill/allocation/growth.

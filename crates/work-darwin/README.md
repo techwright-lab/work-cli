@@ -65,9 +65,15 @@ is captured immediately on failure; parsing occurs only on success.
 `DirectoryCursor::open_at(BorrowedFd, &CStr)` validates one component and makes
 one fresh `openat(O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`. It transfers
 that new FD once into an owned cursor, closed on drop. There is no dup, clone,
-rewind, from-existing-FD constructor or public descriptor accessor: each new
-census must freshly open an independent directory offset. Acquisition borrows
-the parent only for that call and does not retry or open readable payload.
+rewind or public descriptor accessor: each new census must freshly open an
+independent directory offset. Acquisition borrows the parent only for that call
+and does not retry or open readable payload.
+
+`DirectoryCursor::open_held(BorrowedFd)` makes the same fresh open of `.`
+beneath an already held directory whose parent is not retained (a route root).
+It never duplicates that FD. `DirectoryCursor::topology` reports which directory
+the cursor reads, so the caller compares it with the held directory's own
+observation before accepting a batch.
 
 `DirectoryCursor::read_batch(&mut self, &mut [u8])` makes **one**
 `getattrlistbulk` call with the census mask and options zero. The syscall returns

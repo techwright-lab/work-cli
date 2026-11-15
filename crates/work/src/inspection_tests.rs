@@ -1321,3 +1321,371 @@ fn growth_and_missing_names_invalidate_the_private_census() {
         assert!(h.fired, "growth/unlink mutation was not reached");
     }
 }
+
+// Directory-only native primitives, called directly beneath the closed
+// admission gates. Payload acquisition stays refused throughout.
+#[cfg(target_os = "macos")]
+mod darwin_directories {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use work_darwin::{Component, DirectoryTopology};
+
+    struct Tree {
+        _temp: tempfile::TempDir,
+        root: std::path::PathBuf,
+    }
+    // tempfile may hand out a symlinked prefix; the walk needs the real route.
+    fn tree() -> Tree {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap().join("root");
+        fs::create_dir(&root).unwrap();
+        Tree { _temp: temp, root }
+    }
+    fn names(list: &[&str]) -> Vec<Vec<u8>> {
+        list.iter().map(|name| name.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn held_parent_walk_binds_an_owned_tree_and_stays_valid() {
+        let t = tree();
+        fs::create_dir_all(t.root.join("a/b")).unwrap();
+        let mut b = Budget::new();
+        let mut manifest = filesystem::Manifest::new(&t.root, &mut b).unwrap();
+        let metadata = fs::metadata(&t.root).unwrap();
+        assert_eq!(manifest.root_dev_ino(), (metadata.dev(), metadata.ino()));
+        assert_eq!(manifest.is_directory(b"a/b", &mut b), Ok(true));
+        assert_eq!(manifest.absent(b"a/missing", &mut b), Ok(()));
+        // Unrelated sibling churn above the root is not a route change.
+        fs::create_dir(t.root.parent().unwrap().join("sibling")).unwrap();
+        assert_eq!(manifest.recheck(&mut b), Ok(()));
+        fs::create_dir(t.root.join("a/missing")).unwrap();
+        assert_eq!(manifest.recheck(&mut b), Err(IncompleteReason::Changed));
+    }
+
+    #[test]
+    fn symlink_components_refuse_where_the_real_route_binds() {
+        let t = tree();
+        fs::create_dir_all(t.root.join("real/sub")).unwrap();
+        symlink("real", t.root.join("alias")).unwrap();
+        let mut b = Budget::new();
+        assert!(filesystem::Manifest::new(&t.root.join("real/sub"), &mut b).is_ok());
+        for route in ["alias", "alias/sub"] {
+            let refused = filesystem::Manifest::new(&t.root.join(route), &mut b).err();
+            assert!(
+                matches!(
+                    refused,
+                    Some(IncompleteReason::UnsupportedResolution | IncompleteReason::Changed)
+                ),
+                "{route}: {refused:?}"
+            );
+        }
+        let mut manifest = filesystem::Manifest::new(&t.root, &mut b).unwrap();
+        assert_eq!(
+            manifest.is_directory(b"alias", &mut b),
+            Err(IncompleteReason::Symlink)
+        );
+        assert_eq!(
+            manifest.is_directory(b"alias/sub", &mut b),
+            Err(IncompleteReason::Symlink)
+        );
+    }
+
+    #[test]
+    fn substituted_directories_are_detected_on_recheck() {
+        for replaced in ["route", "route/root", "route/root/held"] {
+            let t = tree();
+            let root = t.root.join("route/root");
+            fs::create_dir_all(root.join("held")).unwrap();
+            let mut b = Budget::new();
+            let mut manifest = filesystem::Manifest::new(&root, &mut b).unwrap();
+            assert_eq!(manifest.is_directory(b"held", &mut b), Ok(true));
+            assert_eq!(manifest.recheck(&mut b), Ok(()));
+            let original = t.root.join(replaced);
+            fs::rename(&original, t.root.join("moved")).unwrap();
+            fs::create_dir_all(root.join("held")).unwrap();
+            assert_eq!(
+                manifest.recheck(&mut b),
+                Err(IncompleteReason::Changed),
+                "{replaced}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_acl_change_is_a_binding_change_although_the_mode_is_unchanged() {
+        let t = tree();
+        let route = t.root.join("route");
+        fs::create_dir_all(route.join("root")).unwrap();
+        let mut b = Budget::new();
+        let manifest = filesystem::Manifest::new(&route.join("root"), &mut b).unwrap();
+        let mode = fs::metadata(&route).unwrap().mode();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(&route)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(fs::metadata(&route).unwrap().mode(), mode);
+        assert_eq!(manifest.recheck(&mut b), Err(IncompleteReason::Changed));
+    }
+
+    #[test]
+    fn census_returns_exactly_the_created_names_and_charges_each_batch() {
+        let t = tree();
+        let mut expected = names(&[".hidden", ".hidden-directory", "directory", "file"]);
+        fs::write(t.root.join(".hidden"), b"owned").unwrap();
+        fs::write(t.root.join("file"), b"owned").unwrap();
+        fs::create_dir(t.root.join(".hidden-directory")).unwrap();
+        fs::create_dir(t.root.join("directory")).unwrap();
+        // More names than one native batch can return.
+        for index in 0..400 {
+            let name = format!("many-{index:03}");
+            fs::create_dir(t.root.join(&name)).unwrap();
+            expected.push(name.into_bytes());
+        }
+        expected.sort();
+        let mut b = Budget::new();
+        let mut manifest = filesystem::Manifest::new(&t.root, &mut b).unwrap();
+        let entries = b.counters.entries;
+        assert_eq!(manifest.list(b"", &mut b), Ok(expected.clone()));
+        assert_eq!(b.counters.entries - entries, expected.len() as u64);
+        assert_eq!(
+            b.counters.copied_name_bytes,
+            expected.iter().map(|name| name.len() as u64).sum::<u64>()
+        );
+        // At least two data batches and the end-of-directory attempt are paid.
+        assert!(b.counters.directory_reserved_bytes >= 3 * DIRECTORY_BUFFER_BYTES as u64);
+        assert_eq!(
+            b.counters.charged_read_bytes,
+            b.counters.directory_reserved_bytes
+        );
+        assert_eq!(b.counters.observed_file_bytes, 0);
+        fs::remove_dir(t.root.join("many-000")).unwrap();
+        assert_eq!(manifest.list(b"", &mut b), Err(IncompleteReason::Changed));
+    }
+
+    #[test]
+    fn exhausted_budgets_refuse_the_census() {
+        let t = tree();
+        fs::create_dir(t.root.join("one")).unwrap();
+        fs::create_dir(t.root.join("two")).unwrap();
+        let mut b = Budget::new();
+        let mut manifest = filesystem::Manifest::new(&t.root, &mut b).unwrap();
+        b.counters.entries = MAX_ENTRIES - 1;
+        assert_eq!(
+            manifest.list(b"", &mut b),
+            Err(IncompleteReason::EntryBudget)
+        );
+        let mut b = Budget::new();
+        let mut manifest = filesystem::Manifest::new(&t.root, &mut b).unwrap();
+        b.counters.charged_read_bytes = MAX_CHARGED_BYTES - (DIRECTORY_BUFFER_BYTES as u64 - 1);
+        assert_eq!(
+            manifest.list(b"", &mut b),
+            Err(IncompleteReason::ReadBudget)
+        );
+        assert_eq!(b.counters.directory_reserved_bytes, 0);
+        let mut b = Budget::new();
+        b.test_elapsed = Some(Duration::from_secs(30));
+        assert_eq!(
+            filesystem::Manifest::new(&t.root, &mut b).err(),
+            Some(IncompleteReason::Deadline)
+        );
+    }
+
+    #[test]
+    fn directory_census_walk_is_complete_and_payload_stays_refused() {
+        let t = tree();
+        fs::create_dir_all(t.root.join(".config/nested")).unwrap();
+        fs::create_dir(t.root.join("empty")).unwrap();
+        let mut b = Budget::new();
+        let census = filesystem::walk(&t.root, &mut b, &mut SystemBoundary).unwrap();
+        let paths: Vec<_> = census.entries.iter().map(|e| e.path.as_bytes()).collect();
+        assert_eq!(
+            paths,
+            [
+                b".config".as_slice(),
+                b".config/nested".as_slice(),
+                b"empty".as_slice()
+            ]
+        );
+        assert!(census.entries.iter().all(|e| e.directory()));
+        assert_eq!(b.counters.entries, 4);
+        assert_eq!(census.recheck(&mut b), Ok(()));
+        fs::create_dir(t.root.join("empty/late")).unwrap();
+        assert_eq!(census.recheck(&mut b), Err(IncompleteReason::Changed));
+
+        // A regular file is classified by name and then refused: no accepted
+        // readable-acquisition contract exists on Darwin yet.
+        fs::write(t.root.join("empty/late/payload"), b"owned").unwrap();
+        let mut b = Budget::new();
+        assert_eq!(
+            filesystem::walk(&t.root, &mut b, &mut SystemBoundary).err(),
+            Some(IncompleteReason::UnsupportedResolution)
+        );
+        assert_eq!(b.counters.observed_file_bytes, 0);
+        let mut b = Budget::new();
+        let mut manifest = filesystem::Manifest::new(&t.root, &mut b).unwrap();
+        assert_eq!(manifest.is_directory(b"empty", &mut b), Ok(true));
+        for refused in [
+            manifest.metadata(b"empty/late/payload", &mut b).err(),
+            manifest.optional(b"empty/late/payload", &mut b).err(),
+            manifest.sync_path(b"empty", true, &mut b).err(),
+            manifest.sync_root_attachment(&mut b).err(),
+        ] {
+            assert_eq!(refused, Some(IncompleteReason::UnsupportedResolution));
+        }
+        assert_eq!(b.counters.observed_file_bytes, 0);
+    }
+
+    #[test]
+    fn endpoint_proves_absence_beneath_a_held_route_and_refuses_payload() {
+        let t = tree();
+        let mut b = Budget::new();
+        let endpoint = filesystem::Endpoint::open(&t.root.join("missing"), &mut b).unwrap();
+        assert!(endpoint.missing());
+        assert_eq!(endpoint.recheck(&mut b), Ok(()));
+        fs::write(t.root.join("missing"), b"owned").unwrap();
+        assert_eq!(endpoint.recheck(&mut b), Err(IncompleteReason::Changed));
+        assert_eq!(
+            filesystem::Endpoint::open(&t.root.join("missing"), &mut b).err(),
+            Some(IncompleteReason::UnsupportedResolution)
+        );
+    }
+
+    #[test]
+    fn census_walk_classifies_children_by_name_before_any_open() {
+        for (case, path, reason) in [
+            ("symlink", b"a".as_slice(), IncompleteReason::Symlink),
+            ("hardlink", b"a".as_slice(), IncompleteReason::Hardlink),
+            ("fifo", b"a".as_slice(), IncompleteReason::SpecialFile),
+            ("nested", b"a/.git".as_slice(), IncompleteReason::NestedGit),
+            (
+                "main",
+                b".git".as_slice(),
+                IncompleteReason::GitMetadataUnproven,
+            ),
+        ] {
+            #[derive(Default)]
+            struct Rejected(Option<(Vec<u8>, IncompleteReason)>);
+            impl Boundary for Rejected {
+                fn rejected(&mut self, path: &[u8], reason: IncompleteReason) {
+                    self.0 = Some((path.to_vec(), reason));
+                }
+            }
+            let t = tree();
+            match case {
+                "symlink" => symlink("absent", t.root.join("a")).unwrap(),
+                "hardlink" => {
+                    let outside = t.root.parent().unwrap().join("outside");
+                    fs::write(&outside, b"owned").unwrap();
+                    fs::hard_link(outside, t.root.join("a")).unwrap();
+                }
+                "fifo" => fifo::create_fifo(
+                    &t.root.join("a"),
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                ),
+                "nested" => fs::create_dir_all(t.root.join("a/.git")).unwrap(),
+                "main" => fs::create_dir(t.root.join(".git")).unwrap(),
+                _ => unreachable!(),
+            }
+            let mut hooks = Rejected::default();
+            let mut b = Budget::new();
+            assert_eq!(
+                filesystem::walk(&t.root, &mut b, &mut hooks).err(),
+                Some(reason),
+                "{case}"
+            );
+            assert_eq!(hooks.0, Some((path.to_vec(), reason)), "{case}");
+            assert_eq!(b.counters.observed_file_bytes, 0, "{case}");
+        }
+    }
+
+    fn topology<'a>(
+        real_fsid: [i32; 2],
+        mount_status: u32,
+        path: &'a [u8],
+        no_firmlink_path: &'a [u8],
+    ) -> DirectoryTopology<'a> {
+        DirectoryTopology {
+            file_id: 7,
+            real_fsid,
+            mount_status,
+            path,
+            no_firmlink_path,
+        }
+    }
+
+    #[test]
+    fn hop_rule_refuses_volume_and_route_changes_beneath_the_root() {
+        let child = Component::new(b"child").unwrap();
+        let parent = topology([1, 2], 0, b"/data/root", b"/data/root");
+        let inside = topology([1, 2], 0, b"/data/root/child", b"/data/root/child");
+        assert_eq!(filesystem::darwin::hop(parent, child, inside, true), Ok(()));
+        for crossing in [
+            topology([3, 2], 0, b"/data/root/child", b"/data/root/child"),
+            topology([1, 2], 1, b"/data/root/child", b"/data/root/child"),
+        ] {
+            assert_eq!(
+                filesystem::darwin::hop(parent, child, crossing, true),
+                Err(IncompleteReason::MountCrossing)
+            );
+        }
+        for moved in [
+            topology([1, 2], 0, b"/data/other/child", b"/data/root/child"),
+            topology([1, 2], 0, b"/data/root/child", b"/volumes/alias/child"),
+            topology([1, 2], 0, b"/data/root/childish", b"/data/root/childish"),
+        ] {
+            assert_eq!(
+                filesystem::darwin::hop(parent, child, moved, true),
+                Err(IncompleteReason::Changed)
+            );
+        }
+        // Above the inspected root a route may enter another volume, but the
+        // ordinary path must still grow by exactly the walked component.
+        let root = topology([1, 2], 0, b"/", b"/");
+        let users = Component::new(b"Users").unwrap();
+        let firmlinked = topology([9, 2], 1, b"/Users", b"/System/Volumes/Data/Users");
+        assert_eq!(
+            filesystem::darwin::hop(root, users, firmlinked, false),
+            Ok(())
+        );
+        let elsewhere = topology([9, 2], 0, b"/private/Users", b"/private/Users");
+        assert_eq!(
+            filesystem::darwin::hop(root, users, elsewhere, false),
+            Err(IncompleteReason::Changed)
+        );
+    }
+
+    #[test]
+    fn local_apfs_label_is_necessary_but_does_not_prove_persistent_storage() {
+        const LOCAL: u32 = 0x1000;
+        // The owned tree sits on a local APFS mount, which a RAM-backed volume
+        // or a disk image reports too, so the label must not be accepted.
+        let t = tree();
+        let manifest = filesystem::Manifest::new(&t.root, &mut Budget::new()).unwrap();
+        assert_eq!(
+            manifest.persistent_fs(),
+            Err(IncompleteReason::UnsupportedGit)
+        );
+        assert_eq!(
+            filesystem::darwin::persistent_volume(b"apfs", LOCAL),
+            Ok(())
+        );
+        for (filesystem, flags) in [
+            (b"apfs".as_slice(), 0),
+            (b"hfs".as_slice(), LOCAL),
+            (b"smbfs".as_slice(), 0),
+            (b"nfs".as_slice(), 0),
+            (b"msdos".as_slice(), LOCAL),
+            (b"APFS".as_slice(), LOCAL),
+            (b"apfs2".as_slice(), LOCAL),
+            (b"".as_slice(), LOCAL),
+        ] {
+            assert_eq!(
+                filesystem::darwin::persistent_volume(filesystem, flags),
+                Err(IncompleteReason::UnsupportedGit),
+                "{filesystem:?} {flags:#x}"
+            );
+        }
+    }
+}
