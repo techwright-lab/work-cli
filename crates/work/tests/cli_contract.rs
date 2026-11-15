@@ -468,7 +468,6 @@ fn unimplemented_commands_do_not_silently_succeed() {
         &["allocate"],
         &["finish"],
         &["reap"],
-        &["doctor"],
         &["transfer"],
         &["start"],
     ] {
@@ -480,6 +479,34 @@ fn unimplemented_commands_do_not_silently_succeed() {
             combined(&output)
         );
     }
+}
+
+// Whether an unconfigured doctor exits zero is an open operator decision: the
+// accepted design only says the report needs no configured repository. This
+// assertion is the one place in this file that assumes exit zero.
+fn assert_unconfigured_doctor_exit(output: &Output) {
+    assert!(output.status.success(), "{}", combined(output));
+}
+
+#[test]
+fn unconfigured_doctor_reports_unknown_inventory_without_initializing() {
+    let root = IsolatedRoot::new();
+    let before = root.snapshot();
+    let output = run_work(&root, &["doctor"]);
+    assert_unconfigured_doctor_exit(&output);
+    let report =
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).expect("doctor report json");
+    assert_eq!(report["repositories"], serde_json::json!([]), "{report}");
+    assert_eq!(report["inventory"], serde_json::json!([]), "{report}");
+    assert!(
+        report["uncertainties"]
+            .as_array()
+            .expect("uncertainties")
+            .iter()
+            .any(|reason| reason == "repository inventory not configured; inventory unknown"),
+        "{report}"
+    );
+    assert_eq!(before, root.snapshot());
 }
 
 fn write_file(path: &Path, contents: &str) {
