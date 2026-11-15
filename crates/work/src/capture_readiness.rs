@@ -735,6 +735,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn post_inspection_durable_changes_fail_the_locked_exact_cas() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         for change in ["owner", "requirement", "finish", "writer", "allocation"] {
             let (_temp, cfg, store, a, _r, seal, ack) = closed();
             let dir = cfg.store_dir.clone().unwrap();
@@ -2801,7 +2802,9 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
         crate::capture_finalization::FreezeAcknowledgement,
     );
     fn closed() -> ClosedFixture {
-        closed_with_timeout(50)
+        // Readiness assertions need successful receiver setup, not a 50ms
+        // scheduling guarantee. Select the budget before sealing root intent.
+        closed_with_timeout(1000)
     }
     fn closed_with_timeout(timeout_ms: u64) -> ClosedFixture {
         let (_temp, cfg, a, root, spec) =
