@@ -522,16 +522,38 @@ fn report_accounting_budgets_preserve_inventory() {
     );
 }
 
-#[test]
-fn config_supplies_explicit_scope_and_empty_doctor_fails() {
-    let f = Fixture::new();
-    assert!(!Command::new(env!("CARGO_BIN_EXE_work"))
-        .arg("doctor")
-        .env("WORK_CONFIG", "")
-        .output()
+const INVENTORY_NOT_CONFIGURED: &str = "repository inventory not configured; inventory unknown";
+
+fn has_uncertainty(report: &Value, reason: &str) -> bool {
+    report["uncertainties"]
+        .as_array()
         .unwrap()
-        .status
-        .success());
+        .iter()
+        .any(|u| u == reason)
+}
+
+// Whether an unconfigured doctor exits zero is an open operator decision: the
+// accepted design only says the report needs no configured repository. This
+// helper is the one place in this file that assumes exit zero.
+fn unconfigured_report(o: &std::process::Output) -> Value {
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["repositories"], serde_json::json!([]), "{v}");
+    assert_eq!(v["inventory"], serde_json::json!([]), "{v}");
+    assert!(has_uncertainty(&v, INVENTORY_NOT_CONFIGURED), "{v}");
+    v
+}
+
+#[test]
+fn config_supplies_explicit_scope_and_empty_doctor_reports_unknown_inventory() {
+    let f = Fixture::new();
+    unconfigured_report(
+        &Command::new(env!("CARGO_BIN_EXE_work"))
+            .arg("doctor")
+            .env("WORK_CONFIG", "")
+            .output()
+            .unwrap(),
+    );
     fs::write(
         f.p("config.toml"),
         format!(
@@ -605,6 +627,11 @@ fn config_selectors_home_empty_xdg_and_empty_explicit() {
         "HOME fallback: {}",
         String::from_utf8_lossy(&home_only.stderr)
     );
+    let discovered: Value = serde_json::from_slice(&home_only.stdout).unwrap();
+    assert!(
+        !has_uncertainty(&discovered, INVENTORY_NOT_CONFIGURED),
+        "HOME configuration supplies the scope: {discovered}"
+    );
 
     let empty_xdg = doctor_env(&home, Some(Path::new("")), None)
         .output()
@@ -618,9 +645,11 @@ fn config_selectors_home_empty_xdg_and_empty_explicit() {
     let empty_explicit = doctor_env(&home, None, Some(Path::new("")))
         .output()
         .unwrap();
+    let undiscovered = unconfigured_report(&empty_explicit);
+    let fixture = f.temp.path().file_name().unwrap().to_str().unwrap();
     assert!(
-        !empty_explicit.status.success(),
-        "empty explicit must disable HOME discovery"
+        !undiscovered.to_string().contains(fixture),
+        "empty explicit must disable HOME discovery: {undiscovered}"
     );
 
     let xdg_wins = doctor_env(&home, Some(&xdg), None).output().unwrap();

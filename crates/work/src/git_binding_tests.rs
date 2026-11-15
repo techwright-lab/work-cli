@@ -732,7 +732,7 @@ fn fake_git_completed_helper_change_during_later_helper_rejection_aborts_selecti
 #[cfg(target_os = "linux")]
 fn linux_git_access_proof_accepts_masked_acl_modes_and_rejects_foreign_writers() {
     let path = Path::new("/fixture");
-    for (uid, mode, directory, symlink, accepted) in [
+    for (case, (owner, mode, directory, symlink, accepted)) in [
         (501, 0o755, false, false, true),
         (0, 0o755, false, false, true),
         (502, 0o755, false, false, false),
@@ -743,11 +743,14 @@ fn linux_git_access_proof_accepts_masked_acl_modes_and_rejects_foreign_writers()
         (0, 0o777, true, false, false),
         (501, 0o777, false, true, true),
         (502, 0o777, false, true, false),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         assert_eq!(
-            linux_access_policy(path, uid, mode, directory, symlink, 501).is_ok(),
+            linux_access_policy(path, owner, mode, directory, symlink, 501).is_ok(),
             accepted,
-            "{uid} {mode:o}"
+            "case {case}: mode {mode:o}"
         );
     }
 }
