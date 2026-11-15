@@ -1714,7 +1714,7 @@ fn git(
             SetupAction::Inspect,
             Some("repository"),
             cwd,
-            "Git command failed",
+            crate::git::failure_reason("Git command failed", &output.stderr),
         ))
     }
 }

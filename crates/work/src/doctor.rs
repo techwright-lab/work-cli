@@ -24,7 +24,7 @@ pub struct Report {
     pub accounting: Accounting,
     pub managed_filesystem_count: Option<u64>,
     pub headroom: Vec<Headroom>,
-    pub uncertainties: Vec<&'static str>,
+    pub uncertainties: Vec<String>,
     pub size_basis: &'static str,
 }
 #[derive(Serialize)]
@@ -53,7 +53,7 @@ fn git(
     invocation: &crate::git::GitInvocation,
     path: &Path,
     args: &[&str],
-) -> Result<Vec<u8>, &'static str> {
+) -> Result<Vec<u8>, String> {
     let binding = invocation
         .binding()
         .map_err(|_| "selected Git unavailable; registration inventory incomplete")?;
@@ -79,7 +79,10 @@ fn git(
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err("Git command failed; inventory incomplete")
+        Err(crate::git::failure_reason(
+            "Git command failed; inventory incomplete",
+            &output.stderr,
+        ))
     }
 }
 // Reject obvious unsafe metadata before Git opens it. The process deadline is
@@ -157,7 +160,7 @@ pub(crate) fn precheck(path: &Path) -> Result<(), &'static str> {
     }
     Ok(())
 }
-fn common(invocation: &crate::git::GitInvocation, path: &Path) -> Result<PathBuf, &'static str> {
+fn common(invocation: &crate::git::GitInvocation, path: &Path) -> Result<PathBuf, String> {
     precheck(path)?;
     let b = git(
         invocation,
@@ -169,7 +172,7 @@ fn common(invocation: &crate::git::GitInvocation, path: &Path) -> Result<PathBuf
             .map_err(|_| "non-UTF8 repository identity; inventory incomplete")?
             .trim_end_matches('\n'),
     );
-    validate_path(&p, true).map_err(|_| UNSAFE_METADATA)
+    validate_path(&p, true).map_err(|_| UNSAFE_METADATA.into())
 }
 fn metadata_text(path: &Path) -> Option<String> {
     let m = fs::symlink_metadata(path).ok()?;
@@ -277,6 +280,7 @@ pub(crate) fn report_with_git(
         }
     }
     let mut uncertainties = Vec::new();
+    let mut repository_failures = Vec::new();
     if config.roots.is_empty() || config.repositories.is_empty() {
         uncertainties.push("repository inventory not configured; inventory unknown");
     }
@@ -290,17 +294,18 @@ pub(crate) fn report_with_git(
             Ok(c) => {
                 repos.entry(c).or_insert(repo);
             }
-            Err(reason) => uncertainties.push(reason),
+            Err(reason) => repository_failures.push(reason),
         }
     }
     let mut entries = BTreeMap::new();
     for (c, repo) in &repos {
         let list = match precheck(repo)
+            .map_err(String::from)
             .and_then(|()| git(invocation, repo, &["worktree", "list", "--porcelain", "-z"]))
         {
             Ok(list) => list,
             Err(reason) => {
-                uncertainties.push(reason);
+                repository_failures.push(reason);
                 continue;
             }
         };
@@ -381,6 +386,16 @@ pub(crate) fn report_with_git(
     } else {
         "unknown"
     };
+    let mut uncertainties: Vec<String> = uncertainties.into_iter().map(str::to_owned).collect();
+    uncertainties.extend(repository_failures);
+    if let Ok(binding) = invocation.binding() {
+        let (found, oldest) = (binding.version(), crate::git::OLDEST_RUN_GIT_VERSION);
+        if found < oldest {
+            uncertainties.push(format!(
+                "Git {found} is older than the oldest version Work was run with ({oldest})"
+            ));
+        }
+    }
     uncertainties.sort();
     uncertainties.dedup();
     Ok(Report { git: git_diagnostics, version: 1, repositories: repos.into_keys().collect(), inventory: entries.into_values().collect(),

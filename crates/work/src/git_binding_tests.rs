@@ -378,12 +378,11 @@ fn fake_git_unsafe_nonregular_nonexec_refused_before_execution() {
 
 #[test]
 fn fake_git_explicit_refusal_never_falls_back_but_defaults_advance() {
-    for rejection in ["old", "vendor", "missing", "layout", "nonzero"] {
+    for rejection in ["version", "missing", "layout", "nonzero"] {
         let bad = FakeGit::new();
         let good = FakeGit::new();
         match rejection {
-            "old" => bad.script("git version 2.54.0", ""),
-            "vendor" => bad.script("git version 2.55.0.vendor", ""),
+            "version" => bad.script("git version 2.55", ""),
             "missing" => fs::remove_file(&bad.program).unwrap(),
             "layout" => fs::remove_file(bad.helpers.join(REQUIRED_HELPERS[0])).unwrap(),
             "nonzero" => bad.script("git version 2.55.0", "exit 1"),

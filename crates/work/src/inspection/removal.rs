@@ -59,7 +59,7 @@ fn history(store: &Store, checkout: Uuid) -> Result<Option<journal::History>> {
 fn incomplete_inspection(reasons: &[IncompleteReason]) -> String {
     let mut message = format!("inspection incomplete: {reasons:?}");
     if reasons.contains(&IncompleteReason::UnsupportedGit) {
-        message.push_str("; requires stable Git >=2.55.0 at selected Git (canonical MAJOR.MINOR.PATCH version) and a supported repository layout");
+        message.push_str("; requires a `git version MAJOR.MINOR.PATCH` line from selected Git and a supported repository layout");
     }
     message
 }
@@ -567,9 +567,8 @@ mod tests {
         assert!(message.starts_with("SqliteFailure("), "{message}");
     }
     #[test]
-    fn unsupported_git_explains_minimum_without_mislabeling_other_holds() {
+    fn unsupported_git_explains_layout_without_mislabeling_other_holds() {
         let message = incomplete_inspection(&[IncompleteReason::UnsupportedGit]);
-        assert!(message.contains("stable Git >=2.55.0"), "{message}");
         assert!(message.contains("supported repository layout"), "{message}");
         assert_eq!(
             incomplete_inspection(&[IncompleteReason::Changed]),

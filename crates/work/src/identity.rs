@@ -65,9 +65,10 @@ fn git(
         .map_err(std::io::Error::other)?
         .map_err(hold)?;
     if !output.status.success() {
-        return Err(hold(
+        return Err(hold(&crate::git::failure_reason(
             "Git operation failed; hold for reconciliation (no fallback)",
-        ));
+            &output.stderr,
+        )));
     }
     String::from_utf8(output.stdout)
         .map(|s| s.trim_end_matches('\n').to_owned())

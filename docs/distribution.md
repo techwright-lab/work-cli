@@ -3,8 +3,10 @@
 ## Ordinary users: download the native binary
 
 `work` is a native executable. **No repository checkout, Rust toolchain or Python
-is required to run it.** Require Linux x86_64, glibc >=2.36 and stable Git >=2.55.0
-at `/usr/bin/git`. Git 2.55.0 and 2.56.0 are tested.
+is required to run it.** Require Linux x86_64, glibc >=2.36 and Git at
+`/usr/bin/git`. Work uses that Git without a version minimum. Work was run with
+Git 2.48.1 to 2.56.0, and CI tests Git 2.55.0 and 2.56.0. `work doctor` warns
+when the Git is older than 2.48.1.
 
 Published v0.2.0 files are on
 [GitHub Releases](https://github.com/techwright-lab/work-cli/releases):

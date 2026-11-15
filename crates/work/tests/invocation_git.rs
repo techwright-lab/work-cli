@@ -1,7 +1,13 @@
 //! Invocation selection controls use only owned fake installations and empty authority.
-#[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 use std::{fs, path::Path, process::Command};
+
+// macOS Git qualification compares route directory change times, so a sibling
+// test creating a tempdir in the shared TMPDIR mid-qualification reads as a change.
+static TMPDIR_WRITERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    TMPDIR_WRITERS.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn work(home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_work"));
@@ -11,6 +17,7 @@ fn work(home: &Path) -> Command {
 
 #[test]
 fn help_version_and_skill_install_do_not_qualify_git_or_initialize_config() {
+    let _serial = serial();
     let home = tempfile::tempdir().unwrap();
     for args in [
         vec!["--git", "/missing/git", "--help"],
@@ -30,6 +37,7 @@ fn help_version_and_skill_install_do_not_qualify_git_or_initialize_config() {
 
 #[test]
 fn global_placement_does_not_expose_sensitive_or_private_arguments() {
+    let _serial = serial();
     let home = tempfile::tempdir().unwrap();
     for args in [
         vec!["--git", "/missing/git", "run", "--secret-argv-canary"],
@@ -47,8 +55,16 @@ fn global_placement_does_not_expose_sensitive_or_private_arguments() {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn fake_git(root: &Path, name: impl AsRef<Path>, version: &str) -> std::path::PathBuf {
+    fake_git_with(root, name, version, "exit 1")
+}
+
+fn fake_git_with(
+    root: &Path,
+    name: impl AsRef<Path>,
+    version: &str,
+    otherwise: &str,
+) -> std::path::PathBuf {
     let prefix = root.join(name);
     fs::create_dir(&prefix).unwrap();
     let helpers = prefix.join("helpers");
@@ -66,15 +82,123 @@ fn fake_git(root: &Path, name: impl AsRef<Path>, version: &str) -> std::path::Pa
     script.extend_from_slice(version.as_bytes());
     script.extend_from_slice(b"';;\n--exec-path) printf '%s\\n' '");
     script.extend_from_slice(helpers.as_os_str().as_bytes());
-    script.extend_from_slice(b"';;\n*) exit 1;;\nesac\n");
+    script.extend_from_slice(b"';;\n*)\n");
+    script.extend_from_slice(otherwise.as_bytes());
+    script.extend_from_slice(b"\n;;\nesac\n");
     fs::write(&program, script).unwrap();
     fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
     program
 }
 
 #[test]
+fn doctor_warns_but_qualifies_git_older_than_any_version_work_was_run_with() {
+    let _serial = serial();
+    let home = tempfile::tempdir().unwrap();
+    for (version, warning) in [
+        (
+            "2.30.1",
+            Some("Git 2.30.1 is older than the oldest version Work was run with (2.48.1)"),
+        ),
+        ("2.48.1", None),
+    ] {
+        let git = fake_git(home.path(), version, version);
+        let output = work(home.path())
+            .args(["doctor", "--git", git.to_str().unwrap(), "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["git"]["status"], "qualified", "{value}");
+        assert_eq!(value["git"]["version"], version, "{value}");
+        let warnings: Vec<_> = value["uncertainties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|v| v.starts_with("Git "))
+            .collect();
+        assert_eq!(warnings, Vec::from_iter(warning), "{value}");
+    }
+}
+
+#[test]
+fn doctor_shows_the_error_of_a_git_that_rejects_a_flag() {
+    let _serial = serial();
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    fs::create_dir_all(root.join("managed")).unwrap();
+    let setup = |args: &[&str]| {
+        let status = Command::new("/usr/bin/git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    setup(&["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+    setup(&[
+        "-C",
+        repo.to_str().unwrap(),
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "initial",
+    ]);
+    let git = fake_git_with(
+        &root,
+        "old",
+        "2.30.1",
+        "for a; do [ \"$a\" = -z ] && { echo \"error: unknown switch \\`z'\" >&2; exit 129; }; done\nexec /usr/bin/git \"$@\"",
+    );
+    let output = work(&root)
+        .args([
+            "doctor",
+            "--json",
+            "--git",
+            git.to_str().unwrap(),
+            "--repository",
+        ])
+        .arg(&repo)
+        .arg("--managed-root")
+        .arg(root.join("managed"))
+        .arg("--store-dir")
+        .arg(root.join("store"))
+        .arg("--trusted-registry")
+        .arg(root.join("registry"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        value["uncertainties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "Git command failed; inventory incomplete: error: unknown switch `z'"),
+        "{value}"
+    );
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn doctor_reports_precedence_attempts_and_no_invalid_explicit_fallback_without_writes() {
+    let _serial = serial();
     let home = tempfile::tempdir().unwrap();
     let configured = fake_git(home.path(), "configured", "2.55.0");
     let selected = fake_git(home.path(), "selected", "2.56.0");
@@ -161,6 +285,7 @@ fn doctor_reports_precedence_attempts_and_no_invalid_explicit_fallback_without_w
 #[test]
 #[cfg(target_os = "linux")]
 fn doctor_diagnostics_preserve_opaque_selected_program_and_helper_bytes() {
+    let _serial = serial();
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     let home = tempfile::tempdir().unwrap();
     let prefix = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"selected-\xff".to_vec()));
@@ -253,6 +378,7 @@ fn doctor_diagnostics_preserve_opaque_selected_program_and_helper_bytes() {
 #[test]
 #[cfg(target_os = "macos")]
 fn native_refusal_precedes_config_or_sensitive_parsing_at_global_positions() {
+    let _serial = serial();
     let home = tempfile::tempdir().unwrap();
     for args in [
         vec!["--git", "/secret-selector", "run", "--secret-argv-canary"],

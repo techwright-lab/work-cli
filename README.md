@@ -48,11 +48,14 @@ an installer-managed link with the direct-install command.
 
 ## Requirements and build
 
-Requires Linux x86_64 and **stable Git ≥2.55.0 at `/usr/bin/git`**; source builds
-use Rust 1.98.1. Version admission accepts canonical `git version MAJOR.MINOR.PATCH`
-output, including newer minor and major releases. Older versions, prereleases,
-vendor-suffixed or unparseable version strings are refused as `UnsupportedGit`.
-Unsupported repository layouts are still refused regardless of Git version.
+Requires Linux x86_64 and **Git at `/usr/bin/git`**; source builds use Rust 1.98.1.
+Work uses the selected Git without a version minimum. Work was run with Git 2.48.1
+to 2.56.0. `work doctor` warns when the selected Git is older than 2.48.1.
+
+Version admission reads a `git version MAJOR.MINOR.PATCH` line. Vendor text after
+the three numbers is accepted, for example ` (Apple Git-157)` or `.windows.1`.
+Other output is refused as `UnsupportedGit`. Unsupported repository layouts are
+still refused for each Git version.
 Native packed stores may include validated `.rev` reverse indexes and
 `objects/info/packs`. Standalone commit graphs and split commit-graph chains
 are also admitted within the existing file/read limits, at most 64 layers and
@@ -69,9 +72,9 @@ malformed or replaced metadata still holds. This does not add support for
 remote-HEAD symrefs, bitmaps, multi-pack indexes, Bloom-filter graph chunks,
 cruft-pack mtimes or object alternates.
 
-CI tests Git 2.55.0 (the minimum) and 2.56.0. Newer stable versions are accepted,
-not automatically claimed as tested. Version admission never substitutes for
-fresh repository, object, preservation and removal safety checks.
+CI tests Git 2.55.0 and 2.56.0. Other versions are accepted, but they are not
+claimed as tested. Version admission never substitutes for fresh repository,
+object, preservation and removal safety checks.
 
 Inspection keeps a 128 MiB aggregate read-accounting allowance. Exact internal
 metadata queries reserve retained administration/object-store bytes, without

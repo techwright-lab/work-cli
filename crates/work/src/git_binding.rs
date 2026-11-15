@@ -530,7 +530,7 @@ fn qualify_candidate<'a>(
     let executable = observe_route(&candidate.path, RequiredObject::Executable, access)?;
     let result = (|| {
         let version =
-            require_supported_git_version(&probe(candidate, &executable, "--version", access)?)
+            parse_git_version(&probe(candidate, &executable, "--version", access)?)
                 .map_err(|reason| error(&candidate.path, GitBindingReason::Version(reason)))?;
         let helper_spelling = exec_path(
             &probe(candidate, &executable, "--exec-path", access)?,
@@ -806,10 +806,7 @@ impl GitInvocation {
                 .map(|binding| binding.canonical_program().to_string_lossy().into_owned()),
             canonical_path_bytes: selected
                 .and_then(|binding| diagnostic_path_bytes(binding.canonical_program())),
-            version: selected.map(|binding| {
-                let v = binding.version();
-                format!("{}.{}.{}", v.major, v.minor, v.patch)
-            }),
+            version: selected.map(|binding| binding.version().to_string()),
             helper_directory: selected
                 .map(|binding| binding.helper_directory().to_string_lossy().into_owned()),
             helper_directory_bytes: selected

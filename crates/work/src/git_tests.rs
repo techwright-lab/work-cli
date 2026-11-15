@@ -2,11 +2,14 @@ use super::*;
 use std::path::{Path, PathBuf};
 
 #[test]
-fn git_version_admits_canonical_stable_releases_at_or_above_floor() {
+fn git_version_admits_any_release_with_optional_vendor_text() {
     for (output, expected) in [
         (b"git version 2.55.0\n".as_slice(), (2, 55, 0)),
-        (b"git version 2.56.0\n", (2, 56, 0)),
-        (b"git version 2.55.1\n", (2, 55, 1)),
+        (b"git version 2.54.0 (Apple Git-157)\n", (2, 54, 0)),
+        (b"git version 2.56.0.windows.1\n", (2, 56, 0)),
+        (b"git version 2.48.1\n", (2, 48, 1)),
+        (b"git version 1.7.1\n", (1, 7, 1)),
+        (b"git version 0.0.0\n", (0, 0, 0)),
         (b"git version 3.0.0\n", (3, 0, 0)),
         (
             b"git version 4294967295.4294967295.4294967295\n",
@@ -14,7 +17,7 @@ fn git_version_admits_canonical_stable_releases_at_or_above_floor() {
         ),
     ] {
         assert_eq!(
-            require_supported_git_version(output),
+            parse_git_version(output),
             Ok(GitVersion {
                 major: expected.0,
                 minor: expected.1,
@@ -26,33 +29,7 @@ fn git_version_admits_canonical_stable_releases_at_or_above_floor() {
 }
 
 #[test]
-fn git_version_reports_canonical_below_floor_separately() {
-    for (output, version) in [
-        (b"git version 0.0.0\n".as_slice(), (0, 0, 0)),
-        (b"git version 1.99.99\n", (1, 99, 99)),
-        (b"git version 2.54.4294967295\n", (2, 54, u32::MAX)),
-    ] {
-        assert_eq!(
-            require_supported_git_version(output),
-            Err(GitVersionError::BelowMinimum {
-                found: GitVersion {
-                    major: version.0,
-                    minor: version.1,
-                    patch: version.2,
-                },
-                minimum: GitVersion {
-                    major: 2,
-                    minor: 55,
-                    patch: 0,
-                },
-            }),
-            "{output:?}"
-        );
-    }
-}
-
-#[test]
-fn git_version_rejects_noncanonical_byte_protocol() {
+fn git_version_rejects_lines_without_three_decimal_components() {
     for output in [
         b"".as_slice(),
         b"2.55.0\n",
@@ -63,7 +40,7 @@ fn git_version_rejects_noncanonical_byte_protocol() {
         b"git version 2.55.0\n\n",
         b"git version 2.55.0\nextra\n",
         b"git version 2.55\n",
-        b"git version 2.55.0.1\n",
+        b"git version 2.55 (Apple Git-157)\n",
         b"git version .55.0\n",
         b"git version 2..0\n",
         b"git version 2.55.\n",
@@ -74,18 +51,20 @@ fn git_version_rejects_noncanonical_byte_protocol() {
         b"git version 2.-55.0\n",
         b"git version 2.55.+0\n",
         b"git version 2.55.0-rc0\n",
-        b"git version 2.55.0 (Apple Git-123)\n",
-        b"git version 2.55.0.vendor\n",
+        b"git version 2.55.x\n",
+        b"git version 2.x.0\n",
         b"git version 2.55.0 \n",
+        b"git version 2.55.0.\n",
         b"git version 2.55.0\t\n",
         b"git version 2.55.0\0\n",
+        b"git version 2.55.0 (Apple\tGit)\n",
         b"git version 2.55.\xff\n",
         b"git version 4294967296.55.0\n",
         b"git version 2.4294967296.0\n",
         b"git version 2.55.4294967296\n",
     ] {
         assert_eq!(
-            require_supported_git_version(output),
+            parse_git_version(output),
             Err(GitVersionError::InvalidProtocol),
             "{output:?}"
         );
