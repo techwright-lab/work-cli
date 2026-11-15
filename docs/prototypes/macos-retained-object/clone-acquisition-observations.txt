@@ -1,0 +1,9 @@
+clone file -> before-replacement source_type=100000 source_inode=197593310 result=0 errno=0 (Undefined error: 0)
+ clone_type=100000 clone_inode=197593311 same_inode=0
+ clone_content=ORIGINAL-SYNTHETIC
+clone file -> after-replacement source_type=100000 source_inode=197593312 result=0 errno=0 (Undefined error: 0)
+ clone_type=100000 clone_inode=197593313 same_inode=0
+ clone_content=REPLACEMENT-SYNTHETIC
+clone file -> before-replacement source_type=100000 source_inode=197593312 result=-1 errno=17 (File exists)
+clone fifo -> fifo-copy source_type=10000 source_inode=197593314 result=-1 errno=22 (Invalid argument)
+clone link -> link-copy source_type=120000 source_inode=197593315 result=-1 errno=62 (Too many levels of symbolic links)

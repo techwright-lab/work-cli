@@ -1,0 +1,26 @@
+
+CASE regular replacement=0
+before inode=197752894 type=100000 nlink=1 ctime=1793978374.009268811
+link_result=0 errno=0 (Undefined error: 0)
+private hardlink inode=197752894 type=100000 nlink=2 ctime=1793978374.009585145
+source after acquisition inode=197752894 type=100000 nlink=2 ctime=1793978374.009585145
+retained_read=ORIGINAL opened_original_inode=1 source_replaced=1
+
+CASE directory replacement=1
+before inode=197752898 type=100000 nlink=1 ctime=1793978374.010143480
+link_result=-1 errno=1 (Operation not permitted)
+destination_check=-1 errno=2
+
+CASE fifo replacement=2
+before inode=197752904 type=100000 nlink=1 ctime=1793978374.010857398
+link_result=0 errno=0 (Undefined error: 0)
+private hardlink inode=197752905 type=10000 nlink=2 ctime=1793978374.011277857
+source after acquisition inode=197752905 type=10000 nlink=2 ctime=1793978374.011277857
+decision=REFUSE readable_payload_opens=0
+
+CASE symlink replacement=3
+before inode=197752908 type=100000 nlink=1 ctime=1793978374.011386400
+link_result=0 errno=0 (Undefined error: 0)
+private hardlink inode=197752909 type=120000 nlink=2 ctime=1793978374.011812025
+source after acquisition inode=197752909 type=120000 nlink=2 ctime=1793978374.011812025
+decision=REFUSE readable_payload_opens=0

@@ -1,0 +1,26 @@
+
+CASE stable
+token path=stable len=44 common=0x82080000 fork=0x100 generation=2 fileid=197686319 cloneid=197686319 valid=1
+capture result=0 errno=0 (Undefined error: 0)
+token path=stable len=44 common=0x82080000 fork=0x100 generation=2 fileid=197686319 cloneid=197686319 valid=1
+token path=stable len=44 common=0x82080000 fork=0x100 generation=1 fileid=197686320 cloneid=197686319 valid=1
+validated content=ORIGINAL
+decision=READ readable_clone_opens=1 clone_bytes_read=8 source_stamp_equal=1
+
+CASE path-aba
+token path=path-aba len=44 common=0x82080000 fork=0x100 generation=2 fileid=197686321 cloneid=197686321 valid=1
+capture result=0 errno=0 (Undefined error: 0)
+token path=path-aba len=44 common=0x82080000 fork=0x100 generation=2 fileid=197686321 cloneid=197686321 valid=1
+token path=path-aba len=44 common=0x82080000 fork=0x100 generation=1 fileid=197686323 cloneid=197686322 valid=1
+decision=REFUSE readable_clone_opens=0 clone_bytes_read=0 source_stamp_equal=0
+
+CASE content-aba
+token path=content-aba len=44 common=0x82080000 fork=0x100 generation=2 fileid=197686324 cloneid=197686324 valid=1
+capture result=0 errno=0 (Undefined error: 0)
+token path=content-aba len=44 common=0x82080000 fork=0x100 generation=4 fileid=197686324 cloneid=197686326 valid=1
+token path=content-aba len=44 common=0x82080000 fork=0x100 generation=1 fileid=197686325 cloneid=197686324 valid=1
+decision=REFUSE readable_clone_opens=0 clone_bytes_read=0 source_stamp_equal=0
+
+CASE mapped
+token path=mapped len=44 common=0x82080000 fork=0x100 generation=0 fileid=197686327 cloneid=197686327 valid=0
+decision=REFUSE capture_calls=0 readable_clone_opens=0 clone_bytes_read=0 reason=invalid_initial_tokens
