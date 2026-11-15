@@ -62,9 +62,9 @@ pub(crate) fn commit(tx: rusqlite::Transaction<'_>) -> Result<()> {
     tx.commit().map_err(StoreError::CommitUncertain)
 }
 
-// Passive history access stays separate. Native mutable opens must refuse before
-// even creating private directories, locks, SQLite sidecars or bootstrap markers.
-#[cfg(not(target_os = "linux"))]
+// Passive history access stays separate. Mutable opens on an unsupported OS refuse
+// before creating private directories, locks, SQLite sidecars or bootstrap markers.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn require_mutable_authority_backend() -> Result<()> {
     Err(StoreError::NativeIncomplete)
 }
@@ -735,7 +735,7 @@ impl InitializationRetention {
 }
 impl ExclusiveInitialization {
     fn acquire(registry: &Path, create: bool) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         require_mutable_authority_backend()?;
         if create {
             private_dir(registry)?;
@@ -995,7 +995,7 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         require_mutable_authority_backend()?;
         let (schema, conn, budget, _, authority) =
             existing_authority(registry, dir, managed, true)?;
@@ -1046,7 +1046,7 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> std::result::Result<Self, RetirementAdmissionError> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         require_mutable_authority_backend()?;
         let reader = Self::open_retirement_readonly(registry, dir, managed)?;
         let role = match reader.role {
@@ -1241,7 +1241,7 @@ impl Store {
         dir: &Path,
         managed: &[PathBuf],
     ) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         require_mutable_authority_backend()?;
         let (schema, conn, budget, _, _authority) =
             existing_authority(registry, dir, managed, false)?;
@@ -1272,7 +1272,7 @@ impl Store {
     /// common trusted registry. Choosing a different registry is explicit host
     /// policy, not a security guarantee; no global filesystem scan is performed.
     pub fn open(dir: &Path, managed: &[PathBuf]) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         require_mutable_authority_backend()?;
         let parent = dir.parent().ok_or(StoreError::Unsafe)?;
         Self::open_registered(&parent.join(".work-authorities"), dir, managed)
@@ -1289,7 +1289,7 @@ impl Store {
     /// Only allowlisted Linux local filesystem types are accepted. Overlay backing
     /// storage durability/locality remains a host qualification obligation.
     pub fn open_registered(registry: &Path, dir: &Path, managed: &[PathBuf]) -> Result<Self> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         require_mutable_authority_backend()?;
         let managed = roots(managed)?;
         // Only a specifically validated need for bootstrap, registration or

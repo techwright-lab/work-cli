@@ -49,6 +49,8 @@ an installer-managed link with the direct-install command.
 ## Requirements and build
 
 Requires Linux x86_64 and **Git at `/usr/bin/git`**; source builds use Rust 1.98.1.
+On macOS (Apple Silicon), a source build runs `setup`, `start`, `status` and
+`finish`. `remove` is not yet available on macOS.
 Work uses the selected Git without a version minimum. Work was run with Git 2.48.1
 to 2.56.0. `work doctor` warns when the selected Git is older than 2.48.1.
 

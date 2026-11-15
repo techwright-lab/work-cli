@@ -3004,8 +3004,8 @@ mod filesystem {
         mtime_ns: u64,
         ctime: i64,
         ctime_ns: u64,
-        // Compared by equal() and binding_equal(), never encoded: how Darwin
-        // evidence enters persisted fingerprints and records is undecided.
+        // Compared live by equal() and binding_equal(), never encoded. If full
+        // removal comes to the Mac, it enters fingerprints under macOS-only tags.
         #[cfg(target_os = "macos")]
         native: darwin::Evidence,
     }
@@ -4848,9 +4848,9 @@ mod filesystem {
         pub(super) fn directory_flags() -> OFlags {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
         }
-        // The domain std's MetadataExt::dev() reports, which CheckoutIdentity
-        // is compared against. Whether Darwin device or fsid values may enter
-        // persisted records is undecided (issue 54).
+        // A v1 record stores st_dev as std's MetadataExt::dev() reports it: the
+        // signed 32-bit value widened to 64 bits. The volume fsid is checked
+        // live and never persisted.
         fn device(raw: i32) -> u64 {
             raw as u64
         }

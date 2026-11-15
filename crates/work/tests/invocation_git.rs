@@ -383,10 +383,10 @@ fn native_refusal_precedes_config_or_sensitive_parsing_at_global_positions() {
     for args in [
         vec!["--git", "/secret-selector", "run", "--secret-argv-canary"],
         vec![
-            "setup",
+            "remove",
             "--git=/secret-selector",
-            "--actor",
             "secret-argv-canary",
+            "--confirm-stopped",
         ],
         vec![
             "--git=/secret-selector",

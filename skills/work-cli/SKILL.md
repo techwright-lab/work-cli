@@ -11,9 +11,10 @@ task completion, stopped-writer confirmation and removal as separate decisions.
 ## Start a task
 
 1. Read `work --version`, `work start --help` and `work status --json`. Use v0.1.2
-   or newer on Linux x86_64 with Git at `/usr/bin/git`. Work has no Git version
-   minimum. It was run with Git 2.48.1 to 2.56.0, and `work doctor` warns for
-   older versions.
+   or newer on Linux x86_64 with Git at `/usr/bin/git`. On macOS (Apple Silicon),
+   `setup`, `start`, `status` and `finish` work; `remove` is not yet available.
+   Work has no Git version minimum. It was run with Git 2.48.1 to 2.56.0, and
+   `work doctor` warns for older versions.
 2. Locate the operator-selected configuration. A present nonempty `WORK_CONFIG`
    selects that path. A present empty `WORK_CONFIG` disables discovery with no
    fallback. Otherwise select nonempty `XDG_CONFIG_HOME/work/config.toml`, else
