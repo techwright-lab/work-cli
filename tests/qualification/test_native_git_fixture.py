@@ -252,7 +252,13 @@ class NativeGitFixtureTests(unittest.TestCase):
                  ' stream.write(json.dumps([os.getpid(),child.pid,os.getpgrp()]))\n'
                  f'os.replace({str(staging)!r},{str(marker)!r}); '
                  'print("owned tree ready",flush=True); ')
-        code += 'sys.exit(0)' if leader_exits else 'time.sleep(60)'
+        if leader_exits:
+            code += 'sys.exit(0)'
+        else:
+            # A signal arriving just before a long sleep can defer its Python
+            # handler until the sleep returns. Bound that delay during cleanup.
+            code += ('deadline=time.monotonic()+60\n'
+                     'while time.monotonic()<deadline: time.sleep(0.01)')
         return [sys.executable, "-c", code], marker
 
     def test_owned_tree_command_publishes_only_complete_ready_marker(self):
