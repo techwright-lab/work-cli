@@ -12,7 +12,7 @@
 static void die(const char *s){perror(s);exit(1);}
 static void put(int d,const char *n,const char *s){int f=openat(d,n,O_CREAT|O_EXCL|O_WRONLY,0600);if(f<0)die("create");size_t z=strlen(s);if(write(f,s,z)!=(ssize_t)z)die("write");close(f);}
 static struct stat stamp(int d,const char *n){struct stat s;if(fstatat(d,n,&s,AT_SYMLINK_NOFOLLOW))die("stat");return s;}
-static void show(const char *label,struct stat s){printf("%s inode=%llu type=%o nlink=%u ctime=%lld.%09ld\n",label,(unsigned long long)s.st_ino,s.st_mode&S_IFMT,s.st_nlink,(long long)s.st_ctimespec.tv_sec,s.st_ctimespec.tv_nsec);}
+static void show(const char *label,struct stat s){printf("%s inode=%llu type=%o nlink=%llu ctime=%lld.%09ld\n",label,(unsigned long long)s.st_ino,s.st_mode&S_IFMT,(unsigned long long)s.st_nlink,(long long)s.st_ctimespec.tv_sec,s.st_ctimespec.tv_nsec);}
 static void run(int src,int stage,const char *name,int replacement){
  printf("\nCASE %s replacement=%d\n",name,replacement);put(src,name,"ORIGINAL");struct stat original=stamp(src,name);show("before",original);
  if(replacement){char old[80];snprintf(old,sizeof(old),"%s-old",name);if(renameat(src,name,src,old))die("rename source");

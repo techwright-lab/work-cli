@@ -54,10 +54,10 @@ static void manifest(struct capture *c) {
  /* Fixed bounded record. A real implementation needs a qualified durable journal,
   * atomic transition publication, boot/session binding and bounded safe parser. */
  char b[2048]; int n=snprintf(b,sizeof(b),
-  "THROWAWAY-HARDLINK-1 capture=%s phase=%s charge=%d\nroot=%llu:%llu source_dir=%llu:%llu stage=%llu:%llu\nentry=payload source=payload initial=%llu:%llu initial_nlink=%u linked=%llu:%llu linked_nlink=%u\ngeneration_before=%u generation_linked=%u stream_before=%llu stream_linked=%llu\nsize=%lld mtime=%lld.%09ld ctime_linked=%lld.%09ld\n",
+  "THROWAWAY-HARDLINK-1 capture=%s phase=%s charge=%d\nroot=%llu:%llu source_dir=%llu:%llu stage=%llu:%llu\nentry=payload source=payload initial=%llu:%llu initial_nlink=%llu linked=%llu:%llu linked_nlink=%llu\ngeneration_before=%u generation_linked=%u stream_before=%llu stream_linked=%llu\nsize=%lld mtime=%lld.%09ld ctime_linked=%lld.%09ld\n",
   c->name,c->phase,c->charge,(unsigned long long)c->rootid.st_dev,(unsigned long long)c->rootid.st_ino,
   (unsigned long long)c->srcid.st_dev,(unsigned long long)c->srcid.st_ino,(unsigned long long)c->stageid.st_dev,(unsigned long long)c->stageid.st_ino,
-  (unsigned long long)c->pre.st_dev,(unsigned long long)c->pre.st_ino,c->pre.st_nlink,(unsigned long long)c->linked.st_dev,(unsigned long long)c->linked.st_ino,c->linked.st_nlink,
+  (unsigned long long)c->pre.st_dev,(unsigned long long)c->pre.st_ino,(unsigned long long)c->pre.st_nlink,(unsigned long long)c->linked.st_dev,(unsigned long long)c->linked.st_ino,(unsigned long long)c->linked.st_nlink,
   c->before.generation,c->after.generation,(unsigned long long)c->before.stream,(unsigned long long)c->after.stream,(long long)c->linked.st_size,
   (long long)c->linked.st_mtimespec.tv_sec,c->linked.st_mtimespec.tv_nsec,(long long)c->linked.st_ctimespec.tv_sec,c->linked.st_ctimespec.tv_nsec);
  require(n>0&&(size_t)n<sizeof(b),"manifest bound");
@@ -87,7 +87,7 @@ static int acquire(struct capture *c) {
  if(!protected(c)||c->pre.st_nlink!=1||!c->before.valid)return 0;
  c->phase="INTENT";manifest(c);errno=0;int r=linkat(c->src,"payload",c->stage,"payload",0);int e=errno;
  printf("link_result=%d errno=%d\n",r,e);if(r)return 0;
- if(fsync(c->stage))die("stage sync");c->linked_ok=1;c->linked=st(c->stage,"payload");c->after=tok(c->stage,"payload");printf("capture_identity_match=%d nlink_before=%u nlink_linked=%u mtime_equal=%d ctime_equal=%d\n",id(c->pre,c->linked),c->pre.st_nlink,c->linked.st_nlink,timeeq(c->pre.st_mtimespec,c->linked.st_mtimespec),timeeq(c->pre.st_ctimespec,c->linked.st_ctimespec));c->phase="LINKED";manifest(c);return 1;
+ if(fsync(c->stage))die("stage sync");c->linked_ok=1;c->linked=st(c->stage,"payload");c->after=tok(c->stage,"payload");printf("capture_identity_match=%d nlink_before=%llu nlink_linked=%llu mtime_equal=%d ctime_equal=%d\n",id(c->pre,c->linked),(unsigned long long)c->pre.st_nlink,(unsigned long long)c->linked.st_nlink,timeeq(c->pre.st_mtimespec,c->linked.st_mtimespec),timeeq(c->pre.st_ctimespec,c->linked.st_ctimespec));c->phase="LINKED";manifest(c);return 1;
 }
 static void mutate(struct capture *c) { int f=openat(c->src,"payload",O_WRONLY|O_NOFOLLOW|O_CLOEXEC);if(f<0)die("actor open");if(pwrite(f,"MUTATED!",8,0)!=8||fsync(f))die("actor write");close(f); }
 static void finish(struct capture *c,int clean) {
@@ -96,7 +96,7 @@ static void finish(struct capture *c,int clean) {
   if(unlinkat(c->stage,"payload",0)||fsync(c->stage))die("owned unlink");
   struct stat s=st(c->src,"payload"),missing; require(id(s,c->pre)&&s.st_nlink==1,"completion identity/count");
   errno=0;require(fstatat(c->stage,"payload",&missing,AT_SYMLINK_NOFOLLOW)<0&&errno==ENOENT,"completion absence");
-  printf("completion_nlink=%u mtime_equal_initial=%d ctime_equal_initial=%d\n",s.st_nlink,timeeq(s.st_mtimespec,c->pre.st_mtimespec),timeeq(s.st_ctimespec,c->pre.st_ctimespec));
+  printf("completion_nlink=%llu mtime_equal_initial=%d ctime_equal_initial=%d\n",(unsigned long long)s.st_nlink,timeeq(s.st_mtimespec,c->pre.st_mtimespec),timeeq(s.st_ctimespec,c->pre.st_ctimespec));
   c->phase="LINK_REMOVED";manifest(c);c->charge=0;c->phase="COMPLETE";manifest(c); /* synthetic stage reservation only, never Work checkout capacity */
  } else { c->phase="HELD";manifest(c); }
  printf("outcome=%s data_open_calls=%d data_bytes=%d capture_charge=%d link_retained=%d\n",clean?"COMPLETE":"HOLD",c->opens,c->bytes,c->charge,c->linked_ok&&!clean);

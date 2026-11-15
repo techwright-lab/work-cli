@@ -18,7 +18,7 @@ static void put(int root,const char *name,const char *s){
 static struct stat stamp(int root,const char *name){struct stat s;if(fstatat(root,name,&s,AT_SYMLINK_NOFOLLOW))die("stat");return s;}
 static int timeeq(struct timespec a,struct timespec b){return a.tv_sec==b.tv_sec&&a.tv_nsec==b.tv_nsec;}
 static int full_equal(struct stat a,struct stat b){return a.st_dev==b.st_dev&&a.st_ino==b.st_ino&&a.st_mode==b.st_mode&&a.st_uid==b.st_uid&&a.st_gid==b.st_gid&&a.st_nlink==b.st_nlink&&a.st_size==b.st_size&&timeeq(a.st_mtimespec,b.st_mtimespec)&&timeeq(a.st_ctimespec,b.st_ctimespec)&&timeeq(a.st_birthtimespec,b.st_birthtimespec);}
-static void show(const char *label,struct stat s){printf("%s inode=%llu size=%lld mtime=%lld.%09ld ctime=%lld.%09ld nlink=%u\n",label,(unsigned long long)s.st_ino,(long long)s.st_size,(long long)s.st_mtimespec.tv_sec,s.st_mtimespec.tv_nsec,(long long)s.st_ctimespec.tv_sec,s.st_ctimespec.tv_nsec,s.st_nlink);}
+static void show(const char *label,struct stat s){printf("%s inode=%llu size=%lld mtime=%lld.%09ld ctime=%lld.%09ld nlink=%llu\n",label,(unsigned long long)s.st_ino,(long long)s.st_size,(long long)s.st_mtimespec.tv_sec,s.st_mtimespec.tv_nsec,(long long)s.st_ctimespec.tv_sec,s.st_ctimespec.tv_nsec,(unsigned long long)s.st_nlink);}
 static void clone(int src,const char *from,int dst,const char *to){if(clonefileat(src,from,dst,to,CLONE_NOFOLLOW_ANY|CLONE_RESOLVE_BENEATH))die("clone");}
 static void show_clone(int dst,const char *name){
  int f=openat(dst,name,O_RDONLY|O_NOFOLLOW|O_CLOEXEC);if(f<0)die("read clone");char b[128]={0};ssize_t n=read(f,b,sizeof(b)-1);if(n<0)die("read");printf("captured_content=%s\n",b);close(f);
