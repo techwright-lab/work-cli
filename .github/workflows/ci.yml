@@ -135,10 +135,12 @@ jobs:
       - name: Use a canonical TMPDIR
         run: echo "TMPDIR=$(cd "$RUNNER_TEMP" && pwd -P)" >> "$GITHUB_ENV"
       # Most of the suite is Linux-specific; these tests cover the macOS lifecycle.
+      # The Darwin Git access tests run serially: the route check reads a sibling
+      # test's new tempdir in the shared TMPDIR as a route change.
       - name: Test
         run: |
           cargo test --locked -p work-cli --test macos_lifecycle --test macos_removal --test macos_unsupported
-          cargo test --locked -p work-cli --lib -- darwin inspection::removal failure_reason
+          cargo test --locked -p work-cli --lib -- --test-threads=1 darwin inspection::removal failure_reason
           cargo test --locked -p work-darwin
       - name: Build release binary
         env:
