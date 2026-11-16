@@ -145,7 +145,11 @@ pub(crate) fn status(config: &Config) -> Result<Status> {
         let next_action = match removal.as_ref().map(|h| h.phase.as_str()) {
             Some("intent") => {
                 reason = Some("removal outcome unknown; charge retained".into());
-                "manual investigation required; removal will not replay"
+                if cfg!(target_os = "macos") {
+                    "fix the cause, then run work remove TASK_OR_ID --confirm-stopped again"
+                } else {
+                    "manual investigation required; removal will not replay"
+                }
             }
             Some("native_succeeded") => {
                 reason = Some("native removal recorded; charge reconciliation pending".into());

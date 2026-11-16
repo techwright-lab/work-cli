@@ -97,36 +97,6 @@ pub enum IncompleteReason {
     InvalidObject,
     ContextConflict,
 }
-/// Version admission is a compatibility floor, not proof of repository safety.
-/// Accept canonical stable releases only; every existing physical/layout check
-/// still runs. Vendor suffixes and prereleases need an explicit parsing policy.
-pub(crate) fn require_supported_git_version(output: &[u8]) -> Result<(), IncompleteReason> {
-    let invalid = IncompleteReason::UnsupportedGit;
-    let version = output
-        .strip_prefix(b"git version ")
-        .and_then(|v| v.strip_suffix(b"\n"))
-        .ok_or(invalid)?;
-    let mut components = version.split(|c| *c == b'.');
-    let mut numbers = [0u32; 3];
-    for number in &mut numbers {
-        let digits = components.next().ok_or(invalid)?;
-        if digits.is_empty()
-            || !digits.iter().all(u8::is_ascii_digit)
-            || (digits.len() > 1 && digits[0] == b'0')
-        {
-            return Err(invalid);
-        }
-        *number = std::str::from_utf8(digits)
-            .map_err(|_| invalid)?
-            .parse()
-            .map_err(|_| invalid)?;
-    }
-    if components.next().is_some() || numbers < [2, 55, 0] {
-        return Err(invalid);
-    }
-    Ok(())
-}
-
 /// Exact file observations and conservative directory charges are distinct.
 /// No exact directory-byte metric is available from RawDir.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2193,7 +2163,9 @@ impl GitInputs {
                 b.git_version = std::str::from_utf8(value).ok().map(str::to_owned);
             }
         }
-        require_supported_git_version(&version)?;
+        // The version line is evidence only. Unknown repository formats hold
+        // through the config, index, ref and graph checks, not by version.
+        crate::git::parse_git_version(&version).map_err(|_| IncompleteReason::UnsupportedGit)?;
         if has_graph {
             commit_graph::verify(&identity.common_git_dir, common.read_size(), b)?;
             common.recheck(b)?;
@@ -3032,8 +3004,8 @@ mod filesystem {
         mtime_ns: u64,
         ctime: i64,
         ctime_ns: u64,
-        // Compared by equal() and binding_equal(), never encoded: how Darwin
-        // evidence enters persisted fingerprints and records is undecided.
+        // Compared live by equal() and binding_equal(), never encoded. If full
+        // removal comes to the Mac, it enters fingerprints under macOS-only tags.
         #[cfg(target_os = "macos")]
         native: darwin::Evidence,
     }
@@ -4876,9 +4848,9 @@ mod filesystem {
         pub(super) fn directory_flags() -> OFlags {
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
         }
-        // The domain std's MetadataExt::dev() reports, which CheckoutIdentity
-        // is compared against. Whether Darwin device or fsid values may enter
-        // persisted records is undecided (issue 54).
+        // A v1 record stores st_dev as std's MetadataExt::dev() reports it: the
+        // signed 32-bit value widened to 64 bits. The volume fsid is checked
+        // live and never persisted.
         fn device(raw: i32) -> u64 {
             raw as u64
         }

@@ -65,9 +65,10 @@ fn git(
         .map_err(std::io::Error::other)?
         .map_err(hold)?;
     if !output.status.success() {
-        return Err(hold(
+        return Err(hold(&crate::git::failure_reason(
             "Git operation failed; hold for reconciliation (no fallback)",
-        ));
+            &output.stderr,
+        )));
     }
     String::from_utf8(output.stdout)
         .map(|s| s.trim_end_matches('\n').to_owned())
@@ -93,9 +94,9 @@ fn boot_identity() -> io::Result<String> {
 }
 #[cfg(target_os = "macos")]
 const DARWIN_BOOT_PROVIDER: &str = "darwin-bootsession-v1:";
-// PROVISIONAL, pending the record-compatibility decision (issue 54): the Darwin
-// boot provider and its version travel as a prefix inside the existing boot_id
-// string, so no record format changes. This is the only place that encodes it.
+// The Darwin provider and version travel as a prefix inside the existing boot_id
+// string. The tag also fixes the meaning of the recorded device and inode; a change
+// of meaning needs a new tag version. This is the only place that encodes it.
 #[cfg(target_os = "macos")]
 fn darwin_boot_id(session: &work_darwin::BootSessionUuid) -> String {
     let uuid = session.as_bytes().iter().copied().map(char::from);
@@ -119,6 +120,11 @@ fn recorded_by_native_boot_provider(recorded: &str) -> bool {
 pub(crate) fn device_fits_record(current: &CheckoutIdentity, prior: &CheckoutIdentity) -> bool {
     #[cfg(target_os = "macos")]
     if !recorded_by_native_boot_provider(&prior.boot_id) {
+        return false;
+    }
+    // Linux records a bare kernel UUID, so any provider-tagged value is foreign.
+    #[cfg(target_os = "linux")]
+    if prior.boot_id.contains(':') {
         return false;
     }
     current.boot_id != prior.boot_id || current.directory.device == prior.directory.device
@@ -382,6 +388,37 @@ mod darwin_boot_tests {
         assert!(!device_fits_record(&current, &checkout(this_boot, 1)));
         assert!(!device_fits_record(&current, &checkout(linux_boot, 1)));
         assert!(!device_fits_record(&current, &checkout(linux_boot, 2)));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_boot_tests {
+    use super::*;
+
+    fn checkout(boot_id: &str, device: u64) -> CheckoutIdentity {
+        CheckoutIdentity {
+            path: "/checkout".into(),
+            private_git_dir: "/checkout/.git".into(),
+            common_git_dir: "/checkout/.git".into(),
+            directory: DirectoryIdentity { device, inode: 7 },
+            head: "0".repeat(40),
+            boot_id: boot_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn provider_tagged_records_never_read_as_a_reboot() {
+        let this_boot = "5f0c3b1e-8d2a-4c6f-9b1a-2e7d4f6a8c01";
+        let earlier_boot = "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+        let darwin_boot = format!("darwin-bootsession-v1:{earlier_boot}");
+        let current = checkout(this_boot, 2);
+
+        assert!(device_fits_record(&current, &checkout(this_boot, 2)));
+        assert!(device_fits_record(&current, &checkout(earlier_boot, 1)));
+        assert!(!device_fits_record(&current, &checkout(this_boot, 1)));
+        assert!(device_fits_record(&current, &checkout("not-a-uuid", 1)));
+        assert!(!device_fits_record(&current, &checkout(&darwin_boot, 1)));
+        assert!(!device_fits_record(&current, &checkout(&darwin_boot, 2)));
     }
 }
 

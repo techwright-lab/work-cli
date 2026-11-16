@@ -27,6 +27,8 @@ pub(crate) struct Report {
     pub charge_retained: bool,
     pub preserved_refs: Vec<String>,
     pub next_action: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignored_files: Vec<String>,
 }
 fn references(checkout: Uuid, roots: &[String]) -> Vec<String> {
     roots
@@ -46,6 +48,7 @@ fn report(checkout: Uuid, path: PathBuf, roots: &[String], removed: bool) -> Rep
         } else {
             "stop all agents and editors, then repeat with --confirm-stopped"
         },
+        ignored_files: Vec::new(),
     }
 }
 fn completion(store: &Store, checkout: Uuid) -> Result<crate::allocate::Allocation> {
@@ -56,13 +59,15 @@ fn history(store: &Store, checkout: Uuid) -> Result<Option<journal::History>> {
     let _phase = store.sql_phase();
     checked(journal::history(&store.conn, checkout))
 }
+#[cfg(not(target_os = "macos"))]
 fn incomplete_inspection(reasons: &[IncompleteReason]) -> String {
     let mut message = format!("inspection incomplete: {reasons:?}");
     if reasons.contains(&IncompleteReason::UnsupportedGit) {
-        message.push_str("; requires stable Git >=2.55.0 at selected Git (canonical MAJOR.MINOR.PATCH version) and a supported repository layout");
+        message.push_str("; requires a `git version MAJOR.MINOR.PATCH` line from selected Git and a supported repository layout");
     }
     message
 }
+#[cfg(not(target_os = "macos"))]
 fn clean(
     invocation: &crate::git::GitInvocation,
     store: &mut Store,
@@ -183,6 +188,7 @@ fn record(
         roots,
     })
 }
+#[cfg(not(target_os = "macos"))]
 fn preserve(a: &crate::allocate::Allocation, roots: &[String], b: &mut Budget) -> Result<()> {
     for (reference, root) in references(a.checkout, roots).iter().zip(roots) {
         let output = checked(git(
@@ -215,6 +221,7 @@ fn preserve(a: &crate::allocate::Allocation, roots: &[String], b: &mut Budget) -
     }
     Ok(())
 }
+#[cfg(not(target_os = "macos"))]
 fn verify_refs(
     common: &mut filesystem::Manifest,
     roots: &[String],
@@ -235,6 +242,7 @@ fn verify_refs(
     Ok(())
 }
 /// Fresh native absence plus retained parent identities. Never merely Path::exists.
+#[cfg(not(target_os = "macos"))]
 fn absent(a: &crate::allocate::Allocation, record: &Record, b: &mut Budget) -> Result<()> {
     let identity = identity(a)?;
     let mut parent = checked(filesystem::Manifest::new(
@@ -368,6 +376,13 @@ fn publish(
     checked(b.check())?;
     commit(tx)
 }
+// The Linux inspection path needs kernel features that macOS lacks. On macOS,
+// Git's own refusal of modified and untracked files is the safety check.
+#[cfg(target_os = "macos")]
+mod simple;
+#[cfg(target_os = "macos")]
+pub(crate) use simple::command;
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn command(
     invocation: &crate::git::GitInvocation,
     config: &Config,
@@ -567,9 +582,9 @@ mod tests {
         assert!(message.starts_with("SqliteFailure("), "{message}");
     }
     #[test]
-    fn unsupported_git_explains_minimum_without_mislabeling_other_holds() {
+    #[cfg(not(target_os = "macos"))]
+    fn unsupported_git_explains_layout_without_mislabeling_other_holds() {
         let message = incomplete_inspection(&[IncompleteReason::UnsupportedGit]);
-        assert!(message.contains("stable Git >=2.55.0"), "{message}");
         assert!(message.contains("supported repository layout"), "{message}");
         assert_eq!(
             incomplete_inspection(&[IncompleteReason::Changed]),
@@ -664,6 +679,30 @@ mod tests {
             "removed"
         );
         assert_eq!(json(invoke(&f, &["status", "--json"], None))["charged"], 0);
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn interrupted_mac_removal_completes_on_rerun() {
+        for stage in ["after_intent", "after_native"] {
+            let f = ManagedFixture::recovery("sha1", "2");
+            json(invoke(&f, &["finish", "inspection"], None));
+            let interrupted = invoke(
+                &f,
+                &["remove", "inspection", "--confirm-stopped"],
+                Some(stage),
+            );
+            assert!(!interrupted.status.success(), "{stage}: {interrupted:?}");
+            assert_eq!(f.allocation.destination.exists(), stage == "after_intent");
+            assert_eq!(json(invoke(&f, &["status", "--json"], None))["charged"], 1);
+            let removed = json(invoke(
+                &f,
+                &["remove", "inspection", "--confirm-stopped"],
+                None,
+            ));
+            assert_eq!(removed["outcome"], "removed", "{stage}");
+            assert!(!f.allocation.destination.exists(), "{stage}");
+            assert_eq!(json(invoke(&f, &["status", "--json"], None))["charged"], 0);
+        }
     }
     #[test]
     fn sha256_local_history_is_preserved() {

@@ -26,7 +26,7 @@ fn darwin_acl_witness(
     actor: u32,
     mut resolve: impl FnMut(&[u8; 16]) -> std::io::Result<work_darwin::Principal>,
 ) -> Result<DarwinAclWitness, GitBindingReason> {
-    use work_darwin::{GitAcl, GrantExposure, Principal};
+    use work_darwin::{AccessError, GitAcl, GrantExposure, Principal};
     let GitAcl::Present(acl) = acl else {
         return Ok(DarwinAclWitness::SupportedNone);
     };
@@ -48,9 +48,14 @@ fn darwin_acl_witness(
         } else {
             actor
         };
-        let exposure = ace
-            .exposure(principal, trusted)
-            .map_err(|_| GitBindingReason::AccessUnproven)?;
+        let exposure = match ace.exposure(principal, trusted) {
+            Err(AccessError::MissingMembership)
+                if principal == Principal::Group(DARWIN_ADMIN_GID) =>
+            {
+                GrantExposure::default()
+            }
+            result => result.map_err(|_| GitBindingReason::AccessUnproven)?,
+        };
         if exposure != GrantExposure::default() {
             return Err(GitBindingReason::UnsafeAccess);
         }
@@ -60,6 +65,28 @@ fn darwin_acl_witness(
         flags: acl.flags,
         entries,
     })
+}
+
+// Root, the actor and the admin group are trusted writers on macOS: standard
+// /Applications and Homebrew prefixes are admin group-writable.
+const DARWIN_ADMIN_GID: u32 = 80;
+
+fn darwin_mode_access(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    directory: bool,
+    symlink: bool,
+    actor: u32,
+) -> Result<(), GitBindingError> {
+    let untrusted_write = mode & 0o002 != 0 || (mode & 0o020 != 0 && gid != DARWIN_ADMIN_GID);
+    if (uid != 0 && uid != actor)
+        || (!symlink && untrusted_write && !(directory && mode & 0o1000 != 0))
+    {
+        return Err(error(path, GitBindingReason::UnsafeAccess));
+    }
+    Ok(())
 }
 
 fn darwin_metadata_matches(a: &fs::Metadata, b: &fs::Metadata) -> bool {
@@ -92,13 +119,15 @@ fn darwin_git_access(
     } else {
         return Err(unproven());
     };
-    if (metadata.uid() != 0 && metadata.uid() != actor)
-        || (!symlink
-            && metadata.mode() & 0o022 != 0
-            && !(metadata.is_dir() && metadata.mode() & 0o1000 != 0))
-    {
-        return Err(error(path, GitBindingReason::UnsafeAccess));
-    }
+    darwin_mode_access(
+        path,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode(),
+        metadata.is_dir(),
+        symlink,
+        actor,
+    )?;
     // Acquire directories only, rooted at a held root, with NOFOLLOW on every
     // component. Never open a Git executable/helper/symlink as regular payload.
     let mut parent = fs::OpenOptions::new()
@@ -263,6 +292,27 @@ mod darwin_policy_tests {
             ),
             Err(GitBindingReason::AccessUnproven)
         );
+    }
+
+    #[test]
+    fn admin_group_write_grant_is_trusted() {
+        let dangerous = filesec(4, 1); // WRITE_DATA / ADD_FILE
+        let acl = GitAcl::Present(decode_filesec(&dangerous).unwrap());
+        assert!(darwin_acl_witness(acl, 501, |_| Ok(Principal::Group(80))).is_ok());
+    }
+
+    #[test]
+    fn admin_group_writable_route_entry_passes_but_other_writers_do_not() {
+        let path = Path::new("/Applications");
+        assert_eq!(darwin_mode_access(path, 0, 80, 0o40775, true, false, 501), Ok(()));
+        assert_eq!(darwin_mode_access(path, 501, 80, 0o40775, true, false, 501), Ok(()));
+        for (gid, mode) in [(20, 0o40775), (80, 0o40777), (20, 0o100775)] {
+            assert_eq!(
+                darwin_mode_access(path, 0, gid, mode, mode & 0o40000 != 0, false, 501),
+                Err(error(path, GitBindingReason::UnsafeAccess)),
+                "{gid} {mode:o}"
+            );
+        }
     }
 
     #[test]

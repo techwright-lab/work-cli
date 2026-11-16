@@ -11,26 +11,70 @@ pub(crate) struct GitVersion {
     pub(crate) patch: u32,
 }
 
+impl std::fmt::Display for GitVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GitVersionError {
     InvalidProtocol,
-    BelowMinimum {
-        found: GitVersion,
-        minimum: GitVersion,
-    },
 }
 
-/// Compatibility admission only; repository and executable checks are separate.
-pub(crate) fn require_supported_git_version(output: &[u8]) -> Result<GitVersion, GitVersionError> {
+/// Oldest Git version Work was run with. Doctor warns below it; nothing refuses.
+pub(crate) const OLDEST_RUN_GIT_VERSION: GitVersion = GitVersion {
+    major: 2,
+    minor: 48,
+    patch: 1,
+};
+
+/// `reason`, followed by the first non-empty line of Git's stderr that is not a
+/// `hint:` line. The excerpt is bounded and has control characters replaced, so
+/// it is safe to report.
+pub(crate) fn failure_reason(reason: &str, stderr: &[u8]) -> String {
+    const LIMIT: usize = 200;
+    let text = String::from_utf8_lossy(stderr);
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("hint:"))
+    else {
+        return reason.to_owned();
+    };
+    let mut excerpt = String::new();
+    for c in line.chars() {
+        let c = if c.is_control() { '\u{fffd}' } else { c };
+        if excerpt.len() + c.len_utf8() > LIMIT {
+            break;
+        }
+        excerpt.push(c);
+    }
+    format!("{reason}: {excerpt}")
+}
+
+/// Parse `git version MAJOR.MINOR.PATCH` plus optional vendor text such as
+/// ` (Apple Git-157)` or `.windows.1`. No version is refused; repository and
+/// executable checks are separate.
+pub(crate) fn parse_git_version(output: &[u8]) -> Result<GitVersion, GitVersionError> {
     let invalid = GitVersionError::InvalidProtocol;
-    let version = output
+    let line = output
         .strip_prefix(b"git version ")
         .and_then(|v| v.strip_suffix(b"\n"))
+        .filter(|v| v.iter().all(|c| (b' '..=b'~').contains(c)))
         .ok_or(invalid)?;
-    let mut components = version.split(|c| *c == b'.');
+    let mut components = line.splitn(3, |c| *c == b'.');
     let mut numbers = [0u32; 3];
-    for number in &mut numbers {
-        let digits = components.next().ok_or(invalid)?;
+    let mut vendor: &[u8] = b"";
+    for (index, number) in numbers.iter_mut().enumerate() {
+        let mut digits = components.next().ok_or(invalid)?;
+        if index == 2 {
+            let end = digits
+                .iter()
+                .position(|c| !c.is_ascii_digit())
+                .unwrap_or(digits.len());
+            (digits, vendor) = digits.split_at(end);
+        }
         if digits.is_empty()
             || !digits.iter().all(u8::is_ascii_digit)
             || (digits.len() > 1 && digits[0] == b'0')
@@ -42,23 +86,16 @@ pub(crate) fn require_supported_git_version(output: &[u8]) -> Result<GitVersion,
             .parse()
             .map_err(|_| invalid)?;
     }
-    if components.next().is_some() {
+    if !vendor.is_empty()
+        && (!matches!(vendor[0], b' ' | b'.') || vendor.len() == 1 || vendor.ends_with(b" "))
+    {
         return Err(invalid);
     }
-    let found = GitVersion {
+    Ok(GitVersion {
         major: numbers[0],
         minor: numbers[1],
         patch: numbers[2],
-    };
-    let minimum = GitVersion {
-        major: 2,
-        minor: 55,
-        patch: 0,
-    };
-    if found < minimum {
-        return Err(GitVersionError::BelowMinimum { found, minimum });
-    }
-    Ok(found)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

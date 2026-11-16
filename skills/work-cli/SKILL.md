@@ -11,7 +11,10 @@ task completion, stopped-writer confirmation and removal as separate decisions.
 ## Start a task
 
 1. Read `work --version`, `work start --help` and `work status --json`. Use v0.1.2
-   or newer on Linux x86_64 with stable Git >=2.55.0 at `/usr/bin/git`.
+   or newer on Linux x86_64 with Git at `/usr/bin/git`. On macOS (Apple Silicon),
+   `setup`, `start`, `status`, `finish` and `remove` work.
+   Work has no Git version minimum. It was run with Git 2.48.1 to 2.56.0, and
+   `work doctor` warns for older versions.
 2. Locate the operator-selected configuration. A present nonempty `WORK_CONFIG`
    selects that path. A present empty `WORK_CONFIG` disables discovery with no
    fallback. Otherwise select nonempty `XDG_CONFIG_HOME/work/config.toml`, else
@@ -48,6 +51,11 @@ task completion, stopped-writer confirmation and removal as separate decisions.
    quota to remain: finish is not process-quiescence or deletion proof.
 3. Preview with `work remove TASK_OR_UUID` and report the exact selected path,
    outcome, holds, retained charge and preservation limitations to the operator.
+   On macOS, Git refuses a checkout with modified or untracked files. The preview
+   lists ignored files in `ignored_files`; removal deletes them, so report them
+   before confirmation. Files in the user's global Git excludes count as ignored.
+   The branch stays in the repository, with a preserved ref for the checkout's
+   last commit and for each commit that a per-worktree ref names.
 4. Require explicit operator confirmation that relevant agents, editors and jobs
    are stopped before issuing `work remove UUID --confirm-stopped`. Target only
    the confirmed checkout. Never infer confirmation from age, clean Git status,
@@ -65,6 +73,11 @@ task completion, stopped-writer confirmation and removal as separate decisions.
 | Unknown native outcome or changed identity/boot | Keep the charge and evidence; stop automatic retries and request recovery guidance. |
 | Recorded native success awaiting reconciliation | Follow the CLI's exact UUID reconciliation instruction with stopped-writer confirmation; verify absence again. |
 | Restored backup has new filesystem identities | Recover selected work into fresh managed state; retain old authority as history. Do not rewrite SQL, markers or inode/boot bindings. |
+
+On macOS, ignored files are not a hold: the preview lists them and removal
+deletes them. An interrupted or refused removal is not an unknown outcome to
+stop on: fix the cause, then repeat the same `work remove ... --confirm-stopped`
+to complete it.
 
 Use the documented supported recovery procedure in the operator's runbook. Treat
 historical receipts as observations, never new writer or removal permission.
