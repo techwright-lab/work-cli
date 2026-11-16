@@ -640,6 +640,7 @@ fn parse_reflog(
 
 /// Roots that native worktree removal would erase from private administration.
 /// All other private artifacts are refused by the removal collector.
+#[cfg(not(target_os = "macos"))]
 pub(super) fn interactive_roots(inputs: &mut GitInputs, b: &mut Budget) -> Held<Vec<String>> {
     let mut roots = Roots::new();
     roots.entry(inputs.head.clone()).or_default();

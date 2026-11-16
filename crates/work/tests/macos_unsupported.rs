@@ -128,7 +128,6 @@ fn supervision_refuses_before_config_context_or_child_execution() {
 #[test]
 fn incomplete_native_core_refuses_before_loading_or_mutating_authority() {
     for args in [
-        vec!["remove", "secret-checkout", "--confirm-stopped"],
         vec![
             "inspect",
             "019281b2-67de-7000-8000-000000000001",

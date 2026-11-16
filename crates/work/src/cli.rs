@@ -228,8 +228,8 @@ fn refuse_incomplete_native_command(args: &[std::ffi::OsString]) {
             std::process::exit(1);
         }
         Some(
-            "remove" | "inspect" | "verify-remote" | "audit-preservation" | "prepare-recovery"
-            | "approve" | "retire" | "capture" | "participant" | "adopt",
+            "inspect" | "verify-remote" | "audit-preservation" | "prepare-recovery" | "approve"
+            | "retire" | "capture" | "participant" | "adopt",
         ) => {
             eprintln!(
                 "native backend incomplete; managed operation refused before authority access"

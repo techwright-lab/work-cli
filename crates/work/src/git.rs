@@ -29,12 +29,17 @@ pub(crate) const OLDEST_RUN_GIT_VERSION: GitVersion = GitVersion {
     patch: 1,
 };
 
-/// `reason`, followed by the first non-empty line of Git's stderr. The excerpt
-/// is bounded and has control characters replaced, so it is safe to report.
+/// `reason`, followed by the first non-empty line of Git's stderr that is not a
+/// `hint:` line. The excerpt is bounded and has control characters replaced, so
+/// it is safe to report.
 pub(crate) fn failure_reason(reason: &str, stderr: &[u8]) -> String {
     const LIMIT: usize = 200;
     let text = String::from_utf8_lossy(stderr);
-    let Some(line) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+    let Some(line) = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("hint:"))
+    else {
         return reason.to_owned();
     };
     let mut excerpt = String::new();

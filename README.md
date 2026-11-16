@@ -49,8 +49,9 @@ an installer-managed link with the direct-install command.
 ## Requirements and build
 
 Requires Linux x86_64 and **Git at `/usr/bin/git`**; source builds use Rust 1.98.1.
-On macOS (Apple Silicon), a source build runs `setup`, `start`, `status` and
-`finish`. `remove` is not yet available on macOS.
+On macOS (Apple Silicon), a source build runs `setup`, `start`, `status`,
+`finish` and `remove`. Removal on macOS uses Git's own check; see
+[Removal on macOS](#removal-on-macos).
 Work uses the selected Git without a version minimum. Work was run with Git 2.48.1
 to 2.56.0. `work doctor` warns when the selected Git is older than 2.48.1.
 
@@ -206,6 +207,37 @@ interruption leaves a recorded successful native result, repeat `remove` to
 reconcile capacity. If the native outcome is unknown, the checkout remains
 charged and removal will not replay. `status` reports that hold for manual
 investigation. A recreated destination is never removed by recovery.
+
+### Removal on macOS
+
+On macOS, removal uses Git's own safety check in place of the Linux inspection.
+Work runs `git worktree remove` without `--force`. Git refuses a checkout with
+modified or untracked files. Work names these files and keeps the charge. Commit,
+stash or delete them, then run the same command again.
+
+Git deletes ignored files without a prompt. The preview lists them in
+`ignored_files`, and removal with `--confirm-stopped` deletes them. A wholly
+ignored directory is listed once, as `dir/`. Files that the user's global Git
+excludes name (`core.excludesFile`, or `~/.config/git/ignore` when it is not
+set) count as ignored, for example `.DS_Store`.
+
+The branch stays in the repository. Work keeps a preserved ref,
+`refs/work-preserved/<checkout-uuid>/<object-id>`, for the checkout's last commit
+and for each commit that a per-worktree ref (`refs/worktree/*`, `refs/bisect/*`)
+names.
+
+If Git refuses the removal, or the removal stops before Work records the result,
+fix the cause and run the same command again. Work checks the checkout and its
+Git registration. If Git removed the checkout, Work releases the charge. If the
+checkout is still present, Work runs the removal again with the same record.
+A commit made in the checkout since then must be on a branch. If it is not, for
+example after a commit on a detached HEAD, Work names it and keeps the charge.
+Put it on a branch, then run the same command again. Work also refuses if the
+checkout's identity or its finish record changed. Any other state keeps the
+charge and you correct it by hand.
+
+A per-worktree ref that names a tag is preserved through its commit. A
+per-worktree ref that names no commit, for example a tree, refuses the removal.
 
 ## Existing installations
 

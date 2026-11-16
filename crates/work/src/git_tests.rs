@@ -179,3 +179,12 @@ fn git_candidates_preserve_unqualified_absolute_path_bytes() {
         );
     }
 }
+
+#[test]
+fn failure_reason_quotes_the_error_after_git_hints() {
+    let stderr = b"hint: Support for <GIT_DIR>/info/grafts is deprecated\nhint:\n\nfatal: cannot remove a locked working tree;\nuse 'remove -f -f'\n";
+    assert_eq!(
+        failure_reason("git worktree remove refused", stderr),
+        "git worktree remove refused: fatal: cannot remove a locked working tree;"
+    );
+}
