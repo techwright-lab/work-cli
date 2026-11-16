@@ -43,9 +43,11 @@ fn git(
                 // Identity is the stored object graph, never user-supplied parents.
                 // Override legacy grafts as well as modern replacement objects.
                 .env("GIT_GRAFT_FILE", "/dev/null")
-                // Unsupported Git versions fail closed before inspecting objects;
-                // partial clones must not fetch missing objects during authority proof.
-                .args(["--no-replace-objects", "--no-lazy-fetch"])
+                // Partial clones must not fetch missing objects during authority
+                // proof. The variable, unlike --no-lazy-fetch, does not make a Git
+                // older than 2.44 refuse; such a Git has no lazy-fetch switch at all.
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .args(["--no-replace-objects"])
                 .args([
                     "-c",
                     "core.hooksPath=/dev/null",
