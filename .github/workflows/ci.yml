@@ -117,6 +117,52 @@ jobs:
           path: target/dist/*
           if-no-files-found: error
 
+  macos:
+    name: macos (arm64)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@18f0487477426dce244608110aa2660c2893deb7 # 1.98.1
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      # Packaging needs Python 3.11+; the system python3 on macOS is older.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Work refuses symlinked paths, and the default macOS TMPDIR is under /var.
+      - name: Use a canonical TMPDIR
+        run: echo "TMPDIR=$(cd "$RUNNER_TEMP" && pwd -P)" >> "$GITHUB_ENV"
+      # Most of the suite is Linux-specific; these tests cover the macOS lifecycle.
+      # The Darwin Git access tests run serially: the route check reads a sibling
+      # test's new tempdir in the shared TMPDIR as a route change.
+      - name: Test
+        run: |
+          cargo test --locked -p work-cli --test macos_lifecycle --test macos_removal --test macos_unsupported
+          cargo test --locked -p work-cli --lib -- --test-threads=1 darwin inspection::removal failure_reason
+          cargo test --locked -p work-darwin
+      - name: Build release binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '15.0'
+        run: cargo build --release --locked -p work-cli --bin work
+      - name: Check version
+        run: test "$(target/release/work --version)" = "work $(python3 tools/release_version.py)"
+      - name: Lifecycle smoke
+        run: tools/qualification/smoke-macos.sh "$PWD/target/release/work"
+      - name: Package
+        run: |
+          python3 tools/package-common.py --version "$(python3 tools/release_version.py)" \
+            --platform macos-arm64 --executable "$PWD/target/release/work" \
+            --source-root "$PWD" --output-dir "$PWD/target/dist-macos"
+          cd target/dist-macos
+          shasum -a 256 -c ./*.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: work-cli-macos-arm64
+          path: target/dist-macos/*
+          if-no-files-found: error
+
   build:
     name: build (${{ matrix.device }})
     needs: [lint, test, qualification]
@@ -161,16 +207,21 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # Publish only the archive exercised by the pinned-container smoke test.
-      # Native matrix builds remain CI coverage, not qualified release assets.
+      # Publish the Linux archive exercised by the pinned-container smoke test and
+      # the macOS files smoke-tested on the macos-15 runner. The native Linux
+      # matrix builds remain CI coverage, not release assets.
       - uses: actions/download-artifact@v4
         with:
           name: work-cli-linux-x86_64-qualified
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: work-cli-macos-arm64
           path: dist
       - name: Publish GitHub release
         env:
@@ -178,15 +229,19 @@ jobs:
         run: |
           cd dist
           version="${GITHUB_REF_NAME#v}"
-          binary="work-$version-linux-x86_64"
-          bundle="work-cli-$version-linux-x86_64.tar.gz"
-          sha256sum --check "$binary.sha256" "$bundle.sha256"
-          gh release create "$GITHUB_REF_NAME" "$binary" "$binary.sha256" "$bundle" "$bundle.sha256" \
+          files=()
+          for platform in linux-x86_64 macos-arm64; do
+            binary="work-$version-$platform"
+            bundle="work-cli-$version-$platform.tar.gz"
+            sha256sum --check "$binary.sha256" "$bundle.sha256"
+            files+=("$binary" "$binary.sha256" "$bundle" "$bundle.sha256")
+          done
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
 
   ci:
     if: always()
-    needs: [lint, test, qualification, build]
+    needs: [lint, test, qualification, macos, build]
     runs-on: ubuntu-latest
     steps:
       - name: Require every job to pass

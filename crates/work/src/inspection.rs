@@ -1608,10 +1608,12 @@ fn git_profile(command: &mut std::process::Command, cwd: Option<&Path>) {
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_GRAFT_FILE", "/dev/null")
+        // The variable form keeps a Git older than 2.44 usable; such a Git has
+        // no lazy-fetch switch, and the config allowlist refuses partial clones.
+        .env("GIT_NO_LAZY_FETCH", "1")
         .args([
             "--no-optional-locks",
             "--no-replace-objects",
-            "--no-lazy-fetch",
             "--literal-pathspecs",
         ]);
     for value in [

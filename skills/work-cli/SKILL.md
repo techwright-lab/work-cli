@@ -10,9 +10,10 @@ task completion, stopped-writer confirmation and removal as separate decisions.
 
 ## Start a task
 
-1. Read `work --version`, `work start --help` and `work status --json`. Use v0.1.2
-   or newer on Linux x86_64 with Git at `/usr/bin/git`. On macOS (Apple Silicon),
-   `setup`, `start`, `status`, `finish` and `remove` work.
+1. Read `work --version`, `work start --help` and `work status --json`. Use v0.4.0
+   or newer. It runs on Linux x86_64 with Git at `/usr/bin/git`, and on macOS
+   (Apple Silicon) with the Git from Xcode, the Command Line Tools or Homebrew.
+   On macOS, `setup`, `start`, `status`, `finish` and `remove` work.
    Work has no Git version minimum. It was run with Git 2.48.1 to 2.56.0, and
    `work doctor` warns for older versions.
 2. Locate the operator-selected configuration. A present nonempty `WORK_CONFIG`

@@ -3,44 +3,67 @@
 ## Ordinary users: download the native binary
 
 `work` is a native executable. **No repository checkout, Rust toolchain or Python
-is required to run it.** Require Linux x86_64, glibc >=2.36 and Git at
-`/usr/bin/git`. Work uses that Git without a version minimum. Work was run with
-Git 2.48.1 to 2.56.0, and CI tests Git 2.55.0 and 2.56.0. `work doctor` warns
-when the Git is older than 2.48.1.
+is required to run it.** Two platforms are supported:
 
-Published v0.2.0 files are on
-[GitHub Releases](https://github.com/techwright-lab/work-cli/releases):
+- Linux x86_64, with glibc >=2.36 and Git at `/usr/bin/git`.
+- macOS on Apple Silicon, with Git. Use the Git from Xcode or the Command Line
+  Tools, or Homebrew Git.
 
-- `work-0.2.0-linux-x86_64` - standalone executable.
-- `work-0.2.0-linux-x86_64.sha256` - checksum for that executable.
+Work uses the selected Git without a version minimum. Work was run with Git
+2.48.1 to 2.56.0, and CI tests Git 2.55.0 and 2.56.0. `work doctor` warns when
+the Git is older than 2.48.1.
 
-For a fresh installation of that published release:
+The current release is v0.4.0. Its files are on
+[GitHub Releases](https://github.com/techwright-lab/work-cli/releases/tag/v0.4.0):
+
+- `work-0.4.0-linux-x86_64` - standalone Linux executable.
+- `work-0.4.0-macos-arm64` - standalone macOS executable.
+- A `.sha256` checksum file for each executable.
+
+Linux x86_64: download the executable and its checksum file to the current
+directory, then run:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-sha256sum --check work-0.2.0-linux-x86_64.sha256 &&
-  install -m 755 work-0.2.0-linux-x86_64 "$HOME/.local/bin/work" &&
+sha256sum --check work-0.4.0-linux-x86_64.sha256 &&
+  install -m 755 work-0.4.0-linux-x86_64 "$HOME/.local/bin/work" &&
   work --version
 ```
 
-After a qualified v0.3.0 publication, use `work-0.3.0-linux-x86_64` and
-`work-0.3.0-linux-x86_64.sha256` with the same steps. Do not use 0.3.0 download
-names until that GitHub Release exists. Native `work setup` requires v0.3.0+.
+macOS on Apple Silicon:
+
+```sh
+base=https://github.com/techwright-lab/work-cli/releases/download/v0.4.0
+curl -fLO "$base/work-0.4.0-macos-arm64" &&
+  curl -fLO "$base/work-0.4.0-macos-arm64.sha256"
+mkdir -p "$HOME/.local/bin"
+shasum -a 256 -c work-0.4.0-macos-arm64.sha256 &&
+  install -m 755 work-0.4.0-macos-arm64 "$HOME/.local/bin/work" &&
+  work --version
+```
+
+The macOS executable is not signed or notarized. A file that curl downloads
+runs. A file that a browser downloads has a quarantine attribute, and macOS
+blocks it. Remove the attribute before you install the file:
+`xattr -d com.apple.quarantine work-0.4.0-macos-arm64`.
+
+Native `work setup` requires v0.3.0+.
 
 Add ~/.local/bin to PATH when the shell does not already include it. Keep an
 existing installation intact until its ownership and update method are known;
 use the helper for an installer-managed `work` link instead of overwriting it.
 
 Standalone assets become available after their version is published, not when a
-PR opens. v0.2.0 standalone assets are published. Earlier releases already contain
-the same native executable at `bin/work` inside
-`work-cli-VERSION-linux-x86_64.tar.gz`: verify that archive's sidecar, extract it
-and install `bin/work`. No clone or Python is needed for that path either.
+PR opens. Releases from v0.2.0 have standalone Linux assets; macOS assets start
+at v0.4.0. Earlier releases already contain the same native executable at
+`bin/work` inside `work-cli-VERSION-linux-x86_64.tar.gz`: verify that archive's
+sidecar, extract it and install `bin/work`. No clone or Python is needed for that
+path either.
 
 The optional full bundle adds configuration examples, the agent skill, installer
 and this runbook. Checksums detect corruption; GitHub/publisher access remains the
 authenticity trust. The sidecar is not a cryptographic signing identity. Native
-ARM64/runner builds remain CI coverage, not supported release assets.
+Linux runner builds, x86_64 and ARM64, remain CI coverage, not release assets.
 
 ## Direct binary updates and rollback
 
@@ -92,20 +115,15 @@ can register the skill from a permanently retained full bundle instead.
 
 Choose the bundled Python 3.11+ helper for cached versions, atomic activation,
 managed skill snapshots and rollback. **It is optional, not the binary bootstrap
-requirement.** Use the script in an extracted, verified release bundle:
-
-Published v0.2.0 helper example:
+requirement.** The helper supports Linux x86_64 only. Use the script in an
+extracted, verified release bundle:
 
 ```sh
-python3 /absolute/work-cli-0.2.0-linux-x86_64/tools/work_install.py install \
-  --version v0.2.0 --archive /downloads/work-cli-0.2.0-linux-x86_64.tar.gz \
-  --checksum /downloads/work-cli-0.2.0-linux-x86_64.tar.gz.sha256 \
+python3 /absolute/work-cli-0.4.0-linux-x86_64/tools/work_install.py install \
+  --version v0.4.0 --archive /downloads/work-cli-0.4.0-linux-x86_64.tar.gz \
+  --checksum /downloads/work-cli-0.4.0-linux-x86_64.tar.gz.sha256 \
   --skills-dir "$HOME/.agents/skills" --skills-dir "$HOME/.claude/skills"
 ```
-
-After a qualified v0.3.0 publication, substitute `0.3.0` / `v0.3.0` in those
-paths and `--version`. Do not fetch 0.3.0 archives until that GitHub Release
-exists.
 
 Omit archive/checksum for an anonymous HTTPS download of an explicitly selected
 version. `download --version VERSION --output-dir DIR` verifies files without
@@ -286,15 +304,17 @@ Finish, preview and operator-confirmed removal remain separate steps.
    verifies native skill registration with no Python/Git on PATH before bundle
    extraction, then checks optional helper interoperability and retained snapshots.
 3. Merge and require green exact-SHA main CI, including ARM64, both qualifications,
-   builds and CodeQL. Fetch origin; verify the selected clean release HEAD equals
-   that tested origin/main. Passing results from an older SHA do not qualify it.
+   macOS, builds and CodeQL. Fetch origin; verify the selected clean release HEAD
+   equals that tested origin/main. Passing results from an older SHA do not
+   qualify it.
 4. Run `python3 tools/release_version.py --tag vVERSION`. Confirm no such tag/release
    exists. With explicit publication authorization, create an annotated tag at the
    tested commit and push only that tag. Keep published tags/assets immutable.
-5. Tag CI reruns qualification and rejects tag/workspace/lockfile mismatches.
-   Publication downloads only the pinned-container qualified artifact, verifies
-   the exact version's binary and bundle checksums, and creates the GitHub Release
-   with those four assets and generated notes. No native-runner binary is substituted.
+5. Tag CI reruns qualification and the macOS job, and rejects tag/workspace/lockfile
+   mismatches. Publication downloads the pinned-container qualified Linux artifact
+   and the macOS artifact that the macOS job tested. It verifies the binary and
+   bundle checksums for each platform, then creates the GitHub Release with those
+   eight assets and generated notes. No native Linux runner binary is substituted.
 6. Download public assets afresh, verify binary and bundle checksums and version,
    and exercise a disposable installation. Record tag/commit, workflow and digests.
    Upgrade operator installations only with stopped-operation authorization.

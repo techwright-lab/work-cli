@@ -9,20 +9,39 @@ or remote-preservation configuration is required.
 
 ## Download the binary
 
-Published v0.2.0 assets are on
-[GitHub Releases](https://github.com/techwright-lab/work-cli/releases). For a fresh
-installation of that published release:
+The current release is v0.4.0. Its assets are on
+[GitHub Releases](https://github.com/techwright-lab/work-cli/releases/tag/v0.4.0).
+Each platform has a standalone binary and a `.sha256` checksum file. On Linux,
+download both files to the current directory, then run the commands. On macOS,
+the commands download both files.
+
+Linux x86_64:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-sha256sum --check work-0.2.0-linux-x86_64.sha256 &&
-  install -m 755 work-0.2.0-linux-x86_64 "$HOME/.local/bin/work" &&
+sha256sum --check work-0.4.0-linux-x86_64.sha256 &&
+  install -m 755 work-0.4.0-linux-x86_64 "$HOME/.local/bin/work" &&
   work --version
 ```
 
-After a qualified v0.3.0 publication, install with `work-0.3.0-linux-x86_64` and
-`work-0.3.0-linux-x86_64.sha256` the same way. Do not use 0.3.0 download names
-until that GitHub Release exists. Native `work setup` requires v0.3.0+.
+macOS on Apple Silicon:
+
+```sh
+base=https://github.com/techwright-lab/work-cli/releases/download/v0.4.0
+curl -fLO "$base/work-0.4.0-macos-arm64" &&
+  curl -fLO "$base/work-0.4.0-macos-arm64.sha256"
+mkdir -p "$HOME/.local/bin"
+shasum -a 256 -c work-0.4.0-macos-arm64.sha256 &&
+  install -m 755 work-0.4.0-macos-arm64 "$HOME/.local/bin/work" &&
+  work --version
+```
+
+The macOS binary is not signed or notarized. A file that curl downloads runs.
+A file that a browser downloads has a quarantine attribute, and macOS blocks it.
+Remove the attribute before you install the file:
+`xattr -d com.apple.quarantine work-0.4.0-macos-arm64`.
+
+Native `work setup` requires v0.3.0+.
 
 **No repository clone, Rust or Python is required.** Keep Git installed as described
 below. Standalone assets arrive with their tagged version after publication;
@@ -48,10 +67,11 @@ an installer-managed link with the direct-install command.
 
 ## Requirements and build
 
-Requires Linux x86_64 and **Git at `/usr/bin/git`**; source builds use Rust 1.98.1.
-On macOS (Apple Silicon), a source build runs `setup`, `start`, `status`,
-`finish` and `remove`. Removal on macOS uses Git's own check; see
-[Removal on macOS](#removal-on-macos).
+Requires Linux x86_64 and **Git at `/usr/bin/git`**, or macOS on Apple Silicon
+with Git. On macOS, use the Git from Xcode or the Command Line Tools, or Homebrew
+Git. Source builds use Rust 1.98.1.
+On macOS, `setup`, `start`, `status`, `finish` and `remove` work. Removal on macOS
+uses Git's own check; see [Removal on macOS](#removal-on-macos).
 Work uses the selected Git without a version minimum. Work was run with Git 2.48.1
 to 2.56.0. `work doctor` warns when the selected Git is older than 2.48.1.
 
