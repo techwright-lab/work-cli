@@ -11,13 +11,13 @@ SCRIPT = ROOT / "tools/release_version.py"
 
 
 class ReleaseVersionTests(unittest.TestCase):
-    def test_checkout_workspace_and_local_lockfile_versions_are_0_3_0(self):
+    def test_checkout_workspace_and_local_lockfile_versions_are_0_4_0(self):
         manifest = tomllib.loads((ROOT / "Cargo.toml").read_text())
-        self.assertEqual(manifest["workspace"]["package"]["version"], "0.3.0")
+        self.assertEqual(manifest["workspace"]["package"]["version"], "0.4.0")
         packages = tomllib.loads((ROOT / "Cargo.lock").read_text())["package"]
         for name in ("work-cli", "work-contract"):
             entries = [package["version"] for package in packages if package["name"] == name]
-            self.assertEqual(entries, ["0.3.0"], name)
+            self.assertEqual(entries, ["0.4.0"], name)
 
     def test_workspace_lockfile_and_tag_must_match(self):
         with tempfile.TemporaryDirectory() as root:
