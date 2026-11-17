@@ -701,6 +701,7 @@ use crate::test_run_fixture as fixture;
 pub(crate) mod tests {
     use super::*;
     use crate::capture_diagnostics::{outside_sql_span, FrameName};
+    use crate::capture_preparation::tests::RECEIVER_TIMEOUT_MS;
 
     // Only existing top-level test calls use this wrapper. Product frames (and
     // their SQL/TX/flock locals) return or unwind before the CPU guard drops;
@@ -1896,7 +1897,7 @@ pub(crate) mod tests {
                     .unwrap();
                 assert_eq!(count, 0, "fixture must not have sealed a root intent");
             }
-            let expected = selected.unwrap_or(50);
+            let expected = selected.unwrap_or(RECEIVER_TIMEOUT_MS);
             assert_eq!(cfg.capture.as_ref().unwrap().timeout_ms, expected);
             assert_eq!(
                 serde_json::to_value(&spec).unwrap()["sink"]["timeout_ms"],
@@ -2013,7 +2014,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             &crate::run_journal::RootRunRequest,
         ),
     ) {
-        many_closed_history_with_timeout(50, completed);
+        many_closed_history_with_timeout(RECEIVER_TIMEOUT_MS, completed);
     }
     // Only the populated legacy-migration caller needs to end actual schema
     // participation before reopening. The builder retains its TempDir/config
@@ -2026,7 +2027,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             &crate::run_journal::RootRunRequest,
         ),
     ) {
-        many_closed_history_with_counts_owned(&[2], 50, completed);
+        many_closed_history_with_counts_owned(&[2], RECEIVER_TIMEOUT_MS, completed);
     }
     // Pilot functional coverage keeps every assertion at two roots; full-load
     // qualification remains explicit in the ignored stress callers.
@@ -2049,7 +2050,7 @@ json.dump({{'capture_id':r['capture_id'],'actor_ref':p['actor_ref'],'run_ref':p[
             &crate::run_journal::RootRunRequest,
         ),
     ) {
-        many_closed_history_with_counts(&[2, 48], 50, completed);
+        many_closed_history_with_counts(&[2, 48], RECEIVER_TIMEOUT_MS, completed);
     }
     fn many_closed_history_with_counts(
         counts: &[usize],

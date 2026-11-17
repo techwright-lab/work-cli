@@ -498,6 +498,7 @@ fn begin_replay_failure_preserves_intent_and_reports_uncertainty() {
 }
 #[test]
 fn begin_replay_physical_and_durable_races_refuse_commit() {
+    let _diagnostics = crate::capture_diagnostics::Guard::new();
     for case in [
         "pre_marker",
         "post_marker",
@@ -642,7 +643,7 @@ fn begin_replay_physical_and_durable_races_refuse_commit() {
             assert!(result.is_err());
             assert!(!temp.path().join("calls").exists());
         } else {
-            assert!(temp.path().join("calls").exists());
+            assert!(temp.path().join("calls").exists(), "{case}: {result:?}");
             assert_eq!(result.unwrap(), "begin_uncertain", "{case}");
         }
         if case == "closure" {

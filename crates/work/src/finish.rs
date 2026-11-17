@@ -979,6 +979,8 @@ pub(crate) mod candidate_fixture {
 }
 #[cfg(test)]
 mod tests {
+    use crate::capture_preparation::tests::RECEIVER_TIMEOUT_MS;
+
     fn closed_capture() -> (
         tempfile::TempDir,
         crate::config::Config,
@@ -986,7 +988,7 @@ mod tests {
         crate::run_journal::RootRunRequest,
         crate::capture_readiness::ClosureSeal,
     ) {
-        closed_capture_with_timeout(50)
+        closed_capture_with_timeout(RECEIVER_TIMEOUT_MS)
     }
     fn closed_capture_with_timeout(
         timeout_ms: u64,
@@ -1009,7 +1011,7 @@ mod tests {
         crate::run_journal::RootRunRequest,
         Option<crate::capture_readiness::ClosureSeal>,
     ) {
-        closed_capture_case_with_timeout(case, 50)
+        closed_capture_case_with_timeout(case, RECEIVER_TIMEOUT_MS)
     }
     fn closed_capture_case_with_timeout(
         case: &str,
@@ -1307,6 +1309,7 @@ json.dump(json.load(open({response:?})),sys.stdout)
     }
     #[test]
     fn captured_finish_refuses_changed_physical_identity() {
+        let _diagnostics = crate::capture_diagnostics::Guard::new();
         for damage in ["marker", "branch", "source", "head"] {
             let (_temp, cfg, a, _, _) = closed_capture();
             let sql =
@@ -1426,7 +1429,10 @@ json.dump(json.load(open({response:?})),sys.stdout)
         // or Gap continuation. Corruption cases below are negative fixtures only.
         for case in ["report", "unsafe_lock", "writer", "raw_gap"] {
             let (_temp, cfg, a, root, _seal) = closed_capture();
-            assert_eq!(cfg.capture.as_ref().unwrap().timeout_ms, 50);
+            assert_eq!(
+                cfg.capture.as_ref().unwrap().timeout_ms,
+                RECEIVER_TIMEOUT_MS
+            );
             let other = Store::open_existing_registered_mut(
                 cfg.trusted_registry.as_ref().unwrap(),
                 cfg.store_dir.as_ref().unwrap(),

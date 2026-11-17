@@ -1,6 +1,9 @@
 use super::*;
 use sha2::{Digest, Sha256};
 use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+// Successful fixtures exercise real receiver processes on loaded CI runners.
+// Deadline tests select their own short budget with qualified_fixture_with_timeout.
+pub(crate) const RECEIVER_TIMEOUT_MS: u64 = 2000;
 pub(crate) fn qualified_fixture() -> (
     tempfile::TempDir,
     Config,
@@ -8,7 +11,7 @@ pub(crate) fn qualified_fixture() -> (
     RootRunRequest,
     crate::capture_journal::CaptureSpec,
 ) {
-    qualified_fixture_with_timeout(50)
+    qualified_fixture_with_timeout(RECEIVER_TIMEOUT_MS)
 }
 pub(crate) fn qualified_fixture_with_timeout(
     timeout_ms: u64,
@@ -61,6 +64,68 @@ pub(crate) fn qualified_fixture_with_timeout(
     .unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
     (temp, cfg, a, root, spec)
+}
+#[test]
+fn successful_capture_fixture_allows_receiver_startup_delay() {
+    let _diagnostics = crate::capture_diagnostics::Guard::new();
+    let (_temp, cfg, _a, root, spec) = qualified_fixture();
+    let exe = &cfg.capture.as_ref().unwrap().executable;
+    let original = fs::read_to_string(exe).unwrap();
+    // Exercise real process I/O beyond the old 50ms fixture deadline. This
+    // receiver still succeeds; deadline refusal has separate transport tests.
+    fs::write(
+        exe,
+        original.replacen("#!/bin/sh\n", "#!/bin/sh\n/usr/bin/sleep 0.1\n", 1),
+    )
+    .unwrap();
+    let (store, result) = prepare(&cfg, &root, &spec).unwrap();
+    assert!(matches!(result, PreparationResult::Live(_)));
+    assert!(
+        !store
+            .run_snapshot(&root.identity().run)
+            .unwrap()
+            .unwrap()
+            .recovery_hold
+    );
+}
+#[test]
+fn explicit_receiver_timeout_keeps_unprepared_run_held_and_charged() {
+    let diagnostics = crate::capture_diagnostics::Guard::new();
+    let (_temp, cfg, a, root, spec) = qualified_fixture_with_timeout(50);
+    fs::write(
+        &cfg.capture.as_ref().unwrap().executable,
+        "#!/bin/sh\nexec /usr/bin/sleep 1\n",
+    )
+    .unwrap();
+    let error = prepare(&cfg, &root, &spec).err().expect("receiver timeout");
+    assert_eq!(
+        error.to_string(),
+        "capture preparation refused (receiver); recovery hold recorded"
+    );
+    let store = fixture_store(&cfg);
+    let run = store.run_snapshot(&root.identity().run).unwrap().unwrap();
+    assert!(run.recovery_hold && run.binding.is_none());
+    assert!(store
+        .capture_snapshot(&root.identity().run)
+        .unwrap()
+        .unwrap()
+        .prepared
+        .is_none());
+    assert_eq!(
+        store
+            .charged(a.request.repository.as_ref().unwrap(), None)
+            .unwrap(),
+        1
+    );
+    assert!(diagnostics.events().iter().any(|event| matches!(
+        event,
+        crate::capture_diagnostics::Event::Process {
+            operation: crate::capture_diagnostics::Operation::Begin,
+            timeout_ms: 50,
+            outcome: crate::capture_diagnostics::ProcessOutcome::Timeout,
+            ..
+        }
+    )));
 }
 #[test]
 fn artifact_and_receiver_boundaries_have_no_read_transaction_or_armed_sql_phase() {

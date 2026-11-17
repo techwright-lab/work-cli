@@ -2545,6 +2545,7 @@ fn gap_reports_are_journal_only_allowlisted_observations() {
 
 #[test]
 fn historical_recovery_qualifies_current_union_without_live_authority() {
+    let _diagnostics = crate::capture_diagnostics::Guard::new();
     use std::os::unix::fs::PermissionsExt;
     for closed in [false, true] {
         let h = ScopeHarness::new(true);
