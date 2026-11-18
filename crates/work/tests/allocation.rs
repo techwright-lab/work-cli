@@ -442,6 +442,9 @@ fn unresolved_legacy_charge_fails_closed_without_changing_digest() {
 #[test]
 fn concurrent_same_key_starts_return_one_checkout() {
     let f = Fixture::new();
+    // Create the authority first. This test covers two same-key creators,
+    // not two processes that initialize a new store at the same time.
+    drop(f.store());
     let barrier = std::sync::Barrier::new(2);
     let results = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..2)

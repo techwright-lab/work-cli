@@ -758,7 +758,6 @@ fn print_status(json: bool) {
         std::process::exit(1);
     });
     let os = std::env::consts::OS;
-    let qualification = "runtime qualification not verified";
     if config.store_dir.is_some() {
         match crate::interactive::status(&config) {
             Ok(report) => {
@@ -809,6 +808,5 @@ fn print_status(json: bool) {
         println!("status: not initialized (no store configured)");
     }
     println!("platform: {os}");
-    println!("qualification: {qualification}");
     println!("schema: {}", SchemaVersion::V1);
 }

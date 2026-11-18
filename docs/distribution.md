@@ -13,11 +13,11 @@ Work uses the selected Git without a version minimum. Work was run with Git
 2.48.1 to 2.56.0, and CI tests Git 2.55.0 and 2.56.0. `work doctor` warns when
 the Git is older than 2.48.1.
 
-The current release is v0.4.0. Its files are on
-[GitHub Releases](https://github.com/techwright-lab/work-cli/releases/tag/v0.4.0):
+The current release is v0.4.1. Its files are on
+[GitHub Releases](https://github.com/techwright-lab/work-cli/releases/tag/v0.4.1):
 
-- `work-0.4.0-linux-x86_64` - standalone Linux executable.
-- `work-0.4.0-macos-arm64` - standalone macOS executable.
+- `work-0.4.1-linux-x86_64` - standalone Linux executable.
+- `work-0.4.1-macos-arm64` - standalone macOS executable.
 - A `.sha256` checksum file for each executable.
 
 Linux x86_64: download the executable and its checksum file to the current
@@ -25,27 +25,27 @@ directory, then run:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-sha256sum --check work-0.4.0-linux-x86_64.sha256 &&
-  install -m 755 work-0.4.0-linux-x86_64 "$HOME/.local/bin/work" &&
+sha256sum --check work-0.4.1-linux-x86_64.sha256 &&
+  install -m 755 work-0.4.1-linux-x86_64 "$HOME/.local/bin/work" &&
   work --version
 ```
 
 macOS on Apple Silicon:
 
 ```sh
-base=https://github.com/techwright-lab/work-cli/releases/download/v0.4.0
-curl -fLO "$base/work-0.4.0-macos-arm64" &&
-  curl -fLO "$base/work-0.4.0-macos-arm64.sha256"
+base=https://github.com/techwright-lab/work-cli/releases/download/v0.4.1
+curl -fLO "$base/work-0.4.1-macos-arm64" &&
+  curl -fLO "$base/work-0.4.1-macos-arm64.sha256"
 mkdir -p "$HOME/.local/bin"
-shasum -a 256 -c work-0.4.0-macos-arm64.sha256 &&
-  install -m 755 work-0.4.0-macos-arm64 "$HOME/.local/bin/work" &&
+shasum -a 256 -c work-0.4.1-macos-arm64.sha256 &&
+  install -m 755 work-0.4.1-macos-arm64 "$HOME/.local/bin/work" &&
   work --version
 ```
 
 The macOS executable is not signed or notarized. A file that curl downloads
 runs. A file that a browser downloads has a quarantine attribute, and macOS
 blocks it. Remove the attribute before you install the file:
-`xattr -d com.apple.quarantine work-0.4.0-macos-arm64`.
+`xattr -d com.apple.quarantine work-0.4.1-macos-arm64`.
 
 Native `work setup` requires v0.3.0+.
 
@@ -119,9 +119,9 @@ requirement.** The helper supports Linux x86_64 only. Use the script in an
 extracted, verified release bundle:
 
 ```sh
-python3 /absolute/work-cli-0.4.0-linux-x86_64/tools/work_install.py install \
-  --version v0.4.0 --archive /downloads/work-cli-0.4.0-linux-x86_64.tar.gz \
-  --checksum /downloads/work-cli-0.4.0-linux-x86_64.tar.gz.sha256 \
+python3 /absolute/work-cli-0.4.1-linux-x86_64/tools/work_install.py install \
+  --version v0.4.1 --archive /downloads/work-cli-0.4.1-linux-x86_64.tar.gz \
+  --checksum /downloads/work-cli-0.4.1-linux-x86_64.tar.gz.sha256 \
   --skills-dir "$HOME/.agents/skills" --skills-dir "$HOME/.claude/skills"
 ```
 

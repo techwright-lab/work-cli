@@ -350,7 +350,6 @@ fn configured_status_does_not_claim_initialization_or_runtime_qualification() {
     let text = stdout_str(&output);
     assert!(text.contains("status: not initialized"));
     assert!(!text.contains("not inspected"));
-    assert!(text.contains("runtime qualification not verified"));
     assert_eq!(before, root.snapshot());
     assert_eq!(fs::read_to_string(&config_path).unwrap(), config);
 }
@@ -441,23 +440,6 @@ fn malformed_config_reports_only_safe_location() {
         assert_eq!(before, root.snapshot());
         assert_eq!(fs::read(&config_path).unwrap(), config);
     }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn status_reports_linux_qualification() {
-    let root = IsolatedRoot::new();
-    let output = run_work(&root, &["status"]);
-    assert!(output.status.success(), "{}", combined(&output));
-    let stdout = stdout_str(&output);
-    assert!(
-        stdout.contains("platform: linux"),
-        "status should report linux platform: {stdout}"
-    );
-    assert!(
-        stdout.contains("qualification: runtime qualification not verified"),
-        "Linux alone is not evidence of runtime qualification: {stdout}"
-    );
 }
 
 #[test]
