@@ -9,8 +9,8 @@ or remote-preservation configuration is required.
 
 ## Download the binary
 
-The current release is v0.4.0. Its assets are on
-[GitHub Releases](https://github.com/techwright-lab/work-cli/releases/tag/v0.4.0).
+The current release is v0.4.1. Its assets are on
+[GitHub Releases](https://github.com/techwright-lab/work-cli/releases/tag/v0.4.1).
 Each platform has a standalone binary and a `.sha256` checksum file. On Linux,
 download both files to the current directory, then run the commands. On macOS,
 the commands download both files.
@@ -19,27 +19,27 @@ Linux x86_64:
 
 ```sh
 mkdir -p "$HOME/.local/bin"
-sha256sum --check work-0.4.0-linux-x86_64.sha256 &&
-  install -m 755 work-0.4.0-linux-x86_64 "$HOME/.local/bin/work" &&
+sha256sum --check work-0.4.1-linux-x86_64.sha256 &&
+  install -m 755 work-0.4.1-linux-x86_64 "$HOME/.local/bin/work" &&
   work --version
 ```
 
 macOS on Apple Silicon:
 
 ```sh
-base=https://github.com/techwright-lab/work-cli/releases/download/v0.4.0
-curl -fLO "$base/work-0.4.0-macos-arm64" &&
-  curl -fLO "$base/work-0.4.0-macos-arm64.sha256"
+base=https://github.com/techwright-lab/work-cli/releases/download/v0.4.1
+curl -fLO "$base/work-0.4.1-macos-arm64" &&
+  curl -fLO "$base/work-0.4.1-macos-arm64.sha256"
 mkdir -p "$HOME/.local/bin"
-shasum -a 256 -c work-0.4.0-macos-arm64.sha256 &&
-  install -m 755 work-0.4.0-macos-arm64 "$HOME/.local/bin/work" &&
+shasum -a 256 -c work-0.4.1-macos-arm64.sha256 &&
+  install -m 755 work-0.4.1-macos-arm64 "$HOME/.local/bin/work" &&
   work --version
 ```
 
 The macOS binary is not signed or notarized. A file that curl downloads runs.
 A file that a browser downloads has a quarantine attribute, and macOS blocks it.
 Remove the attribute before you install the file:
-`xattr -d com.apple.quarantine work-0.4.0-macos-arm64`.
+`xattr -d com.apple.quarantine work-0.4.1-macos-arm64`.
 
 Native `work setup` requires v0.3.0+.
 
