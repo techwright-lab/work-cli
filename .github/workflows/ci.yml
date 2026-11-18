@@ -150,17 +150,21 @@ jobs:
         run: test "$(target/release/work --version)" = "work $(python3 tools/release_version.py)"
       - name: Lifecycle smoke
         run: tools/qualification/smoke-macos.sh "$PWD/target/release/work"
+      # The Rust cache restores target/, so package into a new directory
+      # under the canonical TMPDIR. The packager refuses an existing output.
       - name: Package
         run: |
+          dist="$TMPDIR/dist-macos"
+          echo "WORK_DIST_MACOS=$dist" >> "$GITHUB_ENV"
           python3 tools/package-common.py --version "$(python3 tools/release_version.py)" \
             --platform macos-arm64 --executable "$PWD/target/release/work" \
-            --source-root "$PWD" --output-dir "$PWD/target/dist-macos"
-          cd target/dist-macos
+            --source-root "$PWD" --output-dir "$dist"
+          cd "$dist"
           shasum -a 256 -c ./*.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: work-cli-macos-arm64
-          path: target/dist-macos/*
+          path: ${{ env.WORK_DIST_MACOS }}/*
           if-no-files-found: error
 
   build:
