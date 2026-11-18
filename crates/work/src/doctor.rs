@@ -401,7 +401,7 @@ pub(crate) fn report_with_git(
     Ok(Report { git: git_diagnostics, version: 1, repositories: repos.into_keys().collect(), inventory: entries.into_values().collect(),
         accounting: Accounting { status, charges: charges.unwrap_or_default(), reason: "accounting records lack checkout filesystem paths; cannot certify managed filesystem identity yet. Unknown means missing, partial, unsafe, unreadable or over-budget authority/store evidence; no initialization or repair attempted" },
         managed_filesystem_count: None, headroom, uncertainties,
-        size_basis: "bounded logical regular-file lengths, not allocated or reclaimed Btrfs bytes; null means incomplete/unsafe. Immediate root children only; nested checkouts are not exhaustively discovered. SQLite read-only WAL locks may update existing SHM bookkeeping; not byte immutability" })
+        size_basis: "bounded logical regular-file lengths, not allocated or reclaimed disk bytes; null means incomplete/unsafe. Immediate root children only; nested checkouts are not exhaustively discovered. SQLite read-only WAL locks may update existing SHM bookkeeping; not byte immutability" })
 }
 
 #[cfg(test)]
