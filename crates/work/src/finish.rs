@@ -150,12 +150,14 @@ fn allocation(conn: &Connection, checkout: Uuid) -> Result<(allocate::Allocation
         || a.request.task != task
         || identity.common_git_dir != std::path::Path::new(&repository)
         || identity.path != a.destination
-        || a.request
+        || !a
+            .request
             .root
             .as_ref()
-            .map(|root| root.join(&task))
-            .as_ref()
-            != Some(&a.destination)
+            .zip(a.request.repository.as_ref())
+            .is_some_and(|(root, repository)| {
+                allocate::recorded_destination(root, repository, &task, &a.destination)
+            })
     {
         return Err(StoreError::Invalid);
     }

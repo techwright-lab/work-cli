@@ -612,15 +612,14 @@ fn complete_headless_dry_run_previews_without_destination_changes() {
 }
 
 #[test]
-fn missing_headless_actor_repository_or_confirmation_fails_without_changes() {
+fn missing_headless_actor_or_confirmation_fails_without_changes() {
     let fixture = Fixture::new();
     let repo = path_str(&fixture.repo);
-    let cases: [(&[&str], &str); 3] = [
+    let cases: [(&[&str], &str); 2] = [
         (
             &["setup", "--repository", repo.as_str(), "--yes"],
             "inspect",
         ),
-        (&["setup", "--actor", "alice", "--yes"], "inspect"),
         (
             &["setup", "--actor", "alice", "--repository", repo.as_str()],
             "create",
@@ -715,7 +714,7 @@ fn registered_readonly_modes(warm: bool) {
         assert_eq!(started["request"]["task"], "readonly");
         assert_eq!(
             started["destination"],
-            path_str(&fixture.root_dir.join("readonly"))
+            path_str(&fixture.root_dir.join("repo/readonly"))
         );
         if warm {
             prime_readonly(&fixture, &started);
@@ -1537,35 +1536,22 @@ fn guided_interactive_accepts_displayed_defaults_and_prefills() {
 }
 
 #[test]
-fn setup_then_add_before_start_refuses_without_mutation() {
+fn setup_then_add_before_start_adds_the_repository() {
     let fixture = Fixture::new();
     apply(&fixture);
-    let before = fixture.snapshot();
-    let bytes = fs::read(fixture.config_path()).unwrap();
-    for guided in [false, true] {
-        let output = if guided {
-            fixture.run_stdin(
-                &["setup", "--interactive"],
-                &format!("{}\n\nnone\nyes\n", path_str(&fixture.extra_repo)),
-            )
-        } else {
-            fixture.run(&[
-                "setup",
-                "--add-repository",
-                fixture.extra_repo.to_str().unwrap(),
-                "--yes",
-            ])
-        };
-        assert!(!output.status.success(), "{guided}: {output:?}");
-        let parsed = report(&output);
-        assert_eq!(parsed["config_written"], false);
-        assert!(parsed["error"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("registered-root evidence"));
-        assert_eq!(fs::read(fixture.config_path()).unwrap(), bytes);
-        assert_unchanged(&before, &fixture.snapshot());
-    }
+    let output = fixture.run(&[
+        "setup",
+        "--add-repository",
+        fixture.extra_repo.to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(report(&output)["config_written"], true);
+    let config =
+        work_cli::config::Config::from_text(&fs::read_to_string(fixture.config_path()).unwrap())
+            .unwrap();
+    assert!(config.repositories.contains(&fixture.extra_repo));
+    assert!(!fixture.store_dir().exists());
 }
 
 #[test]

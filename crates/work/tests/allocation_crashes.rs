@@ -133,7 +133,7 @@ fn creation_rechecks_filter_policy_and_root_binding_after_creating_intent() {
         assert!(reached);
         assert!(result.is_err());
         assert!(!sentinel.exists());
-        assert!(!f.root.join("task").exists());
+        assert!(!f.checkout("task").exists());
         let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
         assert_eq!(
             conn.query_row(
@@ -350,7 +350,7 @@ fn subprocess_abort_boundaries_retain_exact_path_and_charge() {
                 .is_err());
         }
         if boundary == "created" {
-            assert!(f.root.join("task/.git").exists());
+            assert!(f.checkout("task").join(".git").exists());
         }
     }
 }
@@ -415,7 +415,7 @@ fn reserved_retry_rejects_replaced_source_authority() {
     );
     let out = f.start(&operation.to_string(), "task", "topic", &[]);
     assert!(!out.status.success(), "reservation retargeted");
-    assert!(!f.root.join("task").exists());
+    assert!(!f.checkout("task").exists());
     assert!(!git(&other, &["worktree", "list", "--porcelain"]).contains(f.root.to_str().unwrap()));
     let after: (String, Vec<u8>) = conn
         .query_row("SELECT repository,digest FROM checkouts", [], |r| {
@@ -465,22 +465,26 @@ fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
             }
             "inode" => record["identity"]["directory"]["inode"] = 0.into(),
             "gitdir" => std::fs::write(
-                f.root.join("task/.git"),
+                f.checkout("task").join(".git"),
                 format!("gitdir: {}\n", f.repo.join(".git").display()),
             )
             .unwrap(),
             "registration" => std::fs::write(
                 marker.parent().unwrap().join("gitdir"),
-                f.root.join("wrong/.git").to_str().unwrap(),
+                f.checkout("wrong").join(".git").to_str().unwrap(),
             )
             .unwrap(),
             "replacement" => {
-                std::fs::rename(f.root.join("task"), f.root.join("original")).unwrap();
-                std::fs::create_dir(f.root.join("task")).unwrap();
-                std::fs::copy(f.root.join("original/.git"), f.root.join("task/.git")).unwrap();
+                std::fs::rename(f.checkout("task"), f.checkout("original")).unwrap();
+                std::fs::create_dir(f.checkout("task")).unwrap();
+                std::fs::copy(
+                    f.checkout("original").join(".git"),
+                    f.checkout("task").join(".git"),
+                )
+                .unwrap();
             }
             "nonancestor" => {
-                let path = f.root.join("task");
+                let path = f.checkout("task");
                 git(&path, &["checkout", "--orphan", "unrelated"]);
                 git(&path, &["commit", "--allow-empty", "-m", "unrelated"]);
                 let head = git(&path, &["rev-parse", "HEAD"]);
@@ -546,7 +550,7 @@ fn reboot_reconciles_durable_evidence_but_marker_tampering_holds() {
                 "{damage}: writer eligibility not revoked"
             );
         }
-        assert!(f.root.join("task").exists());
+        assert!(f.checkout("task").exists());
         assert_eq!(
             f.store().charged(&f.repo, None).unwrap(),
             if damage == "copied" { 2 } else { 1 }
@@ -639,13 +643,12 @@ fn readiness_rechecks_marker_after_external_side_effects() {
         };
         let result = start_observed(&config, request, |boundary| {
             if boundary == "marker" {
-                let i =
-                    work_cli::identity::CheckoutIdentity::inspect(&f.root.join("task")).unwrap();
+                let i = work_cli::identity::CheckoutIdentity::inspect(&f.checkout("task")).unwrap();
                 if damage == "marker" {
                     std::fs::write(i.private_git_dir.join("work-lease.json"), "{}").unwrap();
                 } else {
                     git(
-                        &f.root.join("task"),
+                        &f.checkout("task"),
                         &["commit", "--allow-empty", "-m", "premature"],
                     );
                 }
@@ -664,7 +667,7 @@ fn fifo_backlink_is_not_opened_as_blocking_metadata() {
     let f = Fixture::new();
     let op = Uuid::now_v7().to_string();
     assert!(f.start(&op, "task", "topic", &[]).status.success());
-    let identity = work_cli::identity::CheckoutIdentity::inspect(&f.root.join("task")).unwrap();
+    let identity = work_cli::identity::CheckoutIdentity::inspect(&f.checkout("task")).unwrap();
     let backlink = identity.private_git_dir.join("gitdir");
     std::fs::remove_file(&backlink).unwrap();
     fifo::create_fifo(&backlink, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR);
@@ -705,7 +708,7 @@ fn fifo_backlink_is_not_opened_as_blocking_metadata() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
-    assert!(f.root.join("task").exists());
+    assert!(f.checkout("task").exists());
 }
 
 #[test]
@@ -745,7 +748,7 @@ fn blocked_git_on_reserved_retry_is_bounded_and_persistently_held() {
     let out = f.start(&operation.to_string(), "task", "topic", &[]);
     assert!(!out.status.success());
     assert!(before.elapsed() < std::time::Duration::from_secs(4));
-    assert!(!f.root.join("task").exists());
+    assert!(!f.checkout("task").exists());
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
     let state: (String, bool) = conn
         .query_row("SELECT state,ready FROM checkouts", [], |r| {
@@ -794,7 +797,7 @@ fn moved_reuse_branch_boundary_is_persistently_held() {
         }
     })
     .is_err());
-    assert!(!f.root.join("task").exists());
+    assert!(!f.checkout("task").exists());
     let conn = rusqlite::Connection::open(f.temp.path().join("private/store.sqlite")).unwrap();
     let state: (String, bool) = conn
         .query_row("SELECT state,ready FROM checkouts", [], |r| {

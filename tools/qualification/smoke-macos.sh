@@ -54,7 +54,7 @@ work setup --actor smoke --repository "$repo" --skills none --yes >/dev/null
 
 started=$(work start --task smoke --base main)
 checkout=$(field "$started" destination)
-[ "$checkout" = "$home/worktrees/smoke" ] || fail "unexpected checkout: $checkout"
+[ "$checkout" = "$home/worktrees/repo/smoke" ] || fail "unexpected checkout: $checkout"
 
 echo change >"$checkout/change.txt"
 git -C "$checkout" add change.txt

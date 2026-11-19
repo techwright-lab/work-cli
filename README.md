@@ -146,19 +146,22 @@ JSON goes to stdout.
 
 ```sh
 work setup
-work setup --actor alice --repository /home/alice/src/project --yes
-work setup --actor alice --repository /home/alice/src/project --dry-run
+work setup --yes
+work setup --dry-run
 work setup --check
-work setup --actor alice --repository /home/alice/src/project --skills standard --yes
-work setup --add-repository /home/alice/src/other --root /home/alice/worktrees --yes
+work setup --root /home/alice/projects/.worktrees --skills standard --yes
+work setup --add-repository /home/alice/src/other --yes
 ```
 
-Headless apply needs `--actor`, at least one `--repository`, and `--yes`.
+Headless apply needs only `--yes`. The actor comes from Git: the part of the
+global `user.email` before `@`, else `user.name`, lowercased, with characters
+other than letters, digits, `.` and `_` replaced by `-`. Setup asks for the
+actor only when Git has neither value; headless setup then needs `--actor`.
+Repositories are optional: `work start` adds the repository it runs in.
 `--dry-run` must not combine with `--yes`. `--check` is inspection-only and
 rejects action flags. `--interactive` enables the same prompts on non-terminal
 input. A terminal with `--yes` never prompts. `--yes` confirms a valid proposal;
-it does not overwrite protected settings. Setup does not infer actor from Git or
-passwd; interactive mode may suggest a valid `USER` for the operator to accept.
+it does not overwrite protected settings.
 Discovery, defaults, existing-config limits, writer safety and the passive `-shm`
 exception are in [download, install, update and release instructions](docs/distribution.md).
 
@@ -172,10 +175,16 @@ no HOME fallback. Copying the example remains an advanced alternative on v0.3.0+
 Create the managed root first. Keep the store and registry outside repositories
 and managed roots.
 
-A single configured repository/root and the top-level `actor` supply defaults.
-With multiple repositories or roots, pass `--repository` and `--root` explicitly.
+`work start` uses the Git repository that contains the current directory. Outside
+a repository, a single configured repository is the default. A repository that is
+not in the configuration is added to it on first use. A single configured root and
+the top-level `actor` supply defaults; with multiple roots, pass `--root`.
 `--actor` overrides the configured actor. Task names use letters, digits, `_`,
 `-`, or `.`, with no leading dot/dash or consecutive dots.
+
+Each checkout is created at `ROOT/REPOSITORY/TASK`, where `REPOSITORY` is the
+repository's folder name. Checkouts recorded by earlier releases at `ROOT/TASK`
+keep their paths.
 
 ## Daily workflow
 
@@ -185,9 +194,10 @@ release, including v0.2.0.
 
 ```sh
 export WORK_CONFIG=/absolute/path/to/work.toml
+cd /home/alice/src/project
 work start --task fix-login
 # JSON reports the checkout UUID and destination. Keep these for recovery.
-cd /home/alice/worktrees/fix-login
+cd /home/alice/worktrees/project/fix-login
 # Run your interactive agent or editor here; commit the changes you want to keep.
 
 # Stop all agents and editors using this checkout, then leave it.

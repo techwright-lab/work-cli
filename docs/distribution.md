@@ -179,18 +179,21 @@ JSON on stdout.
 
 ```sh
 work setup
-work setup --actor alice --repository /home/alice/src/project --yes
-work setup --actor alice --repository /home/alice/src/project --dry-run
+work setup --yes
+work setup --dry-run
 work setup --check
-work setup --actor alice --repository /home/alice/src/project --skills standard --yes
-work setup --add-repository /home/alice/src/other --root /home/alice/worktrees --yes
+work setup --root /home/alice/projects/.worktrees --skills standard --yes
+work setup --add-repository /home/alice/src/other --yes
 ```
 
-Headless creation requires explicit `--actor`, at least one `--repository`, and
-`--yes` (or `--dry-run` without `--yes`). Other new-install fields derive only
-from usable HOME/state paths; otherwise pass them explicitly. Do not infer actor
-from Git or passwd. Interactive mode may suggest a valid `USER` for the operator
-to accept. `--interactive` selects the same prompts for controlled input.
+Headless creation requires `--yes` (or `--dry-run` without `--yes`). Setup takes
+the actor from the global Git configuration: the part of `user.email` before
+`@`, else `user.name`. It lowercases the value and replaces characters other
+than letters, digits, `.` and `_` with `-`. Setup asks for the actor only when
+Git has neither value; in headless setup, pass `--actor`. `--actor` always
+overrides Git. Repositories are optional: `work start` adds the repository it
+runs in. Other new-install fields derive only from usable HOME/state paths;
+otherwise pass them explicitly. `--interactive` selects the same prompts for controlled input.
 Non-terminal stdin without `--interactive`, and a terminal with `--yes`, never
 prompt. `--yes` confirms a validated proposal; it is not permission to overwrite
 protected settings. `--dry-run` must not combine with `--yes`. `--check` is
@@ -231,9 +234,10 @@ initializes and allocates under operator authority. Setup does not start a task.
 
 Existing configuration is read-only inspection by default. Guided mode inspects
 prerequisites before offering additions or skills. `--add-repository` appends
-only canonical repositories when a positively identified registered root admits
-read-only. Before the first `start`, absent endpoints are not registration proof;
-addition refuses without mutation. `--root` selects an existing registered root
+only canonical repositories. Before the first `start` no store exists, and the
+addition proceeds. After it, a positively identified registered root must admit
+read-only. `work start` makes the same addition for an unlisted repository.
+`--root` selects an existing registered root
 for next-step guidance only; it does not change the root list. Actor, roots,
 store, registry and allocation are protected. There is no adopt, migrate, repair,
 rebind, force or prune path. Unknown TOML is preserved. A duplicate addition
@@ -287,7 +291,9 @@ native skill snapshots embed SKILL.md, its setup reference and this runbook, not
 selects a different authority explicitly.
 
 Verify `work status --json` before allocation: missing authority stays uninitialized.
-Start with an intended base, for example `work start --task TASK --base origin/main`.
+Start inside the repository with an intended base, for example
+`work start --task TASK --base origin/main`. The checkout is created at
+`ROOT/REPOSITORY/TASK`, where `REPOSITORY` is the repository's folder name.
 Run the agent/editor in the returned destination and retain checkout/operation IDs.
 Finish, preview and operator-confirmed removal remain separate steps.
 

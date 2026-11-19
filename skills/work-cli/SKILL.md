@@ -32,9 +32,12 @@ task completion, stopped-writer confirmation and removal as separate decisions.
    ASCII task slug and an explicit repository/base branch. Resolve the base with
    `git rev-parse --verify BASE^{commit}` before allocation; ask for the base when
    none is specified and the repository's remote default is unknown.
-4. Allocate with `work start --task TASK --base BASE`. Supply `--repository`,
-   `--root` and `--actor` when configuration does not select exactly one intended
-   value. Keep the returned checkout UUID, destination and JSON
+4. Allocate with `work start --task TASK --base BASE` from inside the repository.
+   Work uses the repository that contains the current directory and adds it to
+   the configuration on first use. The checkout is created at
+   `ROOT/REPOSITORY/TASK`. Supply `--repository`, `--root` and `--actor` when the
+   current directory or configuration does not select the intended value. Keep
+   the returned checkout UUID, destination and JSON
    `request.operation` as the task record. Reuse the returned live checkout for
    the same task/actor; retain its original operation for exact retries.
 5. Run edits, Git and verification in the returned destination. Keep evidence and

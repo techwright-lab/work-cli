@@ -383,7 +383,7 @@ fn actual_pipeline_projects_git_identity_commits_before_exec_and_closes_only_sco
         fs::read_to_string(h.f.temp.path().join("cwd"))
             .unwrap()
             .trim(),
-        h.f.root.join("task").to_str().unwrap()
+        h.f.checkout("task").to_str().unwrap()
     );
     assert_eq!(
         fs::read(h.f.repo.join(".git/config")).unwrap(),
@@ -1070,7 +1070,7 @@ fn ready_preflights_atomically_refresh_descendant_head_without_changing_lease_ba
             }
         })
         .unwrap();
-    let path = h.f.root.join("task");
+    let path = h.f.checkout("task");
     let marker_path = h
         .allocation
         .identity
@@ -1143,7 +1143,7 @@ fn fresh_lease_damage_refuses_before_intent_and_never_revives_holds() {
             )
             .unwrap(),
             "path" => {
-                fs::rename(h.f.root.join("task"), h.f.root.join("moved")).unwrap();
+                fs::rename(h.f.checkout("task"), h.f.checkout("moved")).unwrap();
             }
             "held" => {
                 let sidecars = ["store.sqlite-wal", "store.sqlite-shm"]
