@@ -36,6 +36,11 @@ impl Fixture {
     pub fn config(&self, quota: u64, sink: bool) {
         std::fs::write(self.temp.path().join("config.toml"), format!("store_dir = {:?}\ntrusted_registry = {:?}\nroots = [{:?}]\nrepositories = [{:?}]\n[allocation]\nrepository_limit = {quota}\nowner_limit = {quota}\nfloor_bytes = 0\nwarn_bytes = 0\n{}", self.temp.path().join("private"), self.temp.path().join("registry"), self.root, self.repo, if sink {"capture_sink = 'unsupported'\n"} else {""})).unwrap();
     }
+    /// Where `start` creates the checkout for `task`.
+    #[allow(dead_code)]
+    pub fn checkout(&self, task: &str) -> PathBuf {
+        self.root.join("repo").join(task)
+    }
     pub fn start(&self, op: &str, task: &str, branch: &str, extra: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_work"))
             .args([

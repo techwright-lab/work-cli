@@ -240,7 +240,7 @@ fn integrated_two_distinct_captures_restore_ready_without_recharging() {
             })
             .unwrap();
         let certificate: serde_json::Value = serde_json::from_str(&body).unwrap();
-        let actual = work_cli::identity::CheckoutIdentity::inspect(&h.f.root.join("task")).unwrap();
+        let actual = work_cli::identity::CheckoutIdentity::inspect(&h.f.checkout("task")).unwrap();
         assert_eq!(certificate["physical"]["checkout"]["head"], actual.head);
         assert_eq!(keeper.charged(&h.f.repo, None).unwrap(), 1);
     }

@@ -873,11 +873,19 @@ fn snapshot_in_transaction(
         || allocation.request.task != task
         || !alias_ok
         || !requested_alias
-        || allocation
+        || !allocation
             .request
             .root
             .as_ref()
-            .is_none_or(|root| root.join(&allocation.request.task) != allocation.destination)
+            .zip(allocation.request.repository.as_ref())
+            .is_some_and(|(root, repository)| {
+                crate::allocate::recorded_destination(
+                    root,
+                    repository,
+                    &allocation.request.task,
+                    &allocation.destination,
+                )
+            })
         || identity.path == identity.common_git_dir
         || identity.private_git_dir == identity.common_git_dir
         || identity.boot_id.is_empty()

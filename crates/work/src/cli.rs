@@ -389,11 +389,28 @@ pub(crate) fn dispatch_public(args: &[std::ffi::OsString]) {
                 request.operation
             );
             let result = (|| {
-                let document =
+                let mut document =
                     crate::config::ConfigDocument::load().map_err(std::io::Error::other)?;
-                let config = document.execution().map_err(std::io::Error::other)?;
-                if request.repository.is_none() && config.repositories.len() == 1 {
-                    request.repository = config.repositories.first().cloned();
+                let mut config = document.execution().map_err(std::io::Error::other)?;
+                if request.repository.is_none() {
+                    let git = crate::git::GitInvocation::new(
+                        git_override.clone(),
+                        config.git_path.clone(),
+                    );
+                    request.repository = crate::setup::current_repository(&git).or_else(|| {
+                        (config.repositories.len() == 1).then(|| config.repositories[0].clone())
+                    });
+                }
+                if let Some(repository) = &request.repository {
+                    if !config.repositories.contains(repository) {
+                        crate::setup::add_repository_for_start(repository).map_err(|reason| {
+                            std::io::Error::other(format!("repository not added: {reason}"))
+                        })?;
+                        eprintln!("added repository: {}", repository.display());
+                        document =
+                            crate::config::ConfigDocument::load().map_err(std::io::Error::other)?;
+                        config = document.execution().map_err(std::io::Error::other)?;
+                    }
                 }
                 if request.root.is_none() && config.roots.len() == 1 {
                     request.root = config.roots.first().cloned();

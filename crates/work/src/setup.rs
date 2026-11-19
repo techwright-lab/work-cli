@@ -35,7 +35,7 @@ enum SkillsArg {
 pub(crate) struct SetupArgs {
     #[arg(skip)]
     pub(crate) git_path: Option<PathBuf>,
-    /// Accountable actor; required for headless creation
+    /// Accountable actor; defaults to the Git user.email local part, else user.name
     #[arg(long)]
     actor: Option<String>,
     /// Existing local non-bare Git repository (repeatable)
@@ -228,6 +228,54 @@ pub(crate) fn command(args: SetupArgs) {
     if !successful(&report) {
         std::process::exit(1);
     }
+}
+
+/// `work start` adds an unlisted repository to the selected configuration.
+pub(crate) fn add_repository_for_start(repository: &Path) -> Result<(), String> {
+    let path = Config::discover_path().ok_or("configuration discovery is disabled")?;
+    let args = SetupArgs {
+        git_path: None,
+        actor: None,
+        repository: Vec::new(),
+        root: None,
+        store_dir: None,
+        trusted_registry: None,
+        repository_limit: None,
+        owner_limit: None,
+        floor_bytes: None,
+        warn_bytes: None,
+        skills: None,
+        yes: true,
+        interactive: false,
+        dry_run: false,
+        check: false,
+        add_repository: vec![repository.to_path_buf()],
+    };
+    let report = run_with_path(args, path, &mut io::empty(), &mut io::sink());
+    if successful(&report) {
+        Ok(())
+    } else {
+        Err(report
+            .error
+            .map(|error| error.reason)
+            .unwrap_or_else(|| "repository was not added".into()))
+    }
+}
+
+/// The main checkout of the Git repository that contains the current directory.
+pub(crate) fn current_repository(invocation: &crate::git::GitInvocation) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let common = git(
+        invocation,
+        Some(&cwd),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let common = PathBuf::from(String::from_utf8(common).ok()?.trim());
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent()?.canonicalize().ok()
 }
 
 pub(crate) fn execute(args: SetupArgs) -> SetupReport {
@@ -545,7 +593,7 @@ fn collect_create(
     }
     writer_ancestors(path, true).map_err(Collect::from)?;
     let invocation = crate::git::GitInvocation::new(args.git_path.clone(), None);
-    let actor = collect_actor(args, prompting, stdin, stderr)?;
+    let actor = collect_actor(args, prompting, stdin, stderr, &invocation)?;
     let repositories = collect_repositories(args, prompting, stdin, stderr, &invocation)?;
     let root = collect_path_field(
         args.root.as_ref(),
@@ -875,7 +923,14 @@ fn collect_existing(
             ));
         }
         if !pending.is_empty() {
-            require_registered(&execution, path)?;
+            // Before the first `work start` no authority exists to conflict with.
+            let uninitialized = match (&execution.store_dir, &execution.trusted_registry) {
+                (Some(store), Some(registry)) => endpoints_absent(store, registry)?,
+                _ => false,
+            };
+            if !uninitialized {
+                require_registered(&execution, path)?;
+            }
             validate_config_writer(path, SetupAction::AddRepositories)?;
             let validated = validate_repositories(&invocation, &pending, &roots_for_git)?;
             for repo in validated {
@@ -1317,9 +1372,13 @@ fn collect_actor(
     prompting: bool,
     stdin: &mut dyn BufRead,
     stderr: &mut dyn Write,
+    invocation: &crate::git::GitInvocation,
 ) -> Result<String, Collect> {
     if let Some(actor) = &args.actor {
         return valid_actor(actor);
+    }
+    if let Some(actor) = git_actor(invocation) {
+        return Ok(actor);
     }
     if prompting {
         let suggested = std::env::var("USER")
@@ -1344,10 +1403,48 @@ fn collect_actor(
             SetupAction::Inspect,
             Some("actor"),
             None,
-            "headless creation requires --actor",
+            "Git has no user.email or user.name; pass --actor",
         )
         .into())
     }
+}
+
+/// The local part of the global Git user.email, else user.name, as an actor.
+fn git_actor(invocation: &crate::git::GitInvocation) -> Option<String> {
+    let email = git_identity(invocation, "user.email");
+    let local = email.as_deref().and_then(|email| email.split('@').next());
+    let name = git_identity(invocation, "user.name");
+    let actor = [local, name.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|text| crate::allocate::slug(&text.to_lowercase()));
+    actor
+}
+
+fn git_identity(invocation: &crate::git::GitInvocation, key: &str) -> Option<String> {
+    let binding = invocation.binding().ok()?;
+    let command = binding
+        .command(std::iter::empty::<&str>(), |command| {
+            command
+                .args(["config", "--global", "--includes", "--get", key])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0");
+            for name in ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        })
+        .ok()?;
+    let output = command
+        .dispatch(|command| crate::bounded_process::output(command, Duration::from_secs(2), 4096))
+        .ok()?
+        .ok()?;
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (output.status.success() && !value.is_empty()).then(|| value.to_owned())
 }
 
 fn valid_actor(actor: &str) -> Result<String, Collect> {
@@ -1365,36 +1462,19 @@ fn collect_repositories(
     stderr: &mut dyn Write,
     invocation: &crate::git::GitInvocation,
 ) -> Result<Vec<PathBuf>, Collect> {
-    if !args.repository.is_empty() {
+    if !args.repository.is_empty() || !prompting {
         return Ok(args.repository.clone());
-    }
-    if !prompting {
-        return Err(fail_val(
-            SetupAction::Inspect,
-            Some("repository"),
-            None,
-            "headless creation requires --repository",
-        )
-        .into());
     }
     let cwd_default = std::env::current_dir()
         .ok()
         .and_then(|cwd| validate_repositories(invocation, std::slice::from_ref(&cwd), &[]).ok())
         .and_then(|mut repos| repos.pop());
     let shown = cwd_default.as_ref().and_then(|path| path.to_str());
-    let first = match prompt(stderr, stdin, "Repository", shown)? {
+    let first = match prompt(stderr, stdin, "Repository (empty for none)", shown)? {
         None => return Err(Collect::Cancel),
         Some(value) if value.is_empty() => match cwd_default {
             Some(path) => path,
-            None => {
-                return Err(fail_val(
-                    SetupAction::Create,
-                    Some("repository"),
-                    None,
-                    "empty response cannot accept an undisplayed default",
-                )
-                .into());
-            }
+            None => return Ok(Vec::new()),
         },
         Some(value) => PathBuf::from(value),
     };
@@ -1572,14 +1652,6 @@ fn validate_repositories(
     paths: &[PathBuf],
     roots: &[PathBuf],
 ) -> Result<Vec<PathBuf>, Fail> {
-    if paths.is_empty() {
-        return Err(fail_val(
-            SetupAction::Inspect,
-            Some("repository"),
-            None,
-            "at least one repository is required",
-        ));
-    }
     admit_git_version(invocation)?;
     let mut out = Vec::new();
     for path in paths {

@@ -5,6 +5,14 @@
 **Engine:** waves
 **Release preparation:** v0.3.0; publication and host upgrade are separate operator actions.
 
+## Amendment (2026-11-19, operator decision)
+
+This amendment replaces three rules below.
+
+- **Actor.** Setup takes the actor from the global Git configuration: the part of `user.email` before `@`, else `user.name`, lowercased, with unsafe characters replaced by `-`. It asks only when Git has neither value. Headless setup then requires `--actor`. This replaces "Do not infer authority from Git user.name or a passwd entry".
+- **Repositories.** Setup no longer requires a repository. `work start` uses the repository that contains the current directory and adds an unlisted repository to the configuration. Before the first `start`, `--add-repository` proceeds because no authority exists yet.
+- **Checkout path.** New checkouts are created at `ROOT/REPOSITORY/TASK`, where `REPOSITORY` is the repository's folder name. Records at `ROOT/TASK` from earlier releases stay valid.
+
 ## Problem
 
 Framing: kept. The request reaches the shared configuration owner rather than adding caller-specific workarounds or a second runtime settings model.

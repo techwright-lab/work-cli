@@ -116,7 +116,7 @@ fn start_is_durable_idempotent_policy_bound_and_not_a_writer() {
     );
     let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(value["stage"], "ready");
-    let path = f.root.join("task");
+    let path = f.checkout("task");
     assert!(path.join(".git").is_file());
     assert!(!path.join("work-lease.json").exists());
     f.config(0, false);
@@ -221,7 +221,7 @@ fn ready_descendant_commit_is_reused_but_changed_branch_is_held() {
     let f = Fixture::new();
     let op = Uuid::now_v7().to_string();
     assert!(f.start(&op, "task", "topic", &[]).status.success());
-    let checkout = f.root.join("task");
+    let checkout = f.checkout("task");
     let identity = work_cli::identity::CheckoutIdentity::inspect(&checkout).unwrap();
     let marker = identity.private_git_dir.join("work-lease.json");
     let baseline = std::fs::read(&marker).unwrap();
@@ -254,7 +254,7 @@ fn synthetic_git_parents_cannot_authorize_ready_descendant_reuse() {
         let f = Fixture::new();
         let op = Uuid::now_v7().to_string();
         assert!(f.start(&op, "task", "topic", &[]).status.success());
-        let checkout = f.root.join("task");
+        let checkout = f.checkout("task");
         let prior = work_cli::identity::CheckoutIdentity::inspect(&checkout).unwrap();
         let marker = prior.private_git_dir.join("work-lease.json");
         let marker_bytes = std::fs::read(&marker).unwrap();
@@ -379,7 +379,7 @@ fn sibling_alias_and_legacy_path_charge_share_capacity() {
             "legacy={legacy}: {}",
             String::from_utf8_lossy(&out.stdout)
         );
-        assert!(!f.root.join("second").exists());
+        assert!(!f.checkout("second").exists());
         // A denied charge must not publish the staged sibling alias. Count the
         // existing charged identity instead; legacy rows/digests remain unchanged.
         assert_eq!(f.store().charged(&f.repo, None).unwrap(), 1);
@@ -432,7 +432,7 @@ fn unresolved_legacy_charge_fails_closed_without_changing_digest() {
         .unwrap();
     let out = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
     assert!(!out.status.success());
-    assert!(!f.root.join("task").exists());
+    assert!(!f.checkout("task").exists());
     let retained: Vec<u8> = conn
         .query_row("SELECT digest FROM checkouts", [], |r| r.get(0))
         .unwrap();
@@ -621,14 +621,14 @@ fn unsafe_names_collisions_and_unsupported_capture_never_grant_ready() {
         assert_eq!(f.store().charged(&f.repo, None).unwrap(), 0);
     }
     let f = Fixture::new();
-    std::fs::create_dir(f.root.join("task")).unwrap();
-    std::fs::write(f.root.join("task/precious"), "keep").unwrap();
+    std::fs::create_dir_all(f.checkout("task")).unwrap();
+    std::fs::write(f.checkout("task").join("precious"), "keep").unwrap();
     assert!(!f
         .start(&Uuid::now_v7().to_string(), "task", "topic", &[])
         .status
         .success());
     assert_eq!(
-        std::fs::read_to_string(f.root.join("task/precious")).unwrap(),
+        std::fs::read_to_string(f.checkout("task").join("precious")).unwrap(),
         "keep"
     );
     f.config(10, true);
@@ -636,7 +636,7 @@ fn unsafe_names_collisions_and_unsupported_capture_never_grant_ready() {
         .start(&Uuid::now_v7().to_string(), "new", "new", &[])
         .status
         .success());
-    assert!(!f.root.join("new").exists());
+    assert!(!f.checkout("new").exists());
 }
 
 #[test]
@@ -661,7 +661,7 @@ fn existing_branch_requires_explicit_reuse_and_preserves_commits() {
         )
         .status
         .success());
-    assert_eq!(git(&f.root.join("task"), &["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&f.checkout("task"), &["rev-parse", "HEAD"]), head);
 }
 
 #[test]
@@ -768,7 +768,7 @@ fn executable_checkout_filters_are_rejected_before_materialization() {
         let out = f.start(&Uuid::now_v7().to_string(), "task", "topic", &[]);
         assert!(!sentinel.exists(), "{kind} executed");
         assert!(!out.status.success(), "{kind} was allowed");
-        assert!(!f.root.join("task").exists());
+        assert!(!f.checkout("task").exists());
     }
 }
 
@@ -800,7 +800,7 @@ fn git_configuration_environment_cannot_inject_checkout_commands() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(f.root.join("task/.git").exists());
+    assert!(f.checkout("task").join(".git").exists());
     assert!(!sentinel.exists());
 }
 

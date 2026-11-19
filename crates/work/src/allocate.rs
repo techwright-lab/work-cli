@@ -14,7 +14,7 @@ use std::{
     fs,
     io::{self, Write},
     os::unix::fs::OpenOptionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 
@@ -85,6 +85,59 @@ pub(crate) fn component(s: &str) -> bool {
         && !s.contains("..")
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+/// Turns free text into a `component`: unsafe characters become `-`.
+pub(crate) fn slug(text: &str) -> Option<String> {
+    let mut out = String::new();
+    for c in text.chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            c
+        } else {
+            '-'
+        };
+        if !(matches!(c, '-' | '.') && out.ends_with(c)) {
+            out.push(c);
+        }
+    }
+    let out: String = out
+        .trim_start_matches(['-', '.'])
+        .trim_end_matches('-')
+        .chars()
+        .take(128)
+        .collect();
+    component(&out).then_some(out)
+}
+/// Checkouts live at `<root>/<repository folder>/<task>`.
+pub(crate) fn destination(root: &Path, repository: &Path, task: &str) -> io::Result<PathBuf> {
+    let folder = repository
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(slug)
+        .ok_or_else(|| err("repository folder name has no usable characters"))?;
+    Ok(root.join(folder).join(task))
+}
+/// Records written before the repository folder was added use `<root>/<task>`.
+pub(crate) fn recorded_destination(
+    root: &Path,
+    repository: &Path,
+    task: &str,
+    recorded: &Path,
+) -> bool {
+    recorded == root.join(task)
+        || destination(root, repository, task).is_ok_and(|current| current == recorded)
+}
+/// Git creates a missing repository folder. An existing one must be a real
+/// directory, so a symlink cannot move the checkout outside the root.
+fn plain_parent(destination: &Path) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| err("destination parent missing"))?;
+    match fs::symlink_metadata(parent) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(meta) if meta.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(err("checkout parent is not a directory")),
+        Err(error) => Err(error),
+    }
 }
 #[cfg(test)]
 pub(crate) fn save(store: &mut Store, a: &Allocation) -> io::Result<()> {
@@ -2314,7 +2367,8 @@ fn candidate_observation_with_git(
     if repo.join(".gitmodules").exists() || source.common_git_dir.join("modules").exists() {
         return Err(err("unsupported submodule layout; hold"));
     }
-    let destination = r.root.as_ref().unwrap().join(&r.task);
+    let destination = destination(r.root.as_ref().unwrap(), repo, &r.task)?;
+    plain_parent(&destination)?;
     if fs::symlink_metadata(&destination).is_ok() {
         return Err(err(
             "destination collision; never adopting existing directory",
@@ -2464,7 +2518,12 @@ fn create_with_git(
     let source = (|| {
         let normalized = normalize(config, a.request.clone())?;
         if normalized != a.request
-            || a.destination != normalized.root.as_ref().unwrap().join(&normalized.task)
+            || !recorded_destination(
+                normalized.root.as_ref().unwrap(),
+                normalized.repository.as_ref().unwrap(),
+                &normalized.task,
+                &a.destination,
+            )
             || !matches!(a.base_commit.len(), 40 | 64)
             || !a
                 .base_commit
@@ -2527,6 +2586,7 @@ fn create_with_git(
             return Err(err("creation request changed"));
         }
         recheck_creation_root(&root, a.request.root.as_ref().unwrap())?;
+        plain_parent(&a.destination)?;
         if fs::symlink_metadata(&a.destination).is_ok() {
             return Err(err("destination collision before Git add"));
         }
@@ -2640,6 +2700,7 @@ fn create_with_git(
         fs::File::open(marker.parent().unwrap())?.sync_all()?;
         fs::File::open(&a.destination)?.sync_all()?;
         fs::File::open(a.destination.parent().unwrap())?.sync_all()?;
+        fs::File::open(a.request.root.as_ref().unwrap())?.sync_all()?;
         Ok::<_, io::Error>(())
     })();
     if let Err(error) = marker_result {
@@ -2685,4 +2746,40 @@ pub(crate) fn observe_reconciliation(
     guard: &crate::checkout_guard::CheckoutGuard,
 ) -> io::Result<PhysicalObservation> {
     observe_reconciliation_with_git(&crate::git::GitInvocation::new(None, None), store, a, guard)
+}
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn checkouts_go_under_the_repository_folder_and_old_records_stay_valid() {
+        let root = Path::new("/w");
+        let repo = Path::new("/src/My Project");
+        assert_eq!(
+            destination(root, repo, "t").unwrap(),
+            Path::new("/w/My-Project/t")
+        );
+        assert!(recorded_destination(
+            root,
+            repo,
+            "t",
+            Path::new("/w/My-Project/t")
+        ));
+        assert!(recorded_destination(root, repo, "t", Path::new("/w/t")));
+        assert!(!recorded_destination(
+            root,
+            repo,
+            "t",
+            Path::new("/w/other/t")
+        ));
+    }
+
+    #[test]
+    fn slug_keeps_safe_characters_and_replaces_the_rest() {
+        assert_eq!(slug("Ravi Yadav").as_deref(), Some("Ravi-Yadav"));
+        assert_eq!(slug("first+tag").as_deref(), Some("first-tag"));
+        assert_eq!(slug("a..b").as_deref(), Some("a.b"));
+        assert_eq!(slug(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(slug("@@@"), None);
+    }
 }

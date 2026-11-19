@@ -29,18 +29,21 @@
    cached version through the helper. Preserve every Work store, registry,
    checkout and outbox. Keep binary rollback separate from data repair.
 8. For a v0.3.0+ binary, run `work setup` only after that onboarding
-   authorization. Headless creation requires `--actor`, at least one
-   `--repository`, and `--yes`. Use `--dry-run` without `--yes` to preview. Use
+   authorization. Headless creation requires `--yes`. Setup takes the actor from
+   the global Git `user.email` (the part before `@`), else `user.name`; pass
+   `--actor` only when Git has neither or the operator chooses another actor.
+   Repositories are optional. Use `--dry-run` without `--yes` to preview. Use
    `--check` for inspection only. Default skill selection is none; pass
    `--skills standard` or `--skills all` only when the operator selects them.
    After a confirmed skill action, follow step 4 for catalog-reload guidance.
    Setup creates the config, the approved root and empty storage parents; it does
    not create store/registry endpoints, SQLite files, markers or checkouts, and it
    does not allocate or start a task. On an existing config, `--add-repository`
-   appends canonical repositories only when a positively identified registered
-   root exists; it cannot change actor, roots, store, registry or limits. `--root`
-   selects an existing registered root for guidance only. Refuse additions before
-   the first `work start`. Duplicate additions without another action are a no-op.
+   appends canonical repositories, before the first `work start` or when a
+   positively identified registered root exists; it cannot change actor, roots,
+   store, registry or limits. `work start` adds an unlisted repository the same
+   way. `--root` selects an existing registered root for guidance only. Duplicate
+   additions without another action are a no-op.
    Reuse an explicitly supplied Work-owned checkout; do not nest or reallocate it.
    Verify read-only `work status --json` before the first allocation. For a v0.2.0
    binary, set explicit `WORK_CONFIG` to an operator-edited configuration file;
